@@ -1,5 +1,6 @@
 //! Encrypted collection storage.
 pub mod crypto;
+pub mod format;
 
 /// Current unix time in seconds.
 pub fn now() -> u64 {
