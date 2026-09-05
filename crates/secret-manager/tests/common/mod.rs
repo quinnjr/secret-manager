@@ -76,6 +76,16 @@ impl Fixture {
 
     /// `pin = None` makes every prompt cancel.
     pub async fn start_with_pin(pin: Option<&str>) -> Fixture {
+        Self::start_with_pin_and_env(pin, Vec::new()).await
+    }
+
+    /// Like [`start_with_pin`](Self::start_with_pin), with extra environment
+    /// variables passed to the fake pinentry (e.g. `FAKE_DELAY` to make it
+    /// hang before answering, for tests that race a `Dismiss` against it).
+    pub async fn start_with_pin_and_env(
+        pin: Option<&str>,
+        extra_pinentry_env: Vec<(String, String)>,
+    ) -> Fixture {
         let bus = TestBus::start();
         let data_dir = tempfile::tempdir().unwrap();
         let runtime_dir = tempfile::tempdir().unwrap();
@@ -115,6 +125,7 @@ impl Fixture {
         if let Some(p) = pin {
             pinentry_env.push(("FAKE_PIN".to_string(), p.to_string()));
         }
+        pinentry_env.extend(extra_pinentry_env);
         let opts = DaemonOptions {
             config,
             bus: BusAddress::Address(bus.address.clone()),

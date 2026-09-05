@@ -136,6 +136,78 @@ async fn cancel_and_dismiss() {
     assert!(sig.args().unwrap().dismissed);
 }
 
+/// `Dismiss` arriving while the prompt's task is still stuck waiting on
+/// pinentry (never having obtained an answer) must abort it cleanly, emit
+/// exactly one `Completed(true, [])` with an `ao` result (unlock prompts
+/// always resolve to `ao`, on success and on dismissal alike), and never a
+/// second `Completed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dismiss_after_prompt_on_unlock_yields_one_completed_with_ao_result() {
+    let fx =
+        Fixture::start_with_pin_and_env(None, vec![("FAKE_DELAY".to_string(), "2".to_string())])
+            .await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+    proxy.dismiss().await.unwrap();
+    let sig = tokio::time::timeout(Duration::from_secs(5), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(args.dismissed);
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap()).unwrap(),
+        Vec::<OwnedObjectPath>::new()
+    );
+    // No second `Completed` ever arrives (the fake pinentry would otherwise
+    // still answer, cancelled, after its `FAKE_DELAY`).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), completed.next())
+            .await
+            .is_err()
+    );
+}
+
+/// The success path must still emit exactly one `Completed`, including when a
+/// (too-late) `Dismiss` arrives after the prompt has already finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unlock_success_emits_exactly_one_completed() {
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+    let sig = tokio::time::timeout(Duration::from_secs(10), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!sig.args().unwrap().dismissed);
+    // The prompt object is already gone; a late `Dismiss` cannot resurrect it
+    // or emit a second `Completed`.
+    let _ = proxy.dismiss().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), completed.next())
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unlock_by_item_path_and_lock() {
     let fx = Fixture::start().await;

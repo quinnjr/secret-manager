@@ -7,6 +7,7 @@ use super::service::ServiceSignals;
 use super::state::Shared;
 use crate::prompt::{PinOutcome, PinRequest};
 use crate::vault::{Vault, VaultError};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use zbus::Connection;
@@ -25,20 +26,51 @@ pub enum PromptAction {
     },
 }
 
+/// Which `Completed` result variant a prompt owes: `ao` for unlock, `o` for
+/// collection creation. Fixed at construction so `dismiss` can pick the right
+/// one even after `prompt()` has consumed the `PromptAction`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    Unlock,
+    CreateCollection,
+}
+
+impl PromptAction {
+    fn kind(&self) -> PromptKind {
+        match self {
+            PromptAction::Unlock { .. } => PromptKind::Unlock,
+            PromptAction::CreateCollection { .. } => PromptKind::CreateCollection,
+        }
+    }
+}
+
 pub struct Prompt {
     state: Shared,
     path: OwnedObjectPath,
+    kind: PromptKind,
     action: Mutex<Option<PromptAction>>,
     task: Mutex<Option<JoinHandle<()>>>,
+    /// Guards the single moment past which aborting the running task could
+    /// leave inconsistent state (a password obtained, about to mutate
+    /// `ServiceState` or the filesystem). Whoever locks this and flips it from
+    /// `false` to `true` first "wins": the task proceeds to completion on its
+    /// own (a too-late `dismiss` becomes a no-op), or `dismiss` proceeds to
+    /// abort the task and finish the prompt itself (the task, if it later
+    /// reaches the same check, finds it already set and abandons its work
+    /// before mutating anything).
+    committed: Arc<Mutex<bool>>,
 }
 
 impl Prompt {
     pub fn new(state: Shared, path: OwnedObjectPath, action: PromptAction) -> Self {
+        let kind = action.kind();
         Self {
             state,
             path,
+            kind,
             action: Mutex::new(Some(action)),
             task: Mutex::new(None),
+            committed: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -63,8 +95,9 @@ impl Prompt {
         let conn = conn.clone();
         let state = self.state.clone();
         let path = self.path.clone();
+        let committed = self.committed.clone();
         let handle = tokio::spawn(async move {
-            let (dismissed, result) = run(&conn, &state, action).await;
+            let (dismissed, result) = run(&conn, &state, action, &committed).await;
             finish(&conn, &state, &path, dismissed, result).await;
         });
         *self.task.lock().await = Some(handle);
@@ -72,12 +105,25 @@ impl Prompt {
     }
 
     async fn dismiss(&self, #[zbus(connection)] conn: &Connection) -> Result<()> {
+        let already_committed = {
+            let mut committed = self.committed.lock().await;
+            let was = *committed;
+            *committed = true;
+            was
+        };
+        if already_committed {
+            // The running task has already passed (or fully completed) the
+            // point of no return; its own `finish` call completes the
+            // prompt exactly once, whatever the real outcome turned out to
+            // be. Nothing to do here.
+            return Ok(());
+        }
         if let Some(handle) = self.task.lock().await.take() {
             handle.abort();
         }
-        let dismissed_result = match self.action.lock().await.take() {
-            Some(PromptAction::CreateCollection { .. }) | None => owned(Value::from(paths::root())),
-            Some(PromptAction::Unlock { .. }) => no_paths(),
+        let dismissed_result = match self.kind {
+            PromptKind::Unlock => no_paths(),
+            PromptKind::CreateCollection => owned(Value::from(paths::root())),
         };
         finish(conn, &self.state, &self.path, true, dismissed_result).await;
         Ok(())
@@ -91,7 +137,13 @@ impl Prompt {
     ) -> zbus::Result<()>;
 }
 
-/// Emit `Completed`, forget the prompt, and remove the object (deferred: may run inside `dismiss`).
+/// Emit `Completed`, forget the prompt, and remove the object.
+///
+/// Idempotent: claims the prompt by removing its `prompt_owners` entry, and
+/// does nothing if some other caller already claimed it first. This is what
+/// guarantees exactly one `Completed` per prompt even when the running task's
+/// own completion races against a `Dismiss` call (both may end up calling
+/// `finish`).
 async fn finish(
     conn: &Connection,
     state: &Shared,
@@ -99,7 +151,15 @@ async fn finish(
     dismissed: bool,
     result: OwnedValue,
 ) {
-    state.lock().await.prompt_owners.remove(path.as_str());
+    let already_done = state
+        .lock()
+        .await
+        .prompt_owners
+        .remove(path.as_str())
+        .is_none();
+    if already_done {
+        return;
+    }
     if let Ok(emitter) = SignalEmitter::new(conn, path.clone()) {
         let _ = emitter.completed(dismissed, Value::from(result)).await;
     }
@@ -113,14 +173,25 @@ async fn finish(
     });
 }
 
-async fn run(conn: &Connection, state: &Shared, action: PromptAction) -> (bool, OwnedValue) {
+async fn run(
+    conn: &Connection,
+    state: &Shared,
+    action: PromptAction,
+    committed: &Mutex<bool>,
+) -> (bool, OwnedValue) {
     match action {
         PromptAction::Unlock {
             collections,
             requested,
         } => {
-            for id in &collections {
-                if !unlock_collection(conn, state, id).await {
+            for (i, id) in collections.iter().enumerate() {
+                // Only the first collection's password exchange is guarded:
+                // once we're committed, later collections in the same prompt
+                // proceed unconditionally (their own mutations are no more
+                // abortable than the first's, and re-checking an already-true
+                // flag would wrongly look like a `dismiss`).
+                let gate = if i == 0 { Some(committed) } else { None };
+                if !unlock_collection_inner(conn, state, id, gate).await {
                     return (true, no_paths());
                 }
             }
@@ -134,7 +205,7 @@ async fn run(conn: &Connection, state: &Shared, action: PromptAction) -> (bool, 
             (false, owned(Value::from(unlocked)))
         }
         PromptAction::CreateCollection { label, alias } => {
-            match create_collection(conn, state, &label, alias.as_deref()).await {
+            match create_collection(conn, state, &label, alias.as_deref(), committed).await {
                 Some(path) => (false, owned(Value::from(path))),
                 None => (true, owned(Value::from(paths::root()))),
             }
@@ -144,6 +215,15 @@ async fn run(conn: &Connection, state: &Shared, action: PromptAction) -> (bool, 
 
 /// Ask for the collection's password up to three times. True when unlocked.
 pub async fn unlock_collection(conn: &Connection, state: &Shared, id: &str) -> bool {
+    unlock_collection_inner(conn, state, id, None).await
+}
+
+async fn unlock_collection_inner(
+    conn: &Connection,
+    state: &Shared,
+    id: &str,
+    mut commit_gate: Option<&Mutex<bool>>,
+) -> bool {
     let (pinentry, label) = {
         let st = state.lock().await;
         let Some(vault) = st.collections.get(id) else {
@@ -173,6 +253,14 @@ pub async fn unlock_collection(conn: &Connection, state: &Shared, id: &str) -> b
                 return false;
             }
         };
+        // Claim the commit point exactly once, on the first real (uncancelled)
+        // answer from pinentry. If `dismiss` claimed it first, back off before
+        // touching any state.
+        if let Some(gate) = commit_gate.take()
+            && !claim(gate).await
+        {
+            return false;
+        }
         let result = {
             let mut st = state.lock().await;
             match st.collections.get_mut(id) {
@@ -203,6 +291,7 @@ async fn create_collection(
     state: &Shared,
     label: &str,
     alias: Option<&str>,
+    committed: &Mutex<bool>,
 ) -> Option<OwnedObjectPath> {
     let pinentry = state.lock().await.pinentry.clone();
     let req = PinRequest {
@@ -220,6 +309,9 @@ async fn create_collection(
             return None;
         }
     };
+    if !claim(committed).await {
+        return None;
+    }
     let id = {
         let mut st = state.lock().await;
         let id = st.unique_collection_id(label);
@@ -252,4 +344,15 @@ async fn create_collection(
         let _ = emitter.collection_created(paths::collection(&id)).await;
     }
     Some(paths::collection(&id))
+}
+
+/// Try to claim the commit point: true if this call won the race (safe to
+/// proceed with irreversible work), false if `dismiss` claimed it first.
+async fn claim(committed: &Mutex<bool>) -> bool {
+    let mut c = committed.lock().await;
+    if *c {
+        return false;
+    }
+    *c = true;
+    true
 }
