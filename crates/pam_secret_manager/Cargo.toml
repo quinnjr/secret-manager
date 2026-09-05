@@ -1,0 +1,14 @@
+[package]
+name = "pam_secret_manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+control-protocol = { path = "../control-protocol" }
+pamsm = { version = "0.5", features = ["libpam"] }
+zeroize.workspace = true
+libc.workspace = true

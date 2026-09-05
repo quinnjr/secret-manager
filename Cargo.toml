@@ -1,6 +1,21 @@
-[package]
-name = "secret-manager"
+[workspace]
+resolver = "3"
+members = [
+    "crates/control-protocol",
+    "crates/secret-manager",
+    "crates/pam_secret_manager",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quinnjr/secret-manager"
 
-[dependencies]
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+zeroize = { version = "1", features = ["serde", "derive"] }
+thiserror = "2"
+anyhow = "1"
+libc = "0.2"
