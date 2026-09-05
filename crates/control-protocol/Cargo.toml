@@ -9,3 +9,4 @@ serde.workspace = true
 postcard.workspace = true
 zeroize.workspace = true
 thiserror.workspace = true
+libc.workspace = true
