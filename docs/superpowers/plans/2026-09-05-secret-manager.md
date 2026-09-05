@@ -15,7 +15,7 @@
 - Edition `2024`, `resolver = "3"`, rustc 1.97 available locally.
 - All work happens in a git worktree, never in the primary checkout (user rule).
 - Every task ends with `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` green before commit.
-- No `unsafe` outside `crates/pam_secret_manager` and the `SO_PEERCRED`/`getuid` calls in `control/server.rs`.
+- No `unsafe` outside `crates/pam_secret_manager`, the `SO_PEERCRED`/`getuid` check in `control/server.rs`, and the `libc::getuid()` fallbacks in `config.rs` (`runtime_dir`) and `control-protocol` (`socket_path`).
 - Secrets in memory live in `zeroize::Zeroizing` wrappers; never `println!`/`tracing` a secret.
 - Bus name `org.freedesktop.secrets`; object root `/org/freedesktop/secrets`; error prefix `org.freedesktop.Secret.Error`.
 - Session algorithms: `plain` and `dh-ietf1024-sha256-aes128-cbc-pkcs7`. Both required.
