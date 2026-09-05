@@ -1,0 +1,320 @@
+mod common;
+
+use common::Fixture;
+use futures_util::StreamExt;
+use secret_manager::dbus::paths;
+use secret_manager::dbus::proxies::{CollectionProxy, PromptProxy, ServiceProxy};
+use secret_manager::dbus::session::SecretStruct;
+use secret_manager::session::ALGORITHM_PLAIN;
+use std::collections::HashMap;
+use std::time::Duration;
+use zbus::proxy::CacheProperties;
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+
+async fn collection(conn: &zbus::Connection, path: OwnedObjectPath) -> CollectionProxy<'static> {
+    CollectionProxy::builder(conn)
+        .path(path)
+        .unwrap()
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap()
+}
+
+/// Subscribe, trigger, and wait for `Completed`. Returns `(dismissed, result)`.
+async fn perform(conn: &zbus::Connection, prompt: &OwnedObjectPath) -> (bool, OwnedValue) {
+    let proxy = PromptProxy::builder(conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+    let sig = tokio::time::timeout(Duration::from_secs(10), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let args = sig.args().unwrap();
+    (args.dismissed, args.result.try_to_owned().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unlock_with_correct_password() {
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let coll = collection(&conn, fx.default_collection()).await;
+    assert!(coll.locked().await.unwrap());
+    let mut changed = service.receive_collection_changed().await.unwrap();
+
+    let (unlocked, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    assert!(unlocked.is_empty());
+    assert!(
+        prompt
+            .as_str()
+            .starts_with("/org/freedesktop/secrets/prompt/")
+    );
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(!dismissed);
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(result).unwrap(),
+        vec![fx.default_collection()]
+    );
+    assert!(!coll.locked().await.unwrap());
+    assert_eq!(
+        changed.next().await.unwrap().args().unwrap().collection,
+        fx.default_collection()
+    );
+    assert!(fx.pinentry_log().contains("GETPIN"));
+
+    // Already unlocked: no prompt.
+    let (unlocked, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    assert_eq!(unlocked, vec![fx.default_collection()]);
+    assert_eq!(prompt.as_str(), "/");
+    // Prompt object is gone.
+    assert!(
+        common::wait_for(Duration::from_secs(2), || async {
+            PromptProxy::builder(&conn)
+                .path(prompt.clone())
+                .unwrap()
+                .build()
+                .await
+                .unwrap()
+                .dismiss()
+                .await
+                .is_err()
+        })
+        .await
+    );
+    assert!(fx.daemon.state.lock().await.prompt_owners.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrong_password_three_times_then_dismissed() {
+    let fx = Fixture::start_with_pin(Some("wrong")).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(dismissed);
+    assert!(Vec::<OwnedObjectPath>::try_from(result).unwrap().is_empty());
+    let log = fx.pinentry_log();
+    assert_eq!(log.matches("GETPIN").count(), 3);
+    assert_eq!(log.matches("SETERROR").count(), 2);
+    assert!(
+        collection(&conn, fx.default_collection())
+            .await
+            .locked()
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_and_dismiss() {
+    let fx = Fixture::start_with_pin(None).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let (dismissed, _) = perform(&conn, &prompt).await;
+    assert!(dismissed);
+
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.dismiss().await.unwrap();
+    let sig = tokio::time::timeout(Duration::from_secs(5), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sig.args().unwrap().dismissed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unlock_by_item_path_and_lock() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap()
+        .1;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let attrs: HashMap<String, String> = HashMap::from([("k".to_string(), "v".to_string())]);
+    let props = HashMap::from([
+        ("org.freedesktop.Secret.Item.Label", Value::from("x")),
+        ("org.freedesktop.Secret.Item.Attributes", Value::from(attrs)),
+    ]);
+    let secret = SecretStruct {
+        session: session.clone(),
+        parameters: vec![],
+        value: b"s".to_vec(),
+        content_type: "text/plain".into(),
+    };
+    let (item_path, _) = coll.create_item(props, &secret, false).await.unwrap();
+
+    let mut changed = service.receive_collection_changed().await.unwrap();
+    let (locked, prompt) = service
+        .lock(std::slice::from_ref(&item_path))
+        .await
+        .unwrap();
+    assert_eq!(locked, vec![item_path.clone()]);
+    assert_eq!(prompt.as_str(), "/");
+    assert!(coll.locked().await.unwrap());
+    assert_eq!(
+        changed.next().await.unwrap().args().unwrap().collection,
+        fx.default_collection()
+    );
+
+    let (_, prompt) = service
+        .unlock(std::slice::from_ref(&item_path))
+        .await
+        .unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(!dismissed);
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(result).unwrap(),
+        vec![item_path.clone()]
+    );
+    assert!(!coll.locked().await.unwrap());
+    let got = service
+        .get_secrets(std::slice::from_ref(&item_path), &session)
+        .await
+        .unwrap();
+    assert_eq!(got[&item_path].value, b"s");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_collection_with_alias_and_delete() {
+    let fx = Fixture::start_with_pin(Some("newpw")).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let mut created = service.receive_collection_created().await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (path, prompt) = service
+        .create_collection(props.clone(), "work")
+        .await
+        .unwrap();
+    assert_eq!(path.as_str(), "/");
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(!dismissed);
+    let new_path = OwnedObjectPath::try_from(result).unwrap();
+    assert_eq!(new_path, paths::collection("work_keys"));
+    assert_eq!(
+        created.next().await.unwrap().args().unwrap().collection,
+        new_path
+    );
+    assert!(fx.pinentry_log().contains("SETREPEAT"));
+    assert!(
+        fx.data_dir
+            .path()
+            .join("secret-manager")
+            .join("work_keys.vault")
+            .exists()
+    );
+    assert_eq!(service.read_alias("work").await.unwrap(), new_path);
+    let work = collection(&conn, new_path.clone()).await;
+    assert_eq!(work.label().await.unwrap(), "Work Keys");
+    assert!(
+        !work.locked().await.unwrap(),
+        "freshly created collections start unlocked"
+    );
+    assert!(service.collections().await.unwrap().contains(&new_path));
+
+    // Existing alias short-circuits without a prompt.
+    let (path, prompt) = service.create_collection(props, "work").await.unwrap();
+    assert_eq!(path, new_path);
+    assert_eq!(prompt.as_str(), "/");
+
+    let mut deleted = service.receive_collection_deleted().await.unwrap();
+    assert_eq!(work.delete().await.unwrap().as_str(), "/");
+    assert_eq!(
+        deleted.next().await.unwrap().args().unwrap().collection,
+        new_path
+    );
+    assert!(
+        !fx.data_dir
+            .path()
+            .join("secret-manager")
+            .join("work_keys.vault")
+            .exists()
+    );
+    assert_eq!(service.read_alias("work").await.unwrap().as_str(), "/");
+    assert!(!service.collections().await.unwrap().contains(&new_path));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_collection_cancelled() {
+    let fx = Fixture::start_with_pin(None).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Nope"),
+    )]);
+    let (_, prompt) = service.create_collection(props, "").await.unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(dismissed);
+    assert_eq!(OwnedObjectPath::try_from(result).unwrap().as_str(), "/");
+    assert_eq!(
+        service.collections().await.unwrap(),
+        vec![fx.default_collection()]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn secret_tool_unlocks_through_prompt() {
+    if std::process::Command::new("secret-tool")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let fx = Fixture::start().await; // locked, pinentry answers "pw"
+    let mut cmd = tokio::process::Command::new("secret-tool");
+    cmd.args(["store", "--label=Prompted", "app", "prompted"])
+        .env("DBUS_SESSION_BUS_ADDRESS", &fx.bus.address)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    use tokio::io::AsyncWriteExt;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"s3cret\n")
+        .await
+        .unwrap();
+    let out = child.wait_with_output().await.unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fx.pinentry_log().contains("GETPIN"));
+
+    let out = tokio::process::Command::new("secret-tool")
+        .args(["lookup", "app", "prompted"])
+        .env("DBUS_SESSION_BUS_ADDRESS", &fx.bus.address)
+        .output()
+        .await
+        .unwrap();
+    // `secret-tool lookup` prints the secret followed by its own trailing newline.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+        "s3cret"
+    );
+}

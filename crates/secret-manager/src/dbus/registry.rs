@@ -3,7 +3,7 @@
 use super::collection::{Collection, CollectionRef};
 use super::item::Item;
 use super::paths;
-use super::service::ServiceSignals;
+use super::service::{Service, ServiceSignals};
 use super::state::Shared;
 use zbus::Connection;
 use zbus::object_server::SignalEmitter;
@@ -106,6 +106,21 @@ pub async fn notify_collection_changed(conn: &Connection, id: &str) {
             .get()
             .await
             .locked_changed(iface.signal_emitter())
+            .await;
+    }
+}
+
+/// `PropertiesChanged` for `Service.Collections`, after a collection is created or deleted.
+pub async fn notify_collections_changed(conn: &Connection) {
+    if let Ok(iface) = conn
+        .object_server()
+        .interface::<_, Service>(paths::SERVICE_PATH)
+        .await
+    {
+        let _ = iface
+            .get()
+            .await
+            .collections_changed(iface.signal_emitter())
             .await;
     }
 }

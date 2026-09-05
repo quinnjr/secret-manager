@@ -2,6 +2,8 @@
 
 use super::errors::{Error, Result};
 use super::paths;
+use super::prompt::{Prompt, PromptAction};
+use super::prop_string;
 use super::registry;
 use super::sender;
 use super::session::{SecretStruct, Session};
@@ -143,6 +145,119 @@ impl Service {
             registry::register_alias(conn, &self.state, name).await?;
         }
         Ok(())
+    }
+
+    #[zbus(out_args("unlocked", "prompt"))]
+    async fn unlock(
+        &self,
+        objects: Vec<OwnedObjectPath>,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(object_server)] server: &ObjectServer,
+    ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+        let mut st = self.state.lock().await;
+        let mut unlocked = Vec::new();
+        let mut collections: Vec<String> = Vec::new();
+        let mut requested = Vec::new();
+        for path in objects {
+            let Some(cid) = st.collection_id_of_path(path.as_str()) else {
+                continue;
+            };
+            if !st.collections[&cid].is_locked() {
+                unlocked.push(path);
+                continue;
+            }
+            if !collections.contains(&cid) {
+                collections.push(cid);
+            }
+            requested.push(path);
+        }
+        if collections.is_empty() {
+            return Ok((unlocked, paths::root()));
+        }
+        let prompt_path = st.new_prompt_path();
+        st.prompt_owners
+            .insert(prompt_path.to_string(), sender(&header));
+        drop(st);
+        let prompt = Prompt::new(
+            self.state.clone(),
+            prompt_path.clone(),
+            PromptAction::Unlock {
+                collections,
+                requested,
+            },
+        );
+        server.at(prompt_path.clone(), prompt).await?;
+        Ok((unlocked, prompt_path))
+    }
+
+    #[zbus(out_args("locked", "prompt"))]
+    async fn lock(
+        &self,
+        objects: Vec<OwnedObjectPath>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+        let (locked, changed) = {
+            let mut st = self.state.lock().await;
+            let mut locked = Vec::new();
+            let mut changed: Vec<String> = Vec::new();
+            for path in objects {
+                let Some(cid) = st.collection_id_of_path(path.as_str()) else {
+                    continue;
+                };
+                if let Some(vault) = st.collections.get_mut(&cid) {
+                    if !vault.is_locked() {
+                        vault.lock();
+                        if !changed.contains(&cid) {
+                            changed.push(cid);
+                        }
+                    }
+                    locked.push(path);
+                }
+            }
+            (locked, changed)
+        };
+        for cid in changed {
+            registry::notify_collection_changed(conn, &cid).await;
+        }
+        Ok((locked, paths::root()))
+    }
+
+    #[zbus(out_args("collection", "prompt"))]
+    async fn create_collection(
+        &self,
+        properties: HashMap<String, OwnedValue>,
+        alias: &str,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(object_server)] server: &ObjectServer,
+    ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+        let label = prop_string(&properties, "org.freedesktop.Secret.Collection.Label")?
+            .unwrap_or_else(|| "Unnamed".to_string());
+        let alias = if alias.is_empty() {
+            None
+        } else if paths::is_segment(alias) {
+            Some(alias.to_string())
+        } else {
+            return Err(Error::invalid_args("alias names must match [A-Za-z0-9_]+"));
+        };
+        let mut st = self.state.lock().await;
+        if let Some(existing) = alias
+            .as_ref()
+            .and_then(|a| st.aliases.get(a))
+            .filter(|id| st.collections.contains_key(*id))
+        {
+            return Ok((paths::collection(existing), paths::root()));
+        }
+        let prompt_path = st.new_prompt_path();
+        st.prompt_owners
+            .insert(prompt_path.to_string(), sender(&header));
+        drop(st);
+        let prompt = Prompt::new(
+            self.state.clone(),
+            prompt_path.clone(),
+            PromptAction::CreateCollection { label, alias },
+        );
+        server.at(prompt_path.clone(), prompt).await?;
+        Ok((paths::root(), prompt_path))
     }
 
     #[zbus(property)]

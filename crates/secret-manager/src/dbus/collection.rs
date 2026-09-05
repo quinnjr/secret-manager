@@ -70,7 +70,10 @@ impl Collection {
         vault.delete_file()?;
         let conn2 = conn.clone();
         let id2 = id.clone();
-        tokio::spawn(async move { registry::unregister_collection(&conn2, &id2, &item_ids).await });
+        tokio::spawn(async move {
+            registry::unregister_collection(&conn2, &id2, &item_ids).await;
+            registry::notify_collections_changed(&conn2).await;
+        });
         SignalEmitter::new(conn, paths::SERVICE_PATH)?
             .collection_deleted(paths::collection(&id))
             .await?;

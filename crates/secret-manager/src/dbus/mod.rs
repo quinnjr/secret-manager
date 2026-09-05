@@ -4,6 +4,7 @@ pub mod collection;
 pub mod errors;
 pub mod item;
 pub mod paths;
+pub mod prompt;
 pub mod proxies;
 pub mod registry;
 pub mod service;
