@@ -397,10 +397,8 @@ async fn secret_tool_interop() {
     };
     run(
         &["store", "--label=Interop", "app", "interop", "user", "joe"],
-        "s3cret\n",
+        "s3cret",
     );
-    // `secret-tool lookup` prints the secret followed by a trailing newline
-    // (see secret-tool(1)); trim it before comparing.
-    assert_eq!(run(&["lookup", "app", "interop"], "").trim_end(), "s3cret");
+    assert_eq!(run(&["lookup", "app", "interop"], ""), "s3cret");
     assert!(run(&["search", "app", "interop"], "").contains("label = Interop"));
 }
