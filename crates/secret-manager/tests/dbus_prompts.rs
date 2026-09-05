@@ -295,7 +295,7 @@ async fn secret_tool_unlocks_through_prompt() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"s3cret\n")
+        .write_all(b"s3cret")
         .await
         .unwrap();
     let out = child.wait_with_output().await.unwrap();
@@ -312,9 +312,5 @@ async fn secret_tool_unlocks_through_prompt() {
         .output()
         .await
         .unwrap();
-    // `secret-tool lookup` prints the secret followed by its own trailing newline.
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
-        "s3cret"
-    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "s3cret");
 }
