@@ -17,10 +17,18 @@ pub struct PinRequest {
     pub repeat: bool,
 }
 
-#[derive(Debug)]
 pub enum PinOutcome {
     Pin(Zeroizing<String>),
     Cancelled,
+}
+
+impl std::fmt::Debug for PinOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PinOutcome::Pin(_) => write!(f, "PinOutcome::Pin(..)"),
+            PinOutcome::Cancelled => write!(f, "PinOutcome::Cancelled"),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -304,6 +312,12 @@ mod tests {
             error: None,
             repeat: false,
         }
+    }
+
+    #[test]
+    fn pin_outcome_debug_does_not_print_the_pin() {
+        let outcome = PinOutcome::Pin(Zeroizing::new("hunter2".to_string()));
+        assert!(!format!("{outcome:?}").contains("hunter2"));
     }
 
     #[test]
