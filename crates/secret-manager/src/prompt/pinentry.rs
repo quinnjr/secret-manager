@@ -1,0 +1,376 @@
+//! Minimal Assuan client that drives a `pinentry` binary.
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, Default)]
+pub struct PinRequest {
+    pub title: String,
+    pub description: String,
+    pub prompt: String,
+    pub error: Option<String>,
+    /// Ask twice and require both entries to match (new passwords).
+    pub repeat: bool,
+}
+
+#[derive(Debug)]
+pub enum PinOutcome {
+    Pin(Zeroizing<String>),
+    Cancelled,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PinentryError {
+    #[error("cannot start {program}: {source}")]
+    Spawn {
+        program: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("pinentry i/o error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("pinentry protocol error: {0}")]
+    Protocol(String),
+    #[error("pinentry error {code}: {message}")]
+    Assuan { code: u32, message: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct Pinentry {
+    program: PathBuf,
+    env: Vec<(OsString, OsString)>,
+}
+
+/// GPG_ERR_CANCELED is 99 in the low 16 bits of an Assuan error code.
+pub fn is_cancel(code: u32) -> bool {
+    code & 0xFFFF == 99
+}
+
+pub fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn unescape(s: &str) -> Result<String, PinentryError> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .ok_or_else(|| PinentryError::Protocol("truncated escape".into()))?;
+            let hex = std::str::from_utf8(hex)
+                .map_err(|_| PinentryError::Protocol("bad escape".into()))?;
+            let v = u8::from_str_radix(hex, 16)
+                .map_err(|_| PinentryError::Protocol(format!("bad escape %{hex}")))?;
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| PinentryError::Protocol("pin is not utf-8".into()))
+}
+
+impl Pinentry {
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            env: Vec::new(),
+        }
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    pub async fn ask(&self, req: &PinRequest) -> Result<PinOutcome, PinentryError> {
+        let mut conn = self.connect().await?;
+        conn.setup(req).await?;
+        if req.repeat {
+            conn.command_lenient("SETREPEAT Repeat:").await?;
+        }
+        let outcome = match conn.getpin().await {
+            Ok(pin) => PinOutcome::Pin(pin),
+            Err(PinentryError::Assuan { code, .. }) if is_cancel(code) => PinOutcome::Cancelled,
+            Err(e) => return Err(e),
+        };
+        conn.bye().await;
+        Ok(outcome)
+    }
+
+    /// Yes/no question. Cancel or any pinentry error means "no".
+    pub async fn confirm(&self, req: &PinRequest) -> Result<bool, PinentryError> {
+        let mut conn = self.connect().await?;
+        conn.setup(req).await?;
+        let ok = match conn.command("CONFIRM").await {
+            Ok(()) => true,
+            Err(PinentryError::Assuan { .. }) => false,
+            Err(e) => return Err(e),
+        };
+        conn.bye().await;
+        Ok(ok)
+    }
+
+    async fn connect(&self) -> Result<Assuan, PinentryError> {
+        let mut cmd = Command::new(&self.program);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().map_err(|source| PinentryError::Spawn {
+            program: self.program.clone(),
+            source,
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| PinentryError::Protocol("no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PinentryError::Protocol("no stdout".into()))?;
+        let mut conn = Assuan {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        };
+        conn.expect_ok().await?; // greeting
+        for opt in tty_options() {
+            conn.command_lenient(&opt).await?;
+        }
+        Ok(conn)
+    }
+}
+
+/// Options that let pinentry-curses/tty find the terminal and locale.
+fn tty_options() -> Vec<String> {
+    let mut opts = Vec::new();
+    if let Ok(tty) = std::env::var("GPG_TTY") {
+        opts.push(format!("OPTION ttyname={tty}"));
+    }
+    if let Ok(term) = std::env::var("TERM") {
+        opts.push(format!("OPTION ttytype={term}"));
+    }
+    let ctype = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()));
+    if let Some(c) = ctype {
+        opts.push(format!("OPTION lc-ctype={c}"));
+    }
+    opts
+}
+
+enum Reply {
+    Ok,
+    Data(String),
+    Err { code: u32, message: String },
+}
+
+struct Assuan {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl Assuan {
+    async fn setup(&mut self, req: &PinRequest) -> Result<(), PinentryError> {
+        if !req.title.is_empty() {
+            self.command_lenient(&format!("SETTITLE {}", escape(&req.title)))
+                .await?;
+        }
+        self.command(&format!("SETDESC {}", escape(&req.description)))
+            .await?;
+        self.command(&format!("SETPROMPT {}", escape(&req.prompt)))
+            .await?;
+        if let Some(e) = &req.error {
+            self.command_lenient(&format!("SETERROR {}", escape(e)))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn send(&mut self, line: &str) -> Result<(), PinentryError> {
+        self.stdin.write_all(line.as_bytes()).await?;
+        self.stdin.write_all(b"\n").await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn read_reply(&mut self) -> Result<Reply, PinentryError> {
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line).await?;
+            if n == 0 {
+                return Err(PinentryError::Protocol(
+                    "pinentry closed the connection".into(),
+                ));
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line == "OK" || line.starts_with("OK ") {
+                return Ok(Reply::Ok);
+            }
+            if let Some(rest) = line.strip_prefix("D ") {
+                return Ok(Reply::Data(rest.to_string()));
+            }
+            if let Some(rest) = line.strip_prefix("ERR ") {
+                let (code, message) = rest.split_once(' ').unwrap_or((rest, ""));
+                let code = code
+                    .parse::<u32>()
+                    .map_err(|_| PinentryError::Protocol(format!("bad error line: {line}")))?;
+                return Ok(Reply::Err {
+                    code,
+                    message: message.to_string(),
+                });
+            }
+            // "S ..." status lines and "# ..." comments are informational.
+        }
+    }
+
+    async fn expect_ok(&mut self) -> Result<(), PinentryError> {
+        match self.read_reply().await? {
+            Reply::Ok => Ok(()),
+            Reply::Err { code, message } => Err(PinentryError::Assuan { code, message }),
+            Reply::Data(_) => Err(PinentryError::Protocol("unexpected data line".into())),
+        }
+    }
+
+    async fn command(&mut self, line: &str) -> Result<(), PinentryError> {
+        self.send(line).await?;
+        self.expect_ok().await
+    }
+
+    /// Like `command` but an Assuan ERR is ignored (unsupported options).
+    async fn command_lenient(&mut self, line: &str) -> Result<(), PinentryError> {
+        match self.command(line).await {
+            Err(PinentryError::Assuan { .. }) => Ok(()),
+            other => other,
+        }
+    }
+
+    async fn getpin(&mut self) -> Result<Zeroizing<String>, PinentryError> {
+        self.send("GETPIN").await?;
+        let mut pin = Zeroizing::new(String::new());
+        loop {
+            match self.read_reply().await? {
+                Reply::Data(d) => pin.push_str(&unescape(&d)?),
+                Reply::Ok => return Ok(pin),
+                Reply::Err { code, message } => {
+                    return Err(PinentryError::Assuan { code, message });
+                }
+            }
+        }
+    }
+
+    async fn bye(&mut self) {
+        let _ = self.send("BYE").await;
+        let _ = self.read_reply().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake() -> Pinentry {
+        Pinentry::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake-pinentry.sh"
+        ))
+    }
+
+    fn req() -> PinRequest {
+        PinRequest {
+            title: "secret-manager".into(),
+            description: "Unlock 'default'\nline two".into(),
+            prompt: "Password:".into(),
+            error: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn escaping_round_trips() {
+        assert_eq!(escape("a%b\nc\rd"), "a%25b%0Ac%0Dd");
+        assert_eq!(unescape("a%25b%0Ac%0Dd").unwrap(), "a%b\nc\rd");
+        assert!(unescape("bad%zz").is_err());
+        assert!(is_cancel(83886179));
+        assert!(!is_cancel(83886180));
+    }
+
+    #[tokio::test]
+    async fn returns_pin() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let p = fake()
+            .env("FAKE_PIN", "hun%25ter2")
+            .env("FAKE_LOG", log.path());
+        match p.ask(&req()).await.unwrap() {
+            PinOutcome::Pin(pin) => assert_eq!(pin.as_str(), "hun%ter2"),
+            PinOutcome::Cancelled => panic!("cancelled"),
+        }
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("SETDESC Unlock 'default'%0Aline two"));
+        assert!(text.contains("SETPROMPT Password:"));
+        assert!(text.contains("SETTITLE secret-manager"));
+        assert!(!text.contains("SETERROR"));
+        assert!(!text.contains("SETREPEAT"));
+        assert!(text.trim_end().ends_with("BYE"));
+    }
+
+    #[tokio::test]
+    async fn cancel_error_and_repeat() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let p = fake().env("FAKE_LOG", log.path());
+        let mut r = req();
+        r.error = Some("Wrong password".into());
+        r.repeat = true;
+        assert!(matches!(p.ask(&r).await.unwrap(), PinOutcome::Cancelled));
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(text.contains("SETERROR Wrong password"));
+        assert!(text.contains("SETREPEAT"));
+    }
+
+    #[tokio::test]
+    async fn confirm_yes_and_no() {
+        assert!(
+            fake()
+                .env("FAKE_CONFIRM", "yes")
+                .confirm(&req())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fake()
+                .env("FAKE_CONFIRM", "no")
+                .confirm(&req())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_program_is_spawn_error() {
+        let err = Pinentry::new("/nonexistent/pinentry")
+            .ask(&req())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PinentryError::Spawn { .. }));
+    }
+}
