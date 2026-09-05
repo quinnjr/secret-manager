@@ -2,12 +2,14 @@
 
 use super::errors::{Error, Result};
 use super::paths;
+use super::registry;
 use super::sender;
-use super::session::Session;
+use super::session::{SecretStruct, Session};
 use super::state::{SessionEntry, Shared};
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
 use std::collections::{BTreeMap, HashMap};
+use zbus::Connection;
 use zbus::interface;
 use zbus::message::Header;
 use zbus::object_server::{ObjectServer, SignalEmitter};
@@ -80,6 +82,67 @@ impl Service {
             .filter(|id| st.collections.contains_key(*id))
             .map(|id| paths::collection(id))
             .unwrap_or_else(paths::root))
+    }
+
+    async fn get_secrets(
+        &self,
+        items: Vec<OwnedObjectPath>,
+        session: OwnedObjectPath,
+    ) -> Result<HashMap<OwnedObjectPath, SecretStruct>> {
+        let mut st = self.state.lock().await;
+        st.touch();
+        let cipher = st.cipher(session.as_str())?;
+        let mut out = HashMap::new();
+        for path in items {
+            let Some((cid, iid)) = st.resolve_item(path.as_str()) else {
+                continue;
+            };
+            let Some(vault) = st.collections.get(&cid) else {
+                continue;
+            };
+            // Locked items are omitted, as the spec allows.
+            let Ok(item) = vault.item(&iid) else {
+                continue;
+            };
+            let (parameters, value) = cipher.encrypt(&item.secret);
+            out.insert(
+                path,
+                SecretStruct {
+                    session: session.clone(),
+                    parameters,
+                    value,
+                    content_type: item.content_type.clone(),
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    async fn set_alias(
+        &self,
+        name: &str,
+        collection: OwnedObjectPath,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<()> {
+        if !paths::is_segment(name) {
+            return Err(Error::invalid_args("alias names must match [A-Za-z0-9_]+"));
+        }
+        {
+            let mut st = self.state.lock().await;
+            if collection.as_str() == "/" {
+                st.aliases.remove(name);
+            } else {
+                let id = st
+                    .resolve_collection(collection.as_str())
+                    .ok_or(Error::NoSuchObject)?;
+                st.aliases.insert(name.to_string(), id);
+            }
+            st.save_aliases().map_err(Error::failed)?;
+        }
+        if collection.as_str() != "/" {
+            registry::register_alias(conn, &self.state, name).await?;
+        }
+        Ok(())
     }
 
     #[zbus(property)]

@@ -93,7 +93,7 @@ impl Daemon {
             .build()
             .await?;
 
-        // Task 10: crate::dbus::registry::register_all(&connection, &state).await?;
+        crate::dbus::registry::register_all(&connection, &state).await?;
         // Task 12: control server, client watcher, idle lock.
         let tasks = Vec::new();
         tracing::info!("serving {BUS_NAME}");

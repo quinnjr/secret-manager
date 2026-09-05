@@ -1,8 +1,11 @@
 //! `org.freedesktop.Secret.*` interfaces.
 
+pub mod collection;
 pub mod errors;
+pub mod item;
 pub mod paths;
 pub mod proxies;
+pub mod registry;
 pub mod service;
 pub mod session;
 pub mod state;
@@ -16,7 +19,6 @@ pub fn sender(header: &Header<'_>) -> String {
     header.sender().map(|s| s.to_string()).unwrap_or_default()
 }
 
-#[allow(dead_code)]
 pub(crate) fn prop_string(
     props: &HashMap<String, OwnedValue>,
     key: &str,
@@ -29,7 +31,6 @@ pub(crate) fn prop_string(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn prop_attributes(
     props: &HashMap<String, OwnedValue>,
     key: &str,

@@ -209,6 +209,29 @@ impl Fixture {
     pub fn pinentry_log(&self) -> String {
         std::fs::read_to_string(&self.pinentry_log).unwrap_or_default()
     }
+
+    pub async fn unlock_default(&self) {
+        self.daemon
+            .state
+            .lock()
+            .await
+            .collections
+            .get_mut("default")
+            .unwrap()
+            .unlock(PASSWORD.as_bytes())
+            .unwrap();
+    }
+
+    pub async fn lock_default(&self) {
+        self.daemon
+            .state
+            .lock()
+            .await
+            .collections
+            .get_mut("default")
+            .unwrap()
+            .lock();
+    }
 }
 
 /// Poll until `f` returns true or `timeout` elapses.
