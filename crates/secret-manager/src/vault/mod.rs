@@ -1,6 +1,8 @@
 //! Encrypted collection storage.
 pub mod crypto;
 pub mod format;
+pub mod store;
+pub use store::{Vault, VaultError};
 
 /// Current unix time in seconds.
 pub fn now() -> u64 {
