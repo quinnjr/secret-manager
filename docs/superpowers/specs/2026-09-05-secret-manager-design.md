@@ -21,6 +21,7 @@ key material, a GUI manager, network sync.
 
 ```
 Cargo.toml                 workspace
+crates/control-protocol/   lib: control socket message types, framing, sync client (std only)
 crates/secret-manager/     bin: daemon + CLI
   src/main.rs
   src/cli/                 clap definitions, one file per subcommand group
@@ -30,7 +31,7 @@ crates/secret-manager/     bin: daemon + CLI
   src/prompt/              pinentry.rs (Assuan client)
   src/control/             unix socket protocol shared by CLI and PAM
   src/config.rs
-crates/pam_secret_manager/ cdylib: PAM module
+crates/pam_secret_manager/ cdylib: PAM module, depends only on control-protocol
 dist/                      systemd user unit, D-Bus service file, pam.d snippets
 docs/                      install guides for Arch and Debian
 ```
@@ -60,6 +61,17 @@ Header, `postcard` encoded, plaintext:
 | kdf           | `KdfParams`       | Argon2id `m_cost`, `t_cost`, `p_cost`  |
 | salt          | `[u8; 16]`        | random per password                    |
 | nonce         | `[u8; 24]`        | random per write                       |
+| index         | `Vec<IndexEntry>` | item ids + salted attribute hashes     |
+
+`IndexEntry { id: String, attr_hashes: Vec<[u8; 32]> }` where each hash is
+`SHA-256(salt || len(key) || key || value)` over one attribute pair, sorted.
+The index lets `SearchItems` work on a locked collection: the daemon hashes
+the query pairs with the same salt and returns items whose hash set contains
+all of them. Item ids are the object path leaves, so a client can call
+`Unlock` on the matches and be prompted. Labels, attribute plaintext, and
+secrets stay inside the encrypted body, matching gnome-keyring's hashed
+attribute scheme for locked keyrings. Anyone with the file can test guesses
+against the hashes; that is the accepted trade-off, as in gnome-keyring.
 
 Body: XChaCha20-Poly1305 over `postcard(Vec<Item>)`. The exact header bytes
 are the associated data, so changing the label, KDF parameters, or salt
@@ -87,11 +99,15 @@ over the original. A crash never leaves a half-written vault.
 Memory: the derived key and decrypted items are held in `Zeroizing` buffers
 and dropped on `Lock`, on idle timeout, and on daemon shutdown.
 
-`init` creates the `default` collection and points the `default` alias at it.
+`init` creates the `default` collection and points the `default` alias at
+it, writing `aliases.toml` next to the vault files. If a daemon is running,
+`init` sends `Reload` so the new collection appears on the bus immediately.
 `CreateCollection` creates additional vaults with their own password.
 
-Crates: `argon2`, `chacha20poly1305`, `zeroize`, `postcard`, `serde`,
-`rand`, `uuid`.
+Crates: `argon2 0.5`, `chacha20poly1305 0.10`, `zeroize`, `postcard`,
+`serde`, `rand_core 0.6` (`OsRng`), `uuid` (simple form, since object path
+segments forbid `-`). Newer RustCrypto majors exist; the 0.5/0.10/0.12
+generation is pinned because its API is stable and well known.
 
 ## D-Bus surface
 
@@ -142,13 +158,14 @@ Attribute search is exact match on every supplied pair, across all
 collections for `Service.SearchItems` and within one for
 `Collection.SearchItems`. Results are split into `unlocked` and `locked`.
 
-`SearchItems`, `Collections`, `Items`, `Label`, `Attributes` work on locked
-collections. The vault therefore keeps labels and attributes readable without
-the key: the daemon caches them from the last unlock in memory, and a locked
-collection that has never been unlocked this session reports no items until
-unlocked. This is the same behaviour as gnome-keyring.
+`SearchItems`, `Collections`, and `Items` work on locked collections through
+the plaintext index in the vault header. On a locked item, `Label` returns
+`""` and `Attributes` returns an empty dict; `GetSecret` returns `IsLocked`.
+Once unlocked, everything is served from the decrypted body.
 
-Crates: `zbus`, `tokio`, `aes`, `cbc`, `hkdf`, `sha2`, `num-bigint-dig`.
+Crates: `zbus 5`, `tokio`, `aes 0.8`, `cbc 0.1`, `hkdf 0.12`, `sha2 0.10`,
+`num-bigint 0.4`. The DH exponentiation is not constant time; the keys are
+ephemeral per session, which matches libsecret's threat model.
 
 ## Prompts
 
@@ -171,7 +188,8 @@ stdin is not a TTY.
 
 `$XDG_RUNTIME_DIR/secret-manager/control.sock`, directory mode 0700, socket
 mode 0600, created by the daemon. Peer UID is checked with `SO_PEERCRED` and
-must equal the daemon's UID.
+must equal the daemon's UID or be 0, because the PAM module runs as root
+during display-manager and console logins.
 
 Protocol: `u32` big-endian length prefix, then a `postcard` encoded message.
 
@@ -181,29 +199,36 @@ enum Request {
     Lock { collection: Option<String> },        // None = all
     ChangePassword { collection: String, old: Zeroizing<String>, new: Zeroizing<String> },
     Status,
+    Reload,          // rescan the vault directory; used by `sm init`
 }
 enum Response {
     Ok,
-    Status { collections: Vec<(String, bool /* locked */)>, uptime_secs: u64 },
+    Status { collections: Vec<CollectionStatus>, uptime_secs: u64 },
     Error(String),
 }
+struct CollectionStatus { id: String, label: String, locked: bool, items: usize }
 ```
 
-Used by the CLI for `lock`, `unlock`, `status`, `change-password`, and by the
-PAM module. Never carries secrets other than the master password.
+Used by the CLI for `lock`, `unlock`, `status`, `change-password`, `init`
+(`Reload`), and by the PAM module. Never carries secrets other than the
+master password. The types, framing, and a blocking std-only client live in
+the `control-protocol` crate so the PAM module does not link tokio or zbus.
 
 ## PAM module
 
-Crate `pam_secret_manager`, cdylib, using `pam-bindings`.
+Crate `pam_secret_manager`, cdylib, using `pamsm` (feature `libpam`).
 
-- `pam_sm_authenticate`: read `PAM_AUTHTOK`, copy it into PAM data under
-  `secret_manager_password` with a cleanup that zeroizes. Return
-  `PAM_SUCCESS`.
-- `pam_sm_open_session`: if the control socket is absent, run
-  `systemctl --user start secret-manager.service` and poll for the socket up
-  to 5 s. Send `Unlock { collection: "default", password }`. Any failure is
-  logged to syslog at `LOG_WARNING` and the hook still returns
-  `PAM_SUCCESS`. Login is never blocked by the vault.
+- `pam_sm_authenticate`: read the cached `PAM_AUTHTOK` without prompting,
+  copy it into PAM data under `secret_manager_password` as a `Zeroizing`
+  string. Return `PAM_SUCCESS`.
+- `pam_sm_open_session`: resolve the socket as
+  `/run/user/<uid>/secret-manager/control.sock` from the PAM user's uid. If
+  absent, run `systemctl --user --machine=<user>@.host start
+  secret-manager.service` and poll for the socket up to 5 s. Send
+  `Unlock { collection: "default", password }`. Any failure is logged to
+  syslog at `LOG_WARNING` and the hook still returns `PAM_SUCCESS`. Login is
+  never blocked by the vault. The module must be listed after `pam_systemd`
+  in the session stack.
 - `pam_sm_chauthtok` (`PAM_UPDATE_AUTHTOK` phase): send `ChangePassword`
   with `PAM_OLDAUTHTOK` and `PAM_AUTHTOK`. Same failure policy.
 - `pam_sm_setcred`, `pam_sm_close_session`: `PAM_SUCCESS`.
