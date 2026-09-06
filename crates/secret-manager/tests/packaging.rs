@@ -17,10 +17,12 @@ fn unit_and_activation_files_agree() {
     assert!(unit.contains("LimitCORE=0"));
     assert!(unit.contains("PrivateTmp=yes"));
     assert!(unit.contains("NoNewPrivileges=yes"));
-    assert!(unit.contains("ProtectSystem=strict"));
+    assert!(unit.contains("ProtectSystem=full"));
+    assert!(unit.contains("RuntimeDirectory=secret-manager"));
+    assert!(unit.contains("RuntimeDirectoryMode=0700"));
     assert!(unit.contains("ProtectKernelTunables=yes"));
     assert!(unit.contains("RestrictSUIDSGID=yes"));
-    assert!(unit.contains("ReadWritePaths=%h/.local/share/secret-manager %t/secret-manager"));
+    assert!(!unit.contains("ReadWritePaths"));
     let activation =
         std::fs::read_to_string(root().join("dist/org.freedesktop.secrets.service")).unwrap();
     assert!(activation.contains("Name=org.freedesktop.secrets"));
