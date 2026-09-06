@@ -9,7 +9,7 @@ fn main() -> std::process::ExitCode {
         )
         .with_writer(std::io::stderr)
         .init();
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(secret_manager::cli::argv_with_dispatch(std::env::args_os()));
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime.block_on(run(cli))
 }

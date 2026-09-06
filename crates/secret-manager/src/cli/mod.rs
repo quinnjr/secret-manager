@@ -2,11 +2,14 @@
 
 pub mod client;
 pub mod secrets;
+pub mod ssh;
 pub mod vault_cmds;
 
 use crate::config::Config;
 use clap::{Parser, Subcommand};
+use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Read};
+use std::path::Path;
 use std::process::ExitCode;
 use zeroize::Zeroizing;
 
@@ -83,6 +86,11 @@ pub enum Command {
     },
     /// Print shell completions
     Completions { shell: clap_complete::Shell },
+    /// SSH key passphrases and the askpass helper
+    Ssh {
+        #[command(subcommand)]
+        command: ssh::SshCommand,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -197,7 +205,35 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             clap_complete::generate(shell, &mut Cli::command(), "sm", &mut std::io::stdout());
             Ok(())
         }
+        Command::Ssh { command } => match command {
+            ssh::SshCommand::Add {
+                path,
+                no_passphrase,
+            } => ssh::add(path, no_passphrase).await,
+            ssh::SshCommand::List => ssh::list().await,
+            ssh::SshCommand::Remove { path } => ssh::remove(path).await,
+            ssh::SshCommand::Askpass { prompt } => ssh::askpass(prompt).await,
+        },
     }
+}
+
+/// Invoked as `sm-askpass <prompt>` (a symlink), behave as `secret-manager ssh askpass <prompt>`.
+pub fn argv_with_dispatch(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = args.into_iter().collect();
+    let is_askpass = args
+        .first()
+        .is_some_and(|a| Path::new(a).file_name() == Some(OsStr::new("sm-askpass")));
+    if !is_askpass {
+        return args;
+    }
+    let rest = args.split_off(1);
+    let mut out = vec![
+        OsString::from("secret-manager"),
+        OsString::from("ssh"),
+        OsString::from("askpass"),
+    ];
+    out.extend(rest);
+    out
 }
 
 async fn daemon() -> Result<(), CliError> {
@@ -211,4 +247,28 @@ async fn daemon() -> Result<(), CliError> {
         })?;
     daemon.run_until_shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn askpass_symlink_dispatches_to_ssh_askpass() {
+        let args = argv_with_dispatch(
+            ["/usr/bin/sm-askpass", "Enter passphrase for key '/k': "].map(OsString::from),
+        );
+        assert_eq!(
+            args,
+            [
+                "secret-manager",
+                "ssh",
+                "askpass",
+                "Enter passphrase for key '/k': "
+            ]
+            .map(OsString::from)
+        );
+        let args = argv_with_dispatch(["/usr/bin/sm", "status"].map(OsString::from));
+        assert_eq!(args, ["/usr/bin/sm", "status"].map(OsString::from));
+    }
 }

@@ -19,7 +19,7 @@ pub fn parse_attrs(args: &[String]) -> Result<BTreeMap<String, String>, CliError
 }
 
 /// Search, unlocking what is locked. Errors with NotFound on a dismissed prompt.
-async fn find(
+pub(crate) async fn find(
     client: &Client,
     query: &BTreeMap<String, String>,
 ) -> Result<Vec<OwnedObjectPath>, CliError> {
