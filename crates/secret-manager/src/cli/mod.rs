@@ -64,6 +64,25 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Lock one collection, or all of them
+    Lock {
+        #[arg(long)]
+        collection: Option<String>,
+    },
+    /// Unlock a collection with its password
+    Unlock {
+        #[arg(long, default_value = "default")]
+        collection: String,
+    },
+    /// Show daemon and collection state
+    Status,
+    /// Change a collection's master password
+    ChangePassword {
+        #[arg(long, default_value = "default")]
+        collection: String,
+    },
+    /// Print shell completions
+    Completions { shell: clap_complete::Shell },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -169,6 +188,15 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Set { attrs, label } => secrets::set(attrs, label).await,
         Command::Delete { attrs } => secrets::delete(attrs).await,
         Command::List { attrs, json } => secrets::list(attrs, json).await,
+        Command::Lock { collection } => vault_cmds::lock(collection),
+        Command::Unlock { collection } => vault_cmds::unlock(collection),
+        Command::Status => vault_cmds::status(),
+        Command::ChangePassword { collection } => vault_cmds::change_password(collection),
+        Command::Completions { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "sm", &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
