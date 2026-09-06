@@ -1,4 +1,5 @@
 //! secret-manager: a freedesktop Secret Service daemon and CLI.
+pub mod cli;
 pub mod config;
 pub mod control;
 pub mod daemon;

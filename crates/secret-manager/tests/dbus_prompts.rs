@@ -143,9 +143,12 @@ async fn cancel_and_dismiss() {
 /// second `Completed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dismiss_after_prompt_on_unlock_yields_one_completed_with_ao_result() {
-    let fx =
-        Fixture::start_with_pin_and_env(None, vec![("FAKE_DELAY".to_string(), "2".to_string())])
-            .await;
+    let fx = Fixture::start_with_pin_and_env(
+        None,
+        vec![("FAKE_DELAY".to_string(), "2".to_string())],
+        Duration::ZERO,
+    )
+    .await;
     let conn = fx.client().await;
     let service = ServiceProxy::new(&conn).await.unwrap();
     let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();

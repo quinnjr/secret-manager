@@ -76,7 +76,18 @@ impl Fixture {
 
     /// `pin = None` makes every prompt cancel.
     pub async fn start_with_pin(pin: Option<&str>) -> Fixture {
-        Self::start_with_pin_and_env(pin, Vec::new()).await
+        Self::start_custom(pin, Duration::ZERO).await
+    }
+
+    /// Daemon with a fast idle-lock timer instead of the default disabled one.
+    pub async fn start_with_idle(idle: Duration) -> Fixture {
+        Self::start_custom(Some(PASSWORD), idle).await
+    }
+
+    /// General constructor: `pin = None` makes every prompt cancel; `idle` sets
+    /// `auto_lock_after`.
+    pub async fn start_custom(pin: Option<&str>, idle: Duration) -> Fixture {
+        Self::start_with_pin_and_env(pin, Vec::new(), idle).await
     }
 
     /// Like [`start_with_pin`](Self::start_with_pin), with extra environment
@@ -85,6 +96,7 @@ impl Fixture {
     pub async fn start_with_pin_and_env(
         pin: Option<&str>,
         extra_pinentry_env: Vec<(String, String)>,
+        idle: Duration,
     ) -> Fixture {
         let bus = TestBus::start();
         let data_dir = tempfile::tempdir().unwrap();
@@ -106,8 +118,8 @@ impl Fixture {
         let pinentry_log = runtime_dir.path().join("pinentry.log");
         let config = Config {
             vault: VaultConfig {
-                dir: vault_dir,
-                auto_lock_after: Duration::ZERO,
+                dir: vault_dir.clone(),
+                auto_lock_after: idle,
             },
             prompt: PromptConfig {
                 pinentry: fake_pinentry().to_string_lossy().into_owned(),
@@ -118,6 +130,17 @@ impl Fixture {
                 p_cost: 1,
             },
         };
+        let config_dir = data_dir.path().join("config").join("secret-manager");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[vault]\ndir = \"{}\"\n[prompt]\npinentry = \"{}\"\n[kdf]\nm_cost_kib = 8\nt_cost = 1\np_cost = 1\n",
+                vault_dir.display(),
+                fake_pinentry().display()
+            ),
+        )
+        .unwrap();
         let mut pinentry_env = vec![(
             "FAKE_LOG".to_string(),
             pinentry_log.to_string_lossy().into_owned(),
