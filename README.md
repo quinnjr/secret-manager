@@ -53,3 +53,9 @@ cargo test --workspace
 Integration tests start a private `dbus-daemon` and a scripted `pinentry`;
 `secret-tool` and `ssh-keygen` are used when present. The PAM test needs
 `pam_wrapper` and skips itself otherwise.
+
+The PAM login-unlock path (see "Unlock at login" in `docs/install-arch.md`
+and `docs/install-debian.md`) is only exercised end to end by that test,
+and only on machines that have `pam_wrapper` and `pam_matrix` installed. It
+has not been run on the development machine. If you rely on it, test login
+unlock on a spare session or user before trusting it in your main session.

@@ -51,6 +51,12 @@ sm status
 
 ## Unlock at login (PAM)
 
+This module is exercised end to end by an integration test only on
+machines with `libpam-wrapper` and its `pam_matrix` test module installed
+(`sudo apt install libpam-wrapper`); it has not been run on the development
+machine. Test login unlock on a spare session before relying on it for
+your main login.
+
 Add the three lines from `/usr/share/doc/secret-manager/pam.d-snippet` to
 `common-auth`, `common-session`, and `common-password`. In `common-session`,
 append the `session` line after the `pam_systemd.so` line so

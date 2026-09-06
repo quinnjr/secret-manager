@@ -43,6 +43,12 @@ sm status
 
 ## Unlock at login (PAM)
 
+This module is exercised end to end by an integration test only on
+machines with `pam_wrapper` and `pam_matrix` installed (`sudo pacman -S
+--needed pam_wrapper`); it has not been run on the development machine.
+Test login unlock on a spare session before relying on it for your main
+login.
+
 Add the three lines from `/usr/share/doc/secret-manager/pam.d-snippet` to the
 stacks you log in through. The `session` line must come after `pam_systemd.so`
 so `/run/user/<uid>` exists:

@@ -13,6 +13,14 @@ fn unit_and_activation_files_agree() {
     assert!(unit.contains("BusName=org.freedesktop.secrets"));
     assert!(unit.contains("ExecStart=/usr/bin/secret-manager daemon --foreground"));
     assert!(unit.contains("Conflicts=gnome-keyring-daemon.service"));
+    // Memory-exposure hardening.
+    assert!(unit.contains("LimitCORE=0"));
+    assert!(unit.contains("PrivateTmp=yes"));
+    assert!(unit.contains("NoNewPrivileges=yes"));
+    assert!(unit.contains("ProtectSystem=strict"));
+    assert!(unit.contains("ProtectKernelTunables=yes"));
+    assert!(unit.contains("RestrictSUIDSGID=yes"));
+    assert!(unit.contains("ReadWritePaths=%h/.local/share/secret-manager %t/secret-manager"));
     let activation =
         std::fs::read_to_string(root().join("dist/org.freedesktop.secrets.service")).unwrap();
     assert!(activation.contains("Name=org.freedesktop.secrets"));
