@@ -314,15 +314,42 @@ impl Vault {
         let State::Unlocked { key, items } = &self.state else {
             return Err(VaultError::Locked);
         };
+        // Snapshot so that any failure below leaves `header` consistent with
+        // the still-valid `aad`/`ciphertext` pair; otherwise a failed write
+        // would carry a fresh nonce/index while the on-disk ciphertext (and
+        // our cached `aad`/`ciphertext`) still describe the old one, and a
+        // later lock()+unlock() would fail decryption permanently.
+        let saved_header = self.header.clone();
         self.header.modified = now();
         self.header.nonce = crypto::random_bytes::<NONCE_LEN>();
         self.header.index = format::build_index(&self.header.salt, items);
-        let aad = VaultFile::header_bytes(&self.header)?;
-        let plain = format::encode_items(items)?;
-        let ciphertext = crypto::seal(key, &self.header.nonce, &aad, &plain)?;
+        let aad = match VaultFile::header_bytes(&self.header) {
+            Ok(aad) => aad,
+            Err(e) => {
+                self.header = saved_header;
+                return Err(e.into());
+            }
+        };
+        let plain = match format::encode_items(items) {
+            Ok(plain) => plain,
+            Err(e) => {
+                self.header = saved_header;
+                return Err(e.into());
+            }
+        };
+        let ciphertext = match crypto::seal(key, &self.header.nonce, &aad, &plain) {
+            Ok(ciphertext) => ciphertext,
+            Err(e) => {
+                self.header = saved_header;
+                return Err(e.into());
+            }
+        };
         let mut bytes = aad.clone();
         bytes.extend_from_slice(&ciphertext);
-        write_atomic(&self.path, &bytes)?;
+        if let Err(e) = write_atomic(&self.path, &bytes) {
+            self.header = saved_header;
+            return Err(e);
+        }
         self.aad = aad;
         self.ciphertext = ciphertext;
         Ok(())
@@ -523,5 +550,64 @@ mod tests {
         assert_eq!(Vault::open(&path).unwrap().label(), "Renamed");
         v.delete_file().unwrap();
         assert!(!path.exists());
+    }
+
+    /// A failed write must not leave the header describing a nonce/index
+    /// that doesn't match the still-on-disk (and still-cached) ciphertext.
+    /// Otherwise the vault becomes permanently un-unlockable: lock() then
+    /// unlock(correct password) would fail crypto::open and report
+    /// WrongPassword until the process restarts and re-reads the file.
+    ///
+    /// NB: `write_atomic` unconditionally `chmod`s the vault directory to
+    /// 0o700 on every call (line ~363), which self-heals a `chmod 0o500`
+    /// applied to that same directory (an owner may always `chmod` their
+    /// own directory regardless of its current mode) before the write is
+    /// even attempted — so a permission-based setup can't actually force
+    /// the failure this test needs. Instead we block the write
+    /// deterministically by pre-creating a directory at the `.vault.tmp`
+    /// path `write_atomic` needs to open as a file, which fails with
+    /// `EISDIR` regardless of permissions.
+    #[test]
+    fn failed_save_does_not_corrupt_header() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.insert_item(
+            "first",
+            attrs(&[("a", "1")]),
+            b"secret-1".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+        let items_before: Vec<_> = v
+            .items()
+            .unwrap()
+            .iter()
+            .map(|i| (i.id.clone(), i.secret.to_vec()))
+            .collect();
+
+        let tmp_path = path.with_extension("vault.tmp");
+        std::fs::create_dir(&tmp_path).unwrap();
+
+        let result = v.insert_item(
+            "second",
+            attrs(&[("a", "2")]),
+            b"secret-2".to_vec(),
+            "text/plain",
+            false,
+        );
+        assert!(result.is_err(), "expected write_atomic to fail");
+
+        std::fs::remove_dir(&tmp_path).unwrap();
+
+        v.lock();
+        v.unlock(b"pw").unwrap();
+        let items_after: Vec<_> = v
+            .items()
+            .unwrap()
+            .iter()
+            .map(|i| (i.id.clone(), i.secret.to_vec()))
+            .collect();
+        assert_eq!(items_after, items_before);
     }
 }
