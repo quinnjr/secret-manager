@@ -12,6 +12,7 @@ use control_protocol::{Request, Response, Zeroizing, call, socket_path_for_runti
 use pamsm::{Pam, PamData, PamError, PamFlags, PamLibExt, PamServiceModule, pam_module};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 
 const DATA_KEY: &str = "secret_manager_password";
@@ -100,16 +101,38 @@ fn socket_for(pamh: &Pam, opts: &Options) -> Option<PathBuf> {
     ))))
 }
 
+/// Spawns `cmd`, polling for exit rather than blocking on it, so the caller's
+/// worst case is bounded by `timeout` regardless of how long the child runs.
+/// Kills (and reaps) the child if it has not exited by then.
+fn run_bounded(cmd: &mut std::process::Command, timeout: Duration) -> Result<ExitStatus, String> {
+    let mut child = cmd.spawn().map_err(|e| format!("cannot spawn: {e}"))?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("timed out after {timeout:?}"));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("cannot wait: {e}")),
+        }
+    }
+}
+
 fn start_daemon(user: &str) {
-    let result = std::process::Command::new("systemctl")
-        .args([
-            "--user",
-            &format!("--machine={user}@.host"),
-            "start",
-            "secret-manager.service",
-        ])
-        .status();
-    match result {
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args([
+        "--user",
+        &format!("--machine={user}@.host"),
+        "--no-block",
+        "start",
+        "secret-manager.service",
+    ]);
+    match run_bounded(&mut cmd, START_TIMEOUT) {
         Ok(s) if s.success() => {}
         Ok(s) => log(&format!("systemctl exited with {s}")),
         Err(e) => log(&format!("cannot run systemctl: {e}")),
@@ -258,5 +281,29 @@ mod tests {
         // SAFETY: getuid has no preconditions.
         assert_eq!(uid_of(&user), Some(unsafe { libc::getuid() }));
         assert_eq!(uid_of("definitely-not-a-user-9f2c"), None);
+    }
+
+    #[test]
+    fn run_bounded_succeeds_within_timeout() {
+        let status = run_bounded(
+            &mut std::process::Command::new("true"),
+            Duration::from_secs(5),
+        )
+        .expect("true should succeed");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn run_bounded_kills_and_errors_on_timeout() {
+        let start = Instant::now();
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let err = run_bounded(&mut cmd, Duration::from_millis(300))
+            .expect_err("sleep 30 should time out");
+        assert!(err.contains("timed out"));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "run_bounded should not wait for the full sleep"
+        );
     }
 }
