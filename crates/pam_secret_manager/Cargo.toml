@@ -12,3 +12,7 @@ control-protocol = { path = "../control-protocol" }
 pamsm = { version = "0.5", features = ["libpam"] }
 zeroize.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+pam-client = "0.5"
+tempfile = "3"
