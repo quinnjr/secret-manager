@@ -1,5 +1,7 @@
 //! Command line interface. Every subcommand except `daemon` is a client.
 
+pub mod client;
+pub mod secrets;
 pub mod vault_cmds;
 
 use crate::config::Config;
@@ -33,6 +35,34 @@ pub enum Command {
         /// Kept for readability in unit files; the daemon always runs in the foreground
         #[arg(long)]
         foreground: bool,
+    },
+    /// Print a secret to stdout (no trailing newline)
+    Get {
+        /// Attribute filters; all must match
+        #[arg(required = true, value_name = "ATTR=VALUE")]
+        attrs: Vec<String>,
+        /// Only consider items with this label
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Store a secret read from stdin
+    Set {
+        #[arg(required = true, value_name = "ATTR=VALUE")]
+        attrs: Vec<String>,
+        #[arg(long)]
+        label: String,
+    },
+    /// Delete every item matching the attributes
+    Delete {
+        #[arg(required = true, value_name = "ATTR=VALUE")]
+        attrs: Vec<String>,
+    },
+    /// List items (labels and attributes, never secrets)
+    List {
+        #[arg(value_name = "ATTR=VALUE")]
+        attrs: Vec<String>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -117,9 +147,6 @@ pub fn read_secret_from_stdin() -> Result<Zeroizing<Vec<u8>>, CliError> {
     std::io::stdin().read_to_end(&mut buf)?;
     if buf.last() == Some(&b'\n') {
         buf.pop();
-        if buf.last() == Some(&b'\r') {
-            buf.pop();
-        }
     }
     Ok(buf)
 }
@@ -138,6 +165,10 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Init { collection } => vault_cmds::init(&collection),
         Command::Daemon { .. } => daemon().await,
+        Command::Get { attrs, label } => secrets::get(attrs, label).await,
+        Command::Set { attrs, label } => secrets::set(attrs, label).await,
+        Command::Delete { attrs } => secrets::delete(attrs).await,
+        Command::List { attrs, json } => secrets::list(attrs, json).await,
     }
 }
 

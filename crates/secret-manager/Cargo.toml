@@ -18,6 +18,7 @@ control-protocol = { path = "../control-protocol" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+serde_json = "1"
 postcard.workspace = true
 zeroize.workspace = true
 libc.workspace = true
