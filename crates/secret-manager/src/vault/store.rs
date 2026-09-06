@@ -296,12 +296,26 @@ impl Vault {
         }
         let salt = crypto::random_bytes::<SALT_LEN>();
         let key = crypto::derive_key(new, &salt, kdf)?;
+        let old_salt = self.header.salt;
+        let old_kdf = self.header.kdf;
+        let old_key = match &self.state {
+            State::Unlocked { key, .. } => key.clone(),
+            State::Locked => unreachable!("unlocked above"),
+        };
         self.header.salt = salt;
         self.header.kdf = kdf;
         if let State::Unlocked { key: k, .. } = &mut self.state {
             *k = key;
         }
-        self.save()
+        if let Err(e) = self.save() {
+            self.header.salt = old_salt;
+            self.header.kdf = old_kdf;
+            if let State::Unlocked { key: k, .. } = &mut self.state {
+                *k = old_key;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn delete_file(self) -> Result<(), VaultError> {
@@ -609,5 +623,41 @@ mod tests {
             .map(|i| (i.id.clone(), i.secret.to_vec()))
             .collect();
         assert_eq!(items_after, items_before);
+    }
+
+    /// A failed `change_password` must leave the header salt/kdf *and* the
+    /// in-memory key consistent with each other and with the old password;
+    /// otherwise `verify_password` disagrees with both passwords and the
+    /// next successful save seals with the new key under the old salt,
+    /// producing a file no password can open.
+    #[test]
+    fn failed_change_password_keeps_old_password_working() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"old", FAST).unwrap();
+
+        let tmp_path = path.with_extension("vault.tmp");
+        std::fs::create_dir(&tmp_path).unwrap();
+
+        let result = v.change_password(b"old", b"new", FAST);
+        assert!(result.is_err(), "expected write_atomic to fail");
+
+        assert!(v.verify_password(b"old").unwrap());
+        assert!(!v.verify_password(b"new").unwrap());
+
+        std::fs::remove_dir(&tmp_path).unwrap();
+
+        v.insert_item(
+            "x",
+            attrs(&[("a", "b")]),
+            b"s".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+        v.lock();
+        v.unlock(b"old").unwrap();
+
+        let mut v2 = Vault::open(&path).unwrap();
+        assert!(matches!(v2.unlock(b"new"), Err(VaultError::WrongPassword)));
     }
 }
