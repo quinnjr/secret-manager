@@ -1,15 +1,17 @@
 //! `org.freedesktop.Secret.Collection`, served at `/collection/<id>` and `/aliases/<name>`.
 
 use super::errors::{Error, Result};
+use super::prompt::{Prompt, PromptAction};
 use super::registry;
-use super::service::ServiceSignals;
+use super::sender;
 use super::session::SecretStruct;
 use super::state::{ServiceState, Shared};
 use super::{paths, prop_attributes, prop_string};
 use std::collections::{BTreeMap, HashMap};
 use zbus::Connection;
 use zbus::interface;
-use zbus::object_server::SignalEmitter;
+use zbus::message::Header;
+use zbus::object_server::{ObjectServer, SignalEmitter};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 pub enum CollectionRef {
@@ -50,34 +52,29 @@ impl Collection {
 
 #[interface(name = "org.freedesktop.Secret.Collection")]
 impl Collection {
-    /// Deletes immediately (no prompt). Requires the collection to be unlocked.
+    /// Returns a prompt that asks for confirmation through pinentry before
+    /// deleting; the collection is only removed once the prompt is run and
+    /// confirmed (see `prompt::delete_collection`). `Item.Delete` stays
+    /// immediate.
     #[zbus(out_args("prompt"))]
-    async fn delete(&self, #[zbus(connection)] conn: &Connection) -> Result<OwnedObjectPath> {
-        let (id, vault) = {
-            let mut st = self.state.lock().await;
-            let id = self.id(&st)?;
-            if st.collections[&id].is_locked() {
-                return Err(Error::IsLocked);
-            }
-            let vault = st.collections.remove(&id).ok_or(Error::NoSuchObject)?;
-            st.aliases.retain(|_, target| target != &id);
-            if let Err(e) = st.save_aliases() {
-                tracing::warn!("cannot save aliases: {e}");
-            }
-            (id, vault)
-        };
-        let item_ids = vault.item_ids();
-        vault.delete_file()?;
-        let conn2 = conn.clone();
-        let id2 = id.clone();
-        tokio::spawn(async move {
-            registry::unregister_collection(&conn2, &id2, &item_ids).await;
-            registry::notify_collections_changed(&conn2).await;
-        });
-        SignalEmitter::new(conn, paths::SERVICE_PATH)?
-            .collection_deleted(paths::collection(&id))
-            .await?;
-        Ok(paths::root())
+    async fn delete(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(object_server)] server: &ObjectServer,
+    ) -> Result<OwnedObjectPath> {
+        let mut st = self.state.lock().await;
+        let id = self.id(&st)?;
+        let prompt_path = st.new_prompt_path();
+        st.prompt_owners
+            .insert(prompt_path.to_string(), sender(&header));
+        drop(st);
+        let prompt = Prompt::new(
+            self.state.clone(),
+            prompt_path.clone(),
+            PromptAction::DeleteCollection { id },
+        );
+        server.at(prompt_path.clone(), prompt).await?;
+        Ok(prompt_path)
     }
 
     async fn search_items(

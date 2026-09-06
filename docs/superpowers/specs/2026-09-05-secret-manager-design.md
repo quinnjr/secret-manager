@@ -128,7 +128,12 @@ Service: `OpenSession`, `CreateCollection`, `SearchItems`, `Unlock`, `Lock`,
 
 Collection: `Delete`, `SearchItems`, `CreateItem`; properties `Items`,
 `Label` (writable), `Locked`, `Created`, `Modified`; signals `ItemCreated`,
-`ItemDeleted`, `ItemChanged`.
+`ItemDeleted`, `ItemChanged`. `Delete` always returns a prompt: it asks for
+confirmation through pinentry (`Permanently delete the keyring '<label>'
+and all <N> secrets?`) and the collection is unlinked only once that prompt
+is run and confirmed; a cancel or refusal leaves the collection untouched
+and completes the prompt with `Completed(true, "/")`. `Item.Delete` stays
+immediate, no prompt.
 
 Item: `Delete`, `GetSecret`, `SetSecret`; properties `Locked`, `Attributes`
 (writable), `Label` (writable), `Created`, `Modified`.
@@ -179,6 +184,15 @@ a TTY. The binary is `pinentry` on `PATH` unless overridden by
 Three wrong passwords or a cancel emit `Completed(dismissed = true)`. A
 correct password unlocks the collection and emits `Completed(false, [paths])`.
 `Dismiss` kills the pinentry child.
+
+`Collection.Delete` prompts use `Pinentry::confirm` (a yes/no Assuan
+`CONFIRM`, not `GETPIN`) instead: refusal or cancel emits
+`Completed(true, "/")` with the collection left untouched, and confirmation
+emits `Completed(false, <collection path>)` after the collection has
+already been removed from state, unlinked from disk, and unregistered from
+the bus. The delete only happens once the confirmation is claimed under the
+same commit gate `Unlock`/`CreateCollection` use, so a `Dismiss` arriving
+after the user confirms can no longer race the unlink.
 
 When the CLI needs a password itself (`init`, `unlock`, `change-password`)
 it reads from the TTY with `rpassword`, and only falls back to pinentry when

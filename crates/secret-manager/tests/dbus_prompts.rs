@@ -269,7 +269,12 @@ async fn unlock_by_item_path_and_lock() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_collection_with_alias_and_delete() {
-    let fx = Fixture::start_with_pin(Some("newpw")).await;
+    let fx = Fixture::start_with_pin_and_env(
+        Some("newpw"),
+        vec![("FAKE_CONFIRM".to_string(), "yes".to_string())],
+        Duration::ZERO,
+    )
+    .await;
     let conn = fx.client().await;
     let service = ServiceProxy::new(&conn).await.unwrap();
     let mut created = service.receive_collection_created().await.unwrap();
@@ -313,7 +318,17 @@ async fn create_collection_with_alias_and_delete() {
     assert_eq!(prompt.as_str(), "/");
 
     let mut deleted = service.receive_collection_deleted().await.unwrap();
-    assert_eq!(work.delete().await.unwrap().as_str(), "/");
+    let delete_prompt = work.delete().await.unwrap();
+    assert!(
+        delete_prompt
+            .as_str()
+            .starts_with("/org/freedesktop/secrets/prompt/"),
+        "Delete must return a confirmation prompt, not delete immediately"
+    );
+    let (dismissed, result) = perform(&conn, &delete_prompt).await;
+    assert!(!dismissed);
+    assert_eq!(OwnedObjectPath::try_from(result).unwrap(), new_path);
+    assert!(fx.pinentry_log().contains("CONFIRM"));
     assert_eq!(
         deleted.next().await.unwrap().args().unwrap().collection,
         new_path
@@ -327,6 +342,47 @@ async fn create_collection_with_alias_and_delete() {
     );
     assert_eq!(service.read_alias("work").await.unwrap().as_str(), "/");
     assert!(!service.collections().await.unwrap().contains(&new_path));
+}
+
+/// Refusing (or cancelling) the confirmation prompt leaves the collection,
+/// its vault file, and its alias untouched, and completes the prompt with
+/// `Completed(true, "/")`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_collection_refused_leaves_it_intact() {
+    // No FAKE_CONFIRM set => the fake pinentry answers CONFIRM with cancel.
+    let fx = Fixture::start_with_pin(Some("newpw")).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (_, prompt) = service.create_collection(props, "work").await.unwrap();
+    let (_, result) = perform(&conn, &prompt).await;
+    let new_path = OwnedObjectPath::try_from(result).unwrap();
+    let work = collection(&conn, new_path.clone()).await;
+
+    let delete_prompt = work.delete().await.unwrap();
+    assert!(
+        delete_prompt
+            .as_str()
+            .starts_with("/org/freedesktop/secrets/prompt/")
+    );
+    let (dismissed, result) = perform(&conn, &delete_prompt).await;
+    assert!(dismissed);
+    assert_eq!(OwnedObjectPath::try_from(result).unwrap().as_str(), "/");
+
+    assert!(
+        fx.data_dir
+            .path()
+            .join("secret-manager")
+            .join("work_keys.vault")
+            .exists(),
+        "refused delete must not remove the vault file"
+    );
+    assert_eq!(service.read_alias("work").await.unwrap(), new_path);
+    assert!(service.collections().await.unwrap().contains(&new_path));
+    assert!(!work.locked().await.unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

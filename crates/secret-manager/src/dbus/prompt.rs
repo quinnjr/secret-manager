@@ -24,15 +24,19 @@ pub enum PromptAction {
         label: String,
         alias: Option<String>,
     },
+    DeleteCollection {
+        id: String,
+    },
 }
 
 /// Which `Completed` result variant a prompt owes: `ao` for unlock, `o` for
-/// collection creation. Fixed at construction so `dismiss` can pick the right
-/// one even after `prompt()` has consumed the `PromptAction`.
+/// collection creation and deletion. Fixed at construction so `dismiss` can
+/// pick the right one even after `prompt()` has consumed the `PromptAction`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PromptKind {
     Unlock,
     CreateCollection,
+    DeleteCollection,
 }
 
 impl PromptAction {
@@ -40,6 +44,7 @@ impl PromptAction {
         match self {
             PromptAction::Unlock { .. } => PromptKind::Unlock,
             PromptAction::CreateCollection { .. } => PromptKind::CreateCollection,
+            PromptAction::DeleteCollection { .. } => PromptKind::DeleteCollection,
         }
     }
 }
@@ -123,7 +128,9 @@ impl Prompt {
         }
         let dismissed_result = match self.kind {
             PromptKind::Unlock => no_paths(),
-            PromptKind::CreateCollection => owned(Value::from(paths::root())),
+            PromptKind::CreateCollection | PromptKind::DeleteCollection => {
+                owned(Value::from(paths::root()))
+            }
         };
         finish(conn, &self.state, &self.path, true, dismissed_result).await;
         Ok(())
@@ -206,6 +213,12 @@ async fn run(
         }
         PromptAction::CreateCollection { label, alias } => {
             match create_collection(conn, state, &label, alias.as_deref(), committed).await {
+                Some(path) => (false, owned(Value::from(path))),
+                None => (true, owned(Value::from(paths::root()))),
+            }
+        }
+        PromptAction::DeleteCollection { id } => {
+            match delete_collection(conn, state, &id, committed).await {
                 Some(path) => (false, owned(Value::from(path))),
                 None => (true, owned(Value::from(paths::root()))),
             }
@@ -344,6 +357,80 @@ async fn create_collection(
         let _ = emitter.collection_created(paths::collection(&id)).await;
     }
     Some(paths::collection(&id))
+}
+
+/// Confirm through pinentry, then perform exactly what `Collection::delete`
+/// used to do directly: remove the collection from state, purge its
+/// aliases, delete its vault file, unregister its D-Bus objects, and emit
+/// `CollectionDeleted` / `Service.Collections` change notifications. The
+/// unlink itself happens only after `claim(committed)` succeeds, so a
+/// racing `Dismiss` cannot land between "confirmed" and "deleted".
+async fn delete_collection(
+    conn: &Connection,
+    state: &Shared,
+    id: &str,
+    committed: &Mutex<bool>,
+) -> Option<OwnedObjectPath> {
+    let (pinentry, label, item_count) = {
+        let st = state.lock().await;
+        let vault = st.collections.get(id)?;
+        (
+            st.pinentry.clone(),
+            vault.label().to_string(),
+            vault.item_ids().len(),
+        )
+    };
+    let req = PinRequest {
+        title: "secret-manager".into(),
+        description: format!(
+            "Permanently delete the keyring '{label}' and all {item_count} secrets?"
+        ),
+        prompt: "Delete".into(),
+        error: None,
+        repeat: false,
+    };
+    let confirmed = match pinentry.confirm(&req).await {
+        Ok(ok) => ok,
+        Err(e) => {
+            tracing::warn!("pinentry failed: {e}");
+            false
+        }
+    };
+    if !confirmed {
+        return None;
+    }
+    if !claim(committed).await {
+        return None;
+    }
+    let (item_ids, vault) = {
+        let mut st = state.lock().await;
+        if st.collections.get(id)?.is_locked() {
+            tracing::warn!(
+                "cannot delete '{id}': it is locked; treating the confirmed delete as dismissed"
+            );
+            return None;
+        }
+        let vault = st.collections.remove(id)?;
+        st.aliases.retain(|_, target| target != id);
+        if let Err(e) = st.save_aliases() {
+            tracing::warn!("cannot save aliases: {e}");
+        }
+        (vault.item_ids(), vault)
+    };
+    if let Err(e) = vault.delete_file() {
+        tracing::warn!("cannot delete vault file for '{id}': {e}");
+        return None;
+    }
+    let conn2 = conn.clone();
+    let id2 = id.to_string();
+    tokio::spawn(async move {
+        registry::unregister_collection(&conn2, &id2, &item_ids).await;
+        registry::notify_collections_changed(&conn2).await;
+    });
+    if let Ok(emitter) = SignalEmitter::new(conn, paths::SERVICE_PATH) {
+        let _ = emitter.collection_deleted(paths::collection(id)).await;
+    }
+    Some(paths::collection(id))
 }
 
 /// Try to claim the commit point: true if this call won the race (safe to
