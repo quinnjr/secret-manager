@@ -64,6 +64,9 @@ impl Collection {
     ) -> Result<OwnedObjectPath> {
         let mut st = self.state.lock().await;
         let id = self.id(&st)?;
+        if st.collections[&id].is_locked() {
+            return Err(Error::IsLocked);
+        }
         let prompt_path = st.new_prompt_path();
         st.prompt_owners
             .insert(prompt_path.to_string(), sender(&header));

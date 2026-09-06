@@ -21,6 +21,13 @@ async fn collection(conn: &zbus::Connection, path: OwnedObjectPath) -> Collectio
         .unwrap()
 }
 
+fn error_name(e: &zbus::Error) -> String {
+    match e {
+        zbus::Error::MethodError(name, _, _) => name.to_string(),
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+}
+
 /// Subscribe, trigger, and wait for `Completed`. Returns `(dismissed, result)`.
 async fn perform(conn: &zbus::Connection, prompt: &OwnedObjectPath) -> (bool, OwnedValue) {
     let proxy = PromptProxy::builder(conn)
@@ -383,6 +390,35 @@ async fn delete_collection_refused_leaves_it_intact() {
     assert_eq!(service.read_alias("work").await.unwrap(), new_path);
     assert!(service.collections().await.unwrap().contains(&new_path));
     assert!(!work.locked().await.unwrap());
+}
+
+/// `Collection.Delete` on a locked collection must fail immediately with
+/// `IsLocked` and must not allocate a confirmation prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_on_locked_collection_returns_is_locked_without_prompt() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let coll_path = fx.default_collection();
+    let coll = collection(&conn, coll_path.clone()).await;
+
+    let (locked, prompt) = service
+        .lock(std::slice::from_ref(&coll_path))
+        .await
+        .unwrap();
+    assert_eq!(locked, vec![coll_path.clone()]);
+    assert_eq!(prompt.as_str(), "/");
+    assert!(coll.locked().await.unwrap());
+
+    let owners_before = fx.daemon.state.lock().await.prompt_owners.clone();
+    let err = coll.delete().await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.IsLocked");
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners,
+        owners_before,
+        "a rejected Delete must not create a prompt"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
