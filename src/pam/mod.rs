@@ -3459,4 +3459,62 @@ mod tests {
         // and `open_session` derives from it like any other.
         assert_eq!(authenticate_decision(Ok(Some(""))), AuthOutcome::Stash);
     }
+
+    /// `socket=` is taken verbatim from the PAM config, so it may be a bare
+    /// name with no directory component. There is then nothing to open,
+    /// validate or hold — and nothing a symlink swap could redirect — so
+    /// `SocketDir` keeps the name exactly as given and lets the connect fail
+    /// with the real errno, rather than refusing or inventing a directory.
+    #[test]
+    fn socket_dir_accepts_a_bare_name_with_no_directory_to_hold() {
+        let sd = SocketDir::open(Path::new("control.sock"), me()).expect("that is a file name");
+        assert!(!sd.is_open(), "there is no parent directory to hold open");
+        assert_eq!(sd.socket_path(), Path::new("control.sock"));
+        assert_eq!(
+            sd.connect_path().expect("nothing to check without a dirfd"),
+            Path::new("control.sock"),
+            "no dirfd means no /proc/self/fd rewrite"
+        );
+    }
+
+    /// A vault file whose header is cut short must be refused, not read
+    /// short: the prefix says how many bytes the header occupies, and a file
+    /// that ends before that is either truncated or a decoy. Reading what is
+    /// there and deriving from it would aim the login at an attacker-chosen
+    /// salt.
+    #[test]
+    fn refuses_a_vault_file_whose_header_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
+        let full = std::fs::read(&path).unwrap();
+        assert!(
+            full.len() > format::PREFIX_LEN + 1,
+            "the fixture must have a header to truncate"
+        );
+        // Long enough for the prefix (so the length is read and believed),
+        // far too short for the header it announces.
+        std::fs::write(&path, &full[..format::PREFIX_LEN + 1]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &full_budget()),
+            None
+        );
+    }
+
+    /// `derive` exists to be non-panicking: it is called as root inside a
+    /// login, with parameters that came off disk. Argon2 rejecting them must
+    /// produce `None` and a log line, never an unwind through the C boundary.
+    #[test]
+    fn derive_reports_parameters_argon2_rejects_instead_of_panicking() {
+        let unusable = KdfParams {
+            m_cost_kib: 0,
+            t_cost: 0,
+            p_cost: 0,
+        };
+        assert!(
+            crypto::derive_key(b"pw", &SALT, unusable).is_err(),
+            "the fixture must be parameters Argon2 refuses"
+        );
+        assert!(derive("pw", &SALT, unusable, &full_budget()).is_none());
+    }
 }

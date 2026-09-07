@@ -192,6 +192,7 @@ async fn ssh_keygen_uses_sm_askpass_symlink() {
     cmd.args(["-y", "-f"])
         .arg(&key)
         .env_clear()
+        .envs(common::profiling_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", fx.data_dir.path())
         .env("SSH_ASKPASS", &link)
@@ -848,5 +849,150 @@ async fn a_dismissed_unlock_after_consent_falls_back_to_a_typed_answer() {
     assert!(
         fx.daemon.state.lock().await.collections["default"].is_locked(),
         "a dismissed master password prompt left the collection unlocked"
+    );
+}
+
+/// `sm ssh remove` on a key whose *directory* is gone too. `add` recorded the
+/// canonical path, so `remove` resolves the parent to match it — and when even
+/// the parent cannot be resolved it falls back to `std::path::absolute`, which
+/// must still produce the path the user named rather than fail. The command
+/// then reports honestly that nothing is registered under it instead of
+/// reporting a removal it did not make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_reports_a_key_under_a_vanished_directory_as_unregistered() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    // Neither the file nor its parent directory exists, so `canonicalize`
+    // fails twice and only `absolute` is left.
+    let gone = keys.path().join("gone").join("id_ed25519");
+
+    fx.sm()
+        .args(["ssh", "remove"])
+        .arg(&gone)
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains(gone.display().to_string())
+                .and(predicate::str::contains("is not registered")),
+        );
+}
+
+/// A pinentry that answers `GETPIN` with an empty line.
+///
+/// The shipped fake answers an unset `FAKE_PIN` with a cancel, so the empty
+/// *answer* — a `D` line with nothing after it — needs its own script.
+fn empty_answer_pinentry(dir: &Path) -> PathBuf {
+    let path = dir.join("empty-pinentry.sh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\n\
+         echo \"OK Pleased to meet you\"\n\
+         while IFS= read -r line; do\n\
+         case \"$line\" in\n\
+         GETPIN*) printf 'D \\n'; echo OK ;;\n\
+         BYE*) echo \"OK closing connection\"; exit 0 ;;\n\
+         *) echo OK ;;\n\
+         esac\n\
+         done\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// An empty answer to the passphrase box must not be sent to `ssh`.
+///
+/// OpenSSH reads an empty answer as "yes" on its confirmation path and as an
+/// empty passphrase everywhere else, so forwarding it would answer a question
+/// the user never answered. The user pressing Enter on an empty box is
+/// reported as "nothing sent", exit 1, with nothing on stdout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_answer_from_the_dialog_is_never_sent_to_ssh() {
+    let fx = Fixture::start().await;
+    let cfg = tempfile::tempdir().unwrap();
+    let pinentry = empty_answer_pinentry(cfg.path());
+    let dir = cfg.path().join("secret-manager");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!("[prompt]\npinentry = \"{}\"\n", pinentry.display()),
+    )
+    .unwrap();
+
+    let out = fx
+        .sm()
+        // No key is registered under this path, so the fallback dialog is
+        // what answers — through the pinentry configured just above.
+        .args([
+            "ssh",
+            "askpass",
+            "Enter passphrase for key '/no/such/key': ",
+        ])
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("empty answer; nothing sent"))
+        .get_output()
+        .clone();
+    assert!(
+        out.stdout.is_empty(),
+        "an empty answer reached ssh: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A write that fails must fail the command. `sm ssh list` writes each row to
+/// stdout, and a full disk (or a closed pipe) makes that write error; exiting
+/// 0 there would tell a script the inventory it never received was complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_list_reports_a_failed_write() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    // `add` only canonicalizes the path, so any existing file will do; this
+    // test is about the write, not the key.
+    let key = keys.path().join("id_written");
+    std::fs::write(&key, b"not really a key").unwrap();
+    fx.sm()
+        .args(["ssh", "add", "--no-passphrase"])
+        .arg(&key)
+        .assert()
+        .success();
+
+    // `/dev/full` accepts the open and fails every write with ENOSPC.
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_secret-manager"));
+    cmd.env_clear()
+        .envs(common::profiling_env())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", fx.data_dir.path());
+    for key in ["LLVM_PROFILE_FILE", "LLVM_PROFILE_DIR"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    for (k, v) in fx.envs() {
+        cmd.env(k, v);
+    }
+    let out = cmd
+        .args(["ssh", "list"])
+        .stdout(std::process::Stdio::from(full))
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failed write was reported as success; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "the failure must say something"
     );
 }

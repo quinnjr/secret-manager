@@ -27,10 +27,22 @@ pub const MAX_CONNECTIONS: usize = 16;
 /// PAM module its login unlock.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// First wait after an `accept(2)` failure, and the base the doubling in
+/// [`next_accept_backoff`] starts from.
+const ACCEPT_BACKOFF_START: Duration = Duration::from_millis(100);
+/// Ceiling on that wait: long enough that a persistent EMFILE costs nothing,
+/// short enough that the daemon starts serving again promptly once the
+/// condition clears.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
 pub struct ControlServer {
     listener: UnixListener,
     path: PathBuf,
     timeout: Duration,
+    /// Ceiling on one request's processing. Always [`HANDLER_TIMEOUT`] for a
+    /// server built by [`bind`](Self::bind); overridable so a test can drive
+    /// the timeout arm without waiting two minutes for it.
+    handler_timeout: Duration,
     /// The peer check the accept loop applies. Always [`peer_allowed`] for a
     /// server built by [`bind`](Self::bind); the indirection exists so a test
     /// can drive the refusal path of the accept loop without needing a second
@@ -48,6 +60,18 @@ impl ControlServer {
     pub async fn bind_with_timeout(
         path: &Path,
         timeout: Duration,
+    ) -> std::io::Result<ControlServer> {
+        Self::bind_with_timeouts(path, timeout, HANDLER_TIMEOUT).await
+    }
+
+    /// [`bind`](Self::bind) with both deadlines given explicitly. They are
+    /// deliberately separate — see [`CONNECTION_TIMEOUT`] and
+    /// [`HANDLER_TIMEOUT`] — so a test can shorten the handler's without
+    /// shortening the peer's, or the other way round.
+    pub async fn bind_with_timeouts(
+        path: &Path,
+        timeout: Duration,
+        handler_timeout: Duration,
     ) -> std::io::Result<ControlServer> {
         let dir = path
             .parent()
@@ -75,6 +99,7 @@ impl ControlServer {
             listener,
             path: path.to_path_buf(),
             timeout,
+            handler_timeout,
             policy: peer_allowed,
         })
     }
@@ -105,10 +130,8 @@ impl ControlServer {
                     // first report of a run.
                     if backoff.is_zero() {
                         tracing::warn!("control socket accept failed: {e}");
-                        backoff = Duration::from_millis(100);
-                    } else {
-                        backoff = (backoff * 2).min(Duration::from_secs(1));
                     }
+                    backoff = next_accept_backoff(backoff);
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
@@ -119,13 +142,31 @@ impl ControlServer {
             }
             let handler = handler.clone();
             let timeout = self.timeout;
+            let handler_timeout = self.handler_timeout;
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(e) = handle_connection(stream, handler, timeout).await {
+                if let Err(e) = handle_connection(stream, handler, timeout, handler_timeout).await {
                     tracing::debug!("control connection ended: {e}");
                 }
             });
         }
+    }
+}
+
+/// The next wait after an `accept(2)` failure: the first failure of a run
+/// waits [`ACCEPT_BACKOFF_START`], each consecutive one doubles up to
+/// [`ACCEPT_BACKOFF_MAX`], and a zero argument — what the accept loop stores
+/// after every successful accept — starts the sequence over.
+///
+/// Split out from the loop because the condition that drives it (an `accept`
+/// that keeps failing, i.e. EMFILE/ENFILE) cannot be provoked in-process
+/// without exhausting the whole test binary's file descriptors, so this
+/// arithmetic is only testable on its own.
+fn next_accept_backoff(current: Duration) -> Duration {
+    if current.is_zero() {
+        ACCEPT_BACKOFF_START
+    } else {
+        (current * 2).min(ACCEPT_BACKOFF_MAX)
     }
 }
 
@@ -179,12 +220,13 @@ async fn handle_connection(
     mut stream: UnixStream,
     handler: Handler,
     timeout: Duration,
+    handler_timeout: Duration,
 ) -> std::io::Result<()> {
     let body = tokio::time::timeout(timeout, read_frame(&mut stream))
         .await
         .map_err(|_| std::io::Error::other("peer sent no request in time"))??;
     let response = match decode_frame::<Request>(&body) {
-        Ok(req) => match tokio::time::timeout(HANDLER_TIMEOUT, handler(req)).await {
+        Ok(req) => match tokio::time::timeout(handler_timeout, handler(req)).await {
             Ok(response) => response,
             Err(_) => Response::Error("the daemon took too long to answer".into()),
         },
@@ -888,5 +930,110 @@ mod tests {
             *slot = *b as libc::c_char;
         }
         addr
+    }
+
+    /// The stale-socket cleanup must not swallow every failure to unlink. A
+    /// path occupied by something that is not a socket file — a directory,
+    /// say — has to be reported, not stepped over on the way to a `bind` that
+    /// would fail with a less informative error.
+    #[tokio::test]
+    async fn a_socket_path_occupied_by_a_directory_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        std::fs::create_dir(&sock).unwrap();
+        let err = match ControlServer::bind(&sock).await {
+            Ok(_) => panic!("bind must not claim a path occupied by a directory"),
+            Err(e) => e,
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::EISDIR), "got {err}");
+        assert!(sock.is_dir(), "the directory must survive the failed bind");
+    }
+
+    /// The doubling, the ceiling, and the restart after a good run. A failing
+    /// `accept(2)` is what this protects against — an unbacked-off loop would
+    /// spin at 100% CPU and fill the log — and the failure itself cannot be
+    /// staged in-process, so the arithmetic is checked directly.
+    #[test]
+    fn the_accept_backoff_starts_small_doubles_and_stops_at_its_ceiling() {
+        // A zero backoff is what the loop holds after a successful accept, so
+        // the first failure of a run always starts from the bottom.
+        assert_eq!(next_accept_backoff(Duration::ZERO), ACCEPT_BACKOFF_START);
+
+        let mut seen = vec![next_accept_backoff(Duration::ZERO)];
+        for _ in 0..8 {
+            seen.push(next_accept_backoff(*seen.last().unwrap()));
+        }
+        assert_eq!(
+            &seen[..4],
+            &[
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+            ]
+        );
+        assert!(
+            seen.iter().all(|d| *d <= ACCEPT_BACKOFF_MAX),
+            "the backoff must never exceed its ceiling: {seen:?}"
+        );
+        assert_eq!(*seen.last().unwrap(), ACCEPT_BACKOFF_MAX);
+        // The ceiling is a fixed point: however long the condition persists,
+        // the wait neither grows nor overflows.
+        assert_eq!(
+            next_accept_backoff(ACCEPT_BACKOFF_MAX),
+            ACCEPT_BACKOFF_MAX,
+            "the ceiling must hold"
+        );
+    }
+
+    /// The handler has its own, much larger deadline than the connection —
+    /// a key rotation re-seals a whole vault — but it is still a deadline. A
+    /// handler that never returns must not hold its connection slot forever:
+    /// the peer gets a readable answer and the slot comes back.
+    #[tokio::test]
+    async fn a_handler_that_never_returns_is_abandoned_with_an_error_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server = ControlServer::bind_with_timeouts(
+            &sock,
+            CONNECTION_TIMEOUT,
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap();
+        let stuck: Handler = Arc::new(|_req: Request| {
+            Box::pin(async move { std::future::pending::<Response>().await })
+        });
+        let task = tokio::spawn(server.run(stuck));
+
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(&encode_frame(&Request::Status).unwrap())
+            .await
+            .unwrap();
+        let body = read_frame(&mut stream).await.unwrap();
+        let resp: Response = crate::protocol::decode_frame(&body).unwrap();
+        assert!(
+            matches!(&resp, Response::Error(msg) if msg.contains("too long")),
+            "got {resp:?}"
+        );
+
+        // And the loop is still accepting: the slot the abandoned handler
+        // held was released rather than leaked, so a second peer is served
+        // (with the same verdict) instead of waiting on a permit forever.
+        let mut second = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        second
+            .write_all(&encode_frame(&Request::Status).unwrap())
+            .await
+            .unwrap();
+        let body = read_frame(&mut second).await.unwrap();
+        let resp: Response = crate::protocol::decode_frame(&body).unwrap();
+        assert!(
+            matches!(&resp, Response::Error(msg) if msg.contains("too long")),
+            "got {resp:?}"
+        );
+
+        task.abort();
+        let _ = task.await;
     }
 }

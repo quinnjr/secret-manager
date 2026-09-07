@@ -24,10 +24,6 @@ pub fn root() -> OwnedObjectPath {
     ObjectPath::from_static_str_unchecked("/").into()
 }
 
-pub fn service() -> OwnedObjectPath {
-    ObjectPath::from_static_str_unchecked(SERVICE_PATH).into()
-}
-
 pub fn collection(id: &str) -> OwnedObjectPath {
     owned(format!("{COLLECTIONS_PREFIX}{id}"))
 }
@@ -162,6 +158,12 @@ mod tests {
             })
         );
         assert_eq!(parse("/org/freedesktop/secrets/collection/a/b/c"), None);
+        // A second component that is not a legal segment is not an item of
+        // that collection - it is nothing at all. (Only `/` can actually
+        // reach here from the bus, but `parse` is also handed paths from the
+        // alias file and from control-socket arguments.)
+        assert_eq!(parse("/org/freedesktop/secrets/collection/a/b.c"), None);
+        assert_eq!(parse("/org/freedesktop/secrets/aliases/a/b-c"), None);
         assert_eq!(parse("/org/freedesktop/secrets"), None);
         assert_eq!(parse("/"), None);
     }

@@ -664,3 +664,57 @@ async fn reload_reports_a_vault_directory_it_cannot_scan() {
     std::fs::remove_file(dir.join("aliases.toml")).unwrap();
     assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
 }
+
+/// SIGTERM must end `run_until_shutdown` and take the daemon's resources with
+/// it: the control socket file is unlinked and the bus name released, so a
+/// replacement daemon can start immediately. The terminate stream is
+/// installed here first, before the signal is raised, so the test process
+/// never sees an unhandled SIGTERM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigterm_ends_run_until_shutdown_and_frees_the_name() {
+    let fx = Fixture::start().await;
+    let sock = fx.control_socket();
+    let conn = fx.client().await;
+    let dbus = zbus::fdo::DBusProxy::new(&conn).await.unwrap();
+    let name = zbus::names::BusName::try_from(paths::BUS_NAME).unwrap();
+    assert!(dbus.name_has_owner(name.clone()).await.unwrap());
+
+    // The bus, the vault directory and the runtime directory outlive the
+    // daemon, so what disappears below is the daemon's own doing and not a
+    // temporary directory being cleaned up.
+    let Fixture {
+        daemon,
+        bus: _bus,
+        data_dir: _data_dir,
+        runtime_dir: _runtime_dir,
+        ..
+    } = fx;
+    let mut _term =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+    let stopped = tokio::spawn(daemon.run_until_shutdown());
+
+    // `run_until_shutdown` registers its own handler; repeat the signal until
+    // it has, so the test cannot lose the race and hang.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !stopped.is_finished() && std::time::Instant::now() < deadline {
+        // SAFETY: `raise` takes a signal number and nothing else. SIGTERM is
+        // already handled process-wide by `_term` above.
+        unsafe { libc::raise(libc::SIGTERM) };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stopped
+        .await
+        .expect("run_until_shutdown returned on SIGTERM");
+
+    assert!(
+        wait_for(Duration::from_secs(5), || async { !sock.exists() }).await,
+        "the control socket file must be removed with the daemon"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || async {
+            !dbus.name_has_owner(name.clone()).await.unwrap_or(true)
+        })
+        .await,
+        "the bus name must be released with the daemon"
+    );
+}

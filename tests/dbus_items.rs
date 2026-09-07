@@ -1210,3 +1210,214 @@ async fn set_secret_rejects_an_oversized_secret() {
         MAX_ITEM_SECRET
     );
 }
+
+/// `GetSecrets` takes an arbitrary array of caller-supplied paths. Anything
+/// that does not name an item it can read is simply left out of the reply, as
+/// the spec allows — the call must not fail, and must still answer for the
+/// paths that *are* good, or one stale path from a client's cache would cost
+/// it every secret in the batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_secrets_omits_paths_that_name_no_readable_item() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("real", &[("k", "v")]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let asked = [
+        // An item id that never existed, under a real collection.
+        OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default/nosuchitem")
+            .unwrap(),
+        // A collection path, which names no item at all.
+        fx.default_collection(),
+        // An item under a collection that does not exist.
+        OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/nope/abc").unwrap(),
+        item_path.clone(),
+    ];
+    let out = service.get_secrets(&asked, &session).await.unwrap();
+    assert_eq!(
+        out.keys().cloned().collect::<Vec<_>>(),
+        vec![item_path],
+        "only the one readable item may appear in the reply"
+    );
+    assert_eq!(out.values().next().unwrap().value, b"s".to_vec());
+}
+
+/// The `Attributes` property is optional in the spec, and `secret-tool`-style
+/// callers do send an item with a label and nothing else. The missing-key arm
+/// of `dbus::prop_attributes` is what makes that an empty attribute set
+/// instead of an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_item_without_an_attributes_property_gets_an_empty_set() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let (item_path, prompt) = coll
+        .create_item(
+            prop(
+                "org.freedesktop.Secret.Item.Label",
+                Value::from("no attributes"),
+            ),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(prompt.as_str(), "/");
+    let it = item(&conn, item_path.clone()).await;
+    assert_eq!(it.label().await.unwrap(), "no attributes");
+    assert!(
+        it.attributes().await.unwrap().is_empty(),
+        "an absent Attributes property must mean no attributes, not a failure"
+    );
+    // And the item is a normal item: an empty query still finds it.
+    assert_eq!(
+        coll.search_items(HashMap::new()).await.unwrap(),
+        vec![item_path]
+    );
+}
+
+/// The batch delete is all-or-nothing *and* single-collection: a path that
+/// resolves to a real item of a **different** collection must refuse the whole
+/// call, with both collections untouched. Without the check, one call could
+/// delete across a collection boundary the caller never named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_delete_refuses_an_item_of_another_collection() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    secret_manager::vault::Vault::create(
+        &dir.join("second.vault"),
+        "Second",
+        common::PASSWORD.as_bytes(),
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    fx.daemon
+        .state
+        .lock()
+        .await
+        .collections
+        .get_mut("second")
+        .unwrap()
+        .unlock(common::PASSWORD.as_bytes())
+        .unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let first = collection(&conn, fx.default_collection()).await;
+    let second_path = secret_manager::dbus::paths::collection("second");
+    let second = collection(&conn, second_path.clone()).await;
+    let (mine, _) = first
+        .create_item(
+            props("mine", &[("k", "v")]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+    let (theirs, _) = second
+        .create_item(
+            props("theirs", &[("k", "v")]),
+            &plain_secret(&session, b"t"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(fx.default_collection())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let err = admin
+        .delete_items(&[mine.clone(), theirs.clone()])
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(
+        error_message(&err).contains("belong to this collection"),
+        "{}",
+        error_message(&err)
+    );
+    assert_eq!(
+        first.items().await.unwrap(),
+        vec![mine],
+        "the refused batch deleted an item of the collection it was sent to"
+    );
+    assert_eq!(
+        second.items().await.unwrap(),
+        vec![theirs],
+        "the refused batch deleted an item of the other collection"
+    );
+}
+
+/// The batch interface is exported on the alias object as well as the
+/// collection's own path, and the CLI reaches a collection through
+/// `/aliases/default`. An alias target that resolves must behave exactly like
+/// the real path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_delete_works_through_the_alias_object() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (a, _) = coll
+        .create_item(
+            props("a", &[("k", "1")]),
+            &plain_secret(&session, b"1"),
+            false,
+        )
+        .await
+        .unwrap();
+    let (b, _) = coll
+        .create_item(
+            props("b", &[("k", "2")]),
+            &plain_secret(&session, b"2"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let alias_path = secret_manager::dbus::paths::alias("default").unwrap();
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(alias_path)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut deleted = coll.receive_item_deleted().await.unwrap();
+    admin.delete_items(std::slice::from_ref(&a)).await.unwrap();
+    assert_eq!(deleted.next().await.unwrap().args().unwrap().item, a);
+    assert_eq!(
+        coll.items().await.unwrap(),
+        vec![b],
+        "the alias object deleted the wrong item, or none"
+    );
+}

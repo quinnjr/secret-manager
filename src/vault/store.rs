@@ -178,7 +178,11 @@ impl Vault {
         &self.header.index_salt
     }
     /// Choose whether future saves hash attributes into the header index.
-    /// Takes effect on the next save; call `resave` to apply immediately.
+    ///
+    /// Takes effect on the next save, so an existing vault keeps the index it
+    /// was written with until something writes it again. There is no method
+    /// that rewrites it on demand: the daemon applies a config change by
+    /// reloading, which re-reads each vault from disk.
     pub fn set_index_attributes(&mut self, enabled: bool) {
         self.index_attributes = enabled;
     }
@@ -2302,5 +2306,184 @@ mod tests {
         };
         assert_eq!(p, &path);
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
+    }
+
+    /// `Vault` carries the master key and every plaintext secret, so its
+    /// hand-written `Debug` must show only the four things an operator needs
+    /// (which file, which label, locked or not, how many items) and nothing
+    /// that a log line or a `{:?}` in an error could leak.
+    #[test]
+    fn the_debug_impl_reports_state_without_any_secret() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Work", b"correct horse", FAST).unwrap();
+        v.insert_item(
+            "github",
+            attrs(&[("service", "github")]),
+            b"hunter2".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+
+        let shown = format!("{v:?}");
+        assert!(shown.contains(&path.display().to_string()), "{shown}");
+        assert!(shown.contains("Work"), "{shown}");
+        assert!(shown.contains("locked: false"), "{shown}");
+        assert!(shown.contains("items: 1"), "{shown}");
+        for leaked in ["hunter2", "correct horse", "github"] {
+            assert!(!shown.contains(leaked), "{leaked} leaked into {shown}");
+        }
+
+        v.lock();
+        assert!(format!("{v:?}").contains("locked: true"));
+    }
+
+    /// The AEAD-failure diagnostic reads the file to report its size and
+    /// mtime. A vault whose file has been removed since it was opened still
+    /// has to answer `WrongPassword` - the missing metadata is the one thing
+    /// the diagnostic is allowed to be silent about, not a reason to fail
+    /// differently or to panic.
+    #[test]
+    fn a_failed_unlock_still_reports_wrong_password_when_the_file_is_gone() {
+        let (_d, path) = tmp();
+        Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let mut v = Vault::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let err = v.unlock(b"wrong").unwrap_err();
+        assert!(matches!(err, VaultError::WrongPassword), "{err:?}");
+        assert!(v.is_locked());
+    }
+
+    /// Every public mutator checks the lock state before it touches anything,
+    /// so this is the backstop underneath them: the writer itself refuses a
+    /// locked vault rather than sealing an empty item list under a key it
+    /// does not have, and the file on disk is left exactly as it was.
+    #[test]
+    fn saving_a_locked_vault_is_refused_and_writes_nothing() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.insert_item("x", BTreeMap::new(), b"s".to_vec(), "text/plain", false)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        v.lock();
+
+        let err = v.save().unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the file was rewritten"
+        );
+    }
+
+    /// The sweep deletes unconditionally, so the name shape is the only
+    /// guard. A name with no random component at all - the shape a user's own
+    /// `something.tmp` has - must not match.
+    #[test]
+    fn a_temp_name_without_a_random_component_is_not_swept() {
+        assert!(!is_write_atomic_temp_name("default.tmp"));
+        assert!(!is_write_atomic_temp_name(".tmp"));
+        assert!(!is_write_atomic_temp_name("default.vault"));
+        // The shape that does match, for contrast.
+        assert!(is_write_atomic_temp_name(
+            "default.vault.0123456789abcdef.tmp"
+        ));
+    }
+
+    /// The sweep runs at daemon start and from `delete_file`, both of which
+    /// can happen before the vault directory exists. An unreadable directory
+    /// is nothing to clean, not a failure.
+    #[test]
+    fn sweeping_a_directory_that_is_not_there_removes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(sweep_stale_temp_files(&d.path().join("never-created")), 0);
+    }
+
+    /// `remove_file` on a directory fails anyway, but the `is_file` check has
+    /// to come first: the sweep must skip anything that is not a regular
+    /// file, however temp-shaped its name, and report it as not removed.
+    #[test]
+    fn the_sweep_skips_a_directory_wearing_a_temp_files_name() {
+        let d = tempfile::tempdir().unwrap();
+        let decoy = d.path().join("default.vault.0123456789abcdef.tmp");
+        std::fs::create_dir(&decoy).unwrap();
+        let real = d.path().join("default.vault.fedcba9876543210.tmp");
+        std::fs::write(&real, b"leftover").unwrap();
+
+        // Zero threshold: the age check cannot be what saves the directory.
+        assert_eq!(sweep_temp_files(d.path(), Duration::ZERO), 1);
+        assert!(decoy.is_dir(), "the directory was removed");
+        assert!(!real.exists(), "the real leftover survived");
+    }
+
+    /// The reservation fallback claims the name with `O_EXCL` before it
+    /// renames. If that create fails for a reason other than the name being
+    /// taken, the error has to be reported as-is, naming the path - reporting
+    /// `AlreadyExists` for a directory that is not there would send the
+    /// caller looking for a collection that does not exist.
+    #[test]
+    fn publish_via_reservation_reports_a_reservation_it_could_not_make() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("missing-dir").join("default.vault");
+        let tmp_file = write_temp(&d.path().join("default.vault"), b"finished").unwrap();
+
+        let err = publish_new_via_reservation(&tmp_file, &path).unwrap_err();
+        let VaultError::Io { path: p, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(p, &path, "the error must name the vault path");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
+        assert!(!path.exists());
+    }
+
+    /// The window this fallback exists to shrink is the one where `path` is a
+    /// zero-length reservation. If the rename that closes it fails, the
+    /// reservation must be removed again: leaving it would stand in for a
+    /// collection, which `open` reports as truncated and `create` then
+    /// refuses as already existing - the exact trap the whole design is
+    /// there to avoid.
+    #[test]
+    fn publish_via_reservation_removes_its_reservation_when_the_rename_fails() {
+        let (_d, path) = tmp();
+        // A temp file that is not there, so the rename cannot succeed.
+        let vanished = path.with_file_name("default.vault.0123456789abcdef.tmp");
+
+        let err = publish_new_via_reservation(&vanished, &path).unwrap_err();
+        let VaultError::Io { path: p, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(p, &path);
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
+        assert!(
+            !path.exists(),
+            "the empty reservation was left standing in for a vault"
+        );
+    }
+
+    /// `publish_new` recognises two rename failures - the name being taken,
+    /// and a kernel without `RENAME_NOREPLACE` - and everything else has to
+    /// come back as an `Io` error carrying the real errno, with the finished
+    /// temp file cleaned up. No errno outside those two classes is reachable
+    /// on a working filesystem, so one is manufactured here with a trailing
+    /// slash on the destination, which makes the kernel insist the name be a
+    /// directory (`ENOTDIR`).
+    #[test]
+    fn an_unexpected_rename_failure_is_reported_and_leaves_no_temp_file() {
+        let d = tempfile::tempdir().unwrap();
+        let path = PathBuf::from(format!("{}/default.vault/", d.path().display()));
+
+        let err = publish_new(&path, b"finished vault").unwrap_err();
+        let VaultError::Io { path: p, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(p, &path);
+        assert_eq!(source.raw_os_error(), Some(libc::ENOTDIR), "{source:?}");
+        let leftovers: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
     }
 }

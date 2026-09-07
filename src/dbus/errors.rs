@@ -173,4 +173,135 @@ mod tests {
             Error::NoSuchObject
         ));
     }
+
+    /// A `zbus::Error` that is *not* an `fdo::Error` is the one family the
+    /// hand-written `DBusError` impl cannot forward, so it has to answer for
+    /// itself: the module exists because the derive folded every real error
+    /// name into a description string, and these three methods are what stop
+    /// that happening again. `Unsupported` stands in for the internal zbus
+    /// failures that reach the wire through `From<zbus::Error>` (an object
+    /// export that fails in `Service::unlock`, a signal emitter that cannot be
+    /// built in `Collection::create_item`).
+    #[test]
+    fn a_non_fdo_zbus_error_reports_the_zbus_name_and_keeps_its_text() {
+        let e = Error::from(zbus::Error::Unsupported);
+        assert!(matches!(e, Error::ZBus(zbus::Error::Unsupported)));
+        assert_eq!(e.name().as_str(), "org.freedesktop.zbus.Error");
+        assert_eq!(
+            e.description(),
+            zbus::Error::Unsupported.description(),
+            "the description must carry the wrapped error's own text"
+        );
+
+        // An `fdo::Error` wrapped by the same enum keeps its real wire name
+        // instead of being flattened into `org.freedesktop.zbus.Error` - the
+        // whole reason `DBusError` is implemented by hand here.
+        let fdo = Error::from(zbus::fdo::Error::UnknownObject("no".into()));
+        assert_eq!(
+            fdo.name().as_str(),
+            "org.freedesktop.DBus.Error.UnknownObject"
+        );
+        assert_eq!(fdo.description(), Some("no"));
+    }
+
+    /// The three `org.freedesktop.Secret.Error.*` variants carry no
+    /// description, so `Display` must still say something usable in a log.
+    #[test]
+    fn secret_service_variants_have_a_name_but_no_description() {
+        for (e, name) in [
+            (Error::IsLocked, "org.freedesktop.Secret.Error.IsLocked"),
+            (Error::NoSession, "org.freedesktop.Secret.Error.NoSession"),
+            (
+                Error::NoSuchObject,
+                "org.freedesktop.Secret.Error.NoSuchObject",
+            ),
+        ] {
+            assert_eq!(e.name().as_str(), name);
+            assert_eq!(e.description(), None);
+            assert_eq!(e.to_string(), format!("{name}: no description"));
+        }
+    }
+
+    /// `create_reply` is what a bus client actually receives. Each family has
+    /// to produce the right error name on the wire: the `Secret.Error.*`
+    /// variants with an empty body, a wrapped `fdo::Error` through its own
+    /// impl, and a non-fdo `zbus::Error` under the zbus name with its text as
+    /// the body.
+    #[test]
+    fn create_reply_puts_each_family_on_the_wire_under_its_own_name() {
+        let call = Message::method_call("/org/freedesktop/secrets", "Unlock")
+            .unwrap()
+            .interface("org.freedesktop.Secret.Service")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let header = call.header();
+        let name_of = |e: &Error| {
+            let reply = e.create_reply(&header).unwrap();
+            reply.header().error_name().unwrap().to_string()
+        };
+        assert_eq!(
+            name_of(&Error::IsLocked),
+            "org.freedesktop.Secret.Error.IsLocked"
+        );
+        assert_eq!(
+            name_of(&Error::NoSession),
+            "org.freedesktop.Secret.Error.NoSession"
+        );
+        assert_eq!(
+            name_of(&Error::NoSuchObject),
+            "org.freedesktop.Secret.Error.NoSuchObject"
+        );
+        assert_eq!(
+            name_of(&Error::not_supported("nope")),
+            "org.freedesktop.DBus.Error.NotSupported",
+            "a wrapped fdo error must keep its own name, not the zbus one"
+        );
+        let generic = Error::from(zbus::Error::Unsupported);
+        assert_eq!(name_of(&generic), "org.freedesktop.zbus.Error");
+        let reply = generic.create_reply(&header).unwrap();
+        assert_eq!(
+            reply.body().deserialize::<String>().unwrap(),
+            generic.description().unwrap(),
+            "the description is the only place the real cause survives"
+        );
+    }
+
+    /// A wrapped `MethodError` is the one non-fdo `zbus::Error` that can carry
+    /// no description at all (an error reply with an empty body). The reply
+    /// built for it must still be a well-formed error message under the zbus
+    /// name, with an empty body rather than a `None` serialised into it.
+    #[test]
+    fn a_non_fdo_error_without_a_description_still_builds_a_reply() {
+        let call = Message::method_call("/org/freedesktop/secrets", "Unlock")
+            .unwrap()
+            .interface("org.freedesktop.Secret.Service")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let bodyless = Message::error(&call.header(), "org.example.Bare")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        let e = Error::from(zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from("org.example.Bare").unwrap(),
+            None,
+            bodyless,
+        ));
+        assert_eq!(e.description(), None);
+        assert_eq!(
+            e.name().as_str(),
+            "org.freedesktop.zbus.Error",
+            "only an fdo error may keep its own name through this enum"
+        );
+        let reply = e.create_reply(&call.header()).unwrap();
+        assert_eq!(
+            reply.header().error_name().unwrap().to_string(),
+            "org.freedesktop.zbus.Error"
+        );
+        assert!(
+            reply.body().deserialize::<()>().is_ok(),
+            "a description-less error must produce an empty body"
+        );
+    }
 }

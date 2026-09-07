@@ -250,6 +250,7 @@ fn status_rejects_a_wrong_reply_variant() {
     let out = assert_cmd::Command::cargo_bin("secret-manager")
         .unwrap()
         .env_clear()
+        .envs(common::profiling_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", runtime.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
@@ -322,6 +323,7 @@ fn a_daemon_error_cannot_write_escape_sequences_to_the_terminal() {
     let out = assert_cmd::Command::cargo_bin("secret-manager")
         .unwrap()
         .env_clear()
+        .envs(common::profiling_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", runtime.path())
         .env("XDG_RUNTIME_DIR", runtime.path())
@@ -344,4 +346,292 @@ fn a_daemon_error_cannot_write_escape_sequences_to_the_terminal() {
     assert!(stderr.contains("\\x0d"), "{stderr:?}");
     assert!(stderr.contains("\\x1b"), "{stderr:?}");
     assert!(stderr.contains("\\xe2\\x80\\xae"), "{stderr:?}");
+}
+
+/// A CLI child with its own HOME, config and runtime directory and no bus.
+///
+/// `env_clear` is deliberate — the CLI must not inherit the test runner's
+/// environment — but it also drops the variable the coverage profiler needs,
+/// so that one is put back explicitly (see `Fixture::sm`).
+fn bare_sm(home: &std::path::Path, runtime: &std::path::Path) -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::cargo_bin("secret-manager").unwrap();
+    cmd.env_clear()
+        .envs(common::profiling_env())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_RUNTIME_DIR", runtime)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent");
+    for key in ["LLVM_PROFILE_FILE", "LLVM_PROFILE_DIR"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd
+}
+
+/// A config with a test-cheap KDF, so `sm init` in these tests costs
+/// milliseconds rather than the shipped Argon2 cost.
+fn write_fast_config(home: &std::path::Path) -> std::path::PathBuf {
+    let vault_dir = home.join("vaults");
+    let config_dir = home.join("config").join("secret-manager");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[vault]\ndir = \"{}\"\n[kdf]\nm_cost_kib = 8\nt_cost = 1\np_cost = 1\n",
+            vault_dir.display()
+        ),
+    )
+    .unwrap();
+    vault_dir
+}
+
+/// A control socket that accepts one connection and hangs up without
+/// answering: a daemon that died between `connect` and its reply. This is not
+/// `ProtocolError::Connect` — something *was* listening — so it must not be
+/// mistaken for "no daemon running".
+fn serve_one_hangup(runtime_dir: &std::path::Path) -> std::thread::JoinHandle<()> {
+    let sock = secret_manager::protocol::socket_path_for_runtime_dir(runtime_dir);
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream);
+    })
+}
+
+/// `sm init` claims the `default` alias only when there is not one already.
+/// The alias is what every later `sm set` resolves, so the first collection on
+/// a fresh machine has to become it — and the running daemon has to see it,
+/// which is the reload the same function sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn init_claims_the_default_alias_when_there_is_none() {
+    use secret_manager::dbus::proxies::ServiceProxy;
+
+    let fx = Fixture::start_without_default_alias().await;
+    let service = ServiceProxy::new(&fx.client().await).await.unwrap();
+    assert_eq!(
+        service.read_alias("default").await.unwrap().as_str(),
+        "/",
+        "the fixture must start with no default alias"
+    );
+
+    fx.sm()
+        .args(["init", "--collection", "Work"])
+        .write_stdin("hunter2\n")
+        .assert()
+        .success();
+
+    let aliases =
+        std::fs::read_to_string(fx.data_dir.path().join("secret-manager/aliases.toml")).unwrap();
+    assert!(
+        aliases.contains("default = \"work\""),
+        "the first collection did not claim the default alias: {aliases}"
+    );
+    assert!(
+        common::wait_for(std::time::Duration::from_secs(3), || async {
+            service.read_alias("default").await.unwrap()
+                == secret_manager::dbus::paths::collection("work")
+        })
+        .await,
+        "the running daemon never picked the new alias up"
+    );
+}
+
+/// A daemon that answers the reload with an error must not fail the `init`:
+/// the vault is on disk and correct, only the running daemon is behind. The
+/// user is warned, on stderr, and the command still succeeds.
+#[test]
+fn init_warns_when_the_running_daemon_refuses_to_reload() {
+    use secret_manager::protocol::{Request, Response};
+
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let vault_dir = write_fast_config(home.path());
+    let server = serve_one_control_reply(runtime.path(), Response::Error("no".into()));
+
+    bare_sm(home.path(), runtime.path())
+        .arg("init")
+        .write_stdin("hunter2\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("did not reload"));
+
+    assert!(matches!(server.join().unwrap(), Request::Reload));
+    assert!(
+        vault_dir.join("default.vault").exists(),
+        "the vault must exist however the daemon answered"
+    );
+}
+
+/// The same rule for a daemon that hangs up mid-call: warn, and keep the
+/// vault. `ProtocolError::Connect` is the "no daemon" case and is silent; this
+/// one is not, because a daemon that is there but unreachable may keep the new
+/// collection invisible until it restarts.
+#[test]
+fn init_warns_when_the_control_socket_hangs_up() {
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let vault_dir = write_fast_config(home.path());
+    let server = serve_one_hangup(runtime.path());
+
+    bare_sm(home.path(), runtime.path())
+        .arg("init")
+        .write_stdin("hunter2\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "could not tell the running daemon",
+        ));
+
+    server.join().unwrap();
+    assert!(vault_dir.join("default.vault").exists());
+}
+
+/// A hang-up on a command whose whole job is the control call is a failure,
+/// not a "daemon not running" (exit 3): something answered, so telling the
+/// user to start the daemon would send them the wrong way.
+#[test]
+fn status_reports_a_control_socket_that_hangs_up_as_a_failure() {
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    write_fast_config(home.path());
+    let server = serve_one_hangup(runtime.path());
+
+    bare_sm(home.path(), runtime.path())
+        .arg("status")
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("control socket")
+                .and(predicate::str::contains("systemctl --user start").not()),
+        );
+    server.join().unwrap();
+}
+
+/// Every string in a `Status` reply — the id, the label and the operator
+/// warning — is chosen by whatever answers the control socket, and all three
+/// reach a terminal. A `\r` or an `ESC [ 2 K` in any of them would erase rows
+/// the user has already read; the warning is the one that goes to stderr,
+/// through its own printer.
+#[test]
+fn a_collection_warning_from_the_control_socket_is_escaped() {
+    use secret_manager::protocol::{CollectionStatus, Response};
+
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    write_fast_config(home.path());
+    let server = serve_one_control_reply(
+        runtime.path(),
+        Response::Status {
+            collections: vec![CollectionStatus {
+                id: "ev\ril".into(),
+                label: "lab\u{1b}[2Kel".into(),
+                locked: false,
+                items: 7,
+                warning: Some("index\rrewrite \u{1b}[2Kfailed".into()),
+            }],
+            uptime_secs: 12,
+        },
+    );
+
+    let out = bare_sm(home.path(), runtime.path())
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let _ = server.join();
+
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(stdout.contains("daemon up 12s"), "{stdout:?}");
+    assert!(stdout.contains("ev\\x0dil"), "{stdout:?}");
+    assert!(stdout.contains("lab\\x1b[2Kel"), "{stdout:?}");
+    assert!(stdout.contains("unlocked"), "{stdout:?}");
+    // The warning is a separate line on stderr, and escaped there too.
+    assert!(stderr.contains("warning: ev\\x0dil"), "{stderr:?}");
+    assert!(stderr.contains("rewrite \\x1b[2Kfailed"), "{stderr:?}");
+    for bad in ['\r', '\u{1b}'] {
+        assert!(!stdout.contains(bad), "raw {bad:?} on stdout: {stdout:?}");
+        assert!(!stderr.contains(bad), "raw {bad:?} on stderr: {stderr:?}");
+    }
+}
+
+/// `sm daemon` that cannot start for a reason other than the bus name already
+/// being owned is exit 1, and says what failed. Only the name clash is exit 3.
+#[test]
+fn daemon_reports_a_start_failure_that_is_not_a_name_clash() {
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let vault_dir = write_fast_config(home.path());
+    std::fs::create_dir_all(&vault_dir).unwrap();
+
+    bare_sm(home.path(), runtime.path())
+        .arg("daemon")
+        .arg("--foreground")
+        .assert()
+        // Not 3: 3 is reserved for "another daemon already owns the name",
+        // which a script may treat as "one is already running".
+        .code(1)
+        .stderr(predicate::str::contains("secret-manager:"));
+}
+
+/// The `daemon` subcommand run end to end: it starts, serves, and returns 0
+/// when it is asked to stop. A daemon that exited non-zero on SIGTERM would
+/// make systemd report every ordinary `systemctl --user stop` as a failure.
+#[test]
+fn the_daemon_subcommand_exits_cleanly_on_sigterm() {
+    let bus = common::TestBus::start();
+    let home = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let vault_dir = write_fast_config(home.path());
+    std::fs::create_dir_all(&vault_dir).unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_secret-manager"));
+    cmd.env_clear()
+        .envs(common::profiling_env())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus.address);
+    for key in ["LLVM_PROFILE_FILE", "LLVM_PROFILE_DIR"] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    let mut child = cmd.args(["daemon", "--foreground"]).spawn().unwrap();
+
+    // The control socket is the last thing `Daemon::start` creates, so its
+    // existence means the daemon is fully up.
+    let sock = secret_manager::protocol::socket_path_for_runtime_dir(runtime.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !sock.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the daemon never bound its control socket"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the daemon exited before it was up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // SAFETY: `kill` takes a pid and a signal number and touches no memory.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) },
+        0,
+        "could not signal the daemon: {}",
+        std::io::Error::last_os_error()
+    );
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "a daemon stopped with SIGTERM exited {status:?}"
+    );
 }

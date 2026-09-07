@@ -593,4 +593,129 @@ mod tests {
             }
         }
     }
+
+    /// Only a name clash becomes `NameTaken`; every other bus failure keeps
+    /// its own text. The distinction is load-bearing: `main` turns
+    /// `NameTaken` into exit code 3 and the "already owns" message, and a
+    /// mapping that swallowed other errors would report a broken bus as a
+    /// second daemon.
+    #[test]
+    fn only_a_name_clash_maps_to_name_taken() {
+        assert!(matches!(
+            DaemonError::from(zbus::Error::NameTaken),
+            DaemonError::NameTaken
+        ));
+        let other = DaemonError::from(zbus::Error::InvalidField);
+        assert!(other.to_string().starts_with("bus error"), "{other}");
+        assert!(matches!(other, DaemonError::ZBus(_)));
+    }
+
+    /// Startup sweeps temp files an interrupted save left behind, and it does
+    /// so before the bus is touched, so a daemon that cannot reach the bus
+    /// has still cleaned up. Only the shape `write_atomic` produces, and only
+    /// when it is older than `STALE_TEMP_AGE`.
+    #[tokio::test]
+    async fn start_sweeps_stale_vault_temp_files_before_touching_the_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("default.vault.0123456789abcdef.tmp");
+        let fresh = dir.path().join("default.vault.fedcba9876543210.tmp");
+        let innocent = dir.path().join("notes.backup.tmp");
+        for f in [&stale, &fresh, &innocent] {
+            std::fs::write(f, b"partial save").unwrap();
+        }
+        age_file(
+            &stale,
+            crate::vault::store::STALE_TEMP_AGE + Duration::from_secs(60),
+        );
+
+        let mut config = Config::default();
+        config.vault.dir = dir.path().to_path_buf();
+        let mut opts = DaemonOptions::new(config);
+        // No bus: `start` gets as far as the connection and fails there,
+        // which is after the sweep and proves the ordering.
+        opts.bus = BusAddress::Address("unix:path=/nonexistent/secret-manager-tests".into());
+        let Err(err) = Daemon::start(opts).await else {
+            panic!("a daemon must not come up on a nonexistent bus address")
+        };
+        assert!(
+            matches!(err, DaemonError::ZBus(_)),
+            "expected the bus step to be what failed, got {err}"
+        );
+
+        assert!(!stale.exists(), "a stale temp file must be swept at start");
+        assert!(
+            fresh.exists(),
+            "a temp file younger than the threshold stays"
+        );
+        assert!(
+            innocent.exists(),
+            "a name `write_atomic` never produces must not be deleted"
+        );
+    }
+
+    /// `[vault] lock_memory = true` is a promise the daemon cannot keep on a
+    /// host whose `RLIMIT_MEMLOCK` cannot cover a derivation, and it refuses
+    /// to start rather than run with secrets that may be swapped out. The
+    /// hardening runs before the vault directory or the bus, so the refusal
+    /// does not depend on either. Which branch applies depends on the host's
+    /// limit, so the test asserts the right one for whichever it is.
+    #[tokio::test]
+    async fn start_refuses_lock_memory_it_cannot_honour() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.vault.dir = dir.path().to_path_buf();
+        config.vault.lock_memory = true;
+        let mut opts = DaemonOptions::new(config);
+        opts.bus = BusAddress::Address("unix:path=/nonexistent/secret-manager-tests".into());
+
+        let Err(err) = Daemon::start(opts).await else {
+            panic!("a daemon must not come up on a nonexistent bus address")
+        };
+        match err {
+            DaemonError::Hardening(e) => assert!(
+                !memlock_is_sufficient(),
+                "refused hardening despite a sufficient RLIMIT_MEMLOCK: {e}"
+            ),
+            // A host that can honour it gets no further than the bus.
+            other => assert!(
+                memlock_is_sufficient(),
+                "expected a hardening refusal on a host limited to less than \
+                 a derivation, got {other}"
+            ),
+        }
+    }
+
+    /// Bytes needed by `lock_memory`, and whether this host's limit covers it.
+    fn memlock_is_sufficient() -> bool {
+        // SAFETY: getrlimit writes a plain rlimit struct through a valid pointer.
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) },
+            0
+        );
+        let needed =
+            u64::from(KdfParams::MAX_M_COST_KIB) * 1024 * crate::kdf::MAX_CONCURRENT as u64
+                + 64 * 1024 * 1024;
+        lim.rlim_cur == libc::RLIM_INFINITY || lim.rlim_cur as u64 >= needed
+    }
+
+    /// Backdate a file's mtime by `age`, so a sweep sees it as stale without
+    /// the test waiting.
+    fn age_file(path: &std::path::Path, age: Duration) {
+        let when = std::time::SystemTime::now() - age;
+        let secs = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let tv = libc::timeval {
+            tv_sec: secs,
+            tv_usec: 0,
+        };
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a NUL-terminated path and `times` is a live array of
+        // two `timeval`s, which is exactly what `utimes` reads.
+        let rc = unsafe { libc::utimes(c.as_ptr(), [tv, tv].as_ptr()) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    }
 }

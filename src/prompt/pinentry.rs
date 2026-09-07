@@ -393,6 +393,7 @@ impl Assuan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn fake() -> Pinentry {
         Pinentry::new(concat!(
@@ -650,5 +651,192 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PinentryError::Spawn { .. }));
+    }
+
+    /// A pinentry stand-in whose whole conversation is scripted, so the
+    /// unhappy Assuan paths — a reply that is not `OK`, an `ERR` line that
+    /// does not parse, a dialog that exits mid-conversation — can be driven
+    /// deterministically. `OPTION` lines (which vary with the environment)
+    /// are always answered `OK` and never consume a script entry; every other
+    /// command takes the next entry, where `CLOSE` exits and `HANG` sleeps.
+    fn scripted(replies: &[&str]) -> (tempfile::TempDir, Pinentry) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scripted-pinentry.sh");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\n\
+             printf 'OK Pleased to meet you\\n'\n\
+             n=0\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in\n\
+                 OPTION*) printf 'OK\\n'; continue ;;\n\
+               esac\n\
+               n=$((n + 1))\n\
+               reply=$(printf '%s\\n' \"$SCRIPT\" | sed -n \"${n}p\")\n\
+               case \"$reply\" in\n\
+                 '') exit 0 ;;\n\
+                 CLOSE) exit 0 ;;\n\
+                 HANG) sleep 30; exit 0 ;;\n\
+                 *) printf '%b\\n' \"$reply\" ;;\n\
+               esac\n\
+             done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let p = Pinentry::new(&path)
+            .env("SCRIPT", replies.join("\n"))
+            .with_timeout(Duration::from_secs(10));
+        (dir, p)
+    }
+
+    /// Runs a scripted dialog, retrying a spawn that lost the `ETXTBSY` race.
+    ///
+    /// The scripted binary is written by the test and executed immediately.
+    /// Any other thread in this process that forks between the `write` and
+    /// the `exec` inherits the still-open write descriptor, and the kernel
+    /// then refuses to execute the file. Nothing about the code under test is
+    /// involved, so the spawn is simply retried.
+    async fn retrying<T>(
+        mut dialog: impl AsyncFnMut() -> Result<T, PinentryError>,
+    ) -> Result<T, PinentryError> {
+        for _ in 0..50 {
+            match dialog().await {
+                Err(PinentryError::Spawn { source, .. })
+                    if source.raw_os_error() == Some(libc::ETXTBSY) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+        dialog().await
+    }
+
+    #[test]
+    fn cancelled_debug_names_the_variant() {
+        assert_eq!(
+            format!("{:?}", PinOutcome::Cancelled),
+            "PinOutcome::Cancelled"
+        );
+    }
+
+    /// A dialog that exits in the middle of the conversation is not a
+    /// cancellation: only an Assuan cancel is. The caller must see the error
+    /// so an unlock is not recorded as "the user said no".
+    #[tokio::test]
+    async fn a_dialog_that_exits_mid_conversation_is_a_protocol_error() {
+        // SETTITLE, SETDESC, SETPROMPT, then GETPIN with the child gone.
+        let (_dir, p) = scripted(&["OK", "OK", "OK", "CLOSE"]);
+        let err = retrying(async || p.ask(&req()).await).await.unwrap_err();
+        assert!(
+            matches!(&err, PinentryError::Protocol(m) if m.contains("closed the connection")),
+            "{err:?}"
+        );
+    }
+
+    /// An option the dialog does not implement answers `ERR`, and that is not
+    /// fatal — pinentry-tty rejects `SETTITLE`, and a password prompt that
+    /// refused to run because of it would be a regression.
+    #[tokio::test]
+    async fn an_option_the_dialog_rejects_is_not_fatal() {
+        let (_dir, p) = scripted(&[
+            "ERR 83886254 Not implemented",
+            "OK",
+            "OK",
+            "D hunter2\\nOK",
+            "OK",
+        ]);
+        match retrying(async || p.ask(&req()).await).await.unwrap() {
+            PinOutcome::Pin(pin) => assert_eq!(pin.as_str(), "hunter2"),
+            PinOutcome::Cancelled => panic!("cancelled"),
+        }
+    }
+
+    /// A `D` line where an `OK` belongs is a protocol violation, not a PIN:
+    /// treating it as one would let a rogue pinentry answer a `SETDESC` with
+    /// data and have it read as an answer to a later command.
+    #[tokio::test]
+    async fn a_data_line_where_ok_belongs_is_a_protocol_error() {
+        let (_dir, p) = scripted(&["D nope"]);
+        let err = retrying(async || p.ask(&req()).await).await.unwrap_err();
+        assert!(
+            matches!(&err, PinentryError::Protocol(m) if m.contains("unexpected data line")),
+            "{err:?}"
+        );
+    }
+
+    /// An `ERR` line whose code is not a number cannot be classified — in
+    /// particular `is_cancel` cannot be consulted — so it is reported rather
+    /// than guessed at.
+    #[tokio::test]
+    async fn an_error_line_with_no_numeric_code_is_a_protocol_error() {
+        let (_dir, p) = scripted(&["OK", "ERR oops the sky is falling"]);
+        let err = retrying(async || p.ask(&req()).await).await.unwrap_err();
+        assert!(
+            matches!(&err, PinentryError::Protocol(m) if m.contains("bad error line")),
+            "{err:?}"
+        );
+    }
+
+    /// `confirm` answers "no" for a cancel or an Assuan error, but a broken
+    /// dialog is a different thing and reaches the caller as an error.
+    #[tokio::test]
+    async fn confirm_reports_a_broken_dialog_rather_than_answering_no() {
+        // SETTITLE, SETDESC, SETPROMPT, then CONFIRM with the child gone.
+        let (_dir, p) = scripted(&["OK", "OK", "OK", "CLOSE"]);
+        let err = retrying(async || p.confirm(&req()).await)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PinentryError::Protocol(m) if m.contains("closed the connection")),
+            "{err:?}"
+        );
+    }
+
+    /// A confirmation nobody answers must not hold the process-wide dialog
+    /// lock forever; it is abandoned at the timeout and read as a refusal,
+    /// which is the fail-closed direction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hanging_confirmation_times_out_as_refused() {
+        let (_dir, p) = scripted(&["OK", "OK", "OK", "HANG"]);
+        let p = p.with_timeout(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert!(!retrying(async || p.confirm(&req()).await).await.unwrap());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "did not time out"
+        );
+    }
+
+    /// An empty title means no `SETTITLE` at all, rather than one with an
+    /// empty argument: pinentry-gtk draws an empty title bar for the latter.
+    #[tokio::test]
+    async fn an_empty_title_sends_no_settitle() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let p = fake().env("FAKE_PIN", "x").env("FAKE_LOG", log.path());
+        let mut r = req();
+        r.title = String::new();
+        assert!(matches!(p.ask(&r).await.unwrap(), PinOutcome::Pin(_)));
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(!text.contains("SETTITLE"), "{text}");
+        assert!(text.contains("SETDESC"), "the rest of the setup still runs");
+    }
+
+    /// Assuan status (`S`) and comment (`#`) lines can arrive before any
+    /// reply. They are informational: the reader must skip them and keep
+    /// waiting, not mistake one for an answer or an error.
+    #[tokio::test]
+    async fn status_and_comment_lines_are_skipped() {
+        let (_dir, p) = scripted(&[
+            "S SETTITLE_DONE\\nOK",
+            "# a comment\\nOK",
+            "OK",
+            "S PINENTRY_LAUNCHED 1234\\nD hunter2\\nOK",
+            "OK",
+        ]);
+        match retrying(async || p.ask(&req()).await).await.unwrap() {
+            PinOutcome::Pin(pin) => assert_eq!(pin.as_str(), "hunter2"),
+            PinOutcome::Cancelled => panic!("cancelled"),
+        }
     }
 }

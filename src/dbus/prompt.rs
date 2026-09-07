@@ -463,12 +463,6 @@ enum Outcome {
     Cancelled,
 }
 
-/// Ask for the collection's password up to three times. True when unlocked.
-pub async fn unlock_collection(conn: &Connection, state: &Shared, id: &str) -> bool {
-    let mut gate = None;
-    unlock_collection_inner(conn, state, id, &mut gate).await == Outcome::Unlocked
-}
-
 async fn unlock_collection_inner(
     conn: &Connection,
     state: &Shared,

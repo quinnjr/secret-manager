@@ -279,11 +279,7 @@ impl Fixture {
         // CLI must not inherit the test runner's environment — but it also
         // removes the variable the profiler needs, which silently reports the
         // whole CLI as unexercised however many times these tests drive it.
-        for key in ["LLVM_PROFILE_FILE", "LLVM_PROFILE_DIR"] {
-            if let Ok(v) = std::env::var(key) {
-                cmd.env(key, v);
-            }
-        }
+        cmd.envs(profiling_env());
         cmd.env("HOME", self.data_dir.path());
         for (k, v) in self.envs() {
             cmd.env(k, v);
@@ -333,4 +329,20 @@ where
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     false
+}
+
+/// The coverage profiler's output path, to survive an `env_clear()`.
+///
+/// A profiled child process records nothing unless it is told where to write
+/// its counters, so a test that clears the environment before running the CLI
+/// silently reports that whole run as unexercised — however much of the CLI it
+/// actually drove. This is not hypothetical: it hid roughly eight points of
+/// measured coverage across the CLI until it was found.
+///
+/// Chain it after every `env_clear()`: `.env_clear().envs(common::profiling_env())`.
+pub fn profiling_env() -> Vec<(String, String)> {
+    ["LLVM_PROFILE_FILE", "LLVM_PROFILE_DIR"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
+        .collect()
 }
