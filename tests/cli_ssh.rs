@@ -708,3 +708,145 @@ async fn askpass_refuses_to_choose_between_two_items_claiming_one_key() {
         .stdout("typed\n")
         .stderr(predicate::str::contains("refusing to choose"));
 }
+
+/// CRITICAL: a key registered with `--no-passphrase` stores an EMPTY secret so
+/// `ssh list` can inventory it. `release_passphrase` guards on
+/// `secret.is_empty()`; without it, `askpass` would print an empty line -- and
+/// OpenSSH reads an empty answer as approval (see
+/// `untagged_question_is_confirmed_and_empty_answers_are_refused`). So the
+/// guard is what stops an empty stored secret being turned into a "yes". The
+/// only correct behaviour is to fall through to the ordinary typed prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn askpass_never_answers_from_a_key_registered_without_a_passphrase() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let plain = make_key(keys.path(), "id_no_pass", "");
+
+    fx.sm()
+        .args(["ssh", "add", "--no-passphrase"])
+        .arg(&plain)
+        .assert()
+        .success();
+
+    let out = fx
+        .sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{}': ", plain.display()),
+        ])
+        .env("FAKE_CONFIRM", "yes")
+        .env("FAKE_PIN", "typed")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "typed\n",
+        "the empty stored secret was released as an answer"
+    );
+}
+
+/// CRITICAL: any bus client -- or `sm set` with binary stdin -- can create an
+/// item carrying the ssh schema, a registered key's `path` and
+/// `has_passphrase=true` with a secret that is not valid UTF-8. That gate sits
+/// *after* consent has been granted and after the collection has been
+/// unlocked, so it is the last thing between a garbage secret and ssh's stdin.
+/// It must fall through to the typed prompt, never emit lossy or truncated
+/// bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn askpass_never_answers_from_a_secret_that_is_not_utf8() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_binary", "pass123");
+    let real = std::fs::canonicalize(&key).unwrap();
+
+    // Registered directly rather than through `ssh add`, so this is the single
+    // item claiming the path and `release_passphrase` reaches the UTF-8 gate
+    // instead of the ambiguity refusal.
+    fx.sm()
+        .args([
+            "set",
+            "xdg:schema=org.secret-manager.ssh",
+            &format!("path={}", real.display()),
+            "has_passphrase=true",
+            "--label",
+            "binary",
+        ])
+        .write_stdin(vec![0xffu8, 0xfe, 0x80, 0x41])
+        .assert()
+        .success();
+
+    let out = fx
+        .sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{}': ", key.display()),
+        ])
+        .env("FAKE_CONFIRM", "yes")
+        .env("FAKE_PIN", "typed")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "typed\n",
+        "a non-UTF-8 stored secret reached ssh"
+    );
+}
+
+/// WARNING: the approve-then-dismiss ordering, which
+/// `declining_does_not_unlock_the_collection` does not cover. Consent is
+/// granted, so the unlock is attempted -- and then the master password prompt
+/// is dismissed. That must degrade to the ordinary typed prompt rather than
+/// propagate an error out of `askpass` before the fallback is reached, and it
+/// must leave the collection locked.
+///
+/// The daemon's pinentry cancels (`start_with_pin(None)`) while the CLI's own
+/// answers `typed`, which is what separates "fell through to the fallback"
+/// from "failed on the way there": both would otherwise exit 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dismissed_unlock_after_consent_falls_back_to_a_typed_answer() {
+    let fx = Fixture::start_with_pin(None).await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_dismissed", "pass123");
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+    fx.lock_default().await;
+
+    let out = fx
+        .sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{}': ", key.display()),
+        ])
+        .env("FAKE_CONFIRM", "yes")
+        .env("FAKE_PIN", "typed")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "typed\n",
+        "a dismissed unlock did not fall through to the typed prompt"
+    );
+    assert!(
+        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        "a dismissed master password prompt left the collection unlocked"
+    );
+}

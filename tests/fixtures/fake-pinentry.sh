@@ -3,8 +3,9 @@
 #   FAKE_PIN      value answered to GETPIN (Assuan-escaped); unset => cancel
 #   FAKE_CONFIRM  "yes" => CONFIRM succeeds; anything else => cancel
 #   FAKE_LOG      file that receives every command line
-#   FAKE_DELAY    seconds to hang before answering GETPIN (tests that race a
-#                 client-side abort/Dismiss against a slow pinentry)
+#   FAKE_DELAY    seconds to hang before answering GETPIN or CONFIRM (tests
+#                 that race a client-side abort/Dismiss, or a state change,
+#                 against a dialog that is still on screen)
 #
 # When FAKE_LOG is set, "${FAKE_LOG}.timing" also receives "START <pid>
 # <epoch-nanos>" when a GETPIN is received and "END <pid> <epoch-nanos>"
@@ -30,6 +31,7 @@ while IFS= read -r line; do
       fi
       ;;
     CONFIRM*)
+      if [ -n "$FAKE_DELAY" ]; then sleep "$FAKE_DELAY"; fi
       if [ "$FAKE_CONFIRM" = "yes" ]; then echo "OK"; else echo "ERR 83886179 Operation cancelled <Pinentry>"; fi
       ;;
     BYE*)

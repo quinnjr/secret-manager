@@ -978,6 +978,54 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ProtocolError::Connect(_)));
     }
+
+    /// The path comes from `XDG_RUNTIME_DIR`, which the PAM module treats as
+    /// hostile. Both shapes must be refused in `unix_addr`: the copy loop
+    /// below the guards writes no terminator of its own, so an over-long
+    /// path would leave `sun_path` unterminated and an empty one would name
+    /// the abstract namespace rather than the file we mean.
+    #[test]
+    fn a_socket_path_that_cannot_fit_sockaddr_un_is_refused() {
+        let invalid = |path: &Path| match call(path, &Request::Status).unwrap_err() {
+            ProtocolError::Connect(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}")
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        };
+        invalid(Path::new(""));
+        // 256 bytes: over the 108-byte `sun_path`, and never truncated into
+        // some shorter path that happens to exist.
+        let long = PathBuf::from(format!("/{}", "a".repeat(255)));
+        assert_eq!(long.as_os_str().len(), 256);
+        invalid(&long);
+    }
+
+    /// The PAM module passes the remaining slice of a whole-login budget, so
+    /// a call can be entered with nothing left. It must fail before
+    /// connecting rather than connect and then arm a zero — that is,
+    /// unbounded — socket timeout, even against a listener that would answer.
+    #[test]
+    fn a_call_entered_with_a_spent_budget_fails_before_connecting() {
+        let dir = test_dir("spent-budget");
+        let sock = dir.join("control.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let start = Instant::now();
+        let err = call_with_timeout(&sock, &Request::Status, Duration::ZERO).unwrap_err();
+        let elapsed = start.elapsed();
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+        match err {
+            ProtocolError::Io(e) | ProtocolError::Connect(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}")
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a spent budget must fail immediately, took {elapsed:?}"
+        );
+    }
     /// postcard stops at the end of the first complete message, so before
     /// this was fixed a peer could append anything it liked to a valid
     /// request and have it accepted. Not exploitable as the protocol stands,

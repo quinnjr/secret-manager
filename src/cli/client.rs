@@ -17,21 +17,56 @@ use zeroize::Zeroizing;
 
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long [`Client::connect`] waits for the session bus.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Environment variable that shortens [`CONNECT_TIMEOUT`]; honoured only when
+/// the `test-util` feature is on, which no shipped build enables.
+#[cfg(feature = "test-util")]
+pub const CONNECT_TIMEOUT_ENV: &str = "SM_CONNECT_TIMEOUT_MS";
+
+/// The deadline [`Client::connect`] actually uses.
+///
+/// A bus that accepts the connection and then says nothing is exactly what
+/// the timeout exists for, and asserting on it at the shipped 10 s costs 10 s
+/// of wall clock. Under `test-util` — the same feature that exposes
+/// `KdfParams::FAST_FOR_TESTS` — `SM_CONNECT_TIMEOUT_MS` may shorten it.
+/// With the feature off this is [`CONNECT_TIMEOUT`] and nothing else: no
+/// environment is read and no override exists in the binary we ship.
+fn connect_timeout() -> Duration {
+    #[cfg(feature = "test-util")]
+    if let Some(ms) = std::env::var(CONNECT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    CONNECT_TIMEOUT
+}
+
+/// Maps a D-Bus method-error name to the CLI error it becomes.
+///
+/// Split out of [`map_zbus`] so it can be tested: `zbus::Error::MethodError`
+/// carries a `zbus::Message`, which cannot be constructed in a unit test, so
+/// the mapping is otherwise reachable only from a live bus. The exit code
+/// this decides is the CLI's contract with scripts — `Unreachable` is 3 and
+/// `Failed` is 1 — so which name lands in which arm is worth pinning.
+pub(crate) fn method_error_to_cli(name: &str, msg: &str) -> CliError {
+    match name {
+        "org.freedesktop.DBus.Error.ServiceUnknown"
+        | "org.freedesktop.DBus.Error.NameHasNoOwner"
+        | "org.freedesktop.DBus.Error.NoReply" => CliError::Unreachable(format!(
+            "secret service is not running ({msg}); start it with `systemctl --user start secret-manager`"
+        )),
+        "org.freedesktop.Secret.Error.IsLocked" => CliError::Failed("collection is locked".into()),
+        other => CliError::Failed(format!("{other}: {msg}")),
+    }
+}
+
 pub fn map_zbus(e: zbus::Error) -> CliError {
     match &e {
         zbus::Error::MethodError(name, msg, _) => {
-            let msg = msg.clone().unwrap_or_default();
-            match name.as_str() {
-                "org.freedesktop.DBus.Error.ServiceUnknown"
-                | "org.freedesktop.DBus.Error.NameHasNoOwner"
-                | "org.freedesktop.DBus.Error.NoReply" => CliError::Unreachable(format!(
-                    "secret service is not running ({msg}); start it with `systemctl --user start secret-manager`"
-                )),
-                "org.freedesktop.Secret.Error.IsLocked" => {
-                    CliError::Failed("collection is locked".into())
-                }
-                other => CliError::Failed(format!("{other}: {msg}")),
-            }
+            method_error_to_cli(name.as_str(), &msg.clone().unwrap_or_default())
         }
         zbus::Error::InputOutput(_) | zbus::Error::Address(_) => {
             CliError::Unreachable(format!("cannot reach the session bus: {e}"))
@@ -59,10 +94,10 @@ pub struct Client {
 impl Client {
     /// Connect to the session bus and open a DH session (plain if the service refuses DH).
     pub async fn connect() -> Result<Client, CliError> {
-        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
         let timed_out = || CliError::Unreachable("session bus did not answer within 10 s".into());
+        let deadline = connect_timeout();
 
-        let conn = tokio::time::timeout(CONNECT_TIMEOUT, Connection::session())
+        let conn = tokio::time::timeout(deadline, Connection::session())
             .await
             .map_err(|_| timed_out())?
             .map_err(|e| {
@@ -75,7 +110,7 @@ impl Client {
             .map_err(map_zbus)?;
         let pair = KeyPair::generate();
         let (session, cipher) = match tokio::time::timeout(
-            CONNECT_TIMEOUT,
+            deadline,
             service.open_session(ALGORITHM_DH, &Value::from(pair.public_bytes().to_vec())),
         )
         .await
@@ -92,7 +127,7 @@ impl Client {
                 if name.as_str() == "org.freedesktop.DBus.Error.NotSupported" =>
             {
                 let (_, path) = tokio::time::timeout(
-                    CONNECT_TIMEOUT,
+                    deadline,
                     service.open_session(ALGORITHM_PLAIN, &Value::from("")),
                 )
                 .await
@@ -323,5 +358,46 @@ impl Client {
             );
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which name lands in which arm decides the process exit code, and that
+    /// is what a script branches on. Only the transport arm is reachable from
+    /// an integration test (a bogus bus address), so the method-error names
+    /// are pinned here.
+    #[test]
+    fn a_method_error_name_decides_the_exit_code() {
+        for name in [
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+            "org.freedesktop.DBus.Error.NoReply",
+        ] {
+            let err = method_error_to_cli(name, "no owner");
+            assert!(
+                matches!(err, CliError::Unreachable(_)),
+                "{name} must be reported as unreachable, got {err:?}"
+            );
+            assert_eq!(err.exit_code(), 3, "{name}");
+            assert!(err.to_string().contains("systemctl --user start"), "{name}");
+        }
+
+        // A locked collection is a plain failure, and the daemon's own message
+        // is deliberately dropped for a fixed one.
+        let err = method_error_to_cli("org.freedesktop.Secret.Error.IsLocked", "ignored");
+        assert!(matches!(err, CliError::Failed(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(err.to_string(), "collection is locked");
+
+        // Anything else keeps both the name and the peer's message, so an
+        // unrecognised error is still diagnosable.
+        let err = method_error_to_cli("com.example.Whatever", "went wrong");
+        assert!(matches!(err, CliError::Failed(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("com.example.Whatever"));
+        assert!(err.to_string().contains("went wrong"));
     }
 }

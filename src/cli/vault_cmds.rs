@@ -1,5 +1,6 @@
 //! init / lock / unlock / status / change-password
 
+use super::secrets::escape_control;
 use super::{CliError, load_config, read_new_password, read_password};
 use crate::config::Config;
 use crate::dbus::state::{load_aliases, save_aliases_to};
@@ -108,7 +109,11 @@ pub fn control(req: Request) -> Result<Response, CliError> {
         other => CliError::Failed(other.to_string()),
     })?;
     match call(&path, &req) {
-        Ok(Response::Error(e)) => Err(CliError::Failed(e)),
+        // The daemon's message is peer-supplied text on its way to a
+        // terminal: whatever answers the socket chose it, and a `\r` or an
+        // ANSI escape in it would rewrite lines the user has already read.
+        // Same table as `sm list` uses for a label.
+        Ok(Response::Error(e)) => Err(CliError::Failed(escape_control(&e))),
         Ok(r) => Ok(r),
         Err(ProtocolError::Connect(e)) => Err(CliError::Unreachable(format!(
             "daemon not running ({e}); start it with `systemctl --user start secret-manager`"
@@ -152,24 +157,34 @@ pub fn status() -> Result<(), CliError> {
         } => {
             println!("daemon up {}s", uptime_secs);
             println!("{:<16} {:<24} {:<9} ITEMS", "ID", "LABEL", "STATE");
+            // Ids, labels and warnings all come off the socket, so they are
+            // escaped before they are printed for the same reason.
             for c in &collections {
                 println!(
                     "{:<16} {:<24} {:<9} {}",
-                    c.id,
-                    c.label,
+                    escape_control(&c.id),
+                    escape_control(&c.label),
                     if c.locked { "locked" } else { "unlocked" },
                     c.items
                 );
             }
             for c in &collections {
                 if let Some(w) = &c.warning {
-                    eprintln!("warning: {}: {w}", c.id);
+                    println_warning(&c.id, w);
                 }
             }
             Ok(())
         }
         other => Err(CliError::Failed(format!("unexpected reply {other:?}"))),
     }
+}
+
+fn println_warning(id: &str, warning: &str) {
+    eprintln!(
+        "warning: {}: {}",
+        escape_control(id),
+        escape_control(warning)
+    );
 }
 
 pub fn change_password(collection: String) -> Result<(), CliError> {

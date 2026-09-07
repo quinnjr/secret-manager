@@ -853,3 +853,360 @@ async fn an_empty_batch_delete_does_nothing() {
     admin.delete_items(&[]).await.unwrap();
     assert_eq!(std::fs::read(&vault_file).unwrap(), before);
 }
+
+/// Properties with one entry whose value the caller controls, so a test can
+/// hand a create path a badly typed `a{sv}`. `props` above always builds a
+/// well-typed pair, which is exactly why the type guards were never reached.
+fn prop(key: &'static str, value: Value<'static>) -> HashMap<&'static str, Value<'static>> {
+    HashMap::from([(key, value)])
+}
+
+/// A DH session plus the cipher its client half needs, for the tests that
+/// feed attacker-shaped bytes to the server's decrypt.
+async fn dh_session(service: &ServiceProxy<'_>) -> (SessionCipher, OwnedObjectPath) {
+    let pair = KeyPair::generate();
+    let (output, session) = service
+        .open_session(ALGORITHM_DH, &Value::from(pair.public_bytes().to_vec()))
+        .await
+        .unwrap();
+    let cipher = SessionCipher::from_dh(&pair, &Vec::<u8>::try_from(output).unwrap()).unwrap();
+    (cipher, session)
+}
+
+fn vault_path(fx: &Fixture) -> std::path::PathBuf {
+    fx.data_dir
+        .path()
+        .join("secret-manager")
+        .join("default.vault")
+}
+
+/// The `a{sv}` properties dict is the only free-form, client-typed structure
+/// the create paths accept, and `dbus::prop_string` / `dbus::prop_attributes`
+/// are the two guards on it. A wrongly typed value must be `InvalidArgs` and
+/// must not half-create anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_paths_reject_wrongly_typed_properties() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let err = coll
+        .create_item(
+            prop("org.freedesktop.Secret.Item.Label", Value::from(42u32)),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(
+        coll.items().await.unwrap().is_empty(),
+        "a refused CreateItem must not create the item"
+    );
+
+    let err = coll
+        .create_item(
+            prop(
+                "org.freedesktop.Secret.Item.Attributes",
+                Value::from("not a dict"),
+            ),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(coll.items().await.unwrap().is_empty());
+
+    // The same guard on the service's own create path, which is checked
+    // before any prompt object is exported.
+    let err = service
+        .create_collection(
+            prop(
+                "org.freedesktop.Secret.Collection.Label",
+                Value::from(42u32),
+            ),
+            "",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+
+    // A well-typed dict still works, so the guard is a type check and not a
+    // blanket refusal.
+    coll.create_item(
+        props("fine", &[("k", "v")]),
+        &plain_secret(&session, b"s"),
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(coll.items().await.unwrap().len(), 1);
+}
+
+/// `DeleteItems` is capped for the same reason as `GetSecrets` and
+/// `SearchItems`: every element costs a path resolution and a linear lookup
+/// under the global state mutex.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_delete_is_capped() {
+    use secret_manager::dbus::collection::MAX_DELETE_ITEMS;
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("one", &[("k", "v")]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(fx.default_collection())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let vault_file = vault_path(&fx);
+    let before = std::fs::read(&vault_file).unwrap();
+
+    // Over the cap is refused on length alone, before any path is resolved.
+    let over = vec![item_path.clone(); MAX_DELETE_ITEMS + 1];
+    let err = admin.delete_items(&over).await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert_eq!(
+        coll.items().await.unwrap(),
+        vec![item_path.clone()],
+        "a refused batch must delete nothing"
+    );
+    assert_eq!(
+        std::fs::read(&vault_file).unwrap(),
+        before,
+        "a refused batch must not rewrite the vault file"
+    );
+
+    // Exactly at the cap still works: the duplicates collapse to the one id.
+    let at_cap = vec![item_path.clone(); MAX_DELETE_ITEMS];
+    admin.delete_items(&at_cap).await.unwrap();
+    assert!(coll.items().await.unwrap().is_empty());
+}
+
+/// A locked collection still lists its item ids (the index lives in the
+/// cleartext header), so `resolve_item` succeeds and the refusal has to come
+/// from the vault itself. That makes this the all-or-nothing case for a
+/// *save* failure rather than for path validation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_delete_on_a_locked_collection_changes_nothing() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("locked", &[("k", "v")]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(fx.default_collection())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    fx.lock_default().await;
+    let vault_file = vault_path(&fx);
+    let before = std::fs::read(&vault_file).unwrap();
+
+    let err = admin
+        .delete_items(std::slice::from_ref(&item_path))
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.IsLocked");
+    assert_eq!(
+        coll.items().await.unwrap(),
+        vec![item_path.clone()],
+        "a locked batch delete must leave the index intact"
+    );
+    assert_eq!(
+        std::fs::read(&vault_file).unwrap(),
+        before,
+        "a locked batch delete must not rewrite the vault file"
+    );
+
+    // And the item is genuinely still there once the collection reopens.
+    fx.unlock_default().await;
+    let got = service
+        .get_secrets(std::slice::from_ref(&item_path), &session)
+        .await
+        .unwrap();
+    assert_eq!(got[&item_path].value, b"s");
+}
+
+/// `CreateItem` is the one mutation path where caller-supplied bytes reach a
+/// cipher: the session decrypt runs on `parameters`/`value` straight off the
+/// wire. Both failure shapes must be `Failed`, with no item created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_item_rejects_an_undecryptable_secret() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (cipher, session) = dh_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (_, good) = cipher.encrypt(b"plaintext");
+
+    // An IV that is not 16 bytes.
+    let err = coll
+        .create_item(
+            props("bad iv", &[("k", "v")]),
+            &SecretStruct {
+                session: session.clone(),
+                parameters: vec![0u8; 8],
+                value: good.clone(),
+                content_type: "text/plain".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.Failed");
+    assert!(coll.items().await.unwrap().is_empty());
+
+    // A ciphertext that is not a whole number of AES blocks.
+    let (iv, mut ragged) = cipher.encrypt(b"plaintext");
+    ragged.push(0);
+    let err = coll
+        .create_item(
+            props("ragged", &[("k", "v")]),
+            &SecretStruct {
+                session: session.clone(),
+                parameters: iv,
+                value: ragged,
+                content_type: "text/plain".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.Failed");
+    assert!(
+        coll.items().await.unwrap().is_empty(),
+        "a refused CreateItem must not create the item"
+    );
+}
+
+/// `SetSecret` decrypts on its own path, and unlike `CreateItem` it has an
+/// existing secret to lose: a regression that wrote garbage — or an empty
+/// vector — before checking the decrypt result would silently destroy it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_secret_leaves_the_old_secret_when_the_decrypt_fails() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (cipher, session) = dh_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (parameters, value) = cipher.encrypt(b"the original");
+    let (item_path, _) = coll
+        .create_item(
+            props("dh set", &[("k", "v")]),
+            &SecretStruct {
+                session: session.clone(),
+                parameters,
+                value,
+                content_type: "text/plain".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let it = item(&conn, item_path.clone()).await;
+
+    let (_, replacement) = cipher.encrypt(b"the replacement");
+    let err = it
+        .set_secret(&SecretStruct {
+            session: session.clone(),
+            parameters: vec![0u8; 8],
+            value: replacement,
+            content_type: "text/plain".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.Failed");
+
+    let got = it.get_secret(&session).await.unwrap();
+    assert_eq!(
+        cipher
+            .decrypt(&got.parameters, &got.value)
+            .unwrap()
+            .as_slice(),
+        b"the original",
+        "a failed SetSecret must not touch the stored secret"
+    );
+}
+
+/// The per-item secret cap was bypassable: `CreateItem` enforced
+/// `MAX_ITEM_SECRET` but `SetSecret` did not, so a one-byte item could have
+/// its secret replaced with something far larger and push the collection past
+/// the vault size limit — at which point the whole collection stops saving.
+/// This pins the check on both paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_secret_rejects_an_oversized_secret() {
+    use secret_manager::dbus::collection::MAX_ITEM_SECRET;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("small", &[("k", "v")]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+    let it = item(&conn, item_path.clone()).await;
+
+    let too_big = vec![b'x'; MAX_ITEM_SECRET + 1];
+    let err = it
+        .set_secret(&plain_secret(&session, &too_big))
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(
+        error_message(&err).contains(&MAX_ITEM_SECRET.to_string()),
+        "the refusal should name the cap: {}",
+        error_message(&err)
+    );
+    assert_eq!(
+        it.get_secret(&session).await.unwrap().value,
+        b"s",
+        "a refused SetSecret must not touch the stored secret"
+    );
+
+    // Exactly at the limit is still accepted, as it is on `CreateItem`.
+    let at_limit = vec![b'y'; MAX_ITEM_SECRET];
+    it.set_secret(&plain_secret(&session, &at_limit))
+        .await
+        .unwrap();
+    assert_eq!(
+        it.get_secret(&session).await.unwrap().value.len(),
+        MAX_ITEM_SECRET
+    );
+}

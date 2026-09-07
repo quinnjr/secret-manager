@@ -433,3 +433,99 @@ async fn list_escapes_control_characters() {
     let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
     assert_eq!(parsed[0]["label"], "sneaky\rHIDDEN\u{1b}[2K");
 }
+
+/// `Client::connect` bounds `Connection::session()` with a timeout, and the
+/// case that timeout exists for is a bus that *accepts* the connection and
+/// then says nothing: an address that refuses fails immediately and never
+/// reaches the guard. Asserting it at the shipped 10 s would cost 10 s of
+/// wall clock, so the deadline is shortened through the `test-util` feature
+/// (`SM_CONNECT_TIMEOUT_MS`), the same mechanism `KdfParams::FAST_FOR_TESTS`
+/// uses. Nothing we ship enables that feature, so the shipped deadline stays
+/// 10 s — which is what the message the user sees still says.
+#[test]
+fn a_session_bus_that_accepts_and_never_answers_is_unreachable() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("silent-bus");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    // The accepted stream must be *held*, not dropped: a closed connection is
+    // an EOF, which is an ordinary transport error, not the hang this guards.
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let worker = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while !worker_stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => held.push(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+        held.len()
+    });
+
+    let started = Instant::now();
+    assert_cmd::Command::cargo_bin("secret-manager")
+        .unwrap()
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", dir.path())
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", sock.display()),
+        )
+        .env("SM_CONNECT_TIMEOUT_MS", "500")
+        .args(["get", "a=b"])
+        .assert()
+        // Exit 3, not 1: a script must be able to tell "the bus is not
+        // answering" from "no such secret".
+        .code(3)
+        .stderr(predicate::str::contains(
+            "session bus did not answer within 10 s",
+        ));
+    let elapsed = started.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    let accepted = worker.join().unwrap();
+    assert!(accepted > 0, "the CLI never reached the listener");
+    // Proof the run ended on the timeout and not on some faster transport
+    // error: with the override honoured the whole command is sub-second, and
+    // without it this arm would take the full ten.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "connect did not honour the shortened deadline: {elapsed:?}"
+    );
+}
+
+/// Every `sm set` resolves the `default` alias first, so a daemon that has a
+/// collection but no `default` alias is the store path with nowhere to store.
+/// The other fixtures all install the alias before the daemon starts, which
+/// makes this arm unreachable from them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_without_a_default_alias_says_to_run_init() {
+    let fx = Fixture::start_without_default_alias().await;
+    // The collection itself is there and the daemon is healthy — the alias is
+    // the only thing missing, so this is not a "daemon is broken" message.
+    fx.sm()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+
+    fx.sm()
+        .args(["set", "app=git", "--label", "git token"])
+        .write_stdin("s3cret")
+        .assert()
+        .code(1)
+        .stderr(
+            predicate::str::contains("no default collection")
+                .and(predicate::str::contains("sm init")),
+        );
+}

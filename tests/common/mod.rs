@@ -113,6 +113,27 @@ impl Fixture {
         idle: Duration,
         mutate: impl FnOnce(&mut Config),
     ) -> Fixture {
+        Self::start_inner(pin, extra_pinentry_env, idle, mutate, true).await
+    }
+
+    /// The default fixture, except that the alias file is never written, so
+    /// `ReadAlias("default")` answers `/`.
+    ///
+    /// Every other constructor installs `default = "default"` before the
+    /// daemon starts, which makes the CLI's "no default collection" path
+    /// unreachable — and that path is what every `sm set` and `sm ssh add`
+    /// hits on a machine where `sm init` has never run.
+    pub async fn start_without_default_alias() -> Fixture {
+        Self::start_inner(Some(PASSWORD), Vec::new(), Duration::ZERO, |_| {}, false).await
+    }
+
+    async fn start_inner(
+        pin: Option<&str>,
+        extra_pinentry_env: Vec<(String, String)>,
+        idle: Duration,
+        mutate: impl FnOnce(&mut Config),
+        write_default_alias: bool,
+    ) -> Fixture {
         let bus = TestBus::start();
         let data_dir = tempfile::tempdir().unwrap();
         let runtime_dir = tempfile::tempdir().unwrap();
@@ -125,11 +146,13 @@ impl Fixture {
             KdfParams::FAST_FOR_TESTS,
         )
         .unwrap();
-        secret_manager::dbus::state::save_aliases_to(
-            &vault_dir,
-            &BTreeMap::from([("default".to_string(), "default".to_string())]),
-        )
-        .unwrap();
+        if write_default_alias {
+            secret_manager::dbus::state::save_aliases_to(
+                &vault_dir,
+                &BTreeMap::from([("default".to_string(), "default".to_string())]),
+            )
+            .unwrap();
+        }
         let pinentry_log = runtime_dir.path().join("pinentry.log");
         let mut config = Config {
             vault: VaultConfig {

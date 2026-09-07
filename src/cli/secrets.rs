@@ -556,3 +556,31 @@ pub async fn list(attrs: Vec<String>, json: bool) -> Result<(), CliError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod parse_attrs_tests {
+    use super::*;
+
+    /// `split_once('=')` accepts `"=value"` happily -- the empty name is only
+    /// rejected by the `.filter(|(k, _)| !k.is_empty())` after it. An empty
+    /// attribute name would go into the query map and match against a stored
+    /// attribute set that can never contain it, so it is usage, not a search
+    /// that quietly finds nothing.
+    #[test]
+    fn parse_attrs_rejects_a_missing_or_empty_name() {
+        for bad in ["noequals", "=value", "="] {
+            let err = parse_attrs(&[bad.to_string()]).unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)), "{bad}: got {err:?}");
+            assert!(err.to_string().contains("ATTR=VALUE"), "{bad}: {err}");
+        }
+    }
+
+    /// Only the *name* may not be empty: `sm get schema=` is a legitimate
+    /// search for an attribute stored with an empty value.
+    #[test]
+    fn parse_attrs_keeps_an_empty_value() {
+        let attrs = parse_attrs(&["a=".to_string(), "b=v".to_string()]).unwrap();
+        assert_eq!(attrs.get("a").map(String::as_str), Some(""));
+        assert_eq!(attrs.get("b").map(String::as_str), Some("v"));
+    }
+}

@@ -467,6 +467,7 @@ async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<(
             continue;
         }
         let name = args.name.to_string();
+        let mut relock: Vec<String> = Vec::new();
         let (sessions, prompts) = {
             let mut st = state.lock().await;
             let sessions: Vec<String> = st
@@ -505,11 +506,29 @@ async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<(
                         tracing::debug!("not aborting prompt {p}: it has already committed");
                     } else {
                         task.abort();
+                        // The task's own re-lock branch runs at the end of
+                        // its loop, which an abort never reaches. The commit
+                        // gate is reset per collection, so a disconnect
+                        // during a later dialog aborts a task that has
+                        // already opened earlier collections; without this
+                        // they would stay decrypted in memory with no owner.
+                        if let Some(ids) = st.prompt_unlocked.remove(p) {
+                            for id in ids {
+                                if let Some(vault) = st.collections.get_mut(&id) {
+                                    vault.lock();
+                                }
+                                relock.push(id);
+                            }
+                        }
                     }
                 }
             }
             (sessions, prompts)
         };
+        // Signals go out with the lock released.
+        for id in &relock {
+            registry::notify_collection_changed(conn, id).await;
+        }
         for p in sessions {
             let _ = conn.object_server().remove::<Session, _>(p.as_str()).await;
         }

@@ -68,6 +68,16 @@ pub struct ServiceState {
     /// change that has already been committed. Exposed so an abort can be
     /// skipped for such a prompt.
     pub prompt_commits: BTreeMap<String, PromptCommit>,
+    /// prompt object path -> collections that prompt has unlocked so far.
+    ///
+    /// The task keeps its own list, but an abort destroys it, and the abort
+    /// is exactly when the list is needed: the commit gate is reset at the
+    /// top of every collection, so a client that disconnects while a *later*
+    /// dialog is on screen has its task aborted, and anything unlocked in an
+    /// earlier iteration would otherwise stay decrypted in memory with no
+    /// owner. `daemon::watch_clients` re-locks these before it drops the
+    /// prompt.
+    pub prompt_unlocked: BTreeMap<String, Vec<String>>,
     pub started: Instant,
     pub last_activity: Instant,
     next_session: u64,
@@ -184,6 +194,7 @@ impl ServiceState {
             prompt_owners: BTreeMap::new(),
             prompt_tasks: BTreeMap::new(),
             prompt_commits: BTreeMap::new(),
+            prompt_unlocked: BTreeMap::new(),
             started: now,
             last_activity: now,
             next_session: 0,

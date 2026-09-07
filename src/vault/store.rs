@@ -2051,4 +2051,256 @@ mod tests {
             assert_eq!(mode, 0o700, "{}", dir.display());
         }
     }
+
+    /// `change_key` is the only place the KDF ceilings are enforced on the
+    /// write path: `Request::ChangeKey` carries a peer-chosen `new_kdf`
+    /// straight through `handle_control` and `daemon::change_key` with no
+    /// intermediate validation. A vault sealed under `m_cost_kib = u32::MAX`
+    /// would need that much memory to open again, so the rotation must be
+    /// refused before anything is written.
+    #[test]
+    fn change_key_refuses_kdf_parameters_over_the_ceiling() {
+        let (_d, path) = tmp();
+        Vault::create(&path, "Default", b"old", FAST).unwrap();
+        let mut v = Vault::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let old_key = crypto::derive_key(b"old", v.salt(), v.kdf()).unwrap();
+        let new_salt = crypto::random_bytes::<SALT_LEN>();
+        let bad = KdfParams {
+            m_cost_kib: u32::MAX,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        // The key is never used - validation refuses on the first line - so
+        // deriving it under FAST keeps the test cheap.
+        let new_key = crypto::derive_key(b"new", &new_salt, FAST).unwrap();
+
+        let err = v
+            .change_key(&old_key, &new_salt, bad, &new_key)
+            .unwrap_err();
+        assert!(
+            matches!(err, VaultError::Crypto(CryptoError::UnsafeKdf(_))),
+            "{err:?}"
+        );
+
+        // Nothing was written and nothing rotated: the old password still
+        // opens the file exactly as it was.
+        assert_eq!(std::fs::read(&path).unwrap(), before, "vault was rewritten");
+        assert_eq!(v.kdf(), FAST, "header kdf moved");
+        let mut again = Vault::open(&path).unwrap();
+        again.unlock(b"old").unwrap();
+        assert_eq!(again.label(), "Default");
+    }
+
+    /// A ciphertext that authenticates but does not decode as an item list is
+    /// damage, not a wrong password, and the two must not be conflated: the
+    /// AEAD has already proved the caller holds the key, so reporting
+    /// `WrongPassword` would send the operator hunting for a password that
+    /// was right all along.
+    #[test]
+    fn unlock_reports_a_decode_failure_rather_than_a_wrong_password() {
+        let (_d, path) = tmp();
+        Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let file = format::VaultFile::decode(&bytes).unwrap();
+        let key = crypto::derive_key(b"pw", &file.header.salt, file.header.kdf).unwrap();
+        // Re-seal the *existing* header over garbage, so the AEAD verifies
+        // (same key, same nonce, same associated data) and only
+        // `decode_items` can fail.
+        let forged =
+            crypto::seal(&key, &file.header.nonce, &file.aad, b"not postcard items").unwrap();
+        let mut out = file.aad.clone();
+        out.extend_from_slice(&forged);
+        std::fs::write(&path, &out).unwrap();
+
+        let mut v = Vault::open(&path).unwrap();
+        let err = v.unlock(b"pw").unwrap_err();
+        assert!(
+            matches!(err, VaultError::Format(FormatError::Encoding(_))),
+            "{err:?}"
+        );
+        assert!(
+            !matches!(err, VaultError::WrongPassword),
+            "a decode failure must not masquerade as a wrong password"
+        );
+        assert!(v.is_locked(), "a failed unlock must leave the vault locked");
+    }
+
+    /// Every accessor and mutator refuses a locked vault, not just `items`.
+    /// A gap here would serve or edit plaintext the daemon believes it has
+    /// dropped, so the refusal is checked at each entry point rather than at
+    /// the one they happen to share today.
+    #[test]
+    fn every_item_entry_point_refuses_a_locked_vault() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let (id, _) = v
+            .insert_item(
+                "x",
+                attrs(&[("a", "b")]),
+                b"s".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        v.lock();
+
+        let err = v.item(&id).unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+        let err = v.search(&attrs(&[("a", "b")])).unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+        let err = v
+            .insert_item("y", BTreeMap::new(), b"t".to_vec(), "text/plain", false)
+            .unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+        let err = v.update_item(&id, |i| i.label = "no".into()).unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+        let err = v.delete_item(&id).unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+        let err = v.delete_items(std::slice::from_ref(&id)).unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+        let err = v.set_label("no").unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
+
+        assert!(v.is_locked());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused call rewrote the vault"
+        );
+    }
+
+    /// `item` and `update_item` must name the id they could not find, and
+    /// `update_item` must refuse before `save_or_restore` runs: an unknown id
+    /// is a client mistake, not a reason to rewrite the file.
+    #[test]
+    fn item_and_update_item_reject_an_unknown_id() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.insert_item(
+            "x",
+            attrs(&[("a", "b")]),
+            b"s".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let err = v.item("nope").unwrap_err();
+        assert!(
+            matches!(&err, VaultError::NoSuchItem(id) if id == "nope"),
+            "{err:?}"
+        );
+
+        let err = v
+            .update_item("nope", |i| i.label = "touched".into())
+            .unwrap_err();
+        assert!(
+            matches!(&err, VaultError::NoSuchItem(id) if id == "nope"),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "vault was rewritten");
+        assert_eq!(v.items().unwrap().len(), 1);
+        assert_eq!(v.items().unwrap()[0].label, "x");
+    }
+
+    /// A missing collection must be an `Io` error carrying `NotFound`, not a
+    /// format error: `load_vaults` and the CLI use exactly that distinction to
+    /// tell a collection that was never created from one that is damaged.
+    #[test]
+    fn open_reports_a_missing_file_as_not_found() {
+        let (_d, path) = tmp();
+        let err = Vault::open(&path).unwrap_err();
+        let VaultError::Io { path: p, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(p, &path, "the path must survive into the error");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
+    }
+
+    /// The `publish_new` fallback runs only when `renameat2` reports
+    /// `ENOSYS`/`EINVAL`/`EOPNOTSUPP`/`EPERM`, which no modern Linux does, so
+    /// it is called directly here. It has to make the same three promises the
+    /// `RENAME_NOREPLACE` path makes.
+    #[test]
+    fn publish_via_reservation_claims_a_free_name_and_never_replaces_a_vault() {
+        // A free name: the reservation is claimed and the finished bytes
+        // land on it.
+        let (d, path) = tmp();
+        let tmp_file = write_temp(&path, b"finished vault").unwrap();
+        publish_new_via_reservation(&tmp_file, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"finished vault");
+        assert!(!tmp_file.exists(), "the temp file was not consumed");
+        drop(d);
+
+        // An existing, non-empty collection is refused and left alone.
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "first", b"pw", FAST).unwrap();
+        v.insert_item("x", BTreeMap::new(), b"s".to_vec(), "text/plain", false)
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let tmp_file = write_temp(&path, b"replacement").unwrap();
+        let err = publish_new_via_reservation(&tmp_file, &path).unwrap_err();
+        assert!(
+            matches!(err, VaultError::AlreadyExists(ref p) if p == &path),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "existing vault lost");
+        let mut again = Vault::open(&path).unwrap();
+        again.unlock(b"pw").unwrap();
+        assert_eq!(again.items().unwrap().len(), 1);
+        let _ = std::fs::remove_file(&tmp_file);
+
+        // A zero-length reservation left by an interrupted older build is
+        // never a vault, so it is reclaimed rather than blocking the name.
+        let (_d, path) = tmp();
+        std::fs::write(&path, b"").unwrap();
+        let tmp_file = write_temp(&path, b"recovered").unwrap();
+        publish_new_via_reservation(&tmp_file, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"recovered");
+    }
+
+    /// The earliest failure in `create`, before any Argon2 work: if the vault
+    /// directory cannot be made, the error names the directory and nothing is
+    /// left on disk.
+    #[test]
+    fn create_reports_a_vault_directory_that_cannot_be_made() {
+        let d = tempfile::tempdir().unwrap();
+        // A regular file where the directory should be, so `DirBuilder` fails.
+        let blocked = d.path().join("collections");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let path = blocked.join("default.vault");
+
+        let err = Vault::create(&path, "Default", b"pw", FAST).unwrap_err();
+        let VaultError::Io { path: p, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(p, &blocked, "the error must name the directory");
+        assert_eq!(
+            std::fs::read(&blocked).unwrap(),
+            b"not a directory",
+            "the blocking file was touched"
+        );
+        assert!(!path.exists());
+    }
+
+    /// A vault file that vanished under the handle is an error, not a silent
+    /// success: `delete_file` reporting `Ok` for a file it did not remove
+    /// would let the caller drop a collection it never actually deleted.
+    #[test]
+    fn delete_file_reports_a_vault_that_is_already_gone() {
+        let (_d, path) = tmp();
+        let v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let err = v.delete_file().unwrap_err();
+        let VaultError::Io { path: p, source } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(p, &path);
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source:?}");
+    }
 }

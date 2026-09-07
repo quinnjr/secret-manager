@@ -19,3 +19,7 @@
 # Seeds are named seed-*; everything else libFuzzer writes is ignored.
 /fuzz/corpus/*/*
 !/fuzz/corpus/*/seed-*
+
+# Worktrees live inside the project (see CLAUDE.md); they are checkouts, not
+# content.
+/.worktrees

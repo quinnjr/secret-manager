@@ -31,6 +31,11 @@ pub struct ControlServer {
     listener: UnixListener,
     path: PathBuf,
     timeout: Duration,
+    /// The peer check the accept loop applies. Always [`peer_allowed`] for a
+    /// server built by [`bind`](Self::bind); the indirection exists so a test
+    /// can drive the refusal path of the accept loop without needing a second
+    /// uid on the machine.
+    policy: fn(&UnixStream) -> bool,
 }
 
 impl ControlServer {
@@ -70,6 +75,7 @@ impl ControlServer {
             listener,
             path: path.to_path_buf(),
             timeout,
+            policy: peer_allowed,
         })
     }
 
@@ -107,7 +113,7 @@ impl ControlServer {
                     continue;
                 }
             };
-            if !peer_allowed(&stream) {
+            if !(self.policy)(&stream) {
                 tracing::warn!("rejected control connection from another uid");
                 continue;
             }
@@ -131,14 +137,20 @@ impl Drop for ControlServer {
 
 /// Same uid as the daemon, or root (the PAM module runs as root at login).
 fn peer_allowed(stream: &UnixStream) -> bool {
-    match stream.peer_cred() {
-        Ok(cred) => {
-            // SAFETY: geteuid has no preconditions and cannot fail. The
-            // effective uid is the one the client side checks for, so both
-            // ends compare the same identity.
-            let me = unsafe { libc::geteuid() };
-            uid_allowed(me, cred.uid())
-        }
+    // SAFETY: geteuid has no preconditions and cannot fail. The effective uid
+    // is the one the client side checks for, so both ends compare the same
+    // identity.
+    let me = unsafe { libc::geteuid() };
+    peer_allowed_from(stream.peer_cred(), me)
+}
+
+/// The credential decision, split out from the two syscalls so every arm —
+/// including the one where the kernel refuses to name the peer — is reachable
+/// from a test. A peer whose credentials cannot be read is refused: there is
+/// no identity to compare, so the only safe answer is no.
+fn peer_allowed_from(cred: std::io::Result<tokio::net::unix::UCred>, me: u32) -> bool {
+    match cred {
+        Ok(cred) => uid_allowed(me, cred.uid()),
         Err(_) => false,
     }
 }
@@ -327,5 +339,554 @@ mod tests {
         std::fs::write(&sock, b"stale").unwrap();
         let server = ControlServer::bind(&sock).await.unwrap();
         assert_eq!(server.path(), sock.as_path());
+    }
+
+    /// This reader is the daemon's own, separate from `protocol::read_frame_sync`:
+    /// it is what every inbound control connection goes through, so the length
+    /// ceiling has to be proven here too. Without it a peer announcing 4 GiB
+    /// would have that much allocated per connection, `MAX_CONNECTIONS` at a
+    /// time.
+    #[tokio::test]
+    async fn read_frame_rejects_an_oversized_length_prefix() {
+        let mut oversized = u32::MAX.to_be_bytes().to_vec();
+        oversized.extend_from_slice(b"body");
+        let err = read_frame(&mut &oversized[..]).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "got {err}",);
+
+        // The bound is a ceiling, not a tightening: a frame of exactly
+        // MAX_FRAME is still a legal frame.
+        let mut exact = (MAX_FRAME as u32).to_be_bytes().to_vec();
+        exact.resize(4 + MAX_FRAME, 0u8);
+        let body = read_frame(&mut &exact[..]).await.unwrap();
+        assert_eq!(body.len(), MAX_FRAME);
+    }
+
+    /// The opposite of `rebinding_replaces_stale_socket`: a socket a running
+    /// daemon is still serving must never be unlinked, which would leave the
+    /// first daemon listening on a nameless socket and every client — the PAM
+    /// module included — seeing ENOENT.
+    #[tokio::test]
+    async fn binding_over_a_live_daemon_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let first = ControlServer::bind(&sock).await.unwrap();
+        let task = tokio::spawn(first.run(handler()));
+
+        let err = match ControlServer::bind(&sock).await {
+            Ok(_) => panic!("a second bind over a live socket must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("already serving"), "got {err}",);
+
+        assert!(
+            sock.exists(),
+            "the live socket must survive the failed bind"
+        );
+        let s = sock.clone();
+        let resp = tokio::task::spawn_blocking(move || call(&s, &Request::Status))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Status { .. }),
+            "the first server must still be answering"
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// A response too large to frame is substituted rather than dropped: the
+    /// peer gets a readable error instead of an unexplained EOF.
+    #[tokio::test]
+    async fn oversized_response_is_replaced_with_a_readable_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server = ControlServer::bind(&sock).await.unwrap();
+        let huge: Handler = Arc::new(|_req: Request| {
+            Box::pin(async move { Response::Error("x".repeat(MAX_FRAME + 1)) })
+        });
+        let task = tokio::spawn(server.run(huge));
+
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let frame = encode_frame(&Request::Status).unwrap();
+        stream.write_all(&frame).await.unwrap();
+        let body = read_frame(&mut stream).await.unwrap();
+        let resp: Response = crate::protocol::decode_frame(&body).unwrap();
+        assert_eq!(resp, Response::Error("response too large".into()));
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    /// `uid_allowed` is arithmetic; this is the arm that actually decides.
+    /// The `Err` case is the one that had no coverage at all: a peer whose
+    /// credentials the kernel will not report must be refused, not admitted.
+    #[tokio::test]
+    async fn peer_allowed_from_fails_closed_on_an_unreadable_credential() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+
+        // A real UCred, from a real socket: the same uid is allowed.
+        assert_eq!(a.peer_cred().unwrap().uid(), me);
+        assert!(peer_allowed_from(a.peer_cred(), me));
+
+        // A foreign uid is refused. Skipped when the suite runs as root,
+        // where every uid it could name is either `me` or 0.
+        if me != 0 {
+            let foreign = me.wrapping_add(1);
+            assert!(
+                !peer_allowed_from(a.peer_cred(), foreign),
+                "a daemon running as {foreign} must refuse a peer at {me}"
+            );
+        }
+
+        // Root is allowed: the PAM module connects as root at login.
+        assert!(uid_allowed(me, 0));
+
+        // No credential, no decision to make: refuse.
+        assert!(!peer_allowed_from(
+            Err(std::io::Error::other("peer_cred failed")),
+            me
+        ));
+        assert!(!peer_allowed_from(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            me
+        ));
+        assert!(!peer_allowed_from(
+            Err(std::io::Error::other("peer_cred failed")),
+            0
+        ));
+    }
+
+    static REFUSALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    /// Refuse the first `REFUSE_FIRST` connections, then defer to the real
+    /// check. More than `MAX_CONNECTIONS` refusals, so a permit leaked on the
+    /// refusal path would wedge the loop before the last one.
+    const REFUSE_FIRST: usize = MAX_CONNECTIONS + 4;
+    fn refuse_first_then_real(stream: &UnixStream) -> bool {
+        if REFUSALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < REFUSE_FIRST {
+            false
+        } else {
+            peer_allowed(stream)
+        }
+    }
+
+    /// A refused peer is dropped *unserved* — it gets EOF, never a response
+    /// frame — and the accept loop carries on: its `continue` has to release
+    /// the concurrency permit, or the twentieth refusal would never be
+    /// reached and the legitimate connection after it would never be
+    /// answered.
+    #[tokio::test]
+    async fn a_refused_peer_is_closed_unserved_and_the_loop_keeps_accepting() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let mut server = ControlServer::bind(&sock).await.unwrap();
+        server.policy = refuse_first_then_real;
+        let task = tokio::spawn(server.run(handler()));
+
+        let frame = encode_frame(&Request::Status).unwrap();
+        for i in 0..REFUSE_FIRST {
+            let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+            // The write may or may not fail depending on when the server
+            // closes; what matters is that nothing comes back.
+            let _ = stream.write_all(&frame).await;
+            let mut buf = [0u8; 64];
+            // EOF or ECONNRESET: both mean the connection was dropped before
+            // anything was written back. A byte count above zero would be a
+            // response frame, which is the thing that must never happen.
+            let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("refused connection {i} was neither served nor closed"))
+            {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => 0,
+                Err(e) => panic!("refused connection {i} failed unexpectedly: {e}"),
+            };
+            assert_eq!(n, 0, "a refused peer must not get a response frame");
+        }
+
+        // ...and the loop is still accepting, with all its slots back.
+        for _ in 0..3 {
+            let s = sock.clone();
+            let resp = tokio::task::spawn_blocking(move || call(&s, &Request::Status))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(resp, Response::Status { .. }),
+                "the loop must keep serving after a refusal"
+            );
+        }
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    // --- the foreign-uid test, and its plumbing ---------------------------
+
+    /// `SO_PEERCRED` on a raw fd. `std`'s accessor is still unstable, and the
+    /// test needs the uid the *kernel* reports, not one Rust hands back.
+    fn peer_uid_of(fd: std::os::fd::RawFd) -> u32 {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `fd` is an open connected socket owned by the caller, and
+        // `cred`/`len` are a correctly sized out-parameter pair.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt(SO_PEERCRED) failed");
+        cred.uid
+    }
+
+    /// Write every byte, retrying short writes. Called on both sides of a
+    /// `fork`, so it is `libc` only: no allocation, no locks.
+    ///
+    /// # Safety
+    /// `fd` must be an open, writable file descriptor.
+    unsafe fn write_all_fd(fd: libc::c_int, buf: &[u8]) {
+        let mut off = 0usize;
+        while off < buf.len() {
+            // SAFETY: the caller guarantees `fd`; the pointer/length pair is
+            // an in-bounds slice of `buf`.
+            let n = unsafe { libc::write(fd, buf[off..].as_ptr().cast(), buf.len() - off) };
+            if n <= 0 {
+                // SAFETY: async-signal-safe, and the only correct move in a
+                // forked child that cannot report.
+                unsafe { libc::_exit(70) };
+            }
+            off += n as usize;
+        }
+    }
+
+    /// The sub-uid ranges delegated to this user, newest first. Empty when
+    /// `/etc/subuid` has no entry for us, which is the usual reason this
+    /// machine cannot host the foreign-uid test.
+    fn delegated_subuids(uid: u32) -> Vec<u32> {
+        // SAFETY: getpwuid has no preconditions; the returned pointer is
+        // owned by libc and only read here, before any other libc call that
+        // could reuse the static buffer.
+        let name = unsafe {
+            let pw = libc::getpwuid(uid);
+            if pw.is_null() {
+                None
+            } else {
+                std::ffi::CStr::from_ptr((*pw).pw_name)
+                    .to_str()
+                    .ok()
+                    .map(str::to_owned)
+            }
+        };
+        let text = match std::fs::read_to_string("/etc/subuid") {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        text.lines()
+            .filter_map(|line| {
+                let mut f = line.split(':');
+                let who = f.next()?;
+                let start: u32 = f.next()?.trim().parse().ok()?;
+                let count: u32 = f.next()?.trim().parse().ok()?;
+                let mine = who == uid.to_string() || name.as_deref() == Some(who);
+                (mine && count >= 2).then_some(start)
+            })
+            .collect()
+    }
+
+    /// The real thing: a connection from a process whose kernel uid is
+    /// genuinely not ours and not root, refused by the accept loop.
+    ///
+    /// Getting a second uid without being root takes a user namespace *plus*
+    /// a delegated sub-uid range. A namespace alone is not enough, and the
+    /// obvious recipe is a trap: `unshare(CLONE_NEWUSER)` with the usual
+    /// `0 <uid> 1` map makes the connecting parent appear as uid **0** to the
+    /// namespaced listener, which `uid_allowed` allows — the test would pass
+    /// while proving nothing. With no map at all, listener and peer both read
+    /// back as the overflow uid, which `uid_allowed` also allows. So the
+    /// namespace here is only the vehicle for `newuidmap`, which maps a
+    /// second uid from `/etc/subuid` that the child can then `setresuid` to:
+    /// a real, different `kuid`, seen as such by an ordinary listener in the
+    /// host namespace.
+    ///
+    /// Plain `#[test]`: the `fork` happens before any tokio runtime exists,
+    /// and the child touches nothing but `libc` before `_exit`.
+    #[test]
+    fn a_connection_from_a_genuinely_foreign_uid_is_refused() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if me == 0 {
+            eprintln!(
+                "SKIP a_connection_from_a_genuinely_foreign_uid_is_refused: running as root, where every uid is allowed by design"
+            );
+            return;
+        }
+        let subuids = delegated_subuids(me);
+        if subuids.is_empty() {
+            eprintln!(
+                "SKIP a_connection_from_a_genuinely_foreign_uid_is_refused: no /etc/subuid range delegated to uid {me}, so no second uid is reachable unprivileged"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let probe_path = dir.path().join("probe.sock");
+        // sockaddr_un is 108 bytes including the NUL.
+        assert!(
+            sock.as_os_str().len() < 100,
+            "temp path too long for AF_UNIX"
+        );
+
+        // Everything the forked child touches is built now: after `fork` it
+        // may only call async-signal-safe functions.
+        let probe = std::os::unix::net::UnixListener::bind(&probe_path).unwrap();
+        let control_addr = sockaddr_un(&sock);
+        let probe_addr = sockaddr_un(&probe_path);
+        let request = encode_frame(&Request::Status).unwrap();
+
+        let mut ready = [0 as libc::c_int; 2];
+        let mut go = [0 as libc::c_int; 2];
+        // SAFETY: both arrays are two-element c_int buffers, as pipe(2) wants.
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::pipe(go.as_mut_ptr()) }, 0);
+
+        // SAFETY: the child below calls only async-signal-safe libc functions
+        // and ends in `_exit`, so no Rust destructor, allocator lock, or
+        // atexit handler inherited from this multi-threaded process runs.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // ---- forked child: libc only, no allocation, no destructors ----
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(go[1]);
+                if libc::unshare(libc::CLONE_NEWUSER) != 0 {
+                    write_all_fd(ready[1], b"U");
+                    libc::_exit(0);
+                }
+                write_all_fd(ready[1], b"R");
+                let mut sig = [0u8; 1];
+                if libc::read(go[0], sig.as_mut_ptr().cast(), 1) != 1 || sig[0] != b'G' {
+                    libc::_exit(71);
+                }
+                // The parent has just mapped a delegated sub-uid to namespace
+                // uid 1; becoming it changes this process's real kernel uid.
+                if libc::setresuid(1, 1, 1) != 0 {
+                    write_all_fd(ready[1], b"S");
+                    libc::_exit(0);
+                }
+                // Let the parent observe the credentials the kernel now
+                // reports for us on an ordinary socket.
+                let p = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if p < 0
+                    || libc::connect(
+                        p,
+                        (&raw const probe_addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    ) != 0
+                {
+                    write_all_fd(ready[1], b"P");
+                    libc::_exit(0);
+                }
+                // Now the real target.
+                let c = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                if c < 0
+                    || libc::connect(
+                        c,
+                        (&raw const control_addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    ) != 0
+                {
+                    write_all_fd(ready[1], b"C");
+                    libc::_exit(0);
+                }
+                libc::write(c, request.as_ptr().cast(), request.len());
+                let mut buf = [0u8; 64];
+                let n = libc::read(c, buf.as_mut_ptr().cast(), buf.len());
+                let err = if n < 0 { *libc::__errno_location() } else { 0 };
+                write_all_fd(ready[1], b"K");
+                write_all_fd(ready[1], &(n as i64).to_ne_bytes());
+                write_all_fd(ready[1], &err.to_ne_bytes());
+                libc::_exit(0);
+            }
+        }
+
+        // ---- parent ----
+        // SAFETY: these are our own pipe ends, still open.
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(go[0]);
+        }
+        let reap = |pid: libc::pid_t| {
+            let mut status = 0;
+            // SAFETY: `pid` is our child; `status` is a valid out-parameter.
+            unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        };
+        let read_exactly = |fd: libc::c_int, buf: &mut [u8]| -> bool {
+            let mut off = 0usize;
+            while off < buf.len() {
+                // SAFETY: `fd` is our open pipe read end; the pointer/length
+                // pair is an in-bounds slice of `buf`.
+                let n = unsafe { libc::read(fd, buf[off..].as_mut_ptr().cast(), buf.len() - off) };
+                if n <= 0 {
+                    return false;
+                }
+                off += n as usize;
+            }
+            true
+        };
+
+        let mut tag = [0u8; 1];
+        if !read_exactly(ready[0], &mut tag) || tag[0] == b'U' {
+            reap(child);
+            eprintln!(
+                "SKIP a_connection_from_a_genuinely_foreign_uid_is_refused: unshare(CLONE_NEWUSER) was refused by the kernel (hardened kernel, seccomp, or a container runtime)"
+            );
+            return;
+        }
+        assert_eq!(tag[0], b'R', "unexpected report from the forked child");
+
+        // Map namespace uid 0 -> our uid, and namespace uid 1 -> the first
+        // delegated sub-uid. newuidmap holds cap_setuid; without it (or
+        // without a delegated range) the mapping is impossible unprivileged.
+        let foreign = subuids[0];
+        let mapped = subuids.iter().any(|start| {
+            std::process::Command::new("newuidmap")
+                .args([
+                    child.to_string(),
+                    "0".into(),
+                    me.to_string(),
+                    "1".into(),
+                    "1".into(),
+                    start.to_string(),
+                    "1".into(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        if !mapped {
+            // SAFETY: `child` is our own child process.
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            reap(child);
+            eprintln!(
+                "SKIP a_connection_from_a_genuinely_foreign_uid_is_refused: newuidmap could not map a delegated sub-uid (missing binary, missing cap_setuid, or an /etc/subuid range this user does not own)"
+            );
+            return;
+        }
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = rt.block_on(ControlServer::bind(&sock)).unwrap();
+        let task = rt.spawn(server.run(handler()));
+
+        // The daemon's own 0700/0600 modes would refuse the foreign uid at
+        // `connect` — that is defence in depth, and it is exactly what has to
+        // be stood down here so the *credential check* is what does the
+        // refusing.
+        std::fs::set_permissions(dir.path(), Permissions::from_mode(0o711)).unwrap();
+        std::fs::set_permissions(&sock, Permissions::from_mode(0o666)).unwrap();
+        std::fs::set_permissions(&probe_path, Permissions::from_mode(0o666)).unwrap();
+
+        // SAFETY: `go[1]` is our open pipe write end.
+        unsafe { write_all_fd(go[1], b"G") };
+
+        let observed = {
+            use std::os::fd::AsRawFd;
+            let (conn, _) = probe
+                .accept()
+                .expect("child never reached the probe socket");
+            peer_uid_of(conn.as_raw_fd())
+        };
+
+        let mut report = [0u8; 13];
+        let got = read_exactly(ready[0], &mut report[..1])
+            && (report[0] != b'K' || read_exactly(ready[0], &mut report[1..]));
+        reap(child);
+        assert!(got, "the forked child died without reporting");
+
+        match report[0] {
+            b'K' => {}
+            b'S' => panic!("setresuid into the mapped sub-uid failed after newuidmap succeeded"),
+            b'C' => panic!(
+                "connect to the control socket failed; the credential check was never reached"
+            ),
+            other => panic!("unexpected report byte {other:#x} from the forked child"),
+        }
+        let n = i64::from_ne_bytes(report[1..9].try_into().unwrap());
+        let err = i32::from_ne_bytes(report[9..13].try_into().unwrap());
+
+        // The uid the kernel reported for the peer really is foreign.
+        assert_eq!(
+            observed, foreign,
+            "expected the delegated sub-uid {foreign} on the wire"
+        );
+        assert_ne!(observed, me, "the peer must not share the daemon's uid");
+        assert_ne!(observed, 0, "the peer must not be root");
+        assert!(
+            !uid_allowed(me, observed),
+            "uid_allowed({me}, {observed}) must refuse"
+        );
+
+        // ...and the server refused it: not one byte of a response frame.
+        // A clean EOF and an ECONNRESET both mean unserved — the reset is
+        // just the kernel's answer to a socket closed with the peer's unread
+        // request still queued on it. Anything else would be a served peer.
+        assert!(
+            n == 0 || (n < 0 && err == libc::ECONNRESET),
+            "a peer at uid {observed} was served {n} bytes (errno {err}) by a daemon at uid {me}"
+        );
+
+        // The loop survived the refusal and still answers a legitimate peer.
+        // A plain blocking call: the server is running on `rt`'s threads,
+        // not this one.
+        let resp = call(&sock, &Request::Status).unwrap();
+        assert!(
+            matches!(resp, Response::Status { .. }),
+            "the loop must keep serving after refusing a foreign uid"
+        );
+
+        eprintln!(
+            "a_connection_from_a_genuinely_foreign_uid_is_refused: daemon uid {me}, peer uid {observed} (delegated sub-uid), refused unserved"
+        );
+
+        task.abort();
+        drop(rt);
+    }
+
+    /// A `sockaddr_un` for a path short enough to fit one, built before any
+    /// `fork` so the child never has to.
+    fn sockaddr_un(path: &Path) -> libc::sockaddr_un {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: sockaddr_un is a plain C struct of integers and a byte
+        // array; an all-zero value is a valid (empty-path) one.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(
+            bytes.len() < addr.sun_path.len(),
+            "path too long for AF_UNIX"
+        );
+        for (slot, b) in addr.sun_path.iter_mut().zip(bytes) {
+            *slot = *b as libc::c_char;
+        }
+        addr
     }
 }

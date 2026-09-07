@@ -1,6 +1,6 @@
 //! `org.freedesktop.Secret.Item`.
 
-use super::collection::CollectionSignals;
+use super::collection::{self, CollectionSignals};
 use super::errors::{Error, Result};
 use super::paths;
 use super::require_sender;
@@ -112,6 +112,17 @@ impl Item {
                 .cipher(secret.session.as_str(), &require_sender(&header)?)?
                 .decrypt(&secret.parameters, &secret.value)
                 .map_err(Error::failed)?;
+            // The same cap `CreateItem` enforces. Without it here the cap is
+            // only a speed bump: create a one-byte item, then replace its
+            // secret with a hundred megabytes and the collection is past the
+            // vault size limit anyway, at which point it stops saving
+            // entirely. Found while auditing negative-test coverage.
+            if plaintext.len() > collection::MAX_ITEM_SECRET {
+                return Err(Error::invalid_args(format!(
+                    "secret is too large; at most {} bytes per item",
+                    collection::MAX_ITEM_SECRET
+                )));
+            }
             let vault = st
                 .collections
                 .get_mut(&self.collection)
