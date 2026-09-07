@@ -1,6 +1,6 @@
 //! Register and unregister collection, alias, and item objects; shared notifications.
 
-use super::collection::{Collection, CollectionRef};
+use super::collection::{Collection, CollectionAdmin, CollectionRef};
 use super::item::Item;
 use super::paths;
 use super::service::{Service, ServiceSignals};
@@ -14,6 +14,14 @@ pub async fn register_collection(conn: &Connection, state: &Shared, id: &str) ->
         .at(
             paths::collection(id),
             Collection::new(state.clone(), CollectionRef::Id(id.to_string())),
+        )
+        .await?;
+    // The private batch interface rides on the same object; see
+    // `collection::CollectionAdmin`.
+    server
+        .at(
+            paths::collection(id),
+            CollectionAdmin::new(state.clone(), CollectionRef::Id(id.to_string())),
         )
         .await?;
     let item_ids = state
@@ -41,6 +49,12 @@ pub async fn unregister_collection(conn: &Connection, id: &str, item_ids: &[Stri
             tracing::debug!("removing item '{iid}' of '{id}': {e}");
         }
     }
+    if let Err(e) = server
+        .remove::<CollectionAdmin, _>(paths::collection(id))
+        .await
+    {
+        tracing::debug!("removing admin interface of '{id}': {e}");
+    }
     if let Err(e) = server.remove::<Collection, _>(paths::collection(id)).await {
         tracing::debug!("removing collection '{id}': {e}");
     }
@@ -50,10 +64,17 @@ pub async fn unregister_collection(conn: &Connection, id: &str, item_ids: &[Stri
 /// registered once and never removed.
 pub async fn register_alias(conn: &Connection, state: &Shared, name: &str) -> zbus::Result<()> {
     if let Some(path) = paths::alias(name) {
-        conn.object_server()
+        let server = conn.object_server();
+        server
+            .at(
+                path.clone(),
+                Collection::new(state.clone(), CollectionRef::Alias(name.to_string())),
+            )
+            .await?;
+        server
             .at(
                 path,
-                Collection::new(state.clone(), CollectionRef::Alias(name.to_string())),
+                CollectionAdmin::new(state.clone(), CollectionRef::Alias(name.to_string())),
             )
             .await?;
     }

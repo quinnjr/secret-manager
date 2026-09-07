@@ -437,6 +437,11 @@ impl Write for TimedStream<'_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        // A no-op for unix sockets today, but the deadline is re-armed anyway
+        // so this method cannot become the one unbounded path if `inner` is
+        // ever generalised.
+        self.inner
+            .set_write_timeout(Some(self.deadline.remaining_io()?))?;
         self.inner.flush()
     }
 }
@@ -857,8 +862,15 @@ mod tests {
         );
     }
 
+    /// A private directory per test. `std::env::temp_dir()` with a
+    /// predictable name would let another user on a shared `/tmp` pre-create
+    /// it and watch the sockets these tests bind.
     fn test_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("cp-test-{}-{tag}", std::process::id()));
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("cp-test-{tag}-"))
+            .tempdir()
+            .unwrap()
+            .keep();
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -175,17 +175,25 @@ pub fn read_secret_from_stdin() -> Result<Zeroizing<Vec<u8>>, CliError> {
     if std::io::stdin().is_terminal() {
         return Ok(Zeroizing::new(read_password("Secret")?.as_bytes().to_vec()));
     }
-    // Read one byte past the limit so an oversized input is detected without
-    // ever holding more than that in memory.
-    let mut buf = Zeroizing::new(Vec::new());
+    // Allocate the whole buffer up front. A `Vec::new()` that grows into this
+    // doubles about twenty times on the way, and every intermediate allocation
+    // is freed *unwiped*, leaving copies of the secret's prefix in the heap
+    // that no `Zeroizing` drop ever reaches.
+    //
+    // Read two bytes past the limit: one to notice an oversized input without
+    // ever holding more than that, and one so a secret of exactly the limit
+    // written with a trailing newline (`printf '%s\n'`) still fits.
+    let mut buf = Zeroizing::new(Vec::with_capacity(MAX_SECRET + 2));
     std::io::stdin()
-        .take(MAX_SECRET as u64 + 1)
+        .take(MAX_SECRET as u64 + 2)
         .read_to_end(&mut buf)?;
-    if buf.len() > MAX_SECRET {
-        return Err(CliError::Usage("secret exceeds 1 MiB".into()));
-    }
+    // The newline is not part of the secret, so it is dropped *before* the
+    // size check: otherwise a 1 MiB secret is rejected for its delimiter.
     if buf.last() == Some(&b'\n') {
         buf.pop();
+    }
+    if buf.len() > MAX_SECRET {
+        return Err(CliError::Usage("secret exceeds 1 MiB".into()));
     }
     Ok(buf)
 }

@@ -20,7 +20,13 @@ pub const MAX_VAULT_BYTES: u64 = 256 << 20;
 
 /// Refuse a file too large to load, from its `stat` size, before any read.
 pub fn check_vault_size(len: u64) -> Result<(), FormatError> {
-    if len > MAX_VAULT_BYTES {
+    check_vault_size_against(len, MAX_VAULT_BYTES)
+}
+
+/// [`check_vault_size`] against an explicit ceiling, so a test can exercise
+/// the refusal without materialising a file of the real limit's size.
+pub fn check_vault_size_against(len: u64, limit: u64) -> Result<(), FormatError> {
+    if len > limit {
         return Err(FormatError::VaultTooLarge(len));
     }
     Ok(())

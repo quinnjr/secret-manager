@@ -615,3 +615,241 @@ async fn closing_an_unknown_session_is_refused_like_a_foreign_one() {
     let err = proxy.close().await.unwrap_err();
     assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.NoSession");
 }
+
+/// One item's decrypted secret is bounded (MEDIUM 6).
+///
+/// `CreateItem` used to accept a secret of any size, which is how a collection
+/// reaches the vault-level size limit — past which the whole collection stops
+/// saving — from a single call. The cap matches the control protocol's frame
+/// cap; anything over it is `InvalidArgs`, and the item is not created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_item_rejects_an_oversized_secret() {
+    use secret_manager::dbus::collection::MAX_ITEM_SECRET;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let too_big = vec![b'x'; MAX_ITEM_SECRET + 1];
+    let err = coll
+        .create_item(
+            props("huge", &[("k", "huge")]),
+            &plain_secret(&session, &too_big),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(
+        coll.items().await.unwrap().is_empty(),
+        "a refused CreateItem must not create the item"
+    );
+
+    // Exactly at the limit is still accepted: the cap is a bound, not a
+    // tightening of the normal case.
+    let at_limit = vec![b'y'; MAX_ITEM_SECRET];
+    let (item_path, _) = coll
+        .create_item(
+            props("big", &[("k", "big")]),
+            &plain_secret(&session, &at_limit),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(coll.items().await.unwrap(), vec![item_path.clone()]);
+    let got = service
+        .get_secrets(std::slice::from_ref(&item_path), &session)
+        .await
+        .unwrap();
+    assert_eq!(got[&item_path].value.len(), MAX_ITEM_SECRET);
+}
+
+/// The private batch delete is atomic: one bad path refuses the whole call,
+/// leaving every real item in place and the vault file byte-identical.
+///
+/// The CLI's `sm delete` / `sm ssh remove` used to issue N separate
+/// `Item.Delete` calls, each rewriting the vault file; a collection that locked
+/// (or a daemon that died) part-way through left a half-deleted set and a
+/// secret that still existed. This is the daemon-side "all or none".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_delete_is_all_or_nothing() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let mut created = Vec::new();
+    for n in ["a", "b", "c"] {
+        let (path, _) = coll
+            .create_item(
+                props(n, &[("k", n)]),
+                &plain_secret(&session, n.as_bytes()),
+                false,
+            )
+            .await
+            .unwrap();
+        created.push(path);
+    }
+
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(fx.default_collection())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+
+    let vault_file = fx
+        .data_dir
+        .path()
+        .join("secret-manager")
+        .join("default.vault");
+    let before = std::fs::read(&vault_file).unwrap();
+
+    // One bogus path among three real ones: the whole batch is refused.
+    let bogus = OwnedObjectPath::try_from(
+        "/org/freedesktop/secrets/collection/default/nosuchitem".to_string(),
+    )
+    .unwrap();
+    let batch = vec![created[0].clone(), bogus, created[2].clone()];
+    let err = admin.delete_items(&batch).await.unwrap_err();
+    assert_eq!(
+        error_name(&err),
+        "org.freedesktop.Secret.Error.NoSuchObject"
+    );
+    assert_eq!(
+        coll.items().await.unwrap().len(),
+        3,
+        "a refused batch must delete nothing"
+    );
+    assert_eq!(
+        std::fs::read(&vault_file).unwrap(),
+        before,
+        "a refused batch must not rewrite the vault file"
+    );
+    // Every item is still readable, not just present in the index.
+    for path in &created {
+        let got = service
+            .get_secrets(std::slice::from_ref(path), &session)
+            .await
+            .unwrap();
+        assert!(got.contains_key(path), "{path} lost its secret");
+    }
+
+    // An item of another collection cannot be smuggled into the batch either.
+    let dir = fx.data_dir.path().join("secret-manager");
+    secret_manager::vault::Vault::create(
+        &dir.join("other.vault"),
+        "Other",
+        common::PASSWORD.as_bytes(),
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    let foreign =
+        OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/other/whatever".to_string())
+            .unwrap();
+    assert!(
+        admin
+            .delete_items(&[created[0].clone(), foreign])
+            .await
+            .is_err()
+    );
+    assert_eq!(coll.items().await.unwrap().len(), 3);
+
+    // The successful batch: three items gone, three `ItemDeleted` signals.
+    let mut deleted = coll.receive_item_deleted().await.unwrap();
+    admin.delete_items(&created).await.unwrap();
+    let mut signalled = Vec::new();
+    for _ in 0..3 {
+        let sig = tokio::time::timeout(Duration::from_secs(5), deleted.next())
+            .await
+            .expect("an ItemDeleted signal")
+            .unwrap();
+        signalled.push(sig.args().unwrap().item.clone());
+    }
+    let mut signalled: Vec<String> = signalled.iter().map(|p| p.to_string()).collect();
+    signalled.sort();
+    let mut expected: Vec<String> = created.iter().map(|p| p.to_string()).collect();
+    expected.sort();
+    assert_eq!(signalled, expected);
+    assert!(coll.items().await.unwrap().is_empty());
+    assert_ne!(
+        std::fs::read(&vault_file).unwrap(),
+        before,
+        "the successful batch must have been written"
+    );
+
+    // The spec's own per-item Delete is untouched.
+    let (path, _) = coll
+        .create_item(
+            props("d", &[("k", "d")]),
+            &plain_secret(&session, b"d"),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        item(&conn, path.clone())
+            .await
+            .delete()
+            .await
+            .unwrap()
+            .as_str(),
+        "/"
+    );
+    assert!(coll.items().await.unwrap().is_empty());
+
+    // And the batch interface is a *separate* interface: the spec interface
+    // must not have grown a DeleteItems method.
+    let introspect = zbus::fdo::IntrospectableProxy::builder(&conn)
+        .destination(secret_manager::dbus::paths::BUS_NAME)
+        .unwrap()
+        .path(fx.default_collection())
+        .unwrap()
+        .build()
+        .await
+        .unwrap()
+        .introspect()
+        .await
+        .unwrap();
+    let spec_iface = introspect
+        .split("<interface name=\"org.freedesktop.Secret.Collection\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</interface>").next())
+        .expect("the spec interface is exported");
+    assert!(
+        !spec_iface.contains("DeleteItems"),
+        "the batch method leaked onto the freedesktop interface:\n{spec_iface}"
+    );
+    assert!(
+        introspect.contains("org.secret_manager.Collection1"),
+        "the private interface is exported alongside it:\n{introspect}"
+    );
+}
+
+/// An empty batch is a no-op: no save, no signals, no error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_batch_delete_does_nothing() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(fx.default_collection())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let vault_file = fx
+        .data_dir
+        .path()
+        .join("secret-manager")
+        .join("default.vault");
+    let before = std::fs::read(&vault_file).unwrap();
+    admin.delete_items(&[]).await.unwrap();
+    assert_eq!(std::fs::read(&vault_file).unwrap(), before);
+}

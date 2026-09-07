@@ -439,3 +439,145 @@ rotations, no parser panic across 20,000 mutated inputs, no object-path
 escape, and a genuine safe prime for the DH group so the small-subgroup
 rejection is complete. These are now a permanent test (`tests/invariants.rs`)
 rather than a one-off check.
+
+---
+
+# Third audit — 2026-09-07
+
+Same threat model. Three reviewers worked the CLI/askpass, PAM, and D-Bus
+surfaces independently; the vault and daemon findings were handled directly.
+Every fix below carries a test that was confirmed **red before the fix** —
+that discipline caught two findings whose "fix" would otherwise have been
+inert, and is the reason the two hang bugs are known to be real hangs.
+
+## HIGH — decrypt before consent (askpass)
+
+`sm-askpass` looked the key up and **decrypted** the passphrase before showing
+the confirmation dialog, so declining still cost a decryption, and an unlock
+prompt could fire for a request the user was about to refuse. The order is now
+classify → resolve → `SearchItems` → confirm → unlock/decrypt. The pre-consent
+lookup uses a raw search that never unlocks, never prompts and never
+decrypts. Test `declining_does_not_unlock_the_collection` sets a working PIN,
+so an unlock *would* have succeeded, and asserts the collection is still
+locked after a decline.
+
+## HIGH — the askpass dialog could name the wrong key
+
+The prompt path was resolved more than once, so the dialog could name a
+symlink while the lookup matched its target. The path is now resolved exactly
+once and the dialog names the *matched item's* registered path.
+`the_consent_dialog_names_the_real_key_behind_a_symlink` asserts the dialog
+does not contain the symlink's name.
+
+## HIGH — PAM read of the vault header was unbounded
+
+`O_NONBLOCK` bounds only the `open`, not the subsequent `read`. A vault file
+on a FUSE or NFS mount, or any non-answering server, blocked **root** for as
+long as it liked during login. Header reads now poll for readability against
+the login budget before every `read`. Documented honestly: a *local* regular
+file's read is not interruptible by this deadline, but that case cannot
+stall; the attacker-reachable cases return `EAGAIN` and take the bounded
+path. Two of its tests hung indefinitely before the fix.
+
+## HIGH — PAM connect followed a symlink at the final component
+
+This corrects an overclaim in the second audit. Validating the runtime
+directory on a descriptor and using `/proc/self/fd` defeats a **directory**
+swap, but the `connect` is still name-resolved, so a symlink planted at the
+socket's own name redirected it. `connect_path()` now does
+`fstatat(..., AT_SYMLINK_NOFOLLOW)` and requires `S_IFSOCK`. Its test failed
+before the fix by returning a path that would have connected out of the
+directory. The docstring no longer claims more than it delivers: the unlink
+is inode-safe, the connect is only *narrowed* (there is no `connectat`), and
+the residue is contained by the `SO_PEERCRED` check — worst case is
+redirection to another of the user's own listeners, which is not an
+escalation.
+
+## HIGH — a hostile collection label could forge the consent dialog
+
+`display_label` stripped control characters and bidi overrides, but a label
+could still reproduce the `"` and `()` the dialog uses structurally and so
+forge a complete, plausible clause naming a *different* collection. Verified
+attack: a 58-character label rendered
+`Permanently delete the keyring "x" (id: default) and all 0 secrets? Nothing
+to worry about" (id: work) and all 47 secrets?`.
+
+Fixed on both sides. The daemon's authoritative clause now comes **first**
+and carries the id it actually operates on; the label goes on its own line
+after `Its label is:`; and `display_label` maps `"`, `(` and `)` to spaces so
+the label cannot reproduce the punctuation the clause is built from. The same
+payload now renders inertly, confined to the trailing label line.
+
+## HIGH — a disconnect vetoed every collection in a multi-collection unlock
+
+One collection's commit gate leaked into the next, so an owner disconnect
+could suppress dialogs for collections it had no say over. The gate is now
+reset per collection and ownership re-checked each iteration.
+
+## HIGH — prompt dialog lock wait was unbounded; session quota checked too late
+
+`ask`/`confirm` now bound the dialog-lock wait with the prompt timeout (a
+queued dialog waited 5.1 s instead of 300 ms before the fix). `open_session`
+checks the per-client quota **before** the algorithm match, so the modular
+exponentiations no longer run for a request that is about to be refused, and
+re-checks under the lock afterwards.
+
+## MEDIUM — non-atomic multi-item delete
+
+`sm delete` and `sm ssh remove` issued N separate `Item.Delete` calls; a
+failure partway left a half-deleted set with the secret still present. Added
+a daemon-side all-or-nothing `DeleteItems`, deliberately **not** on
+`org.freedesktop.Secret.Collection` — the freedesktop spec has no batch
+delete and libsecret clients must see the spec's methods exactly — but on a
+private `org.secret_manager.Collection1` interface at the same path. It
+validates every path before mutating, then performs one `Vault::save` with
+the store's existing in-memory rollback. Signals and unexports happen only
+after the save succeeds. The CLI falls back to the per-item loop when the
+interface is absent, and its message then says the items were left untouched
+rather than naming survivors. A test asserts via introspection that
+`DeleteItems` is absent from the spec interface and that per-item
+`Item.Delete` is unchanged.
+
+## MEDIUM/LOW — remainder
+
+Argon2 in PAM now respects the login budget (bound stated honestly as the
+budget *plus at most one KDF-ceiling derivation*, since Argon2 is not
+interruptible). Per-item secret cap enforced in `create_item`. Unicode
+formatting characters — including the `U+202A–202E` range the finding list
+omitted — stripped from anything shown in a dialog or listed by `sm ssh
+list`. `ssh-add`'s prompt forms recognised; relative key paths resolved and
+released only if they canonicalise to a registered key; `sm ssh` refuses to
+choose between two items claiming the same key rather than releasing an
+attacker-planted one. Object-path escaping widened to every byte below
+`0x20` plus `0x7f`. Prompt abort handle no longer duplicated across two
+fields. Dismissal re-checked on both sides of every dialog.
+
+## Dependency
+
+`postcard`'s default features pulled in `heapless 0.7`, whose
+`atomic-polyfill` dependency is unmaintained (RUSTSEC-2023-0089). It was
+never compiled for this host — it only applies to bare-metal targets — but
+the feature is unused, so it is now `default-features = false`. Dependency
+count 183 → 172 and `cargo audit` is clean with no allowed warnings.
+
+## Process note
+
+The oversize-vault refusal test built a real 256 MiB vault and cost 42.4 s of
+every run. The ceiling is now injectable for tests, so the test proves *more*
+(it re-runs the same insert with the real ceiling restored, showing the
+refusal was the limit and nothing else) in under a second. Whole unit suite
+44 s → 13 s.
+
+One reviewer's own report miscounted a suite's test total, and another was
+interrupted mid-run leaving three deliberate "neutering" stubs in the source.
+Both were caught by checking the tree directly rather than trusting the
+reports; the stubs were confirmed removed by inspecting the real function
+bodies. An earlier claim in this document that `/proc/self/fd` pinning closed
+the PAM path-swap hole was incomplete, and is corrected above.
+
+## State
+
+283 tests pass. `cargo clippy --all-targets -- -D warnings` and the
+`pam`-only lib clippy are both clean, `cargo fmt --check` is clean, and
+`cargo audit` reports nothing. `make build` produces a daemon with no libpam
+linked and a PAM module with six `pam_sm_*` entry points and no tokio.

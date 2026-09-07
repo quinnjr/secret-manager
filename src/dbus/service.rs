@@ -57,6 +57,14 @@ impl Service {
         #[zbus(header)] header: Header<'_>,
         #[zbus(object_server)] server: &ObjectServer,
     ) -> Result<(OwnedValue, OwnedObjectPath)> {
+        // The identity check and the quota check come FIRST, before any
+        // key material is generated: `dh` costs two 1024-bit modexps
+        // (`KeyPair::generate` and `SessionCipher::from_dh`), and running
+        // them ahead of the cap meant the cap did not bound the work it
+        // exists to bound — a client at its limit could still spend the
+        // daemon's CPU on every refused call (HIGH 4).
+        let owner = require_sender(&header)?;
+        self.state.lock().await.check_session_quota(&owner)?;
         let (cipher, output) = match algorithm {
             ALGORITHM_PLAIN => (SessionCipher::plain(), Value::from("")),
             ALGORITHM_DH => {
@@ -72,18 +80,27 @@ impl Service {
                 )));
             }
         };
-        let owner = require_sender(&header)?;
         let path = {
             let mut st = self.state.lock().await;
+            // Re-checked: the lock was released across the key generation
+            // above, so concurrent calls from the same client could otherwise
+            // all pass the first check and land together.
             st.check_session_quota(&owner)?;
             let path = st.new_session_path();
             st.sessions
                 .insert(path.to_string(), SessionEntry { owner, cipher });
             path
         };
-        server
+        if let Err(e) = server
             .at(path.clone(), Session::new(self.state.clone(), path.clone()))
-            .await?;
+            .await
+        {
+            // Otherwise the session entry counts against this client's quota
+            // for the life of the connection, for an object that was never
+            // exported.
+            self.state.lock().await.sessions.remove(path.as_str());
+            return Err(e.into());
+        }
         let output = OwnedValue::try_from(output).map_err(Error::failed)?;
         Ok((output, path))
     }
@@ -246,7 +263,16 @@ impl Service {
                 requested,
             },
         );
-        server.at(prompt_path.clone(), prompt).await?;
+        // A failed export must not leave an owner entry counting against this
+        // client's prompt quota for a prompt that does not exist (LOW 3).
+        if let Err(e) = server.at(prompt_path.clone(), prompt).await {
+            self.state
+                .lock()
+                .await
+                .prompt_owners
+                .remove(prompt_path.as_str());
+            return Err(e.into());
+        }
         Ok((unlocked, prompt_path))
     }
 
@@ -311,7 +337,15 @@ impl Service {
             prompt_path.clone(),
             PromptAction::CreateCollection { label, alias },
         );
-        server.at(prompt_path.clone(), prompt).await?;
+        // See `unlock` (LOW 3).
+        if let Err(e) = server.at(prompt_path.clone(), prompt).await {
+            self.state
+                .lock()
+                .await
+                .prompt_owners
+                .remove(prompt_path.as_str());
+            return Err(e.into());
+        }
         Ok((paths::root(), prompt_path))
     }
 

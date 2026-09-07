@@ -97,7 +97,8 @@ impl PamServiceModule for PamSecretManager {
             };
             // Salt and parameters come from the vault file itself, never from
             // whatever happens to answer the socket.
-            let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid) else {
+            let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, &budget)
+            else {
                 clear_stashed_password(&pamh);
                 return PamError::SUCCESS;
             };
@@ -109,22 +110,30 @@ impl PamServiceModule for PamSecretManager {
             // A leftover socket from a crashed daemon looks exactly like a
             // running one, so only a failed connect is a usable test.
             let sock = dir.socket_path();
-            match unlock_by_key(
-                &sock,
-                &opts.collection,
-                t.uid,
-                &password,
-                &salt,
-                kdf,
-                match budget.capped(CALL_BUDGET) {
-                    Some(left) => left,
-                    None => {
-                        log("no time left in the login budget; vault stays locked");
-                        clear_stashed_password(&pamh);
-                        return PamError::SUCCESS;
-                    }
-                },
-            ) {
+            let Some(call) = budget.capped(CALL_BUDGET) else {
+                log("no time left in the login budget; vault stays locked");
+                clear_stashed_password(&pamh);
+                return PamError::SUCCESS;
+            };
+            // `connect_path` re-checks the socket *name* with
+            // `AT_SYMLINK_NOFOLLOW`: holding the directory open pins the
+            // parent, but `connect(2)` still resolves the final component, so
+            // a symlink planted there would redirect root. A refusal is
+            // reported as a connect failure, which is exactly what it is.
+            let attempt = match dir.connect_path() {
+                Ok(path) => unlock_by_key(
+                    &path,
+                    &opts.collection,
+                    t.uid,
+                    &password,
+                    &salt,
+                    kdf,
+                    &budget,
+                    call,
+                ),
+                Err(e) => Err(ProtocolError::Connect(e)),
+            };
+            match attempt {
                 Ok(()) => {}
                 Err(ProtocolError::Connect(e)) if opts.auto_start => {
                     match stale_socket_action(e.kind()) {
@@ -146,16 +155,25 @@ impl PamServiceModule for PamSecretManager {
                                             if budget.remaining().is_none() {
                                                 log(SPENT);
                                             } else if let Some(left) = budget.capped(CALL_BUDGET) {
-                                                if let Err(e) = unlock_by_key(
-                                                    &dir.socket_path(),
-                                                    &opts.collection,
-                                                    t.uid,
-                                                    &password,
-                                                    &salt,
-                                                    kdf,
-                                                    left,
-                                                ) {
-                                                    log_transport("unlock", &e);
+                                                match dir.connect_path() {
+                                                    Ok(path) => {
+                                                        if let Err(e) = unlock_by_key(
+                                                            &path,
+                                                            &opts.collection,
+                                                            t.uid,
+                                                            &password,
+                                                            &salt,
+                                                            kdf,
+                                                            &budget,
+                                                            left,
+                                                        ) {
+                                                            log_transport("unlock", &e);
+                                                        }
+                                                    }
+                                                    Err(e) => log_transport(
+                                                        "unlock",
+                                                        &ProtocolError::Connect(e),
+                                                    ),
                                                 }
                                             } else {
                                                 log("no time left in the login budget");
@@ -207,12 +225,14 @@ impl PamServiceModule for PamSecretManager {
             let Some(dir) = SocketDir::open(&t.sock, t.uid) else {
                 return PamError::SUCCESS;
             };
-            let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid) else {
+            let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, &budget)
+            else {
                 return PamError::SUCCESS;
             };
             let old = Zeroizing::new(old.to_string_lossy().into_owned());
             let new = Zeroizing::new(new.to_string_lossy().into_owned());
-            let Some(req) = change_key_request(&opts.collection, &old, &new, &salt, kdf) else {
+            let Some(req) = change_key_request(&opts.collection, &old, &new, &salt, kdf, &budget)
+            else {
                 return PamError::SUCCESS;
             };
             if budget.remaining().is_none() {
@@ -220,13 +240,14 @@ impl PamServiceModule for PamSecretManager {
                 return PamError::SUCCESS;
             }
             match budget.capped(CALL_BUDGET) {
-                Some(left) => {
-                    if let Err(e) =
-                        try_send(&dir.socket_path(), &req, t.uid, "password change", left)
-                    {
-                        log_transport("password change", &e);
+                Some(left) => match dir.connect_path() {
+                    Ok(path) => {
+                        if let Err(e) = try_send(&path, &req, t.uid, "password change", left) {
+                            log_transport("password change", &e);
+                        }
                     }
-                }
+                    Err(e) => log_transport("password change", &ProtocolError::Connect(e)),
+                },
                 None => log("no time left in the password-change budget"),
             }
             PamError::SUCCESS

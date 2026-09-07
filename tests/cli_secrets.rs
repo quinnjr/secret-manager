@@ -359,6 +359,32 @@ async fn set_rejects_an_oversized_secret() {
         .write_stdin(vec![b'x'; 1 << 20])
         .assert()
         .success();
+    // LOW: the trailing newline is a delimiter, not part of the secret, so it
+    // must be dropped *before* the size check. `printf '%s\n'` of a 1 MiB
+    // secret is a 1 MiB secret.
+    let mut with_newline = vec![b'x'; 1 << 20];
+    with_newline.push(b'\n');
+    fx.sm()
+        .args(["set", "big=2", "--label", "big2"])
+        .write_stdin(with_newline)
+        .assert()
+        .success();
+    fx.sm()
+        .args(["get", "big=2"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|o: &[u8]| {
+            o.len() == (1 << 20) && o.iter().all(|b| *b == b'x')
+        }));
+    // One byte past the limit *plus* a newline is still too big.
+    let mut oversized = vec![b'x'; (1 << 20) + 1];
+    oversized.push(b'\n');
+    fx.sm()
+        .args(["set", "big=3", "--label", "big3"])
+        .write_stdin(oversized)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("exceeds 1 MiB"));
 }
 
 /// LOW 1: control characters in a label or an attribute value must not reach

@@ -5,12 +5,12 @@ use super::paths;
 use super::registry;
 use super::require_sender;
 use super::service::ServiceSignals;
-use super::state::Shared;
+use super::state::{PromptCommit, Shared};
 use crate::prompt::{PinOutcome, PinRequest};
 use crate::vault::{Vault, VaultError};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use zbus::Connection;
 use zbus::interface;
 use zbus::message::Header;
@@ -56,21 +56,25 @@ pub struct Prompt {
     path: OwnedObjectPath,
     kind: PromptKind,
     action: Mutex<Option<PromptAction>>,
-    task: Mutex<Option<JoinHandle<()>>>,
     /// Guards the single moment past which aborting the running task could
     /// leave inconsistent state (a password obtained, about to mutate
-    /// `ServiceState` or the filesystem). Whoever locks this and flips it from
-    /// `false` to `true` first "wins": the task proceeds to completion on its
-    /// own (a too-late `dismiss` becomes a no-op), or `dismiss` proceeds to
-    /// abort the task and finish the prompt itself (the task, if it later
-    /// reaches the same check, finds it already set and abandons its work
-    /// before mutating anything).
-    committed: Arc<Mutex<bool>>,
+    /// `ServiceState` or the filesystem). Whoever flips it from `false` to
+    /// `true` first "wins": the task proceeds to completion on its own (a
+    /// too-late `dismiss` becomes a no-op), or `dismiss` proceeds to abort the
+    /// task and finish the prompt itself (the task, if it later reaches the
+    /// same check, finds it already set and abandons its work before mutating
+    /// anything).
+    ///
+    /// The gate is a *veto on aborting*, so it may only ever cover an
+    /// irreversible step. An `Unlock` is reversible (the collection can simply
+    /// be locked again), so its arm resets the gate at the top of every
+    /// collection: the veto lasts one collection, never the whole prompt.
+    committed: PromptCommit,
     /// Set by every `dismiss()`, including one that arrives *after* the
     /// commit gate was claimed. A multi-collection `Unlock` checks it before
     /// each remaining collection, so a dismissal stops the loop instead of
     /// raising a dialog for every collection left in the request.
-    cancelled: Arc<Mutex<bool>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Prompt {
@@ -81,9 +85,8 @@ impl Prompt {
             path,
             kind,
             action: Mutex::new(Some(action)),
-            task: Mutex::new(None),
-            committed: Arc::new(Mutex::new(false)),
-            cancelled: Arc::new(Mutex::new(false)),
+            committed: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -107,23 +110,82 @@ impl Prompt {
     }
 }
 
+/// True for a codepoint in general category `Cf` (format), `Co` (private use)
+/// or `Cn` (unassigned-but-reserved-for-formatting) that a toolkit may act on
+/// rather than draw. (`Cs`, the surrogates, cannot occur in a Rust `str` at
+/// all, so there is nothing to filter for them.)
+///
+/// `char::is_control()` covers only `Cc`, which leaves the whole invisible
+/// half of the problem intact: `U+00AD` (soft hyphen), `U+061C` (Arabic letter
+/// mark), `U+200B..U+200F` (zero-width space/joiners and the LTR/RTL marks),
+/// `U+2060` (word joiner) and `U+FEFF` (zero-width no-break space) all survive
+/// it. The marks among them still reorder neutral text in a GTK/Qt dialog, and
+/// the zero-width ones let a label split a word an operator is scanning for
+/// ("de\u{200B}lete"). Enumerated explicitly rather than pulled from a unicode
+/// crate; the list is the set of `Cf`/`Cs`/`Co` ranges plus the `Cn`
+/// codepoints reserved for formatting use (MEDIUM 1).
+fn is_invisible_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061C}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{08E2}'
+        | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}'
+        | '\u{E000}'..='\u{F8FF}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}'
+        | '\u{110CD}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}'
+        | '\u{E0020}'..='\u{E007F}'
+        | '\u{F0000}'..='\u{FFFFD}'
+        | '\u{100000}'..='\u{10FFFD}'
+    )
+}
+
 /// Render a client-supplied label for a pinentry dialog.
 ///
-/// Any bus client can set `Collection.Label`, and the label is the entire
-/// text of a destructive-consent dialog. `escape()` turns a newline into
-/// `%0A`, which pinentry decodes back into a real line break, so an
-/// unfiltered label can forge extra lines of dialog text ("safe to remove,
-/// no secrets"). Bidi overrides can likewise reorder what the user reads.
-/// So: neutralise every control character (a newline, tab or NUL becomes an
-/// ordinary space, so words are not silently glued together), drop every bidi
-/// override, collapse whitespace runs to single spaces, and truncate to 64
-/// characters with an ellipsis.
+/// Any bus client can set `Collection.Label` (no authorization is required for
+/// it), and the label is interpolated into the text of a destructive-consent
+/// dialog. Three separate forgeries have to be shut out:
+///
+/// * `escape()` turns a newline into `%0A`, which pinentry decodes back into a
+///   real line break, so an unfiltered label can forge extra *lines* of dialog
+///   text ("safe to remove, no secrets"). Every control character therefore
+///   becomes an ordinary space (a space, not nothing, so words are not
+///   silently glued together).
+/// * A label can forge the daemon's own punctuation and so fake a complete
+///   authoritative clause — `x" (id: default) and all 0 secrets? Nothing to
+///   worry about` renders as a whole plausible first sentence naming a
+///   *different* collection. `"`, `(` and `)` are the only characters the
+///   daemon's own dialog text uses structurally, so all three are replaced by
+///   a space and the label is left unable to imitate it (HIGH 1). The dialogs
+///   additionally put the authoritative clause first and the label on a line
+///   of its own, so a label cannot get in front of it at all.
+/// * Bidi and other invisible format characters reorder or hide what the user
+///   reads; see [`is_invisible_format`].
+///
+/// Whitespace runs then collapse to single spaces, and the result is truncated
+/// to 64 characters plus a trailing ellipsis (so at most 65 characters).
 pub fn display_label(label: &str) -> String {
     const MAX: usize = 64;
     let cleaned: String = label
         .chars()
-        .filter(|c| !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter(|c| !is_invisible_format(*c))
+        .map(|c| {
+            if c.is_control() || matches!(c, '"' | '(' | ')') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() > MAX {
@@ -166,7 +228,11 @@ impl Prompt {
         // The handle is registered before the task can reach `finish` (which
         // removes it): take the lock first, so a prompt that completes
         // immediately cannot leave a stale entry behind. `watch_clients` uses
-        // it to abort the task, and its pinentry, if the owner disconnects.
+        // it to abort the task, and its pinentry, if the owner disconnects,
+        // and so does `dismiss` — the abort handle lives in `prompt_tasks` and
+        // nowhere else, so a `Dismiss` that wakes on the state lock the moment
+        // this one drops it can never find "no task" for a task that is in
+        // fact running (MEDIUM 2).
         let mut st = self.state.lock().await;
         let handle = tokio::spawn(async move {
             let (dismissed, result) =
@@ -181,7 +247,6 @@ impl Prompt {
         st.prompt_commits
             .insert(self.path.to_string(), self.committed.clone());
         drop(st);
-        *self.task.lock().await = Some(handle);
         Ok(())
     }
 
@@ -197,21 +262,24 @@ impl Prompt {
         self.action.lock().await.take();
         // Always recorded, even past the commit gate, so a multi-collection
         // unlock stops asking about the collections it has not reached yet.
-        *self.cancelled.lock().await = true;
-        let already_committed = {
-            let mut committed = self.committed.lock().await;
-            let was = *committed;
-            *committed = true;
-            was
+        self.cancelled.store(true, Ordering::Release);
+        // Claiming the gate and taking the abort handle happen under one
+        // acquisition of the state lock, which is also the lock `prompt()`
+        // holds while it registers the handle. That is what makes "gate not
+        // yet claimed" and "no handle to abort" impossible to observe
+        // together for a task that is actually running (MEDIUM 2).
+        let handle = {
+            let mut st = self.state.lock().await;
+            if !claim(&self.committed) {
+                // The running task has already passed (or fully completed)
+                // the point of no return; its own `finish` call completes
+                // the prompt exactly once, whatever the real outcome turned
+                // out to be. Nothing to do here.
+                return Ok(());
+            }
+            st.prompt_tasks.remove(self.path.as_str())
         };
-        if already_committed {
-            // The running task has already passed (or fully completed) the
-            // point of no return; its own `finish` call completes the
-            // prompt exactly once, whatever the real outcome turned out to
-            // be. Nothing to do here.
-            return Ok(());
-        }
-        if let Some(handle) = self.task.lock().await.take() {
+        if let Some(handle) = handle {
             handle.abort();
         }
         let dismissed_result = match self.kind {
@@ -273,8 +341,8 @@ async fn run(
     state: &Shared,
     path: &OwnedObjectPath,
     action: PromptAction,
-    committed: &Mutex<bool>,
-    cancelled: &Mutex<bool>,
+    committed: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> (bool, OwnedValue) {
     match action {
         PromptAction::Unlock {
@@ -283,13 +351,35 @@ async fn run(
         } => {
             let mut any_unlocked = false;
             let mut unlocked_now: Vec<String> = Vec::new();
-            // The gate is claimed by whichever collection first gets a real
-            // answer from pinentry, not necessarily the first in the list.
-            let mut gate = Some(committed);
             for id in collections.iter() {
+                // Unlocking is reversible, so the commit gate — which is a
+                // veto on aborting this task — must not cover the whole
+                // prompt. It is reset here, at the top of every collection, so
+                // the veto lasts exactly one collection's dialog: a client
+                // that disconnects, or dismisses, part-way through a
+                // multi-collection unlock can always be obeyed (HIGH 2).
+                //
+                // Reset *before* reading `cancelled`, so a `Dismiss` racing
+                // this point is caught by one side or the other: either it
+                // claims the freshly-reset gate (and aborts this task), or it
+                // claimed the old one first — in which case it set `cancelled`
+                // before that, and the read below sees it.
+                committed.store(false, Ordering::Release);
+                // The gate is claimed by this collection's first real
+                // (uncancelled) answer from pinentry.
+                let mut gate = Some(committed);
                 // A `Dismiss` that arrived after the commit gate was claimed
                 // still stops the remaining collections here.
-                if *cancelled.lock().await {
+                if cancelled.load(Ordering::Acquire) {
+                    break;
+                }
+                // And an owner that vanished stops them too, whatever the gate
+                // says: `daemon::watch_clients` skips the abort for a prompt
+                // that has claimed its gate, so without this check a
+                // disconnect landing inside one dialog left the task walking
+                // the rest of the list, raising a dialog for each with nobody
+                // left to receive the result (HIGH 2).
+                if !state.lock().await.prompt_owners.contains_key(path.as_str()) {
                     break;
                 }
                 match unlock_collection_inner(conn, state, id, &mut gate).await {
@@ -333,13 +423,15 @@ async fn run(
             (false, owned(Value::from(unlocked)))
         }
         PromptAction::CreateCollection { label, alias } => {
-            match create_collection(conn, state, &label, alias.as_deref(), committed).await {
+            match create_collection(conn, state, &label, alias.as_deref(), committed, cancelled)
+                .await
+            {
                 Some(path) => (false, owned(Value::from(path))),
                 None => (true, owned(Value::from(paths::root()))),
             }
         }
         PromptAction::DeleteCollection { id } => {
-            match delete_collection(conn, state, &id, committed).await {
+            match delete_collection(conn, state, &id, committed, cancelled).await {
                 Some(path) => (false, owned(Value::from(path))),
                 None => (true, owned(Value::from(paths::root()))),
             }
@@ -367,7 +459,7 @@ async fn unlock_collection_inner(
     conn: &Connection,
     state: &Shared,
     id: &str,
-    commit_gate: &mut Option<&Mutex<bool>>,
+    commit_gate: &mut Option<&AtomicBool>,
 ) -> Outcome {
     let (pinentry, label) = {
         let st = state.lock().await;
@@ -389,8 +481,11 @@ async fn unlock_collection_inner(
     for _ in 0..3 {
         let req = PinRequest {
             title: "secret-manager".into(),
+            // The immutable id comes FIRST, and the client-controlled
+            // label sits on a line of its own after it, so a label cannot
+            // render text in front of the authoritative clause (HIGH 1).
             description: format!(
-                "An application wants access to the keyring \"{label}\" (id: {id}), but it is locked."
+                "An application wants access to the locked keyring with id \"{id}\".\nIts label is: {label}"
             ),
             prompt: "Password:".into(),
             error: error.take(),
@@ -408,7 +503,7 @@ async fn unlock_collection_inner(
         // answer from pinentry. If `dismiss` claimed it first, back off before
         // touching any state.
         if let Some(gate) = commit_gate.take()
-            && !claim(gate).await
+            && !claim(gate)
         {
             return Outcome::Cancelled;
         }
@@ -460,7 +555,8 @@ async fn create_collection(
     state: &Shared,
     label: &str,
     alias: Option<&str>,
-    committed: &Mutex<bool>,
+    committed: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Option<OwnedObjectPath> {
     let pinentry = state.lock().await.pinentry.clone();
     let req = PinRequest {
@@ -473,6 +569,13 @@ async fn create_collection(
         error: None,
         repeat: true,
     };
+    // `dismiss()` records the dismissal unconditionally, including when it
+    // arrives too late to abort this task. Checking it on both sides of the
+    // dialog means a dismissal that failed to abort still cannot raise one, or
+    // act on one already answered (MEDIUM 3).
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
     let pin = match pinentry.ask(&req).await {
         Ok(PinOutcome::Pin(pin)) if !pin.is_empty() => pin,
         Ok(_) => return None,
@@ -481,7 +584,10 @@ async fn create_collection(
             return None;
         }
     };
-    if !claim(committed).await {
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
+    if !claim(committed) {
         return None;
     }
     // Only the cheap bookkeeping happens under the state lock: `Vault::create`
@@ -492,15 +598,18 @@ async fn create_collection(
     // it exclusively, so a concurrent create can legitimately take the name
     // between the two. That is a lost race, not a failure: pick the next free
     // id and try again rather than failing a create the user confirmed.
-    const NAME_ATTEMPTS: usize = 8;
+    // Every attempt costs a full Argon2 derivation, and a same-uid attacker
+    // who races file creation on the (predictable) candidate names can force
+    // every one of them. Three is enough for a genuine lost race (MEDIUM 4).
+    const NAME_ATTEMPTS: usize = 3;
     let mut attempt = 0;
     let (id, mut vault) = loop {
         attempt += 1;
-        let (id, path, kdf, index_attributes) = {
+        let (id, path, kdf) = {
             let st = state.lock().await;
             let id = st.unique_collection_id(label);
             let path = st.vault_dir.join(format!("{id}.vault"));
-            (id, path, st.kdf, st.index_attributes)
+            (id, path, st.kdf)
         };
         let created = {
             let (path, label) = (path.clone(), label.to_string());
@@ -508,10 +617,7 @@ async fn create_collection(
             crate::kdf::run_bounded(move || Vault::create(&path, &label, &pin, kdf)).await
         };
         match created {
-            Ok(vault) => {
-                let _ = index_attributes;
-                break (id, vault);
-            }
+            Ok(vault) => break (id, vault),
             Err(VaultError::AlreadyExists(_)) if attempt < NAME_ATTEMPTS => {
                 tracing::debug!("collection id '{id}' was taken while creating it; retrying");
             }
@@ -521,10 +627,12 @@ async fn create_collection(
             }
         }
     };
-    let index_attributes = state.lock().await.index_attributes;
     {
+        // One acquisition, not three: the loop used to read `index_attributes`
+        // only to discard it, then re-read it here under a second lock, then
+        // take a third for the insert (MEDIUM 4).
         let mut st = state.lock().await;
-        vault.set_index_attributes(index_attributes);
+        vault.set_index_attributes(st.index_attributes);
         st.collections.insert(id.clone(), vault);
         if let Some(a) = alias {
             st.aliases.insert(a.to_string(), id.clone());
@@ -556,7 +664,8 @@ async fn delete_collection(
     conn: &Connection,
     state: &Shared,
     id: &str,
-    committed: &Mutex<bool>,
+    committed: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Option<OwnedObjectPath> {
     let (pinentry, label, item_count) = {
         let st = state.lock().await;
@@ -569,13 +678,25 @@ async fn delete_collection(
     };
     let req = PinRequest {
         title: "secret-manager".into(),
+        // The whole question — the immutable id and the secret count — is
+        // stated before any client-controlled text, and the label follows on a
+        // line of its own. A hostile label used to be interpolated *before*
+        // the id in the same sentence, so it could close the daemon's quote,
+        // forge its own `(id: ...)` clause and describe a different, empty
+        // collection; the real clause then trailed after it and read as noise
+        // (HIGH 1).
         description: format!(
-            "Permanently delete the keyring \"{label}\" (id: {id}) and all {item_count} secrets?"
+            "Permanently delete the keyring with id \"{id}\" and all {item_count} secrets?\nIts label is: {label}"
         ),
         prompt: "Delete".into(),
         error: None,
         repeat: false,
     };
+    // See `create_collection`: a dismissal that arrived too late to abort
+    // this task must still stop it, before and after the dialog (MEDIUM 3).
+    if cancelled.load(Ordering::Acquire) {
+        return None;
+    }
     let confirmed = match pinentry.confirm(&req).await {
         Ok(ok) => ok,
         Err(e) => {
@@ -583,10 +704,10 @@ async fn delete_collection(
             false
         }
     };
-    if !confirmed {
+    if !confirmed || cancelled.load(Ordering::Acquire) {
         return None;
     }
-    if !claim(committed).await {
+    if !claim(committed) {
         return None;
     }
     // Removing the collection from state and unlinking its file happen under
@@ -631,13 +752,10 @@ async fn delete_collection(
 
 /// Try to claim the commit point: true if this call won the race (safe to
 /// proceed with irreversible work), false if `dismiss` claimed it first.
-async fn claim(committed: &Mutex<bool>) -> bool {
-    let mut c = committed.lock().await;
-    if *c {
-        return false;
-    }
-    *c = true;
-    true
+fn claim(committed: &AtomicBool) -> bool {
+    committed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -653,7 +771,9 @@ mod tests {
         let shown = display_label(hostile);
         assert!(!shown.contains('\n'), "{shown}");
         assert!(!shown.contains('\r'));
-        assert_eq!(shown, "Scratch keyring (no secrets)");
+        // The parentheses the label tried to use are neutralised too; see
+        // `display_label_cannot_forge_the_daemons_own_punctuation`.
+        assert_eq!(shown, "Scratch keyring no secrets");
         // A longer forged dialog is both flattened and truncated.
         let long_hostile =
             "Scratch keyring \u{2014} safe to remove\n(created by the installer, no secrets)";
@@ -667,15 +787,94 @@ mod tests {
         assert_eq!(display_label(""), "");
     }
 
+    /// The delete dialog's own text uses `"` and `(`/`)` structurally. A label
+    /// that can reproduce them can forge a complete, plausible authoritative
+    /// clause naming a *different* collection, so all three must be
+    /// neutralised wherever the label ends up (HIGH 1).
+    ///
+    /// The payload is the verified attack: against the old filter, which
+    /// stripped only control characters and bidi overrides, it rendered as
+    /// `Permanently delete the keyring "x" (id: default) and all 0 secrets?
+    /// Nothing to worry about" (id: work) and all 47 secrets?` — a first
+    /// sentence a user reads and acts on, describing the wrong keyring.
     #[test]
-    fn display_label_strips_bidi_overrides() {
+    fn display_label_cannot_forge_the_daemons_own_punctuation() {
+        let payload = "x\" (id: default) and all 0 secrets? Nothing to worry about";
+        let shown = display_label(payload);
+        assert!(!shown.contains('"'), "a quote survived: {shown}");
+        assert!(!shown.contains('('), "an open paren survived: {shown}");
+        assert!(!shown.contains(')'), "a close paren survived: {shown}");
+        assert!(
+            !shown.contains("(id:"),
+            "the label forged an id clause: {shown}"
+        );
+        // Neutralised as spaces, not deleted, so words are never glued
+        // together into something new.
+        assert_eq!(
+            shown,
+            "x id: default and all 0 secrets? Nothing to worry about"
+        );
+        assert_eq!(display_label("a(b)c"), "a b c");
+        assert_eq!(display_label("say \"hi\""), "say hi");
+    }
+
+    /// `char::is_control()` is general category `Cc` only, which leaves every
+    /// invisible formatting codepoint intact: the marks among them reorder
+    /// neutral text in a GTK/Qt dialog and the zero-width ones split a word an
+    /// operator is scanning for. The filter is a category-based whitelist, so
+    /// this covers `Cf`, `Cs`, `Co` and the formatting `Cn` alike — not just
+    /// the bidi overrides the old test enumerated back at the filter (MEDIUM 1).
+    #[test]
+    fn display_label_drops_invisible_format_characters() {
         for c in [
-            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
-            '\u{2068}', '\u{2069}',
+            // Bidi controls (these the old filter already handled).
+            '\u{202A}',
+            '\u{202B}',
+            '\u{202C}',
+            '\u{202D}',
+            '\u{202E}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            // All of these survived the old filter.
+            '\u{00AD}',
+            '\u{0600}',
+            '\u{0605}',
+            '\u{061C}',
+            '\u{06DD}',
+            '\u{070F}',
+            '\u{180E}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{206F}',
+            '\u{FEFF}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{1D173}',
+            '\u{1D17A}',
+            '\u{E0001}',
+            '\u{E0020}',
+            '\u{E007F}',
+            // Private use: a font can render these as anything at all.
+            '\u{E000}',
+            '\u{F8FF}',
         ] {
             let shown = display_label(&format!("safe{c}delete"));
             assert_eq!(shown, "safedelete", "U+{:04X} survived", c as u32);
         }
+        // Ordinary text, including non-ASCII, is untouched.
+        assert_eq!(
+            display_label("caf\u{e9} \u{4e2d}\u{6587}"),
+            "caf\u{e9} \u{4e2d}\u{6587}"
+        );
     }
 
     #[test]

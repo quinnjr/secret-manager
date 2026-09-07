@@ -104,6 +104,14 @@ async fn session_close_is_refused_to_a_non_owner() {
 /// exported object (plus a 1024-bit modexp for `dh`), so one client may hold
 /// only so many at once (MEDIUM 4). The cap is per sender: another client is
 /// unaffected.
+///
+/// The cap must also actually *bound the work it was added to bound* (HIGH 4).
+/// `KeyPair::generate()` and `SessionCipher::from_dh` — two 1024-bit modexps —
+/// used to run before `require_sender` and the quota check, so a client at its
+/// limit still spent the daemon's CPU on every refused call. That ordering is
+/// asserted here without relying on wall-clock timing: a `dh` request whose
+/// peer key `from_dh` rejects would answer `InvalidArgs` if the key exchange
+/// ran first, and answers the quota error only if the quota check ran first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_session_is_capped_per_client() {
     use secret_manager::dbus::state::MAX_SESSIONS_PER_SENDER;
@@ -135,6 +143,36 @@ async fn open_session_is_capped_per_client() {
     assert_eq!(
         fx.daemon.state.lock().await.sessions.len(),
         MAX_SESSIONS_PER_SENDER
+    );
+
+    // Ordering proof (HIGH 4): `vec![1u8]` is a peer key `from_dh` rejects —
+    // `unsupported_algorithm_and_bad_input` shows it yields `InvalidArgs` when
+    // the quota is free. With the quota exhausted it must be refused *before*
+    // the key exchange is attempted, so the quota error is what comes back.
+    let err = service
+        .open_session(ALGORITHM_DH, &Value::from(vec![1u8]))
+        .await
+        .unwrap_err();
+    match &err {
+        zbus::Error::MethodError(name, desc, _) => {
+            assert_eq!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.Failed",
+                "the modexps ran before the quota check: {desc:?}"
+            );
+            assert!(
+                desc.as_deref()
+                    .unwrap_or_default()
+                    .contains("too many open sessions"),
+                "{desc:?}"
+            );
+        }
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.sessions.len(),
+        MAX_SESSIONS_PER_SENDER,
+        "a refused call must not have created a session"
     );
 
     // A different client is unaffected by the first one's exhausted quota.

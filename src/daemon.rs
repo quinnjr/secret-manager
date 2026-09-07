@@ -114,6 +114,26 @@ pub fn lock_memory() -> std::io::Result<()> {
     if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // The soft limit is ours to raise up to the hard limit; only give up when
+    // even that is too small, so an operator who raised LimitMEMLOCK does not
+    // also have to think about the soft/hard split.
+    if lim.rlim_cur != libc::RLIM_INFINITY
+        && (lim.rlim_cur as u64) < needed
+        && (lim.rlim_max == libc::RLIM_INFINITY || (lim.rlim_max as u64) >= needed)
+    {
+        let raised = libc::rlimit {
+            rlim_cur: if lim.rlim_max == libc::RLIM_INFINITY {
+                needed as libc::rlim_t
+            } else {
+                lim.rlim_max
+            },
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: setrlimit reads a valid rlimit through a live pointer.
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &raised) } == 0 {
+            lim = raised;
+        }
+    }
     if lim.rlim_cur != libc::RLIM_INFINITY && (lim.rlim_cur as u64) < needed {
         return Err(std::io::Error::other(format!(
             "RLIMIT_MEMLOCK is {} bytes but at least {needed} are needed; raise LimitMEMLOCK= in the unit (within the session's hard limit)",
@@ -271,17 +291,15 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                                 changed.push(id);
                             }
                         }
-                        None => {
-                            missing = Some(id);
-                            break;
-                        }
+                        // Only reachable for a named collection, in which case
+                        // `targets` held exactly that one and nothing was
+                        // locked; the loop still continues so the invariant
+                        // survives a future multi-collection request.
+                        None => missing = Some(id),
                     }
                 }
                 (changed, missing)
             };
-            // Announce whatever was locked before reporting the failure, so
-            // no client keeps a stale unlocked view of a collection this call
-            // actually locked.
             let (changed, missing) = changed;
             for id in changed {
                 registry::notify_collection_changed(&conn, &id).await;
@@ -323,18 +341,20 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
             // reload at a time, on the blocking pool.
             static RELOAD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
             let _reload = RELOAD.acquire().await.expect("semaphore is never closed");
-            let new_ids = {
-                let state = state.clone();
-                let joined = tokio::task::spawn_blocking(move || {
-                    let mut st = state.blocking_lock();
-                    st.load_vaults()
-                })
-                .await;
-                match joined {
-                    Ok(Ok(ids)) => ids,
-                    Ok(Err(e)) => return Response::Error(e.to_string()),
-                    Err(e) => return Response::Error(format!("reload failed: {e}")),
-                }
+            let (dir, index_attributes, loaded) = {
+                let st = state.lock().await;
+                (st.vault_dir.clone(), st.index_attributes, st.loaded_ids())
+            };
+            // The scan opens and parses every vault file, so it runs on the
+            // blocking pool with no lock held; only the merge takes the mutex.
+            let scanned = tokio::task::spawn_blocking(move || {
+                crate::dbus::state::scan_vault_dir(&dir, index_attributes, &loaded)
+            })
+            .await;
+            let new_ids = match scanned {
+                Ok(Ok(scan)) => state.lock().await.merge_scan(scan),
+                Ok(Err(e)) => return Response::Error(e.to_string()),
+                Err(e) => return Response::Error(format!("reload failed: {e}")),
             };
             if let Err(e) = registry::register_all(&conn, &state).await {
                 return Response::Error(e.to_string());
@@ -361,8 +381,11 @@ async fn unlock_with_key(
     let result = {
         let mut st = state.lock().await;
         match st.collections.get_mut(collection) {
-            // One message for both "no such collection" and "wrong key", so
-            // the socket is not an existence oracle for collection names.
+            // One message for both "no such collection" and "wrong key".
+            // Collection ids are not secret from this socket — `Status`
+            // enumerates them, and the CLI needs that — so this is not an
+            // anti-enumeration measure; it just keeps a failed unlock from
+            // reporting which of the two it was.
             Some(vault) => vault
                 .unlock_with_key(key)
                 .map_err(|_| "cannot unlock that collection".to_string()),
@@ -418,9 +441,16 @@ async fn watch_clients(conn: Connection, state: Shared) {
     // failure is retried rather than logged once and abandoned.
     let mut backoff = Duration::from_secs(1);
     loop {
+        let started = std::time::Instant::now();
         match watch_clients_once(&conn, &state).await {
             Ok(()) => tracing::warn!("bus client watch ended; restarting it"),
             Err(e) => tracing::error!("bus client watch failed: {e}; retrying in {backoff:?}"),
+        }
+        // A run that lasted is evidence the bus is healthy again; without this
+        // reset one transient failure degrades cleanup to a 30 s cadence for
+        // the life of the daemon.
+        if started.elapsed() >= Duration::from_secs(30) {
+            backoff = Duration::from_secs(1);
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -464,10 +494,13 @@ async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<(
                     // user already confirmed and leave the daemon disagreeing
                     // with the disk, so let it finish; its own `finish` call
                     // completes the prompt exactly once.
+                    // An atomic, so this cannot fail and cannot be confused
+                    // with contention; a missing gate means the prompt never
+                    // reached its commit point, so aborting is safe.
                     let committed = commit
                         .as_ref()
-                        .and_then(|c| c.try_lock().ok().map(|g| *g))
-                        .unwrap_or(true);
+                        .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+                        .unwrap_or(false);
                     if committed {
                         tracing::debug!("not aborting prompt {p}: it has already committed");
                     } else {

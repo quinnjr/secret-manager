@@ -560,10 +560,26 @@ async fn dismiss_after_the_commit_gate_stops_the_remaining_collections() {
     );
 }
 
-/// A collection label is attacker-controlled (any client can set it) and is
-/// interpolated into the delete-confirmation dialog. It must never be able to
-/// forge extra lines of dialog text, and the dialog must additionally name
-/// the immutable collection id (HIGH 3).
+/// A collection label is attacker-controlled — any client can call `SetLabel`,
+/// no authorization required — and it is shown in the delete-confirmation
+/// dialog. It must not be able to forge extra lines of dialog text, and it must
+/// not be able to forge the daemon's *own* authoritative clause (HIGH 1).
+///
+/// The payload here is the verified attack. The dialog used to read
+/// `Permanently delete the keyring "{label}" (id: {id}) and all N secrets?`,
+/// interpolating the label ahead of the id in the same sentence, and
+/// `display_label` passed `"`, `(` and `)` through. So a label of
+/// `x" (id: default) and all 0 secrets? Nothing to worry about` rendered as
+///
+/// ```text
+/// Permanently delete the keyring "x" (id: default) and all 0 secrets? Nothing to worry about" (id: work) and all 47 secrets?
+/// ```
+///
+/// — a complete, plausible first sentence naming a *different*, empty keyring,
+/// with the real question trailing after it as noise. Both halves are fixed:
+/// the authoritative clause (id and secret count) now comes first and the
+/// label sits on a line of its own after it, and the label can no longer
+/// reproduce the punctuation that clause is built from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hostile_label_cannot_forge_the_delete_dialog() {
     let fx = Fixture::start_with_pin_and_env(
@@ -575,7 +591,7 @@ async fn a_hostile_label_cannot_forge_the_delete_dialog() {
     fx.unlock_default().await;
     let conn = fx.client().await;
     let coll = collection(&conn, fx.default_collection()).await;
-    coll.set_label("Scratch\n(no secrets)\u{202E}")
+    coll.set_label("x\" (id: default) and all 0 secrets? Nothing to worry about\n\u{202E}")
         .await
         .unwrap();
 
@@ -588,22 +604,141 @@ async fn a_hostile_label_cannot_forge_the_delete_dialog() {
         .lines()
         .find(|l| l.starts_with("SETDESC"))
         .expect("a SETDESC line");
+
+    // The authoritative clause is the whole of the first line, and it is
+    // entirely daemon-authored: the id is an object-path segment
+    // (`[A-Za-z0-9_]+`) and the count is a number.
     assert!(
-        !desc.contains("%0A") && !desc.contains("%0D"),
+        desc.starts_with(
+            "SETDESC Permanently delete the keyring with id \"default\" and all 0 secrets?%0A"
+        ),
+        "the dialog must lead with the authoritative clause: {desc}"
+    );
+    // Exactly one line break, the daemon's own; the label added none.
+    assert_eq!(
+        desc.matches("%0A").count(),
+        1,
         "a label forged a line break into the dialog: {desc}"
     );
+    assert!(!desc.contains("%0D"), "a carriage return survived: {desc}");
     assert!(
         !desc.contains('\u{202E}'),
         "a bidi override survived into the dialog: {desc}"
     );
+
+    // Whatever the label renders as, it lives after that line and cannot
+    // imitate it: the punctuation the clause is built from is gone.
+    let (first_line, label_line) = desc.split_once("%0A").unwrap();
     assert!(
-        desc.contains("Scratch (no secrets)"),
-        "the label should still be shown, flattened: {desc}"
+        !label_line.contains('"') && !label_line.contains('(') && !label_line.contains(')'),
+        "the label kept the daemon's structural punctuation: {label_line}"
     );
     assert!(
-        desc.contains("(id: default)"),
-        "the dialog must name the immutable collection id: {desc}"
+        !label_line.contains("(id:"),
+        "the label forged an id clause: {label_line}"
     );
+    assert_eq!(
+        first_line.matches("id: ").count() + first_line.matches("(id:").count(),
+        0,
+        "the first line is the daemon's own clause and names the id its own way: {first_line}"
+    );
+    // The label is still shown, flattened.
+    assert!(
+        label_line.contains("Nothing to worry about"),
+        "the label should still be shown: {label_line}"
+    );
+}
+
+/// A multi-collection `Unlock` whose owner disconnects part-way through must
+/// stop, not walk the rest of the list raising a dialog for each (HIGH 2).
+///
+/// The commit gate is a veto on aborting — `daemon::watch_clients` skips the
+/// abort for a prompt that has claimed it — and it used to be claimed once per
+/// prompt, on the very first pinentry answer. From that moment the whole
+/// prompt was un-abortable: a client that vanished left the task unlocking
+/// every collection the user answered for, with no owner to receive the result
+/// and no handle left to stop it. Two fixes make this test pass: the gate is
+/// reset per collection (so it only ever covers one irreversible step), and
+/// `run()` re-checks `prompt_owners` at the top of every iteration.
+///
+/// Three locked collections, the owner disconnecting after the first dialog is
+/// answered. The fake pinentry logs one `GETPIN` per dialog, so the log is the
+/// record of how many were raised: it must never reach three.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_disconnect_stops_the_remaining_unlock_dialogs() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_DELAY".to_string(), "2".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    for id in ["second", "third"] {
+        secret_manager::vault::Vault::create(
+            &dir.join(format!("{id}.vault")),
+            id,
+            common::PASSWORD.as_bytes(),
+            secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+        )
+        .unwrap();
+    }
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (_, prompt) = service
+        .unlock(&[
+            fx.default_collection(),
+            paths::collection("second"),
+            paths::collection("third"),
+        ])
+        .await
+        .unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    proxy.prompt("").await.unwrap();
+
+    // The first dialog answers at ~2s (claiming the gate) and the second is
+    // raised straight after it.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        2,
+        "timing assumption: the first dialog is answered and the second raised by now:\n{}",
+        fx.pinentry_log()
+    );
+
+    // The owner vanishes, past the point where the gate was first claimed.
+    drop(proxy);
+    drop(service);
+    conn.close().await.unwrap();
+
+    // Long enough for the second dialog to have answered (2s) and a third to
+    // have been raised, had anything still been walking the list.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let log = fx.pinentry_log();
+    assert_eq!(
+        log.matches("GETPIN").count(),
+        2,
+        "a dialog was raised for a collection after the owner disconnected:\n{log}"
+    );
+    let st = fx.daemon.state.lock().await;
+    assert!(
+        st.collections["third"].is_locked(),
+        "an orphaned prompt unlocked a collection for nobody"
+    );
+    assert!(st.prompt_owners.is_empty());
+    assert!(st.prompt_tasks.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

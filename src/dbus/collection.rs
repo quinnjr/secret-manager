@@ -1,6 +1,7 @@
 //! `org.freedesktop.Secret.Collection`, served at `/collection/<id>` and `/aliases/<name>`.
 
 use super::errors::{Error, Result};
+use super::item::Item;
 use super::prompt::{Prompt, PromptAction};
 use super::registry;
 use super::require_sender;
@@ -13,6 +14,24 @@ use zbus::interface;
 use zbus::message::Header;
 use zbus::object_server::{ObjectServer, SignalEmitter};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+
+/// Upper bound on one item's decrypted secret, matching the control
+/// protocol's frame cap. Without it a single client could push a collection
+/// past the vault-level size limit — at which point the whole collection
+/// stops saving — with one `CreateItem` call.
+pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
+
+/// Upper bound on one `DeleteItems` batch, for the same reason as
+/// [`super::service::MAX_GET_SECRETS_ITEMS`]: every element costs a path
+/// resolution and a linear item lookup under the global state mutex.
+pub const MAX_DELETE_ITEMS: usize = 1024;
+
+/// Wire name of the private batch interface. Deliberately *not* under
+/// `org.freedesktop.Secret.*`: the freedesktop spec has no batch delete, and a
+/// libsecret client must keep seeing exactly the spec's methods on
+/// `org.freedesktop.Secret.Collection`. This is a separate interface on the
+/// same object, for this project's own CLI.
+pub const ADMIN_INTERFACE: &str = "org.secret_manager.Collection1";
 
 pub enum CollectionRef {
     Id(String),
@@ -84,7 +103,16 @@ impl Collection {
             prompt_path.clone(),
             PromptAction::DeleteCollection { id },
         );
-        server.at(prompt_path.clone(), prompt).await?;
+        // A failed export must not leave an owner entry counting against this
+        // client's prompt quota for a prompt that does not exist (LOW 3).
+        if let Err(e) = server.at(prompt_path.clone(), prompt).await {
+            self.state
+                .lock()
+                .await
+                .prompt_owners
+                .remove(prompt_path.as_str());
+            return Err(e.into());
+        }
         Ok(prompt_path)
     }
 
@@ -132,6 +160,11 @@ impl Collection {
                 .cipher(secret.session.as_str(), &require_sender(&header)?)?
                 .decrypt(&secret.parameters, &secret.value)
                 .map_err(Error::failed)?;
+            if plaintext.len() > MAX_ITEM_SECRET {
+                return Err(Error::invalid_args(format!(
+                    "secret is too large; at most {MAX_ITEM_SECRET} bytes per item"
+                )));
+            }
             // `id` was already validated by `self.id(&st)` above; missing
             // from `collections` here means it's a broken collection.
             let vault = st.collections.get_mut(&id).ok_or(Error::IsLocked)?;
@@ -240,4 +273,102 @@ impl Collection {
         emitter: &SignalEmitter<'_>,
         item: OwnedObjectPath,
     ) -> zbus::Result<()>;
+}
+
+/// A private, non-spec interface exported alongside
+/// `org.freedesktop.Secret.Collection` on the same object path.
+///
+/// It exists for one operation the freedesktop spec does not have: deleting a
+/// set of items atomically. The CLI's `sm delete` / `sm ssh remove` used to
+/// issue N separate `Item.Delete` calls, each of which rewrites the vault
+/// file; if the collection locked or the daemon died part-way through, the
+/// user was left with a half-deleted set and a secret that still existed.
+pub struct CollectionAdmin {
+    state: Shared,
+    target: CollectionRef,
+}
+
+impl CollectionAdmin {
+    pub fn new(state: Shared, target: CollectionRef) -> Self {
+        Self { state, target }
+    }
+
+    fn id(&self, st: &ServiceState) -> Result<String> {
+        match &self.target {
+            CollectionRef::Id(id) => (st.collections.contains_key(id)
+                || st.broken.contains_key(id))
+            .then(|| id.clone())
+            .ok_or(Error::NoSuchObject),
+            CollectionRef::Alias(name) => st.alias_target(name).ok_or(Error::NoSuchObject),
+        }
+    }
+}
+
+#[interface(name = "org.secret_manager.Collection1")]
+impl CollectionAdmin {
+    /// Delete every item in `items`, or none of them.
+    ///
+    /// Every path is resolved and checked to belong to *this* collection
+    /// before anything is removed, so one bogus or foreign path refuses the
+    /// whole call with the vault untouched and its file unwritten. The removal
+    /// itself is a single `Vault::delete_items`, which is one `retain` plus one
+    /// save with in-memory rollback on write failure.
+    ///
+    /// The critical section is one short acquisition of the state mutex with
+    /// no `.await` inside it and no key derivation — the vault is already
+    /// unlocked, so a delete needs none — as `CLAUDE.md` requires. The
+    /// `ItemDeleted` signals and the object unexports happen after the save
+    /// has succeeded, for the whole batch at once; a failed save emits
+    /// nothing.
+    async fn delete_items(
+        &self,
+        items: Vec<OwnedObjectPath>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> Result<()> {
+        if items.len() > MAX_DELETE_ITEMS {
+            return Err(Error::invalid_args(format!(
+                "too many items; at most {MAX_DELETE_ITEMS} per call"
+            )));
+        }
+        let (id, item_ids) = {
+            let mut st = self.state.lock().await;
+            let id = self.id(&st)?;
+            // Validate the whole batch first, against an immutable borrow.
+            let mut item_ids: Vec<String> = Vec::with_capacity(items.len());
+            for path in &items {
+                let (cid, iid) = st.resolve_item(path.as_str()).ok_or(Error::NoSuchObject)?;
+                if cid != id {
+                    return Err(Error::invalid_args(
+                        "every item must belong to this collection",
+                    ));
+                }
+                if !item_ids.contains(&iid) {
+                    item_ids.push(iid);
+                }
+            }
+            if item_ids.is_empty() {
+                return Ok(());
+            }
+            // Not in `collections` despite `id()` having validated it: a
+            // broken collection, which is always reported locked.
+            let vault = st.collections.get_mut(&id).ok_or(Error::IsLocked)?;
+            vault.delete_items(&item_ids)?;
+            st.touch();
+            (id, item_ids)
+        };
+        // Past this point the file on disk no longer has any of them.
+        let conn2 = conn.clone();
+        let (id2, ids2) = (id.clone(), item_ids.clone());
+        tokio::spawn(async move {
+            let server = conn2.object_server();
+            for iid in &ids2 {
+                let _ = server.remove::<Item, _>(paths::item(&id2, iid)).await;
+            }
+        });
+        let emitter = SignalEmitter::new(conn, paths::collection(&id))?;
+        for iid in &item_ids {
+            emitter.item_deleted(paths::item(&id, iid)).await?;
+        }
+        Ok(())
+    }
 }

@@ -61,6 +61,10 @@ pub struct Vault {
     /// `index_attributes`, so the condition is reportable rather than only
     /// logged once. Cleared by a successful rescrub.
     index_warning: Option<String>,
+    /// Largest file this vault may write, normally
+    /// [`format::MAX_VAULT_BYTES`]. Overridable only in tests, so the
+    /// refusal can be exercised without building a quarter-gigabyte vault.
+    size_limit: u64,
 }
 
 impl std::fmt::Debug for Vault {
@@ -75,43 +79,38 @@ impl std::fmt::Debug for Vault {
 }
 
 impl Vault {
+    /// Create a new collection at `path`, failing with
+    /// [`VaultError::AlreadyExists`] if one is already there.
+    ///
+    /// The whole vault is built in a temp file and published with
+    /// `RENAME_NOREPLACE`, which both resolves the race between two concurrent
+    /// `sm init work` runs (exactly one rename can win) and leaves `path` with
+    /// no observable intermediate state.
+    ///
+    /// The previous design reserved `path` with an empty `O_EXCL` file and
+    /// held that reservation across the 100-500 ms Argon2 derivation and the
+    /// save. That window is not survivable: a SIGINT, SIGTERM, OOM kill or
+    /// power loss inside it runs no cleanup code and strands a zero-length
+    /// `<id>.vault`, which `open` reports as `Truncated`, `load_vaults` files
+    /// under `broken`, and this function then refuses as `AlreadyExists` -
+    /// permanently, since no command removes it. Nothing reserves anything
+    /// now, and a zero-length file left by an older build is treated as
+    /// absent rather than as a collection.
     pub fn create(
         path: &Path,
         label: &str,
         password: &[u8],
         kdf: KdfParams,
     ) -> Result<Vault, VaultError> {
-        // Reserve the name *before* deriving the key. A plain `exists()`
-        // check is separated from the rename that publishes the file by
-        // 100-500 ms of Argon2, so two concurrent `sm init work` runs both
-        // pass it, both derive, and the loser's collection is silently
-        // replaced by the winner's empty one. `O_EXCL` makes the first
-        // publish exclusive; `write_atomic`'s rename then legitimately
-        // replaces our own reservation.
         ensure_vault_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(VaultError::AlreadyExists(path.to_path_buf()));
-            }
-            Err(e) => return Err(io_err(path, e)),
-        }
-        let created = Self::fill_reservation(path, label, password, kdf);
-        if created.is_err() {
-            // Never leave an empty reservation standing in for a vault:
-            // it would fail to decode and block every later create.
-            let _ = std::fs::remove_file(path);
-        }
-        created
+        let mut vault = Self::build(path, label, password, kdf)?;
+        vault.save_with(publish_new)?;
+        Ok(vault)
     }
 
-    /// The body of [`Vault::create`], run with `path` already reserved.
-    fn fill_reservation(
+    /// A new, unlocked, empty vault in memory. Touches no file, so a failure
+    /// here (an unavailable RNG, an out-of-range KDF) leaves nothing behind.
+    fn build(
         path: &Path,
         label: &str,
         password: &[u8],
@@ -132,7 +131,7 @@ impl Vault {
             nonce: [0u8; NONCE_LEN],
             index: Vec::new(),
         };
-        let mut vault = Vault {
+        let vault = Vault {
             path: path.to_path_buf(),
             header,
             aad: Vec::new(),
@@ -143,8 +142,8 @@ impl Vault {
             },
             index_attributes: true,
             index_warning: None,
+            size_limit: format::MAX_VAULT_BYTES,
         };
-        vault.save()?;
         Ok(vault)
     }
 
@@ -165,6 +164,7 @@ impl Vault {
             state: State::Locked,
             index_attributes: true,
             index_warning: None,
+            size_limit: format::MAX_VAULT_BYTES,
         })
     }
 
@@ -182,6 +182,12 @@ impl Vault {
     pub fn set_index_attributes(&mut self, enabled: bool) {
         self.index_attributes = enabled;
     }
+    /// Shrink the size ceiling so the refusal path can be tested cheaply.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_size_limit_for_tests(&mut self, limit: u64) {
+        self.size_limit = limit;
+    }
+
     /// True when the on-disk index carries attribute hashes for any item.
     pub fn index_has_attributes(&self) -> bool {
         self.header.index.iter().any(|e| !e.attr_hashes.is_empty())
@@ -476,6 +482,33 @@ impl Vault {
         self.save_or_restore(items_before, Self::restore_items)
     }
 
+    /// Delete several items in a single save: either every id in `ids` is gone
+    /// from the file, or none of them is.
+    ///
+    /// Every id is checked *before* anything is removed, so an unknown one is
+    /// refused with the vault untouched and unwritten. The removal itself is
+    /// one `retain` followed by one `save_or_restore`, so a failed write rolls
+    /// the whole batch back in memory exactly as `delete_item` rolls back one.
+    /// Duplicate ids are harmless.
+    ///
+    /// An empty batch is a no-op and does not rewrite the file.
+    pub fn delete_items(&mut self, ids: &[String]) -> Result<(), VaultError> {
+        let items_before = self.items()?.to_vec();
+        for id in ids {
+            if !items_before.iter().any(|i| &i.id == id) {
+                return Err(VaultError::NoSuchItem(id.clone()));
+            }
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        {
+            let items = self.items_mut()?;
+            items.retain(|i| !ids.contains(&i.id));
+        }
+        self.save_or_restore(items_before, Self::restore_items)
+    }
+
     pub fn set_label(&mut self, label: &str) -> Result<(), VaultError> {
         self.items_mut()?;
         let old_label = self.header.label.clone();
@@ -527,6 +560,21 @@ impl Vault {
         // file would still apply to the new one. Drawn before anything is
         // mutated so an unavailable RNG needs no rollback.
         let new_index_salt = crypto::try_random_bytes::<SALT_LEN>()?;
+        // A temp file left by an interrupted save is a complete copy of this
+        // vault under the *old* key, and rotating the master password is
+        // exactly the operation that is supposed to revoke the old key.
+        // Waiting for `STALE_TEMP_AGE` here would leave a working copy of the
+        // pre-rotation vault sitting next to the rotated one, so the sweep
+        // runs with no age threshold - shape matching only. It runs twice:
+        // once before the rotation is written, and once after it succeeds, to
+        // catch anything that appeared in between.
+        //
+        // The zero threshold can unlink a temp belonging to a save running
+        // *right now* in another process, which makes that save's rename fail
+        // with ENOENT. That save then rolls back and reports an error, which
+        // is the acceptable side of the trade: the alternative is a silently
+        // un-revoked copy of the old vault.
+        self.sweep_dir_now();
         let was_locked = self.is_locked();
         if was_locked {
             self.unlock_with_key(old_key)?;
@@ -552,11 +600,23 @@ impl Vault {
             if let State::Unlocked { key: k, .. } = &mut self.state {
                 *k = old_key.clone();
             }
+        } else {
+            // The rotation is on disk; nothing shaped like a temp file next to
+            // it may still open under the old key.
+            self.sweep_dir_now();
         }
         if was_locked {
             self.lock();
         }
         result
+    }
+
+    /// Remove every `write_atomic`-shaped temp file beside this vault, with no
+    /// age threshold. See the call sites in [`Vault::change_key`].
+    fn sweep_dir_now(&self) {
+        if let Some(dir) = self.path.parent() {
+            sweep_temp_files(dir, Duration::ZERO);
+        }
     }
 
     pub fn delete_file(self) -> Result<(), VaultError> {
@@ -568,6 +628,17 @@ impl Vault {
     }
 
     fn save(&mut self) -> Result<(), VaultError> {
+        self.save_with(write_atomic)
+    }
+
+    /// [`Vault::save`], with the step that publishes the finished bytes at
+    /// `self.path` left to the caller: an ordinary save renames over whatever
+    /// is there, while [`Vault::create`] must refuse to replace an existing
+    /// file (see [`publish_new`]).
+    fn save_with(
+        &mut self,
+        publish: impl FnOnce(&Path, &[u8]) -> Result<(), VaultError>,
+    ) -> Result<(), VaultError> {
         let State::Unlocked { key, items } = &self.state else {
             return Err(VaultError::Locked);
         };
@@ -606,9 +677,22 @@ impl Vault {
                 return Err(e.into());
             }
         };
-        let mut bytes = aad.clone();
+        let mut bytes = Vec::with_capacity(aad.len() + ciphertext.len());
+        bytes.extend_from_slice(&aad);
         bytes.extend_from_slice(&ciphertext);
-        if let Err(e) = write_atomic(&self.path, &bytes) {
+        // Bound the whole file, not just the header. `open` refuses anything
+        // over `MAX_VAULT_BYTES`, so without this a collection can be grown
+        // past the limit one item at a time: every save succeeds, the daemon
+        // keeps serving from memory, and at the next restart `load_vaults`
+        // files the collection under `broken` with every secret in it
+        // unreachable - and the rename has already replaced the last good
+        // copy by then. Refusing here routes through the same header rollback
+        // as the other failure arms.
+        if let Err(e) = format::check_vault_size_against(bytes.len() as u64, self.size_limit) {
+            self.header = saved_header;
+            return Err(e.into());
+        }
+        if let Err(e) = publish(&self.path, &bytes) {
             self.header = saved_header;
             return Err(e);
         }
@@ -624,11 +708,15 @@ impl Vault {
 pub const STALE_TEMP_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// True for a name `write_atomic` could actually have produced:
-/// `<file name>.<16 lowercase hex digits>.tmp`.
+/// `<something>.vault.<16 lowercase hex digits>.tmp`.
 ///
 /// The shape check is the whole point. Matching on "contains `.vault.` and
 /// ends with `.tmp`" also matches a user's own `backup.vault.2026-09.tmp`,
-/// and the sweep deletes unconditionally.
+/// and the sweep deletes unconditionally. Two narrower traps mattered just as
+/// much: `is_ascii_hexdigit` accepts uppercase, which `{b:02x}` never emits,
+/// so `notes.0123456789ABCDEF.tmp` was eaten; and leaving the stem
+/// unconstrained let `receipts.2024.deadbeefdeadbeef.tmp` through. The stem a
+/// real temp file carries is a vault file name, so require that.
 fn is_write_atomic_temp_name(name: &str) -> bool {
     let Some(rest) = name.strip_suffix(".tmp") else {
         return false;
@@ -636,7 +724,14 @@ fn is_write_atomic_temp_name(name: &str) -> bool {
     let Some((stem, hex)) = rest.rsplit_once('.') else {
         return false;
     };
-    !stem.is_empty() && hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    let vault_stem = stem
+        .strip_suffix(".vault")
+        .is_some_and(|base| !base.is_empty());
+    let lower_hex = hex.len() == 16
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    vault_stem && lower_hex
 }
 
 /// Remove `<name>.<16 hex>.tmp` files left behind by a save that was
@@ -650,6 +745,14 @@ fn is_write_atomic_temp_name(name: &str) -> bool {
 /// `delete_file`, concurrently with saves in other processes, and unlinking
 /// a live temp file mid-write makes that save's rename fail with ENOENT.
 pub fn sweep_stale_temp_files(dir: &Path) -> usize {
+    sweep_temp_files(dir, STALE_TEMP_AGE)
+}
+
+/// [`sweep_stale_temp_files`] with the age threshold chosen by the caller.
+/// `Duration::ZERO` removes every temp-shaped file regardless of age, which
+/// [`Vault::change_key`] needs: a leftover is a copy of the vault under the
+/// key being revoked, so it cannot be left for five minutes.
+fn sweep_temp_files(dir: &Path, min_age: Duration) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -667,12 +770,19 @@ pub fn sweep_stale_temp_files(dir: &Path) -> usize {
         if !meta.is_file() {
             continue;
         }
-        // A future mtime yields Err here and is treated as "not yet stale".
-        let stale = meta
-            .modified()
-            .ok()
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age >= STALE_TEMP_AGE);
+        // A timestamp in the future makes `duration_since` fail. Reading that
+        // as "not yet stale" is a permanent evasion: one `touch -d` in the
+        // future and the file survives every sweep for good. Treat an
+        // unreadable or nonsensical timestamp as stale instead - the shape
+        // match has already established that only `write_atomic` produces
+        // this name.
+        let stale = match meta.modified() {
+            Ok(m) => match now.duration_since(m) {
+                Ok(age) => age >= min_age,
+                Err(_) => true,
+            },
+            Err(_) => true,
+        };
         if stale && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
@@ -697,9 +807,9 @@ fn ensure_vault_dir(dir: &Path) -> Result<(), VaultError> {
 }
 
 /// Write to a fresh `<path>.<random>.tmp` (`O_CREAT|O_EXCL`, so a planted
-/// file or symlink at a guessable name is never followed), fsync, rename over
-/// `path`, fsync the directory.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+/// file or symlink at a guessable name is never followed), fsync, and return
+/// the temp path for the caller to publish.
+fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, VaultError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     ensure_vault_dir(dir)?;
     let stem = path
@@ -729,14 +839,155 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    Ok(tmp)
+}
+
+fn sync_dir(path: &Path) {
+    if let Ok(d) = File::open(path.parent().unwrap_or_else(|| Path::new("."))) {
+        let _ = d.sync_all();
+    }
+}
+
+/// [`write_temp`], then rename over `path` and fsync the directory. Replaces
+/// whatever is at `path`, which is what an update of an existing vault wants.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    let tmp = write_temp(path, bytes)?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(io_err(path, e));
     }
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
-    }
+    sync_dir(path);
     Ok(())
+}
+
+/// `renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE)`: rename that
+/// fails with `EEXIST` rather than replacing `to`.
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let from_c = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let to_c = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `from_c` and `to_c` are NUL-terminated C strings that outlive
+    // the call; `renameat2` reads them and retains neither. `AT_FDCWD` is a
+    // valid dirfd value for both path arguments, and `RENAME_NOREPLACE` is a
+    // valid flag. The raw `syscall` is used rather than the glibc wrapper,
+    // which only exists from glibc 2.28 and is absent on some libcs; an
+    // unsupported kernel or filesystem reports `ENOSYS`/`EINVAL` and is
+    // handled by the caller.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from_c.as_ptr(),
+            libc::AT_FDCWD,
+            to_c.as_ptr(),
+            libc::RENAME_NOREPLACE as libc::c_uint,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// True for a path that is present but zero bytes long.
+///
+/// A zero-length file is never a valid vault - `decode` needs eight bytes of
+/// magic - so it is a dead reservation from an interrupted create by an older
+/// build, not a collection. Treating it as one blocks the name forever.
+fn is_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0)
+}
+
+/// Publish `bytes` at `path` as a *new* file: exactly one concurrent caller
+/// can win, and an existing collection is never renamed over.
+///
+/// `RENAME_NOREPLACE` is the whole mechanism. Unlike an `O_EXCL` reservation
+/// held across the key derivation, it makes the name appear already complete,
+/// so a signal or power loss at any point leaves either nothing or a finished
+/// vault - never a zero-length file that blocks the name.
+fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    let tmp = write_temp(path, bytes)?;
+    let finish = |r: Result<(), VaultError>| {
+        if r.is_ok() {
+            sync_dir(path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        r
+    };
+    let exists = || VaultError::AlreadyExists(path.to_path_buf());
+
+    match rename_noreplace(&tmp, path) {
+        Ok(()) => finish(Ok(())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Reclaim a dead zero-length reservation left by an older build,
+            // then try once more. The unlink and the retry are not one atomic
+            // step, so two creates racing over a *pre-existing* empty file can
+            // still both win; nothing produces such a file any more, and the
+            // alternative is a collection name that is blocked for good.
+            if is_empty_file(path) && std::fs::remove_file(path).is_ok() {
+                return finish(rename_noreplace(&tmp, path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        exists()
+                    } else {
+                        io_err(path, e)
+                    }
+                }));
+            }
+            finish(Err(exists()))
+        }
+        // No `renameat2` (pre-3.15 kernel) or a filesystem that rejects the
+        // flag. Fall back to claiming the name with an `O_EXCL` create and
+        // renaming our finished file over that reservation. The window in
+        // which `path` is zero bytes is now microseconds rather than a whole
+        // Argon2 derivation, and the reclaim above covers what it can still
+        // leave behind.
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOSYS)
+                    | Some(libc::EINVAL)
+                    | Some(libc::EOPNOTSUPP)
+                    | Some(libc::EPERM)
+            ) =>
+        {
+            finish(publish_new_via_reservation(&tmp, path))
+        }
+        Err(e) => finish(Err(io_err(path, e))),
+    }
+}
+
+/// The `publish_new` fallback for kernels and filesystems without
+/// `RENAME_NOREPLACE`.
+fn publish_new_via_reservation(tmp: &Path, path: &Path) -> Result<(), VaultError> {
+    let reserve = || {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    match reserve() {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !(is_empty_file(path) && std::fs::remove_file(path).is_ok() && reserve().is_ok()) {
+                return Err(VaultError::AlreadyExists(path.to_path_buf()));
+            }
+        }
+        Err(e) => return Err(io_err(path, e)),
+    }
+    match std::fs::rename(tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Never leave the empty reservation standing in for a vault.
+            let _ = std::fs::remove_file(path);
+            Err(io_err(path, e))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -783,6 +1034,14 @@ mod tests {
     fn backdate(path: &Path, ago: Duration) {
         let f = File::options().write(true).open(path).unwrap();
         f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - ago))
+            .unwrap();
+    }
+
+    /// Move a file's mtime into the future. `duration_since` then fails, which
+    /// must not be read as "not yet stale".
+    fn postdate(path: &Path, ahead: Duration) {
+        let f = File::options().write(true).open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() + ahead))
             .unwrap();
     }
 
@@ -1149,6 +1408,50 @@ mod tests {
         assert_eq!(v.search(&attrs(&[("app", "git")])).unwrap().len(), 1);
     }
 
+    /// `delete_items` is all-or-nothing: an unknown id refuses the batch with
+    /// nothing removed and nothing written, and a batch whose save fails rolls
+    /// the whole in-memory set back, exactly as `delete_item` does for one.
+    #[test]
+    fn delete_items_is_atomic() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let ids: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|n| {
+                v.insert_item(n, BTreeMap::new(), b"s".to_vec(), "text/plain", false)
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        let before = std::fs::read(&path).unwrap();
+
+        // One unknown id refuses the whole batch, untouched and unwritten.
+        let err = v
+            .delete_items(&[ids[0].clone(), "nope".into(), ids[2].clone()])
+            .unwrap_err();
+        assert!(matches!(err, VaultError::NoSuchItem(_)), "{err}");
+        assert_eq!(v.item_ids(), ids);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "vault was rewritten");
+
+        // An empty batch is a no-op and does not rewrite the file either.
+        v.delete_items(&[]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // A save that cannot be written rolls the whole batch back in memory.
+        let block = block_writes(&path);
+        assert!(v.delete_items(&[ids[0].clone(), ids[1].clone()]).is_err());
+        assert_eq!(v.item_ids(), ids, "a failed save must roll the batch back");
+        unblock(block);
+
+        // The happy path: one save, all of them gone, duplicates harmless.
+        v.delete_items(&[ids[0].clone(), ids[1].clone(), ids[0].clone()])
+            .unwrap();
+        assert_eq!(v.item_ids(), vec![ids[2].clone()]);
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        assert_eq!(reopened.item_ids(), vec![ids[2].clone()]);
+    }
+
     /// A collection whose items carry no attributes produces an index with
     /// no hashes under either policy, so it must not be re-sealed on every
     /// single unlock (an unbounded write amplification on the hot path).
@@ -1340,25 +1643,140 @@ mod tests {
         assert!(!v.is_locked());
     }
 
-    /// `create` must reserve its name before the 100-500 ms key derivation.
-    /// A second create racing the first sees the reservation - an existing
-    /// but not yet written file - and must lose there, rather than deriving
-    /// its own key and having `write_atomic` rename over the winner.
+    /// `create` publishes with `RENAME_NOREPLACE`, so an existing collection
+    /// is never renamed over: the second create must lose at the publish and
+    /// leave the first one's bytes exactly as they were.
     #[test]
-    fn create_loses_against_a_reserved_but_unwritten_path() {
+    fn create_loses_against_an_existing_vault() {
         let (_d, path) = tmp();
-        // Exactly what the losing racer sees: the winner's empty O_EXCL
-        // reservation, before its `save` has published anything.
-        std::fs::write(&path, b"").unwrap();
+        Vault::create(&path, "first", b"pw", FAST).unwrap();
+        let before = std::fs::read(&path).unwrap();
         assert!(matches!(
-            Vault::create(&path, "x", b"pw", FAST),
+            Vault::create(&path, "second", b"pw", FAST),
             Err(VaultError::AlreadyExists(_))
         ));
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"",
-            "reservation overwritten"
+        assert_eq!(std::fs::read(&path).unwrap(), before, "existing vault lost");
+        assert_eq!(Vault::open(&path).unwrap().label(), "first");
+    }
+
+    /// An interrupted `create` used to leave a zero-length reservation, which
+    /// `open` reports as `Truncated`, `load_vaults` files under `broken`, and
+    /// `create` refuses as `AlreadyExists` - permanently, with no command that
+    /// removes it. A zero-length file is never a valid vault, so `create`
+    /// claims the name instead of being blocked by it.
+    #[test]
+    fn a_zero_length_vault_file_does_not_block_a_later_create() {
+        let (_d, path) = tmp();
+        std::fs::write(&path, b"").unwrap();
+        assert!(matches!(
+            Vault::open(&path),
+            Err(VaultError::Format(FormatError::Truncated))
+        ));
+        let v = Vault::create(&path, "recovered", b"pw", FAST).unwrap();
+        assert_eq!(v.label(), "recovered");
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        let mut again = Vault::open(&path).unwrap();
+        again.unlock(b"pw").unwrap();
+        assert_eq!(again.label(), "recovered");
+    }
+
+    /// `save` must bound the whole file, not just the header. `open` refuses a
+    /// file over `MAX_VAULT_BYTES`, so a save that produces one writes a
+    /// collection that works until the next restart and is then unreachable
+    /// for good - over the top of the last good copy.
+    #[test]
+    fn save_refuses_an_oversized_file_and_keeps_the_old_one() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.insert_item(
+            "small",
+            attrs(&[("a", "1")]),
+            b"keep".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // Exercise the ceiling rather than materialise it: building a real
+        // 256 MiB vault cost 42 s of every test run and proved nothing the
+        // injected limit does not.
+        v.set_size_limit_for_tests(before.len() as u64 + 64);
+        let err = v
+            .insert_item(
+                "over",
+                attrs(&[("a", "2")]),
+                vec![0u8; 4096],
+                "application/octet-stream",
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, VaultError::Format(FormatError::VaultTooLarge(_))),
+            "{err:?}"
         );
+        assert_eq!(std::fs::read(&path).unwrap(), before, "old file replaced");
+        assert_eq!(v.items().unwrap().len(), 1, "item list not rolled back");
+
+        // The rollback left header, aad and ciphertext consistent, so the
+        // vault still works in memory and from disk.
+        assert_eq!(v.item_ids().len(), 1);
+        v.lock();
+        v.unlock(b"pw").unwrap();
+        assert_eq!(v.items().unwrap()[0].secret.as_slice(), b"keep");
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        assert_eq!(reopened.items().unwrap().len(), 1);
+
+        // With the real ceiling restored the same insert succeeds, so the
+        // refusal was the limit and nothing else.
+        v.set_size_limit_for_tests(format::MAX_VAULT_BYTES);
+        v.insert_item(
+            "over",
+            attrs(&[("a", "2")]),
+            vec![0u8; 4096],
+            "application/octet-stream",
+            false,
+        )
+        .unwrap();
+        assert_eq!(v.items().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn change_key_removes_leftover_copies_under_the_old_key() {
+        let (d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"old", FAST).unwrap();
+        v.insert_item(
+            "x",
+            attrs(&[("a", "b")]),
+            b"s".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+        let leftover = d.path().join("default.vault.00112233445566aa.tmp");
+        std::fs::copy(&path, &leftover).unwrap();
+        assert!(
+            Vault::open(&leftover)
+                .unwrap()
+                .verify_password(b"old")
+                .unwrap(),
+            "fixture is not a working copy under the old password"
+        );
+
+        let old_key = crypto::derive_key(b"old", v.salt(), v.kdf()).unwrap();
+        let new_salt = crypto::random_bytes::<SALT_LEN>();
+        let new_key = crypto::derive_key(b"new", &new_salt, FAST).unwrap();
+        v.change_key(&old_key, &new_salt, FAST, &new_key).unwrap();
+
+        assert!(
+            !leftover.exists(),
+            "a leftover temp still decrypts under the old password after a rotation"
+        );
+        assert!(path.exists());
+        let mut again = Vault::open(&path).unwrap();
+        again.unlock(b"new").unwrap();
+        assert_eq!(again.items().unwrap()[0].secret.as_slice(), b"s");
     }
 
     /// The defect this guards against is not the existence check itself but
@@ -1415,11 +1833,19 @@ mod tests {
         v.unlock(b"pw").unwrap();
     }
 
-    /// A create that fails after reserving must not leave the empty
-    /// reservation behind: it decodes as nothing and would block every
-    /// later create of that collection forever.
+    /// A create that fails must leave nothing behind at `path`: a partial or
+    /// empty file there decodes as nothing and would block every later create
+    /// of that collection.
+    ///
+    /// This covers the *graceful* failure path only - an `Err` returned from
+    /// inside `create`. The path that actually stranded files was a SIGINT,
+    /// SIGTERM, OOM kill or power loss mid-create, where no Rust cleanup code
+    /// runs at all; that one is addressed structurally (the vault is built in
+    /// a temp file and published with `RENAME_NOREPLACE`, so `path` has no
+    /// observable intermediate state) and is covered by
+    /// `a_zero_length_vault_file_does_not_block_a_later_create`.
     #[test]
-    fn failed_create_removes_its_reservation() {
+    fn failed_create_leaves_nothing_at_the_path() {
         let (_d, path) = tmp();
         let bad = KdfParams {
             m_cost_kib: u32::MAX,
@@ -1561,16 +1987,33 @@ mod tests {
         let short_hex = d.path().join("default.vault.00112233.tmp");
         std::fs::write(&short_hex, b"mine too").unwrap();
         backdate(&short_hex, STALE_TEMP_AGE * 2);
+        // `write_atomic` formats with `{b:02x}`, so it never produces an
+        // uppercase name; a user's own file may well be uppercase.
+        let upper_hex = d.path().join("notes.0123456789ABCDEF.tmp");
+        std::fs::write(&upper_hex, b"mine three").unwrap();
+        backdate(&upper_hex, STALE_TEMP_AGE * 2);
+        // Right hex shape, but the stem is not a vault file name.
+        let not_a_vault = d.path().join("receipts.2024.deadbeefdeadbeef.tmp");
+        std::fs::write(&not_a_vault, b"mine four").unwrap();
+        backdate(&not_a_vault, STALE_TEMP_AGE * 2);
         // A genuine leftover from an interrupted save.
         let stale = d.path().join("default.vault.0123456789abcdef.tmp");
         std::fs::write(&stale, b"leftover").unwrap();
         backdate(&stale, STALE_TEMP_AGE * 2);
+        // A leftover whose mtime is in the future: `duration_since` fails, and
+        // reading that as "not yet stale" lets it evade every future sweep.
+        let future = d.path().join("default.vault.ffffffffffffffff.tmp");
+        std::fs::write(&future, b"leftover too").unwrap();
+        postdate(&future, STALE_TEMP_AGE * 100);
 
-        assert_eq!(sweep_stale_temp_files(d.path()), 1);
+        assert_eq!(sweep_stale_temp_files(d.path()), 2);
         assert!(!stale.exists(), "genuine stale temp file kept");
+        assert!(!future.exists(), "a future mtime evades the sweep forever");
         assert!(live.exists(), "live temp file unlinked mid-write");
         assert!(unrelated.exists(), "unrelated user file deleted");
         assert!(short_hex.exists(), "wrong-shaped name deleted");
+        assert!(upper_hex.exists(), "uppercase-hex user file deleted");
+        assert!(not_a_vault.exists(), "non-vault stem deleted");
         assert!(path.exists());
     }
 

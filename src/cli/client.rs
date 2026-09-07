@@ -1,7 +1,9 @@
 //! Secret Service client used by the CLI: session setup, prompts, item helpers.
 
 use super::CliError;
-use crate::dbus::proxies::{CollectionProxy, ItemProxy, PromptProxy, ServiceProxy};
+use crate::dbus::proxies::{
+    CollectionAdminProxy, CollectionProxy, ItemProxy, PromptProxy, ServiceProxy,
+};
 use crate::dbus::session::SecretStruct;
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
@@ -269,6 +271,43 @@ impl Client {
             .await
             .map(|_| ())
             .map_err(map_zbus)
+    }
+
+    /// Delete every item in `items` from `collection` in one atomic call, via
+    /// the daemon's private batch interface (see
+    /// `dbus::collection::CollectionAdmin`): either all of them are gone from
+    /// the vault file or none is, where N separate `Item.Delete` calls could
+    /// leave the set half-deleted.
+    ///
+    /// `Ok(false)` means this daemon does not export the batch interface at
+    /// all (an older build), and the caller should fall back to deleting one
+    /// at a time. Every other failure is reported as an error, and on the
+    /// batch path a failure means nothing was deleted.
+    pub async fn delete_items(
+        &self,
+        collection: &OwnedObjectPath,
+        items: &[OwnedObjectPath],
+    ) -> Result<bool, CliError> {
+        let proxy = CollectionAdminProxy::builder(&self.conn)
+            .path(collection.clone())
+            .map_err(map_zbus)?
+            .build()
+            .await
+            .map_err(map_zbus)?;
+        match proxy.delete_items(items).await {
+            Ok(()) => Ok(true),
+            Err(zbus::Error::MethodError(name, _, _))
+                if matches!(
+                    name.as_str(),
+                    "org.freedesktop.DBus.Error.UnknownInterface"
+                        | "org.freedesktop.DBus.Error.UnknownMethod"
+                        | "org.freedesktop.DBus.Error.UnknownObject"
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(map_zbus(e)),
+        }
     }
 
     /// Every item path in every collection.

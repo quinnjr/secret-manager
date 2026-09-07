@@ -20,6 +20,13 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 /// Connections served at once; the rest wait in the listen backlog.
 pub const MAX_CONNECTIONS: usize = 16;
 
+/// Ceiling on one request's processing, separate from (and much larger than)
+/// [`CONNECTION_TIMEOUT`]. A key rotation re-seals and fsyncs a whole vault,
+/// so the handler must not share the I/O deadline — but without any bound a
+/// peer could pin all [`MAX_CONNECTIONS`] slots indefinitely and deny the
+/// PAM module its login unlock.
+pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct ControlServer {
     listener: UnixListener,
     path: PathBuf,
@@ -42,6 +49,16 @@ impl ControlServer {
             .ok_or_else(|| std::io::Error::other("socket path has no parent"))?;
         tokio::fs::create_dir_all(dir).await?;
         tokio::fs::set_permissions(dir, Permissions::from_mode(0o700)).await?;
+        // Replace a stale socket, but never one a running daemon is still
+        // serving: unlinking that would leave the first daemon listening on a
+        // socket with no name, and every client (and the PAM module) seeing
+        // ENOENT.
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("another daemon is already serving {}", path.display()),
+            ));
+        }
         match tokio::fs::remove_file(path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -155,7 +172,10 @@ async fn handle_connection(
         .await
         .map_err(|_| std::io::Error::other("peer sent no request in time"))??;
     let response = match decode_frame::<Request>(&body) {
-        Ok(req) => handler(req).await,
+        Ok(req) => match tokio::time::timeout(HANDLER_TIMEOUT, handler(req)).await {
+            Ok(response) => response,
+            Err(_) => Response::Error("the daemon took too long to answer".into()),
+        },
         Err(e) => Response::Error(format!("malformed request: {e}")),
     };
     // A response too large to frame must still be diagnosable: send an error

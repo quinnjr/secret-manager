@@ -71,13 +71,22 @@ pub fn is_cancel(code: u32) -> bool {
     code & 0xFFFF == 99
 }
 
+/// Assuan-escape a string for use as a command argument.
+///
+/// `%` must be escaped because it introduces an escape, and every byte below
+/// `0x20` plus `0x7f` because they are not representable on an Assuan line —
+/// a raw newline ends the line and injects a further command, and the rest
+/// reach the dialog as terminal control sequences. `askpass` puts a fully
+/// attacker-controlled string into a description, so the whole C0 range is
+/// escaped rather than just `\n` and `\r` (LOW 1).
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
             '%' => out.push_str("%25"),
-            '\n' => out.push_str("%0A"),
-            '\r' => out.push_str("%0D"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                out.push_str(&format!("%{:02X}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -136,7 +145,16 @@ impl Pinentry {
     /// is abandoned — the child is dropped, which kills it — and reported as
     /// a cancellation, so one unanswered dialog cannot wedge the daemon.
     pub async fn ask(&self, req: &PinRequest) -> Result<PinOutcome, PinentryError> {
-        let _one_at_a_time = self.dialog.lock().await;
+        // The wait for the shared dialog lock is bounded by the same timeout
+        // as the dialog itself. Acquiring it outside the timeout meant a
+        // client that raised a dialog and never answered blocked every other
+        // unlock in the daemon for the full timeout with no deadline of their
+        // own, and repeating that indefinitely blocked them forever (HIGH 3).
+        let Ok(_one_at_a_time) = tokio::time::timeout(self.timeout, self.dialog.lock()).await
+        else {
+            tracing::warn!("timed out waiting for the pinentry dialog lock; giving up");
+            return Ok(PinOutcome::Cancelled);
+        };
         let work = async {
             let mut conn = self.connect().await?;
             conn.setup(req).await?;
@@ -162,7 +180,12 @@ impl Pinentry {
 
     /// Yes/no question. Cancel, a timeout, or any pinentry error means "no".
     pub async fn confirm(&self, req: &PinRequest) -> Result<bool, PinentryError> {
-        let _one_at_a_time = self.dialog.lock().await;
+        // Bounded like `ask`'s (HIGH 3).
+        let Ok(_one_at_a_time) = tokio::time::timeout(self.timeout, self.dialog.lock()).await
+        else {
+            tracing::warn!("timed out waiting for the pinentry dialog lock; refusing");
+            return Ok(false);
+        };
         let work = async {
             let mut conn = self.connect().await?;
             conn.setup(req).await?;
@@ -345,7 +368,11 @@ impl Assuan {
 
     async fn getpin(&mut self) -> Result<Zeroizing<String>, PinentryError> {
         self.send("GETPIN").await?;
-        let mut pin = Zeroizing::new(String::new());
+        // Pre-allocated for the same reason as `read_reply`'s buffer: a
+        // pinentry that splits its answer over several `D` lines would
+        // otherwise grow this `String`, leaving unwiped prefix copies of the
+        // PIN behind in freed heap (MEDIUM 5).
+        let mut pin = Zeroizing::new(String::with_capacity(1024));
         loop {
             match self.read_reply().await? {
                 Reply::Data(d) => pin.push_str(&unescape(&d)?),
@@ -394,6 +421,16 @@ mod tests {
     fn escaping_round_trips() {
         assert_eq!(escape("a%b\nc\rd"), "a%25b%0Ac%0Dd");
         assert_eq!(unescape("a%25b%0Ac%0Dd").unwrap().as_str(), "a%b\nc\rd");
+        // Every C0 byte and DEL, not just CR/LF: `askpass` puts a fully
+        // attacker-controlled string into a description, and the rest of the
+        // range reaches the dialog as terminal control sequences (LOW 1).
+        assert_eq!(escape("a\u{0}b\u{1b}c\u{7f}d\u{9}e"), "a%00b%1Bc%7Fd%09e");
+        assert_eq!(
+            unescape("a%00b%1Bc%7Fd%09e").unwrap().as_str(),
+            "a\u{0}b\u{1b}c\u{7f}d\u{9}e"
+        );
+        // Printable text, including non-ASCII, is passed through untouched.
+        assert_eq!(escape("caf\u{e9} ~!"), "caf\u{e9} ~!");
         assert!(unescape("bad%zz").is_err());
         assert!(is_cancel(83886179));
         assert!(!is_cancel(83886180));
@@ -518,6 +555,53 @@ mod tests {
             .env("FAKE_PIN", "y")
             .with_timeout(Duration::from_secs(5));
         assert!(matches!(ok.ask(&req()).await.unwrap(), PinOutcome::Pin(_)));
+    }
+
+    /// The wait for the process-wide dialog lock is bounded by the same
+    /// timeout as the dialog itself (HIGH 3).
+    ///
+    /// The lock used to be taken *outside* the timeout, so a client that
+    /// raised a dialog and never answered held it for the full timeout while
+    /// every other unlock in the daemon queued behind it with no deadline of
+    /// its own — repeat that and no unlock ever completes again. Here the
+    /// holder hangs for 5 s; the queued caller has a 300 ms timeout of its
+    /// own and must give up on that, not on the holder's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_dialog_gives_up_rather_than_waiting_for_the_lock() {
+        let p = fake()
+            .env("FAKE_DELAY", "30")
+            .with_timeout(Duration::from_secs(5));
+        // A clone shares the `dialog` lock, exactly as the daemon's single
+        // `Pinentry` does across concurrent prompts.
+        let queued = p.clone().with_timeout(Duration::from_millis(300));
+        let holder = tokio::spawn(async move { p.ask(&req()).await });
+        // Let the holder take the lock before the second caller queues.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            queued.ask(&req()).await.unwrap(),
+            PinOutcome::Cancelled
+        ));
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "queued ask waited {waited:?} for the lock instead of its own 300ms timeout"
+        );
+
+        // `confirm` bounds its wait the same way.
+        let started = std::time::Instant::now();
+        assert!(!queued.confirm(&req()).await.unwrap());
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "queued confirm waited {waited:?} for the lock"
+        );
+
+        assert!(matches!(
+            holder.await.unwrap().unwrap(),
+            PinOutcome::Cancelled
+        ));
     }
 
     /// The timeout wrapper must not change the normal `confirm` outcome (the

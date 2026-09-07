@@ -3,7 +3,7 @@
 use super::{CliError, load_config, read_new_password, read_password};
 use crate::config::Config;
 use crate::dbus::state::{load_aliases, save_aliases_to};
-use crate::protocol::{ProtocolError, Request, Response, Zeroizing, call, socket_path};
+use crate::protocol::{ProtocolError, Request, Response, call, socket_path};
 use crate::vault::crypto::{self, KdfParams, SALT_LEN};
 use crate::vault::format;
 use crate::vault::{Vault, collection_id_from_label};
@@ -135,7 +135,10 @@ pub fn unlock(collection: String) -> Result<(), CliError> {
         .map_err(|e| CliError::Failed(e.to_string()))?;
     control(Request::UnlockWithKey {
         collection: collection.clone(),
-        key: Zeroizing::new(*key.as_bytes()),
+        // `Zeroizing::new(*key.as_bytes())` would build the array on the
+        // stack first and leave that copy unwiped; `to_zeroizing` clones the
+        // already-wrapped buffer.
+        key: key.to_zeroizing(),
     })?;
     println!("Unlocked '{collection}'.");
     Ok(())
@@ -176,17 +179,20 @@ pub fn change_password(collection: String) -> Result<(), CliError> {
     let old = read_password("Current password")?;
     let new = read_new_password("New password")?;
     let new_kdf: KdfParams = config.kdf.into();
-    let new_salt = crypto::random_bytes::<SALT_LEN>();
+    // The panicking form would abort the process on an unavailable system
+    // RNG, mid-way through a password change; report it instead.
+    let new_salt =
+        crypto::try_random_bytes::<SALT_LEN>().map_err(|e| CliError::Failed(e.to_string()))?;
     let old_key = crypto::derive_key(old.as_bytes(), &salt, kdf)
         .map_err(|e| CliError::Failed(e.to_string()))?;
     let new_key = crypto::derive_key(new.as_bytes(), &new_salt, new_kdf)
         .map_err(|e| CliError::Failed(e.to_string()))?;
     control(Request::ChangeKey {
         collection: collection.clone(),
-        old_key: Zeroizing::new(*old_key.as_bytes()),
+        old_key: old_key.to_zeroizing(),
         new_salt,
         new_kdf,
-        new_key: Zeroizing::new(*new_key.as_bytes()),
+        new_key: new_key.to_zeroizing(),
     })?;
     println!("Password changed for '{collection}'.");
     Ok(())

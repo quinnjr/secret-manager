@@ -17,7 +17,12 @@ use zbus::zvariant::OwnedObjectPath;
 pub type Shared = Arc<tokio::sync::Mutex<ServiceState>>;
 
 /// A prompt's commit gate; see `ServiceState::prompt_commits`.
-pub type PromptCommit = Arc<tokio::sync::Mutex<bool>>;
+///
+/// An atomic rather than a mutex: `daemon::watch_clients` has to read it
+/// while holding the state lock, and a `try_lock` there could not distinguish
+/// "committed" from "momentarily contended", so it had to guess — and guessed
+/// in the direction that leaves an orphaned prompt running.
+pub type PromptCommit = Arc<std::sync::atomic::AtomicBool>;
 
 /// Sessions one bus client may hold open at once. Each costs an exported
 /// object (and, for `dh`, a 1024-bit modexp), and is only reclaimed on
@@ -95,6 +100,65 @@ pub fn save_aliases_to(dir: &Path, aliases: &BTreeMap<String, String>) -> std::i
     std::fs::write(dir.join(ALIAS_FILE), text)
 }
 
+/// What a directory scan found, before any of it is applied to the daemon's
+/// state. Produced by [`scan_vault_dir`] and consumed by
+/// [`ServiceState::merge_scan`].
+pub struct VaultScan {
+    pub opened: Vec<(String, Vault)>,
+    pub broken: Vec<(String, PathBuf, String)>,
+    pub aliases: BTreeMap<String, String>,
+    pub seen: std::collections::BTreeSet<String>,
+}
+
+/// Read every `<id>.vault` in `dir` that is not already loaded.
+///
+/// Deliberately a free function taking no state: opening a vault reads the
+/// whole file, and doing that while holding the daemon's state mutex lets any
+/// peer stall every other request. The caller scans here, then applies the
+/// result with [`ServiceState::merge_scan`] under a brief lock.
+pub fn scan_vault_dir(
+    dir: &Path,
+    index_attributes: bool,
+    already_loaded: &std::collections::BTreeSet<String>,
+) -> std::io::Result<VaultScan> {
+    std::fs::create_dir_all(dir)?;
+    let mut scan = VaultScan {
+        opened: Vec::new(),
+        broken: Vec::new(),
+        aliases: BTreeMap::new(),
+        seen: std::collections::BTreeSet::new(),
+    };
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("vault") {
+            continue;
+        }
+        let Some(id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        scan.seen.insert(id.clone());
+        if !paths::is_segment(&id) || already_loaded.contains(&id) {
+            continue;
+        }
+        match Vault::open(&path) {
+            Ok(mut v) => {
+                v.set_index_attributes(index_attributes);
+                scan.opened.push((id, v));
+            }
+            Err(e) => {
+                tracing::warn!("skipping {}: {e}", path.display());
+                scan.broken.push((id, path, e.to_string()));
+            }
+        }
+    }
+    scan.aliases = load_aliases(dir)?;
+    Ok(scan)
+}
+
 /// Item ids matching `query`: from the plaintext items when unlocked, from
 /// the hashed header index otherwise (which is empty under
 /// `locked_search = false`).
@@ -135,50 +199,41 @@ impl ServiceState {
     /// this call (freshly opened, or freshly found broken) — the set a
     /// caller should register D-Bus objects for and announce.
     pub fn load_vaults(&mut self) -> std::io::Result<Vec<String>> {
-        std::fs::create_dir_all(&self.vault_dir)?;
+        let scan = scan_vault_dir(
+            &self.vault_dir,
+            self.index_attributes,
+            &self.collections.keys().cloned().collect(),
+        )?;
+        Ok(self.merge_scan(scan))
+    }
+
+    /// The ids already loaded, so a scan can skip re-reading them.
+    pub fn loaded_ids(&self) -> std::collections::BTreeSet<String> {
+        self.collections.keys().cloned().collect()
+    }
+
+    /// Apply a [`VaultScan`] taken outside the lock. Fast and allocation-only:
+    /// no file is opened here.
+    pub fn merge_scan(&mut self, scan: VaultScan) -> Vec<String> {
         let mut new_ids = Vec::new();
-        // Ids seen on this scan, so a `broken` entry whose file has since been
-        // deleted or repaired stops being advertised as a locked collection.
-        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for entry in std::fs::read_dir(&self.vault_dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("vault") {
-                continue;
-            }
-            let Some(id) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_string)
-            else {
-                continue;
-            };
-            seen.insert(id.clone());
-            if !paths::is_segment(&id) || self.collections.contains_key(&id) {
-                continue;
-            }
-            let previously_broken = self.broken.contains_key(&id);
-            match Vault::open(&path) {
-                Ok(mut v) => {
-                    v.set_index_attributes(self.index_attributes);
-                    self.broken.remove(&id);
-                    self.collections.insert(id.clone(), v);
-                    if !previously_broken {
-                        new_ids.push(id);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("skipping {}: {e}", path.display());
-                    self.broken
-                        .insert(id.clone(), (path.clone(), e.to_string()));
-                    if !previously_broken {
-                        new_ids.push(id);
-                    }
-                }
+        for (id, vault) in scan.opened {
+            let previously_broken = self.broken.remove(&id).is_some();
+            if self.collections.insert(id.clone(), vault).is_none() && !previously_broken {
+                new_ids.push(id);
             }
         }
-        self.broken.retain(|id, _| seen.contains(id));
-        self.aliases = load_aliases(&self.vault_dir)?;
-        Ok(new_ids)
+        for (id, path, err) in scan.broken {
+            let previously_known = self.broken.insert(id.clone(), (path, err)).is_some()
+                || self.collections.contains_key(&id);
+            if !previously_known {
+                new_ids.push(id);
+            }
+        }
+        // A `broken` entry whose file has since been deleted or repaired stops
+        // being advertised as a locked collection.
+        self.broken.retain(|id, _| scan.seen.contains(id));
+        self.aliases = scan.aliases;
+        new_ids
     }
 
     /// The stored error for a broken collection (see `broken`), if `id`

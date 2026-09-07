@@ -5,13 +5,14 @@
 //! `ssh list` can inventory them.
 
 use super::client::Client;
-use super::secrets::{find, find_all};
+use super::secrets::{delete_each, escape_control, find, find_all};
 use super::{CliError, load_config, read_password};
 use crate::prompt::{PinOutcome, PinRequest, Pinentry};
 use clap::Subcommand;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use zbus::zvariant::OwnedObjectPath;
 use zeroize::Zeroizing;
 
 pub const SSH_SCHEMA: &str = "org.secret-manager.ssh";
@@ -92,9 +93,7 @@ pub async fn add(path: PathBuf, no_passphrase: bool) -> Result<(), CliError> {
     // Strict: a lenient delete here would leave a stale registration behind in
     // a collection that could not be unlocked, which `askpass` may later
     // prefer over the one we are about to write.
-    for item in find_all(&client, &key_query(&path)).await? {
-        client.delete_item(&item).await?;
-    }
+    delete_each(&client, &find_all(&client, &key_query(&path)).await?).await?;
     client
         .store(
             &key_attrs(&path, !no_passphrase),
@@ -120,7 +119,10 @@ pub async fn list() -> Result<(), CliError> {
     let mut out = std::io::stdout().lock();
     for item in find(&client, &query).await? {
         let info = client.item_info(&item).await?;
-        let path = info.attributes.get("path").cloned().unwrap_or_default();
+        // The `path` attribute is settable by any client on the session bus,
+        // so it gets the same treatment as every other value `sm list` prints:
+        // a `\r` or an ANSI escape must not be able to forge or erase a row.
+        let path = escape_control(info.attributes.get("path").map_or("", String::as_str));
         let stored = info
             .attributes
             .get("has_passphrase")
@@ -151,9 +153,7 @@ pub async fn remove(path: PathBuf) -> Result<(), CliError> {
             path.display()
         )));
     }
-    for item in &items {
-        client.delete_item(item).await?;
-    }
+    delete_each(&client, &items).await?;
     println!("Removed {}", path.display());
     Ok(())
 }
@@ -183,31 +183,23 @@ const CONFIRM_MARKERS: [&str; 4] = [
 /// the passphrase question, holds no newline, quotes the path symmetrically
 /// and names an absolute path is treated as a request for a stored secret.
 pub fn classify_prompt(prompt: &str, askpass_prompt_env: Option<&str>) -> AskpassKind {
-    if askpass_prompt_env == Some("confirm") || CONFIRM_MARKERS.iter().any(|m| prompt.contains(m)) {
+    // The explicit tag is authoritative and comes from `ssh` itself, not from
+    // the prompt text, so it is honoured before anything is parsed.
+    if askpass_prompt_env == Some("confirm") {
         return AskpassKind::Confirm;
     }
     // A passphrase question is a single line; anything multi-line is some
     // other dialog that merely quotes one.
-    if !prompt.contains('\n') {
-        // Anchored, and each quote style closed by its own kind, so a key path
-        // containing an apostrophe is not truncated to a different key.
-        let re =
-            regex::Regex::new(r#"(?i)^\s*Enter passphrase for(?: key)? (?:'([^']+)'|"([^"]+)")"#)
-                .expect("static regex");
-        if let Some(c) = re.captures(prompt) {
-            let path = PathBuf::from(
-                c.get(1)
-                    .or_else(|| c.get(2))
-                    .expect("one alternative matched")
-                    .as_str(),
-            );
-            // A relative path would be resolved against this process's cwd,
-            // which the asking program chose; only an absolute path names the
-            // key unambiguously.
-            if path.is_absolute() {
-                return AskpassKind::Passphrase(path);
-            }
-        }
+    if !prompt.contains('\n')
+        && let Some(path) = passphrase_path(prompt)
+    {
+        return AskpassKind::Passphrase(path);
+    }
+    // Only now: the markers are substring matches, so testing them first would
+    // let a key path containing `Allow use of key` turn a real passphrase
+    // request into a yes/no question.
+    if CONFIRM_MARKERS.iter().any(|m| prompt.contains(m)) {
+        return AskpassKind::Confirm;
     }
     // OpenSSH treats an empty answer to a question as "yes", so anything still
     // shaped like a question is confirmed rather than typed into.
@@ -217,25 +209,176 @@ pub fn classify_prompt(prompt: &str, askpass_prompt_env: Option<&str>) -> Askpas
     AskpassKind::Other
 }
 
+/// The key path in a passphrase prompt, if this is one.
+///
+/// Three shapes are accepted, matching the installed OpenSSH binaries:
+/// `ssh` quotes with `'…'`, `ssh-keygen` with `"…"`, and `ssh-add` does not
+/// quote at all and may append ` (will confirm each use)`. Each quote style is
+/// closed by its own kind so an apostrophe in a path cannot truncate it to a
+/// different key, and the whole prompt must be consumed, so a longer line that
+/// merely opens with the question is not a passphrase request.
+///
+/// The unquoted form has no delimiters, so it is restricted to an absolute
+/// path; a quoted relative path (`ssh -i ./key`) is returned as-is and
+/// resolved — and checked against the registered keys — by [`askpass`].
+fn passphrase_path(prompt: &str) -> Option<PathBuf> {
+    let re = regex::Regex::new(
+        r#"(?i)^\s*Enter passphrase for (?:key )?(?:'([^']+)'|"([^"]+)"|(/[^:]*?))(?: \(will confirm each use\))?: *$"#,
+    )
+    .expect("static regex");
+    let c = re.captures(prompt)?;
+    let m = c
+        .get(1)
+        .or_else(|| c.get(2))
+        .or_else(|| c.get(3))
+        .expect("one alternative matched");
+    Some(PathBuf::from(m.as_str()))
+}
+
+/// `ssh` prints the identity file with `%.100s`, so a longer registered path
+/// arrives truncated to exactly this many bytes and can only be matched by
+/// prefix.
+const SSH_PROMPT_PATH_LIMIT: usize = 100;
+
+/// One registered key that a prompt could be asking about.
+struct KeyMatch {
+    item: OwnedObjectPath,
+    /// The path to name in the consent dialog: the value the item was
+    /// registered under, never the (symlinked, relative, truncated) spelling
+    /// the prompt used.
+    display: PathBuf,
+    locked: bool,
+}
+
+/// Registered keys matching `path`, **without unlocking anything**: this runs
+/// before the user has consented, so it must not be able to raise the master
+/// password prompt, unlock the collection for every other bus client, or pull
+/// a plaintext secret into this process. `Client::search` is the plain
+/// `SearchItems` call, which reports locked matches instead of opening them.
+async fn registered_keys(
+    client: &Client,
+    path: &Path,
+    as_prompted: &str,
+) -> Result<Vec<KeyMatch>, CliError> {
+    let (unlocked, locked) = client.search(&key_query(path)).await?;
+    // An exact attribute match means the stored `path` *is* `path`, so it can
+    // be named in the dialog without reading the (locked) item back.
+    let mut out: Vec<KeyMatch> = unlocked
+        .into_iter()
+        .map(|item| KeyMatch {
+            item,
+            display: path.to_path_buf(),
+            locked: false,
+        })
+        .chain(locked.into_iter().map(|item| KeyMatch {
+            item,
+            display: path.to_path_buf(),
+            locked: true,
+        }))
+        .collect();
+    if !out.is_empty() || as_prompted.len() != SSH_PROMPT_PATH_LIMIT {
+        return Ok(out);
+    }
+    // Truncated by `%.100s`. Only unlocked items can be matched this way,
+    // because reading the stored `path` back is what makes the prefix
+    // comparison possible in the first place.
+    let schema = BTreeMap::from([("xdg:schema".to_string(), SSH_SCHEMA.to_string())]);
+    let (unlocked, _locked) = client.search(&schema).await?;
+    for item in unlocked {
+        let info = client.item_info(&item).await?;
+        if let Some(stored) = info.attributes.get("path")
+            && stored.as_bytes().starts_with(as_prompted.as_bytes())
+        {
+            out.push(KeyMatch {
+                item,
+                display: PathBuf::from(stored),
+                locked: false,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the path a prompt named to the path `add` would have recorded:
+/// symlinks followed, relative paths taken against this process's cwd. Doing
+/// this once, before anything else, is what keeps the key named in the consent
+/// dialog and the key whose passphrase is released the same key.
+fn resolve_prompt_path(raw: &Path) -> PathBuf {
+    canonical(raw).unwrap_or_else(|_| raw.to_path_buf())
+}
+
 pub async fn askpass(words: Vec<String>) -> Result<(), CliError> {
     let prompt = words.join(" ");
     let env = std::env::var("SSH_ASKPASS_PROMPT").ok();
     let kind = classify_prompt(&prompt, env.as_deref());
-    if let AskpassKind::Passphrase(path) = &kind
-        && let Some(pass) = lookup_passphrase(path).await
+    if let AskpassKind::Passphrase(raw) = &kind
+        && let Some(pass) = release_passphrase(raw).await?
     {
-        // `ssh` consults SSH_ASKPASS precisely when there is no controlling
-        // terminal, so this is the only place a human can consent to the key
-        // being used. Releasing the passphrase without asking would make the
-        // documented "every use gets your explicit consent" false in exactly
-        // the case the helper runs.
-        if !consented(path).await? {
-            return Err(CliError::NotFound("key use declined".into()));
-        }
         println!("{}", pass.as_str());
         return Ok(());
     }
     fallback(&prompt, kind == AskpassKind::Confirm).await
+}
+
+/// Confirm, then look up. `ssh` consults SSH_ASKPASS precisely when there is
+/// no controlling terminal, so the dialog is the only place a human can
+/// consent to the key being used.
+///
+/// Order matters as much as the question: the lookup is what raises the master
+/// password prompt, unlocks the collection for every client on the bus and
+/// pulls the plaintext into this process, so a declined use must not have done
+/// any of it. Everything before the dialog is a plain `SearchItems`, which
+/// cannot unlock anything.
+///
+/// `Ok(None)` means "not ours to answer" and falls back to an interactive
+/// prompt; `Err` means the user said no.
+async fn release_passphrase(raw: &Path) -> Result<Option<Zeroizing<String>>, CliError> {
+    let path = resolve_prompt_path(raw);
+    let as_prompted = raw.to_string_lossy().into_owned();
+    // No daemon, no bus, an unreadable collection: not an error, just nothing
+    // we can answer from, so the user gets the ordinary passphrase box.
+    let Ok(client) = Client::connect().await else {
+        return Ok(None);
+    };
+    let Ok(matches) = registered_keys(&client, &path, &as_prompted).await else {
+        return Ok(None);
+    };
+    let one = match matches.len() {
+        0 => return Ok(None),
+        1 => &matches[0],
+        // Attributes are settable by any client on the session bus, so a
+        // planted item can claim a registered key's path. Picking one would
+        // mean answering ssh from an item an attacker chose; refuse and let
+        // the user type the passphrase instead.
+        n => {
+            eprintln!(
+                "secret-manager: {n} stored keys claim {}; refusing to choose between them",
+                escape_control(&path.to_string_lossy())
+            );
+            return Ok(None);
+        }
+    };
+    if !consented(&one.display).await? {
+        return Err(CliError::NotFound("key use declined".into()));
+    }
+    // Consent given: only now may anything unlock or decrypt.
+    if one.locked
+        && client
+            .unlock(std::slice::from_ref(&one.item))
+            .await
+            .is_err()
+    {
+        return Ok(None);
+    }
+    let Ok(secret) = client.get_secret(&one.item).await else {
+        return Ok(None);
+    };
+    if secret.is_empty() {
+        return Ok(None);
+    }
+    Ok(std::str::from_utf8(&secret)
+        .ok()
+        .map(|s| Zeroizing::new(s.to_string())))
 }
 
 /// Ask the user to approve one use of `path`. `SM_ASKPASS_NO_CONFIRM=1` opts
@@ -250,7 +393,7 @@ async fn consented(path: &Path) -> Result<bool, CliError> {
             title: "ssh".into(),
             description: format!(
                 "Allow ssh to use the stored passphrase for the key\n{}?",
-                path.display()
+                escape_control(&path.to_string_lossy())
             ),
             prompt: String::new(),
             error: None,
@@ -258,22 +401,6 @@ async fn consented(path: &Path) -> Result<bool, CliError> {
         })
         .await
         .map_err(|e| CliError::Failed(e.to_string()))
-}
-
-/// Vault lookup. Any failure (no daemon, dismissed prompt, unknown key, empty
-/// secret) yields `None` so the caller falls back to an interactive prompt.
-async fn lookup_passphrase(path: &Path) -> Option<Zeroizing<String>> {
-    let path = canonical(path).unwrap_or_else(|_| path.to_path_buf());
-    let client = Client::connect().await.ok()?;
-    let items = find(&client, &key_query(&path)).await.ok()?;
-    let item = items.first()?;
-    let secret = client.get_secret(item).await.ok()?;
-    if secret.is_empty() {
-        return None;
-    }
-    std::str::from_utf8(&secret)
-        .ok()
-        .map(|s| Zeroizing::new(s.to_string()))
 }
 
 async fn fallback(prompt: &str, confirm: bool) -> Result<(), CliError> {
@@ -378,11 +505,13 @@ mod tests {
             ),
             AskpassKind::Passphrase(PathBuf::from("/home/j/o'brien/id_ed25519"))
         );
-        // Single-quoted (ssh): the path ends at the first apostrophe, and the
-        // truncated result must at least not name a *different* absolute key.
+        // Single-quoted (ssh): the quoted run stops at the first apostrophe
+        // and the remainder does not close the prompt, so the whole thing is
+        // not a passphrase request at all. Falling back to a typed answer is
+        // right: naming a *different* key would be worse.
         assert_eq!(
             classify_prompt("Enter passphrase for key '/home/j/o'brien/id': ", None),
-            AskpassKind::Passphrase(PathBuf::from("/home/j/o"))
+            AskpassKind::Other
         );
     }
 
@@ -394,10 +523,58 @@ mod tests {
         );
     }
 
+    /// MEDIUM 1: `ssh-add` does not quote the path, and appends an optional
+    /// suffix with `-c`. These are the four prompt strings the installed
+    /// OpenSSH binaries actually print.
     #[test]
-    fn a_relative_key_path_is_not_a_passphrase_request() {
+    fn the_real_openssh_prompts_are_all_recognized() {
+        let key = "/home/j/.ssh/id_ed25519";
+        for prompt in [
+            // ssh(1)
+            "Enter passphrase for key '/home/j/.ssh/id_ed25519': ",
+            // ssh-add(1)
+            "Enter passphrase for /home/j/.ssh/id_ed25519: ",
+            // ssh-add -c
+            "Enter passphrase for /home/j/.ssh/id_ed25519 (will confirm each use): ",
+            // ssh-keygen(1)
+            "Enter passphrase for \"/home/j/.ssh/id_ed25519\": ",
+        ] {
+            assert_eq!(
+                classify_prompt(prompt, None),
+                AskpassKind::Passphrase(PathBuf::from(key)),
+                "{prompt:?}"
+            );
+        }
+    }
+
+    /// LOW: the confirmation markers are matched anywhere in the prompt, so a
+    /// key whose path contains one must still be a passphrase request. The
+    /// markers only apply once the passphrase pattern has failed.
+    #[test]
+    fn a_key_path_containing_a_confirm_marker_is_still_a_passphrase_request() {
+        assert_eq!(
+            classify_prompt(
+                "Enter passphrase for key '/home/j/Allow use of key/id': ",
+                None
+            ),
+            AskpassKind::Passphrase(PathBuf::from("/home/j/Allow use of key/id"))
+        );
+    }
+
+    #[test]
+    fn a_relative_key_path_is_a_passphrase_request_resolved_later() {
+        // LOW: `ssh -i ./key` prints the identity file as given. The path is
+        // kept relative here and resolved against the process cwd by
+        // `askpass`, which releases a passphrase only if it canonicalizes to
+        // an already registered key.
         assert_eq!(
             classify_prompt("Enter passphrase for key 'id_ed25519': ", None),
+            AskpassKind::Passphrase(PathBuf::from("id_ed25519"))
+        );
+        // The unquoted (ssh-add) form still requires an absolute path: it has
+        // no delimiters, so a relative capture could swallow arbitrary text.
+        assert_eq!(
+            classify_prompt("Enter passphrase for id_ed25519: ", None),
             AskpassKind::Other
         );
     }

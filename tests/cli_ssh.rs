@@ -61,11 +61,22 @@ async fn add_list_askpass_remove() {
         .assert()
         .success()
         .stdout("pass123\n");
-    // A relative key path is not a passphrase request: the prompt must name an
-    // absolute path, or a lookup could be steered at another key entirely.
+    // `ssh -i ./key` prints the identity file exactly as given, so a relative
+    // path is resolved against this process's cwd -- and only answered when it
+    // canonicalizes to an already registered key.
     fx.sm()
         .current_dir(keys.path())
         .args(["ssh", "askpass", "Enter passphrase for \"id_test\": "])
+        .env("FAKE_CONFIRM", "yes")
+        .env("FAKE_PIN", "typed")
+        .assert()
+        .success()
+        .stdout("pass123\n");
+    // A relative path that resolves to nothing registered is not answered from
+    // the vault; the user types it.
+    fx.sm()
+        .current_dir(keys.path())
+        .args(["ssh", "askpass", "Enter passphrase for \"id_unknown\": "])
         .env("FAKE_CONFIRM", "yes")
         .env("FAKE_PIN", "typed")
         .assert()
@@ -409,6 +420,15 @@ async fn host_key_question_embedding_a_passphrase_prompt_is_a_confirmation() {
 
 /// LOW 2: an untagged confirmation question must not be answered with a typed
 /// value, and an empty answer (which OpenSSH reads as "yes") is never printed.
+///
+/// Note what `no` on stdout with exit 0 means here, because the shape invites
+/// the opposite reading: OpenSSH inspects the *content* of what the askpass
+/// helper prints, not its exit status. `ssh_askpass()` collects the answer and
+/// `ask_permission()` accepts it only when it is empty or `yes`; anything else
+/// -- `no` included -- is a refusal. So printing `no` and exiting 0 is the
+/// correct way to decline, and an EMPTY answer means YES. That is precisely
+/// why the helper must never print an empty line: a cancelled or empty pinentry
+/// box would otherwise read as the user approving the use of the key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn untagged_question_is_confirmed_and_empty_answers_are_refused() {
     let fx = Fixture::start().await;
@@ -430,4 +450,261 @@ async fn untagged_question_is_confirmed_and_empty_answers_are_refused() {
         .stdout
         .clone();
     assert!(out.is_empty(), "an empty answer was printed: {out:?}");
+}
+
+/// HIGH 1: the consent dialog must name the key whose passphrase is about to
+/// be released, not the (attacker-chosen) spelling the prompt used. A hostile
+/// repo can steer `ssh -i` at a symlink through `core.sshCommand` or a
+/// `.gitmodules` URL; the dialog naming the symlink while the production key's
+/// passphrase is what gets released is consent to the wrong thing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_consent_dialog_names_the_real_key_behind_a_symlink() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_prod", "pass123");
+    let real = std::fs::canonicalize(&key).unwrap();
+    let link = keys.path().join("deploy_key");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+
+    let before = fx.pinentry_log().len();
+    fx.sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{}': ", link.display()),
+        ])
+        .env("FAKE_CONFIRM", "yes")
+        .assert()
+        .success()
+        .stdout("pass123\n");
+
+    let log = fx.pinentry_log();
+    let dialog: String = log[before..]
+        .lines()
+        .filter(|l| l.starts_with("SETDESC"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        dialog.contains(&real.display().to_string()),
+        "the dialog must name the key being released: {dialog:?}"
+    );
+    assert!(
+        !dialog.contains("deploy_key"),
+        "the dialog named the symlink, not the key: {dialog:?}"
+    );
+}
+
+/// HIGH 2: the lookup is what raises the master password prompt and unlocks
+/// the collection for every client on the bus. Declining must not have done
+/// any of that, so the question comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declining_does_not_unlock_the_collection() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_locked", "pass123");
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+    fx.lock_default().await;
+
+    // FAKE_PIN is set, so any unlock prompt raised here *would* succeed --
+    // which is the point: the collection must stay locked because nothing
+    // asked for it, not because the prompt failed.
+    let out = fx
+        .sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{}': ", key.display()),
+        ])
+        .env("FAKE_CONFIRM", "no")
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    assert!(out.is_empty(), "declined confirmation leaked output");
+    assert!(
+        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        "a declined key use left the collection unlocked for every bus client"
+    );
+
+    // Approving still works, and only then may it unlock.
+    fx.sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{}': ", key.display()),
+        ])
+        .env("FAKE_CONFIRM", "yes")
+        .assert()
+        .success()
+        .stdout("pass123\n");
+}
+
+/// MEDIUM 1: `/usr/bin/ssh-add` prompts unquoted, with an optional suffix.
+/// Against the old anchored regex every one of these classified as `Other`,
+/// so the user was asked to type a passphrase sitting in the vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_add_style_prompts_are_answered_from_the_vault() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_add", "pass123");
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+
+    for prompt in [
+        format!("Enter passphrase for {}: ", key.display()),
+        format!(
+            "Enter passphrase for {} (will confirm each use): ",
+            key.display()
+        ),
+    ] {
+        fx.sm()
+            .args(["ssh", "askpass", &prompt])
+            .env("FAKE_CONFIRM", "yes")
+            .env("FAKE_PIN", "typed")
+            .assert()
+            .success()
+            .stdout("pass123\n");
+    }
+}
+
+/// LOW: `ssh` formats the identity file with `%.100s`, so a registered key
+/// with a longer path is only ever named truncated. Match those by prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prompt_truncated_at_a_hundred_bytes_still_finds_the_key() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let base = tempfile::tempdir().unwrap();
+    // Build a directory deep enough that the key's canonical path is well
+    // past 100 bytes.
+    let mut dir = std::fs::canonicalize(base.path()).unwrap();
+    while dir.to_string_lossy().len() < 110 {
+        dir = dir.join("dddddddddd");
+    }
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = make_key(&dir, "id_long", "pass123");
+    let real = std::fs::canonicalize(&key).unwrap();
+    let full = real.to_string_lossy().into_owned();
+    assert!(full.len() > 100, "{full}");
+
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+
+    let truncated = &full[..100];
+    fx.sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{truncated}': "),
+        ])
+        .env("FAKE_CONFIRM", "yes")
+        .env("FAKE_PIN", "typed")
+        .assert()
+        .success()
+        .stdout("pass123\n");
+}
+
+/// MEDIUM 2: `sm ssh list` prints the `path` attribute, and attributes are
+/// settable by any client on the session bus, so a row could be erased or
+/// forged with `\r` and ANSI escapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ssh_list_escapes_control_characters_in_the_path() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    fx.sm()
+        .args([
+            "set",
+            "xdg:schema=org.secret-manager.ssh",
+            "path=/k\u{1b}[2K\rforged\tpassphrase: stored",
+            "has_passphrase=true",
+            "--label",
+            "planted",
+        ])
+        .write_stdin("x")
+        .assert()
+        .success();
+    let out = fx
+        .sm()
+        .args(["ssh", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        !text.contains('\r') && !text.contains('\u{1b}'),
+        "raw control characters reached stdout: {text:?}"
+    );
+    assert!(text.contains("\\x1b") && text.contains("\\x0d"), "{text:?}");
+}
+
+/// MEDIUM 2: any client on the bus can plant an item claiming a registered
+/// key's `path`, and `SearchItems` is subset matching, so it matches too.
+/// Picking one would mean answering ssh from an item an attacker chose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn askpass_refuses_to_choose_between_two_items_claiming_one_key() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_ambiguous", "pass123");
+    let real = std::fs::canonicalize(&key).unwrap();
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+    // The extra attribute keeps this a separate item while still matching a
+    // subset search on {xdg:schema, path}.
+    fx.sm()
+        .args([
+            "set",
+            "xdg:schema=org.secret-manager.ssh",
+            &format!("path={}", real.display()),
+            "has_passphrase=true",
+            "planted=1",
+            "--label",
+            "planted",
+        ])
+        .write_stdin("attacker-chosen")
+        .assert()
+        .success();
+
+    fx.sm()
+        .args([
+            "ssh",
+            "askpass",
+            &format!("Enter passphrase for key '{}': ", key.display()),
+        ])
+        .env("FAKE_CONFIRM", "yes")
+        .env("FAKE_PIN", "typed")
+        .assert()
+        .success()
+        // Neither stored secret is released; the user types the answer.
+        .stdout("typed\n")
+        .stderr(predicate::str::contains("refusing to choose"));
 }

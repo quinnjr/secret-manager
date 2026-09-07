@@ -99,6 +99,14 @@ impl Key {
         &self.0
     }
 
+    /// A wiping copy of the key material, for callers that must hand it to an
+    /// API taking ownership (the control protocol's request types).
+    /// `Zeroizing::new(*key.as_bytes())` would build the array on the stack
+    /// first, leaving an unwiped copy behind; this never does.
+    pub fn to_zeroizing(&self) -> Zeroizing<[u8; KEY_LEN]> {
+        self.0.clone()
+    }
+
     /// Wrap key material that was derived elsewhere (the PAM module or the
     /// CLI, arriving over the control socket).
     ///

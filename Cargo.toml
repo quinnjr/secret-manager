@@ -48,7 +48,7 @@ test-util = []
 # Always present: vault format and crypto, config, control protocol, and the
 # PAM module's own logic.
 serde = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["use-std"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 zeroize = { version = "1", features = ["serde", "derive"] }
 thiserror = "2"
 libc = "0.2"

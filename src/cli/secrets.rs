@@ -88,13 +88,35 @@ async fn find_inner(
     Ok(items)
 }
 
+/// Unicode formatting characters that are not category Cc, and so are not
+/// `char::is_control`, but still let a row hide or visually reorder itself:
+/// the soft hyphen, the bidirectional controls and marks, the zero-width
+/// space and joiners, the line and paragraph separators, the embeddings and
+/// overrides (U+202E RIGHT-TO-LEFT OVERRIDE among them), the invisible
+/// operators and the byte order mark.
+fn is_invisible_format(ch: char) -> bool {
+    matches!(ch,
+        '\u{00ad}'
+        | '\u{061c}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{2028}'
+        | '\u{2029}'
+        // The embedding/override controls U+202A..U+202E: U+202E alone is
+        // enough to render a row's text backwards.
+        | '\u{202a}'..='\u{202e}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206f}'
+        | '\u{feff}')
+}
+
 /// Render a string for a terminal: labels and attribute values come from argv
-/// or from any bus client, so a `\r` or an ANSI escape could erase or forge
-/// `sm list` rows. Anything below U+0020, plus DEL, becomes `\xNN`.
-fn escape_control(s: &str) -> String {
+/// or from any bus client, so a `\r`, an ANSI escape or a bidi override could
+/// erase, forge or reorder `sm list` rows. Anything below U+0020, plus DEL and
+/// the invisible formatters above, becomes `\xNN` per UTF-8 byte.
+pub(crate) fn escape_control(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
-        if ch.is_control() {
+        if ch.is_control() || is_invisible_format(ch) {
             for b in ch.to_string().into_bytes() {
                 out.push_str(&format!("\\x{b:02x}"));
             }
@@ -156,6 +178,122 @@ mod tests {
         assert_eq!(escape_control("\u{7f}"), "\\x7f");
         // Non-ASCII text is untouched.
         assert_eq!(escape_control("clé"), "clé");
+    }
+
+    /// MEDIUM 3: `char::is_control` is category Cc only, so the bidi and
+    /// zero-width formatters used to visually reorder or hide a row survive
+    /// it. They are escaped byte by byte like any other control character.
+    #[test]
+    fn escape_control_hides_unicode_format_characters() {
+        // RIGHT-TO-LEFT OVERRIDE reverses everything after it.
+        assert_eq!(escape_control("a\u{202e}b"), "a\\xe2\\x80\\xaeb");
+        // Soft hyphen, Arabic letter mark, zero width space/joiners and the
+        // bidi marks, the line/paragraph separators, the invisible operators,
+        // the remaining bidi controls, and the byte order mark.
+        for ch in [
+            '\u{00ad}', '\u{061c}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}',
+            '\u{2028}', '\u{2029}', '\u{202a}', '\u{202e}', '\u{2060}', '\u{2064}', '\u{2066}',
+            '\u{206f}', '\u{feff}',
+        ] {
+            let escaped = escape_control(&ch.to_string());
+            assert!(
+                !escaped.contains(ch),
+                "U+{:04X} reached the terminal: {escaped:?}",
+                ch as u32
+            );
+            assert!(
+                escaped.starts_with("\\x"),
+                "U+{:04X}: {escaped:?}",
+                ch as u32
+            );
+        }
+        // Characters just outside the escaped ranges are still printable text.
+        for ch in ['\u{2065}', '\u{2070}', '\u{061d}', '\u{00ae}'] {
+            assert_eq!(escape_control(&ch.to_string()), ch.to_string());
+        }
+    }
+
+    /// MEDIUM 4: a delete that stops half-way must say so, and say which half.
+    /// That is the one-at-a-time fallback path; see
+    /// `an_atomic_batch_failure_says_nothing_was_deleted` for the batch path.
+    #[test]
+    fn a_partial_delete_names_what_survived() {
+        assert_eq!(partial_delete_report(3, &[], &[]), None);
+        let failed = vec![
+            (
+                "/org/x/item/1".to_string(),
+                "collection is locked".to_string(),
+            ),
+            (
+                "/org/x/item/2".to_string(),
+                "collection is locked".to_string(),
+            ),
+        ];
+        let msg = partial_delete_report(1, &failed, &[]).expect("a failure must be reported");
+        assert!(msg.contains("deleted 1 item(s)"), "{msg}");
+        assert!(msg.contains("2 could not be deleted"), "{msg}");
+        assert!(msg.contains("still exists"), "{msg}");
+        assert!(
+            msg.contains("/org/x/item/1") && msg.contains("/org/x/item/2"),
+            "{msg}"
+        );
+        // The reason is daemon-supplied text; it is escaped like any other.
+        let hostile = vec![("/i".to_string(), "gone\rdeleted everything".to_string())];
+        let msg = partial_delete_report(0, &hostile, &[]).unwrap();
+        assert!(!msg.contains('\r') && msg.contains("\\x0d"), "{msg}");
+    }
+
+    /// A batch that the daemon refuses is all-or-nothing, so the message must
+    /// say the secrets were left untouched rather than naming survivors — the
+    /// user has nothing to clean up and nothing half-deleted to hunt for.
+    #[test]
+    fn an_atomic_batch_failure_says_nothing_was_deleted() {
+        let untouched = vec![(
+            "/org/freedesktop/secrets/collection/default".to_string(),
+            3,
+            "collection is locked".to_string(),
+        )];
+        let msg = partial_delete_report(0, &[], &untouched).expect("a failure must be reported");
+        assert!(msg.contains("3 item(s)"), "{msg}");
+        assert!(msg.contains("left untouched"), "{msg}");
+        assert!(msg.contains("collection/default"), "{msg}");
+        assert!(
+            !msg.contains("still exists"),
+            "a rejected batch has no survivors to warn about: {msg}"
+        );
+        // Daemon-supplied text is escaped here too.
+        let hostile = vec![("/c".to_string(), 1, "no\rall gone".to_string())];
+        let msg = partial_delete_report(0, &[], &hostile).unwrap();
+        assert!(!msg.contains('\r') && msg.contains("\\x0d"), "{msg}");
+    }
+
+    /// Items are batched per collection, in input order, and a path that names
+    /// no collection is left to the one-at-a-time fallback.
+    #[test]
+    fn items_group_by_their_collection() {
+        let p = |s: &str| OwnedObjectPath::try_from(s.to_string()).unwrap();
+        let groups = group_by_collection(&[
+            p("/org/freedesktop/secrets/collection/default/a"),
+            p("/org/freedesktop/secrets/collection/work/b"),
+            p("/org/freedesktop/secrets/collection/default/c"),
+            p("/org/freedesktop/secrets/aliases/login/d"),
+            p("/nonsense"),
+        ]);
+        assert_eq!(groups.len(), 4);
+        assert_eq!(
+            groups[0].0.as_ref().unwrap().as_str(),
+            "/org/freedesktop/secrets/collection/default"
+        );
+        assert_eq!(groups[0].1.len(), 2, "same collection batches together");
+        assert_eq!(
+            groups[1].0.as_ref().unwrap().as_str(),
+            "/org/freedesktop/secrets/collection/work"
+        );
+        assert_eq!(
+            groups[2].0.as_ref().unwrap().as_str(),
+            "/org/freedesktop/secrets/aliases/login"
+        );
+        assert_eq!(groups[3].0, None, "an unattributable path is not batched");
     }
 
     #[test]
@@ -230,10 +368,124 @@ pub async fn delete(attrs: Vec<String>) -> Result<(), CliError> {
     if items.is_empty() {
         return Err(CliError::NotFound("no matching secret".into()));
     }
-    for item in &items {
-        client.delete_item(item).await?;
+    delete_each(&client, &items).await
+}
+
+/// Delete every item, then report.
+///
+/// Items are grouped by collection and each group goes to the daemon in one
+/// atomic `DeleteItems` call (the private batch interface — the freedesktop
+/// spec has no batch delete), so a collection that locks part-way through, or
+/// a daemon that dies mid-write, leaves that collection's set entirely deleted
+/// or entirely intact. N separate `Item.Delete` calls could not promise that.
+///
+/// The one-at-a-time path is kept as the fallback for a daemon that does not
+/// export the batch interface. `find_all` proves each locked match was opened,
+/// but the collection can still lock (an idle timer, a `sm lock` from another
+/// terminal) between then and the delete, so that path keeps going and names
+/// what was removed and what was not. On the batch path there are no
+/// survivors to name: the group was left untouched.
+pub(crate) async fn delete_each(
+    client: &Client,
+    items: &[OwnedObjectPath],
+) -> Result<(), CliError> {
+    let mut deleted = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+    let mut untouched: Vec<(String, usize, String)> = Vec::new();
+    for (collection, paths) in group_by_collection(items) {
+        // A path we cannot attribute to a collection cannot be batched; it is
+        // almost certainly stale, and `Item.Delete` will say so.
+        let batched = match &collection {
+            Some(c) => client.delete_items(c, &paths).await,
+            None => Ok(false),
+        };
+        match batched {
+            Ok(true) => deleted += paths.len(),
+            // No batch interface on this daemon: fall back, honestly.
+            Ok(false) => {
+                for item in &paths {
+                    match client.delete_item(item).await {
+                        Ok(()) => deleted += 1,
+                        Err(e) => failed.push((item.to_string(), e.to_string())),
+                    }
+                }
+            }
+            Err(e) => untouched.push((
+                collection.map(|c| c.to_string()).unwrap_or_default(),
+                paths.len(),
+                e.to_string(),
+            )),
+        }
     }
-    Ok(())
+    match partial_delete_report(deleted, &failed, &untouched) {
+        Some(msg) => Err(CliError::Failed(msg)),
+        None => Ok(()),
+    }
+}
+
+/// Item paths grouped by the collection they live in, preserving the input
+/// order within each group. A path that is not an item path under a collection
+/// or alias groups under `None`.
+fn group_by_collection(
+    items: &[OwnedObjectPath],
+) -> Vec<(Option<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+    use crate::dbus::paths::{self, Target};
+    let mut groups: Vec<(Option<OwnedObjectPath>, Vec<OwnedObjectPath>)> = Vec::new();
+    for item in items {
+        let owner = match paths::parse(item.as_str()) {
+            Some(Target::Item { collection, .. }) => Some(paths::collection(&collection)),
+            Some(Target::AliasItem { alias, .. }) => paths::alias(&alias),
+            _ => None,
+        };
+        match groups.iter_mut().find(|(c, _)| *c == owner) {
+            Some((_, paths)) => paths.push(item.clone()),
+            None => groups.push((owner, vec![item.clone()])),
+        }
+    }
+    groups
+}
+
+/// The message for a delete that could not finish, or `None` if it did.
+/// Separate from the loop so the wording is testable without a bus.
+///
+/// `failed` are individual items from the one-at-a-time fallback, which really
+/// can leave survivors. `untouched` are whole batches that were rejected
+/// atomically: nothing in them was deleted, so the wording must not invite the
+/// user to go hunting for a half-deleted set.
+fn partial_delete_report(
+    deleted: usize,
+    failed: &[(String, String)],
+    untouched: &[(String, usize, String)],
+) -> Option<String> {
+    if failed.is_empty() && untouched.is_empty() {
+        return None;
+    }
+    let mut msg = String::new();
+    if !failed.is_empty() {
+        msg.push_str(&format!(
+            "deleted {deleted} item(s), but {} could not be deleted; \
+             the secret still exists in the collection",
+            failed.len()
+        ));
+        for (path, why) in failed {
+            msg.push_str(&format!(
+                "\n  {}: {}",
+                escape_control(path),
+                escape_control(why)
+            ));
+        }
+    }
+    for (collection, n, why) in untouched {
+        if !msg.is_empty() {
+            msg.push('\n');
+        }
+        msg.push_str(&format!(
+            "{n} item(s) in {} were left untouched: {}",
+            escape_control(collection),
+            escape_control(why)
+        ));
+    }
+    Some(msg)
 }
 
 #[derive(serde::Serialize)]

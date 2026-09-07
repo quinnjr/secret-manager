@@ -83,6 +83,18 @@ pub trait Collection {
     fn item_changed(&self, item: OwnedObjectPath) -> zbus::Result<()>;
 }
 
+/// The private, non-spec batch interface exported alongside
+/// `org.freedesktop.Secret.Collection` on the same object path (see
+/// `collection::CollectionAdmin`). Only this project's own CLI uses it; the
+/// spec interface above is unchanged, so libsecret sees exactly the spec.
+#[proxy(
+    interface = "org.secret_manager.Collection1",
+    default_service = "org.freedesktop.secrets"
+)]
+pub trait CollectionAdmin {
+    fn delete_items(&self, items: &[OwnedObjectPath]) -> zbus::Result<()>;
+}
+
 #[proxy(
     interface = "org.freedesktop.Secret.Item",
     default_service = "org.freedesktop.secrets"

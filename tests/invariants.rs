@@ -83,6 +83,10 @@ fn absurd_header_length_is_rejected_without_allocating() {
 
 /// Every header field is covered by the AEAD's associated data: changing any
 /// one of them must make the correct password fail.
+/// One tweak to a decoded header, so the AEAD-coverage test can name each
+/// field it flips.
+type HeaderMutation = Box<dyn Fn(&mut format::Header)>;
+
 #[test]
 fn every_header_field_is_authenticated() {
     let dir = tempfile::tempdir().unwrap();
@@ -99,7 +103,7 @@ fn every_header_field_is_authenticated() {
     let bytes = std::fs::read(&path).unwrap();
     let file = VaultFile::decode(&bytes).unwrap();
 
-    let mutate: Vec<(&str, Box<dyn Fn(&mut format::Header)>)> = vec![
+    let mutate: Vec<(&str, HeaderMutation)> = vec![
         (
             "label",
             Box::new(|h: &mut format::Header| h.label = "evil".into()),

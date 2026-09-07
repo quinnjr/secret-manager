@@ -11,7 +11,8 @@
 //! Argon2 parameters are read from the collection's own vault file on disk
 //! (see [`vault_header`]), which is opened `O_NOFOLLOW | O_NONBLOCK` and
 //! required to be a *regular* file owned by the target user and not group- or
-//! world-writable. The most an
+//! world-writable, and whose header is read under the hook's own deadline so a
+//! file backed by something that never answers cannot wedge root. The most an
 //! impostor daemon can learn is an Argon2id hash of the password under
 //! parameters this module bounds on both sides (see
 //! [`kdf_acceptable_for_login`]) — the same thing a thief of the vault file
@@ -48,9 +49,8 @@ use crate::protocol::{
 };
 use std::ffi::{CString, OsStr};
 use std::fs::File;
-use std::io::Read;
 use std::mem::ManuallyDrop;
-use std::os::fd::{FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -80,8 +80,23 @@ const DEFAULT_VAULT_SUBDIR: &str = ".local/share/secret-manager";
 /// stages are serial and every one of them is influenced by the user being
 /// logged in (the vault header they wrote, the daemon that answers the
 /// socket, the systemd job that starts it), so their sum is login latency an
-/// attacker chooses. One deadline covers the lot; when it is spent the unlock
-/// is abandoned and the login proceeds without the vault.
+/// attacker chooses. One deadline covers the lot — the vault-file read
+/// included, via [`read_exact_bounded`] — and when it is spent the unlock is
+/// abandoned and the login proceeds without the vault.
+///
+/// The real bound on a hook is *not* exactly this constant. Argon2 is not
+/// interruptible, so the budget is checked before each derivation but cannot
+/// cut one short once it has begun. `open_session` runs at most two
+/// derivations (the first unlock and the retry after starting the daemon) and
+/// `chauthtok` runs two (old key and new key), each bounded by the login KDF
+/// ceiling of [`MAX_M_COST_KIB_LOGIN`] / [`MAX_T_COST_LOGIN`] /
+/// [`MAX_P_COST_LOGIN`] rather than by the vault's. So the guarantee is:
+///
+/// > this budget, plus at most the KDF ceiling cost of the derivations that
+/// > were actually started before it ran out.
+///
+/// A derivation is never *started* after the budget is spent, so the excess is
+/// bounded by one ceiling-cost derivation in practice.
 pub(crate) const HOOK_BUDGET: Duration = Duration::from_secs(8);
 /// Secondary budget for reaping a child that has already been killed.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -364,6 +379,27 @@ fn open_dir_fd(dir: &Path) -> std::io::Result<Option<DirFd>> {
 /// operation goes through that descriptor: `unlinkat` for the removal, a
 /// re-`fstat` of the same fd for the re-check, and a `/proc/self/fd/<n>/`
 /// path for the connect.
+///
+/// What that does and does not guarantee, precisely:
+///
+/// * **The unlink is inode-safe.** `unlinkat(dirfd, name, 0)` is genuinely
+///   descriptor-relative: no part of the parent path is resolved again, so a
+///   swap of the directory *name* after validation cannot redirect it.
+/// * **The connect is not.** `connect(2)` takes a path, and
+///   `/proc/self/fd/<n>/control.sock` is resolved in full — including a
+///   symlink at the final component. Pinning the directory means root's
+///   connect always starts from the validated inode, but the user can still
+///   make `control.sock` inside it a symlink to a socket elsewhere. That
+///   window is narrowed to the gap between check and connect by
+///   [`SocketDir::connect_path`], which `fstatat`s the name with
+///   `AT_SYMLINK_NOFOLLOW` and requires a socket; it is not closed, because
+///   this API has no `connectat`.
+/// * **What contains the residue** is the `SO_PEERCRED` check in
+///   [`crate::protocol`]: whatever root ends up connected to must be owned by
+///   the target uid, so the worst a swap achieves is redirecting the unlock to
+///   another of the user's own listeners. It is not a privilege escalation,
+///   and the key that would reach it is an Argon2 hash under the vault
+///   header's own parameters, not the password.
 pub(crate) struct SocketDir {
     /// The name the socket was originally given, used when the directory does
     /// not exist yet and there is therefore nothing to hold open.
@@ -443,9 +479,14 @@ impl SocketDir {
         self.dir.is_some()
     }
 
-    /// Path to hand to `connect`. When the directory is held open this
-    /// resolves through the validated inode, so a swap of the name cannot
-    /// redirect it; the daemon-start window is exactly when that matters.
+    /// The path the socket is addressed by. When the directory is held open
+    /// this is rooted at the validated inode via `/proc/self/fd/<n>`, so no
+    /// part of the *parent* path is resolved again.
+    ///
+    /// The final component still is. Use [`SocketDir::connect_path`] for
+    /// anything that connects; this one is for the existence poll in
+    /// [`wait_for`], which does its own `lstat` and is not harmed by a symlink
+    /// it can see.
     pub(crate) fn socket_path(&self) -> PathBuf {
         match &self.dir {
             Some(fd) => PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw()))
@@ -454,11 +495,71 @@ impl SocketDir {
         }
     }
 
+    /// The path to connect to, but only once the entry at the socket name has
+    /// been confirmed to be a socket *and not a symlink*, right now.
+    ///
+    /// `connect(2)` resolves its whole path, symlinks at the final component
+    /// included, so without this the user could point root's connect at any
+    /// socket on the system simply by replacing `control.sock` with a link.
+    /// `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)` answers about the entry in
+    /// the validated directory rather than about whatever it points to.
+    ///
+    /// This is a check-then-use, and the gap is real: the user may swap the
+    /// name between the `fstatat` and the `connect`. There is no `connectat`,
+    /// so that gap is as tight as this interface allows; the `SO_PEERCRED`
+    /// check on the other side is what keeps the consequence to "one of the
+    /// user's own listeners".
+    ///
+    /// `ErrorKind::NotFound` means there is nothing there yet, which the
+    /// caller reads as "start the daemon". Anything else is a refusal.
+    pub(crate) fn connect_path(&self) -> std::io::Result<PathBuf> {
+        let Some(fd) = &self.dir else {
+            // No directory to hold, so nothing has been created inside it
+            // either; let the connect fail with the real errno.
+            return Ok(self.sock.clone());
+        };
+        // SAFETY: `st` is plain data; zeroed is a valid initial value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is an open directory descriptor owned by `self`,
+        // `self.name` is a NUL-terminated relative name outliving the call,
+        // and `st` is a live out-parameter of the right type.
+        let rc = unsafe {
+            libc::fstatat(
+                fd.as_raw(),
+                self.name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if st.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+            log(&format!(
+                "{} is not a socket (mode {:o}); refusing to connect to it",
+                self.sock.display(),
+                st.st_mode & 0o7777
+            ));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the control socket name is not a socket",
+            ));
+        }
+        Ok(self.socket_path())
+    }
+
     /// Re-checks after the daemon-start window. A held descriptor is
     /// re-`fstat`ed — the same inode, so this catches a `chown`/`chmod` but
     /// cannot be fooled by a rename. A directory that did not exist before is
     /// opened and validated now; nothing was done through its name in the
     /// meantime, so there is nothing for a swap to have redirected.
+    ///
+    /// By construction this says nothing about the directory's *contents*:
+    /// re-`fstat`ing an inode cannot see that `control.sock` inside it was
+    /// replaced — with a symlink, a regular file, or another socket — while
+    /// the daemon was starting. Nor is it meant to. The socket entry is
+    /// covered by the `fstatat` in [`SocketDir::connect_path`], which is done
+    /// immediately before each connect.
     pub(crate) fn revalidate(&mut self) -> bool {
         match &self.dir {
             Some(fd) => match fd.metadata() {
@@ -535,29 +636,122 @@ const MAX_P_COST_LOGIN: u32 = 2;
 /// the memory corner with the passes corner.
 const MAX_TOTAL_WORK_LOGIN: u64 = MAX_M_COST_KIB_LOGIN as u64 * MAX_T_COST_LOGIN as u64;
 
+/// Waits for `fd` to become readable, or gives up when `budget` is spent.
+///
+/// `ErrorKind::TimedOut` means the budget ran out; the caller abandons the
+/// unlock rather than waiting on something the user controls.
+fn poll_readable(fd: RawFd, budget: &Budget) -> std::io::Result<()> {
+    loop {
+        let Some(left) = budget.remaining() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the login budget is spent",
+            ));
+        };
+        // At least 1ms, so a sub-millisecond remainder is a real wait rather
+        // than a spin; `poll` clamps to `c_int` milliseconds.
+        let ms = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is a live, correctly initialised single-element array
+        // of `pollfd`, and `fd` is borrowed for the duration of the call.
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc > 0 {
+            return Ok(());
+        }
+        if rc == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for the vault file to become readable",
+            ));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// `read_exact`, but with a deadline: every read is preceded by a
+/// [`poll_readable`] against what is left of `budget`, and an `EAGAIN` from
+/// the non-blocking descriptor sends us back to the poll rather than failing.
+///
+/// This is what bounds the vault-file read. `O_NONBLOCK` affects the *open*,
+/// and on a pipe, socket or FUSE-backed file it also makes `read` return
+/// `EAGAIN` instead of blocking — so the wait happens in `poll`, where it has
+/// a deadline. On a local regular file `poll` reports readable immediately and
+/// the kernel's own read is not interruptible by this deadline; that case does
+/// not stall in the first place. What an attacker can reach — a FIFO, a
+/// socket, a file served by a filesystem they control or a server that is not
+/// answering — goes through the bounded path.
+fn read_exact_bounded(fd: RawFd, buf: &mut [u8], budget: &Budget) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        poll_readable(fd, budget)?;
+        let rest = &mut buf[done..];
+        // SAFETY: `rest` is a live, uniquely borrowed slice of exactly
+        // `rest.len()` bytes, and `fd` is an open descriptor for the call.
+        let n = unsafe { libc::read(fd, rest.as_mut_ptr().cast(), rest.len()) };
+        if n > 0 {
+            done += n as usize;
+            continue;
+        }
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the file ended before the header did",
+            ));
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            // Nothing ready after all, or a signal: poll again, which is what
+            // enforces the deadline.
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Opens `<vault_dir>/<collection>.vault` and returns the salt and KDF
 /// parameters from its header, or `None` (already logged) if anything about
-/// the file or the header is unsuitable.
+/// the file or the header is unsuitable, or if `budget` runs out first.
 ///
 /// The file belongs to `uid` but is read by root, so it is opened with
-/// `O_NOFOLLOW` and the *open file* is then checked: owned by `uid`, and
-/// writable by nobody else. Only the header prefix is read; the ciphertext
-/// never enters this process.
+/// `O_NOFOLLOW` and the *open file* is then checked: owned by `uid`, a regular
+/// file, and writable by nobody else. Only the header prefix is read; the
+/// ciphertext never enters this process.
+///
+/// Both the open and the read are bounded. `O_NOFOLLOW | O_NONBLOCK` keeps the
+/// *open* from blocking on a FIFO, and the type check then refuses one — but
+/// `O_NONBLOCK` does nothing for a `read` of something that passes for a
+/// regular file. A FUSE mount the user owns, or a vault on a network
+/// filesystem that has stopped answering, blocks root in the kernel exactly as
+/// the FIFO did. So every read goes through [`read_exact_bounded`], which
+/// polls against what is left of the hook's `budget` and abandons the unlock
+/// on a timeout.
 pub(crate) fn vault_header(
     vault_dir: &Path,
     collection: &str,
     uid: u32,
+    budget: &Budget,
 ) -> Option<([u8; SALT_LEN], KdfParams)> {
     let path = vault_dir.join(format!("{collection}.vault"));
     let shown = path.display().to_string();
-    let mut file = match std::fs::OpenOptions::new()
+    // Held for the life of the function: `fd` below borrows it, and dropping
+    // it would close the descriptor the reads use.
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         // O_NONBLOCK: `O_NOFOLLOW` refuses a symlink but not a FIFO, and
         // `open(O_RDONLY)` on a FIFO blocks until a writer appears — so a
         // `mkfifo <collection>.vault` would wedge root in the kernel and lock
-        // that user out of their own machine. It is a no-op for the regular
-        // file this is supposed to be. O_CLOEXEC: never leak the descriptor
-        // into the `systemctl` child.
+        // that user out of their own machine. It is kept set afterwards so a
+        // read of a FUSE- or NFS-backed file returns `EAGAIN` and the wait
+        // happens in `read_exact_bounded`'s poll, where it has a deadline.
+        // O_CLOEXEC: never leak the descriptor into the `systemctl` child.
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&path)
     {
@@ -605,8 +799,9 @@ pub(crate) fn vault_header(
         return None;
     }
 
+    let fd = file.as_raw_fd();
     let mut bytes = vec![0u8; format::PREFIX_LEN];
-    if let Err(e) = file.read_exact(&mut bytes) {
+    if let Err(e) = read_exact_bounded(fd, &mut bytes, budget) {
         log(&format!(
             "cannot read the header of {shown}: {}",
             sanitize(&e.to_string())
@@ -621,7 +816,7 @@ pub(crate) fn vault_header(
         }
     };
     bytes.resize(need, 0);
-    if let Err(e) = file.read_exact(&mut bytes[format::PREFIX_LEN..]) {
+    if let Err(e) = read_exact_bounded(fd, &mut bytes[format::PREFIX_LEN..], budget) {
         log(&format!(
             "cannot read the header of {shown}: {}",
             sanitize(&e.to_string())
@@ -865,7 +1060,20 @@ pub(crate) fn try_send(
     }
 }
 
-fn derive(password: &str, salt: &[u8; SALT_LEN], kdf: KdfParams) -> Option<Key> {
+/// Argon2id under the header's own parameters. This is the expensive part of
+/// a login — up to the login KDF ceiling, and `open_session` and `chauthtok`
+/// each run it twice — so the hook's budget is consulted before starting one:
+/// once it is spent the unlock is abandoned rather than added to.
+///
+/// The check is *before* the derivation, not during it: `derive_key` is not
+/// interruptible, so a started derivation always runs to completion. The
+/// bound this gives is "budget plus at most one KDF ceiling cost", which is
+/// what [`HOOK_BUDGET`] documents.
+fn derive(password: &str, salt: &[u8; SALT_LEN], kdf: KdfParams, budget: &Budget) -> Option<Key> {
+    if budget.remaining().is_none() {
+        log("no time left in the login budget; skipping the key derivation");
+        return None;
+    }
     match crypto::derive_key(password.as_bytes(), salt, kdf) {
         Ok(key) => Some(key),
         Err(e) => {
@@ -889,16 +1097,17 @@ pub(crate) fn unlock_by_key(
     password: &str,
     salt: &[u8; SALT_LEN],
     kdf: KdfParams,
-    budget: Duration,
+    budget: &Budget,
+    call_budget: Duration,
 ) -> Result<(), ProtocolError> {
-    let Some(key) = derive(password, salt, kdf) else {
+    let Some(key) = derive(password, salt, kdf, budget) else {
         return Ok(());
     };
     let req = Request::UnlockWithKey {
         collection: collection.to_string(),
         key: Zeroizing::new(*key.as_bytes()),
     };
-    try_send(sock, &req, uid, "unlock", budget)
+    try_send(sock, &req, uid, "unlock", call_budget)
 }
 
 /// Builds the `ChangeKey` request: `old_key` under the header's salt, and
@@ -910,6 +1119,7 @@ pub(crate) fn change_key_request(
     new: &str,
     salt: &[u8; SALT_LEN],
     kdf: KdfParams,
+    budget: &Budget,
 ) -> Option<Request> {
     // Non-panicking: an unavailable RNG must not abort a login.
     let new_salt = match crypto::try_random_bytes::<SALT_LEN>() {
@@ -922,8 +1132,8 @@ pub(crate) fn change_key_request(
             return None;
         }
     };
-    let old_key = derive(old, salt, kdf)?;
-    let new_key = derive(new, &new_salt, kdf)?;
+    let old_key = derive(old, salt, kdf, budget)?;
+    let new_key = derive(new, &new_salt, kdf, budget)?;
     Some(Request::ChangeKey {
         collection: collection.to_string(),
         old_key: Zeroizing::new(*old_key.as_bytes()),
@@ -1000,6 +1210,11 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
+    }
+
+    /// A budget with plenty left, for the tests that are not about the bound.
+    fn full_budget() -> Budget {
+        Budget::new(Duration::from_secs(60))
     }
 
     fn me() -> u32 {
@@ -1232,6 +1447,7 @@ mod tests {
             "hunter2",
             &SALT,
             LOGIN_KDF,
+            &full_budget(),
             Duration::from_secs(5),
         )
         .expect("unlock");
@@ -1259,6 +1475,7 @@ mod tests {
             "hunter2",
             &SALT,
             LOGIN_KDF,
+            &full_budget(),
             Duration::from_secs(5),
         )
         .expect_err("nothing is listening");
@@ -1269,11 +1486,15 @@ mod tests {
     fn reads_salt_and_kdf_from_the_vault_header() {
         let dir = tempfile::tempdir().unwrap();
         write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
-        let (salt, kdf) = vault_header(dir.path(), "default", me()).expect("header readable");
+        let (salt, kdf) =
+            vault_header(dir.path(), "default", me(), &full_budget()).expect("header readable");
         assert_eq!(salt, SALT);
         assert_eq!(kdf, LOGIN_KDF);
         // A collection with no vault file yields nothing, not a fallback.
-        assert_eq!(vault_header(dir.path(), "absent", me()), None);
+        assert_eq!(
+            vault_header(dir.path(), "absent", me(), &full_budget()),
+            None
+        );
     }
 
     /// Root reads this file out of a user-owned tree: anything the group or
@@ -1283,16 +1504,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
-        assert_eq!(vault_header(dir.path(), "default", me()), None);
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &full_budget()),
+            None
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o606)).unwrap();
-        assert_eq!(vault_header(dir.path(), "default", me()), None);
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &full_budget()),
+            None
+        );
     }
 
+    /// What this proves: the owner comparison in `vault_header` rejects a file
+    /// whose owner is not the uid it was asked about.
+    ///
+    /// What it does **not** prove: that a genuinely cross-owner inode is
+    /// refused. Creating a file owned by another uid needs root, which the test
+    /// suite does not have, so the foreign owner is simulated from the other
+    /// side — by passing `me() ^ 1` as the *expected* uid against a file this
+    /// user owns. The comparison is exercised; the real cross-owner case is
+    /// not. Do not read this as coverage of the privileged path.
     #[test]
     fn refuses_a_vault_file_owned_by_someone_else() {
         let dir = tempfile::tempdir().unwrap();
         write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
-        assert_eq!(vault_header(dir.path(), "default", me() ^ 1), None);
+        assert_eq!(
+            vault_header(dir.path(), "default", me() ^ 1, &full_budget()),
+            None
+        );
     }
 
     /// O_NOFOLLOW: a symlink at `<collection>.vault` could point at a file
@@ -1302,7 +1541,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let real = write_vault(dir.path(), "real", header_with(LOGIN_KDF, SALT));
         std::os::unix::fs::symlink(&real, dir.path().join("default.vault")).unwrap();
-        assert_eq!(vault_header(dir.path(), "default", me()), None);
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &full_budget()),
+            None
+        );
     }
 
     #[test]
@@ -1321,7 +1563,7 @@ mod tests {
                 SALT,
             ),
         );
-        assert_eq!(vault_header(dir.path(), "weak", me()), None);
+        assert_eq!(vault_header(dir.path(), "weak", me(), &full_budget()), None);
         // Above the vault's own ceiling: rejected by `decode_header` itself.
         write_vault(
             dir.path(),
@@ -1335,7 +1577,7 @@ mod tests {
                 SALT,
             ),
         );
-        assert_eq!(vault_header(dir.path(), "huge", me()), None);
+        assert_eq!(vault_header(dir.path(), "huge", me(), &full_budget()), None);
     }
 
     #[test]
@@ -1344,14 +1586,17 @@ mod tests {
         let path = dir.path().join("default.vault");
         std::fs::write(&path, b"NOTAVAULT and then some").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(vault_header(dir.path(), "default", me()), None);
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &full_budget()),
+            None
+        );
     }
 
     /// `ChangeKey` re-seals under a fresh salt, but keeps the header's
     /// parameters; the old key must still be the one that opens the vault.
     #[test]
     fn change_key_request_derives_both_keys_from_the_header_kdf() {
-        let req = change_key_request("work", "old-pw", "new-pw", &SALT, LOGIN_KDF)
+        let req = change_key_request("work", "old-pw", "new-pw", &SALT, LOGIN_KDF, &full_budget())
             .expect("request built");
         let Request::ChangeKey {
             collection,
@@ -1403,16 +1648,27 @@ mod tests {
         assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
     }
 
-    /// `O_NOFOLLOW` does not refuse a FIFO, and `open(O_RDONLY)` on one blocks
-    /// until a writer appears — so a `mkfifo ~/.local/share/secret-manager/
-    /// default.vault` would wedge root inside the login forever. The open must
-    /// be non-blocking and the file type checked.
+    /// Scope: the **open**, not the read. `O_NOFOLLOW` does not refuse a FIFO,
+    /// and `open(O_RDONLY)` on one blocks until a writer appears — so a
+    /// `mkfifo ~/.local/share/secret-manager/default.vault` would wedge root
+    /// inside the login forever. This test proves only that the open is
+    /// non-blocking and that the file type is checked, so the FIFO never
+    /// reaches a read at all.
+    ///
+    /// The separate hazard of a read that blocks on something that *is* a
+    /// regular file (a FUSE mount, a stalled NFS server) is covered by
+    /// `a_read_that_never_completes_is_abandoned_within_the_budget` and
+    /// `vault_header_refuses_to_read_on_a_spent_budget`; nothing here bears on
+    /// it.
     #[test]
-    fn refuses_a_fifo_in_place_of_the_vault_file() {
+    fn refuses_a_fifo_in_place_of_the_vault_file_at_open_time() {
         let dir = tempfile::tempdir().unwrap();
         mkfifo_at(&dir.path().join("default.vault"));
         let start = Instant::now();
-        assert_eq!(vault_header(dir.path(), "default", me()), None);
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &full_budget()),
+            None
+        );
         assert!(
             start.elapsed() < Duration::from_secs(3),
             "opening a FIFO must not block root: took {:?}",
@@ -1475,6 +1731,15 @@ mod tests {
         assert!(SocketDir::open(&link.join("control.sock"), me()).is_none());
     }
 
+    /// What this proves: `SocketDir::open` refuses a directory whose owner is
+    /// not the uid it was asked about, and one that is group-writable.
+    ///
+    /// What it does **not** prove: that a directory genuinely owned by another
+    /// uid is refused. As in `refuses_a_vault_file_owned_by_someone_else`, the
+    /// foreign owner is simulated by passing `me() ^ 1` as the *expected* uid
+    /// rather than by creating an inode owned by someone else, which needs
+    /// root. Only the group-writable half of this test uses a real inode
+    /// property.
     #[test]
     fn socket_dir_rejects_a_wrong_owner_or_group_writable_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -1650,6 +1915,213 @@ mod tests {
         assert_eq!(
             parse_options(&["collection=work_2".into()]).collection,
             "work_2"
+        );
+    }
+
+    /// A pipe with its write end held open and nothing ever written is the
+    /// cheapest fd that is open, readable in principle, and never ready. It
+    /// stands in for the hostile case that motivates the bound: a FUSE mount
+    /// (or a stalled NFS server) serving a file that reports `S_IFREG | 0600`
+    /// owned by the user, whose read handler simply never returns.
+    fn blocked_pipe() -> (File, File) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a live array of two ints, which is what pipe2 writes.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "pipe2: {}", std::io::Error::last_os_error());
+        // SAFETY: both descriptors were just returned by pipe2 and are given to
+        // `File`s that own them from here on.
+        unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) }
+    }
+
+    /// The HIGH finding: `O_NONBLOCK` bounds the *open*, not the *read*. A
+    /// read that never completes must be abandoned when the hook's budget is
+    /// spent, not waited on forever inside a login, as root.
+    #[test]
+    fn a_read_that_never_completes_is_abandoned_within_the_budget() {
+        let (reader, _writer) = blocked_pipe();
+        let mut buf = [0u8; 16];
+        let budget = Budget::new(Duration::from_millis(300));
+        let start = Instant::now();
+        let e = read_exact_bounded(reader.as_raw_fd(), &mut buf, &budget)
+            .expect_err("a read that never completes must not hang");
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "it must actually wait for the budget: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "it must not wait past the budget: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// An already-spent budget must not start a read at all.
+    #[test]
+    fn a_spent_budget_refuses_the_read_outright() {
+        let (reader, _writer) = blocked_pipe();
+        let mut buf = [0u8; 16];
+        let start = Instant::now();
+        let e = read_exact_bounded(reader.as_raw_fd(), &mut buf, &Budget::new(Duration::ZERO))
+            .expect_err("no budget, no read");
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    /// The bound must not break the ordinary case: data that is there, and
+    /// data that arrives late, are both read in full.
+    #[test]
+    fn the_bounded_read_still_reads_data_that_is_there() {
+        let (reader, mut writer) = blocked_pipe();
+        writer.write_all(b"0123456789").unwrap();
+        let mut buf = [0u8; 10];
+        read_exact_bounded(
+            reader.as_raw_fd(),
+            &mut buf,
+            &Budget::new(Duration::from_secs(5)),
+        )
+        .expect("data already in the pipe");
+        assert_eq!(&buf, b"0123456789");
+
+        let (late_reader, mut late_writer) = blocked_pipe();
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            late_writer.write_all(b"late").unwrap();
+            late_writer
+        });
+        let mut buf = [0u8; 4];
+        read_exact_bounded(
+            late_reader.as_raw_fd(),
+            &mut buf,
+            &Budget::new(Duration::from_secs(5)),
+        )
+        .expect("data that arrives inside the budget");
+        assert_eq!(&buf, b"late");
+        drop(feeder.join().unwrap());
+    }
+
+    /// A truncated file is an error, not a silent short header.
+    #[test]
+    fn the_bounded_read_reports_end_of_file() {
+        let (reader, writer) = blocked_pipe();
+        drop(writer);
+        let mut buf = [0u8; 4];
+        let e = read_exact_bounded(
+            reader.as_raw_fd(),
+            &mut buf,
+            &Budget::new(Duration::from_secs(5)),
+        )
+        .expect_err("no writer, no data, ever");
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof, "{e}");
+    }
+
+    /// The budget reaches `vault_header` itself: a spent hook must not start
+    /// reading a file the user controls.
+    #[test]
+    fn vault_header_refuses_to_read_on_a_spent_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
+        assert!(vault_header(dir.path(), "default", me(), &full_budget()).is_some());
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &Budget::new(Duration::ZERO)),
+            None,
+            "a spent budget must abandon the read"
+        );
+    }
+
+    /// The HIGH finding on `connect`: `unlinkat` is descriptor-relative and so
+    /// is inode-safe, but `connect(2)` on `/proc/self/fd/<n>/control.sock`
+    /// resolves the whole path and follows a symlink at the final component.
+    /// The name must be checked with `AT_SYMLINK_NOFOLLOW` first.
+    #[test]
+    fn connect_path_refuses_a_symlink_planted_at_the_socket_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+
+        // Somewhere else entirely, with a real listener on it, so the only
+        // reason to refuse is the symlink itself.
+        let elsewhere = dir.path().join("elsewhere.sock");
+        let listener = UnixListener::bind(&elsewhere).unwrap();
+
+        let sd = SocketDir::open(&sock, me()).expect("owned 0700 dir");
+        std::os::unix::fs::symlink(&elsewhere, &sock).unwrap();
+        let e = sd
+            .connect_path()
+            .expect_err("a symlink at the socket name must be refused");
+        assert_ne!(
+            e.kind(),
+            std::io::ErrorKind::NotFound,
+            "a planted symlink is a refusal, not an absent socket"
+        );
+        drop(listener);
+    }
+
+    /// The same check must not refuse the real thing, and must report an
+    /// absent entry as `NotFound` so the caller can still start the daemon.
+    #[test]
+    fn connect_path_accepts_a_real_socket_and_reports_an_absent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        let sd = SocketDir::open(&sock, me()).expect("owned 0700 dir");
+
+        let e = sd.connect_path().expect_err("nothing there yet");
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+
+        let listener = UnixListener::bind(&sock).unwrap();
+        let p = sd.connect_path().expect("a real socket is accepted");
+        assert!(p.starts_with("/proc/self/fd/"), "{}", p.display());
+        drop(listener);
+
+        // A regular file planted at the name is refused too, and not as
+        // "absent" — root must not be pointed at a non-socket.
+        std::fs::remove_file(&sock).unwrap();
+        std::fs::write(&sock, b"not a socket").unwrap();
+        let e = sd
+            .connect_path()
+            .expect_err("a regular file is not a socket");
+        assert_ne!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    }
+
+    /// The MEDIUM finding: `HOOK_BUDGET` has to cover the Argon2 derivations,
+    /// which are the expensive part of a login, not just the socket calls.
+    #[test]
+    fn a_spent_budget_skips_the_derivations() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let spent = Budget::new(Duration::ZERO);
+
+        // No listener: if the derivation were skipped but the call still made,
+        // this would come back as a transport error rather than `Ok`.
+        let start = Instant::now();
+        unlock_by_key(
+            &sock,
+            "work",
+            me(),
+            "hunter2",
+            &SALT,
+            LOGIN_KDF,
+            &spent,
+            Duration::from_secs(5),
+        )
+        .expect("a spent budget abandons the unlock rather than failing it");
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "no Argon2 may run on a spent budget: took {:?}",
+            start.elapsed()
+        );
+
+        let start = Instant::now();
+        assert!(
+            change_key_request("work", "old-pw", "new-pw", &SALT, LOGIN_KDF, &spent).is_none(),
+            "a spent budget abandons the key change"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "no Argon2 may run on a spent budget: took {:?}",
+            start.elapsed()
         );
     }
 
