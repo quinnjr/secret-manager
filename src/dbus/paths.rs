@@ -40,12 +40,23 @@ pub fn alias(name: &str) -> Option<OwnedObjectPath> {
     is_segment(name).then(|| owned(format!("{ALIASES_PREFIX}{name}")))
 }
 
+/// 64 bits of randomness as lowercase hex, appended to session and prompt
+/// path segments. The counter alone makes them unique; this makes them
+/// unguessable, so one client cannot enumerate another's session or prompt
+/// objects and probe them. Hex keeps `is_segment` satisfied.
+fn unguessable_suffix() -> String {
+    crate::vault::crypto::random_bytes::<8>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub fn session(n: u64) -> OwnedObjectPath {
-    owned(format!("{SESSIONS_PREFIX}s{n}"))
+    owned(format!("{SESSIONS_PREFIX}s{n}_{}", unguessable_suffix()))
 }
 
 pub fn prompt(n: u64) -> OwnedObjectPath {
-    owned(format!("{PROMPTS_PREFIX}p{n}"))
+    owned(format!("{PROMPTS_PREFIX}p{n}_{}", unguessable_suffix()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,8 +115,30 @@ mod tests {
             "/org/freedesktop/secrets/aliases/default"
         );
         assert!(alias("bad-name").is_none());
-        assert_eq!(session(3).as_str(), "/org/freedesktop/secrets/session/s3");
-        assert_eq!(prompt(7).as_str(), "/org/freedesktop/secrets/prompt/p7");
+        // Session and prompt paths carry a random suffix (LOW 1): the counter
+        // fixes the prefix, so only the prefix and charset are asserted.
+        let s3 = session(3);
+        let seg = s3.as_str().rsplit('/').next().unwrap();
+        assert!(seg.starts_with("s3_"), "{seg}");
+        assert_eq!(seg.len(), "s3_".len() + 16, "64 bits of hex: {seg}");
+        assert!(is_segment(seg), "{seg}");
+        assert!(
+            seg["s3_".len()..].bytes().all(|b| b.is_ascii_hexdigit()),
+            "{seg}"
+        );
+        assert_ne!(session(3), session(3), "suffixes must differ");
+        let p7 = prompt(7);
+        let seg = p7.as_str().rsplit('/').next().unwrap();
+        assert!(seg.starts_with("p7_"), "{seg}");
+        assert!(is_segment(seg), "{seg}");
+        assert!(
+            p7.as_str().starts_with("/org/freedesktop/secrets/prompt/"),
+            "{p7}"
+        );
+        assert!(
+            s3.as_str().starts_with("/org/freedesktop/secrets/session/"),
+            "{s3}"
+        );
         assert_eq!(
             parse("/org/freedesktop/secrets/collection/default"),
             Some(Target::Collection("default".into()))

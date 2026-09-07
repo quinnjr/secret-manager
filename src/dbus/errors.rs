@@ -40,11 +40,18 @@ impl Error {
 }
 
 impl From<VaultError> for Error {
+    /// Anything but `Locked`/`NoSuchItem` becomes a deliberately generic
+    /// `Failed`: a vault I/O or format error's own text names the vault file
+    /// path, which is daemon-internal detail no bus caller needs (LOW 3). The
+    /// detail is logged instead.
     fn from(e: VaultError) -> Self {
         match e {
             VaultError::Locked => Error::IsLocked,
             VaultError::NoSuchItem(_) => Error::NoSuchObject,
-            other => Error::failed(other),
+            other => {
+                tracing::warn!("vault error reported to a bus caller: {other}");
+                Error::failed("cannot access the collection")
+            }
         }
     }
 }
@@ -64,7 +71,11 @@ pub fn vault_error_to_fdo(e: VaultError) -> zbus::fdo::Error {
         VaultError::Locked => zbus::fdo::Error::Failed(
             "org.freedesktop.Secret.Error.IsLocked: collection is locked".into(),
         ),
-        other => zbus::fdo::Error::Failed(other.to_string()),
+        // Generic on the wire for the same reason as `From<VaultError>`.
+        other => {
+            tracing::warn!("vault error reported to a bus caller: {other}");
+            zbus::fdo::Error::Failed("cannot access the collection".into())
+        }
     }
 }
 
@@ -131,3 +142,35 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vault I/O error names the vault file; that path must not reach the
+    /// wire (LOW 3).
+    #[test]
+    fn vault_io_errors_are_generic_on_the_wire() {
+        let io = || VaultError::Io {
+            path: "/home/u/.local/share/secret-manager/private.vault".into(),
+            source: std::io::Error::other("permission denied"),
+        };
+        assert!(
+            io().to_string().contains("private.vault"),
+            "fixture assumption: {}",
+            io()
+        );
+        let text = Error::from(io()).to_string();
+        assert!(text.contains("cannot access the collection"), "{text}");
+        assert!(!text.contains("private.vault"), "path leaked: {text}");
+        let fdo = vault_error_to_fdo(io()).to_string();
+        assert!(!fdo.contains("private.vault"), "path leaked: {fdo}");
+
+        // The mapped variants keep their own wire names.
+        assert!(matches!(Error::from(VaultError::Locked), Error::IsLocked));
+        assert!(matches!(
+            Error::from(VaultError::NoSuchItem("x".into())),
+            Error::NoSuchObject
+        ));
+    }
+}

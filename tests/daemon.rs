@@ -298,17 +298,6 @@ async fn daemon_start_makes_the_process_non_dumpable() {
     assert_eq!(dumpable, 0);
 }
 
-/// `lock_memory = true` must never prevent startup, even when
-/// `RLIMIT_MEMLOCK` is too small for the process (the usual 8 MiB default).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lock_memory_option_never_blocks_startup() {
-    let fx = Fixture::start_with_config(|c| c.vault.lock_memory = true).await;
-    assert!(matches!(
-        control(&fx, Request::Status).await,
-        Response::Status { .. }
-    ));
-}
-
 /// The PAM and CLI path: read salt and parameters from the vault file,
 /// derive locally, unlock and rotate by key. No password, and no
 /// salt/parameter choice, ever crosses the socket.

@@ -50,21 +50,27 @@ async fn add_list_askpass_remove() {
     let ssh_prompt = format!("Enter passphrase for key '{}': ", key.display());
     fx.sm()
         .args(["ssh", "askpass", &ssh_prompt])
+        .env("FAKE_CONFIRM", "yes")
         .assert()
         .success()
         .stdout("pass123\n");
     let keygen_prompt = format!("Enter passphrase for \"{}\": ", key.display());
     fx.sm()
         .args(["ssh", "askpass", &keygen_prompt])
+        .env("FAKE_CONFIRM", "yes")
         .assert()
         .success()
         .stdout("pass123\n");
+    // A relative key path is not a passphrase request: the prompt must name an
+    // absolute path, or a lookup could be steered at another key entirely.
     fx.sm()
         .current_dir(keys.path())
         .args(["ssh", "askpass", "Enter passphrase for \"id_test\": "])
+        .env("FAKE_CONFIRM", "yes")
+        .env("FAKE_PIN", "typed")
         .assert()
         .success()
-        .stdout("pass123\n");
+        .stdout("typed\n");
 
     fx.sm()
         .args(["ssh", "add", "--no-passphrase"])
@@ -179,6 +185,7 @@ async fn ssh_keygen_uses_sm_askpass_symlink() {
         .env("HOME", fx.data_dir.path())
         .env("SSH_ASKPASS", &link)
         .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("FAKE_CONFIRM", "yes")
         .env("DISPLAY", ":0")
         .stdin(std::process::Stdio::null());
     for (k, v) in fx.envs() {
@@ -255,4 +262,172 @@ async fn askpass_falls_back_to_pinentry() {
         .assert()
         .success()
         .stdout("offline\n");
+}
+
+/// HIGH 1: `sm ssh remove` must not report success while a copy of the
+/// passphrase survives in a collection whose unlock prompt was not answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_refuses_a_partial_unlock() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_two_places", "pass123");
+    let canonical = std::fs::canonicalize(&key).unwrap();
+
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+
+    // A second collection with a different password holding the same key.
+    let dir = fx.data_dir.path().join("secret-manager");
+    let mut extra = secret_manager::vault::Vault::create(
+        &dir.join("extra.vault"),
+        "Extra",
+        b"other-password",
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    extra
+        .insert_item(
+            "SSH key",
+            std::collections::BTreeMap::from([
+                (
+                    "xdg:schema".to_string(),
+                    "org.secret-manager.ssh".to_string(),
+                ),
+                ("path".to_string(), canonical.to_string_lossy().into_owned()),
+                ("has_passphrase".to_string(), "true".to_string()),
+            ]),
+            b"pass123".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+    drop(extra);
+    secret_manager::protocol::call(
+        &fx.control_socket(),
+        &secret_manager::protocol::Request::Reload,
+    )
+    .unwrap();
+    fx.lock_default().await;
+
+    fx.sm()
+        .args(["ssh", "remove"])
+        .arg(&key)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("nothing was deleted"));
+    fx.sm()
+        .args(["ssh", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("id_two_places"));
+}
+
+/// MEDIUM 3: releasing a stored passphrase needs an explicit confirmation,
+/// because `ssh` only calls the helper when there is no terminal to ask on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn askpass_requires_confirmation_before_releasing_a_passphrase() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_consent", "pass123");
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+    let prompt = format!("Enter passphrase for key '{}': ", key.display());
+
+    // Declined: exits as cancelled and prints nothing.
+    let out = fx
+        .sm()
+        .args(["ssh", "askpass", &prompt])
+        .env("FAKE_CONFIRM", "no")
+        .env_remove("FAKE_PIN")
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    assert!(out.is_empty(), "declined confirmation leaked output");
+
+    // Accepted: the passphrase is released.
+    fx.sm()
+        .args(["ssh", "askpass", &prompt])
+        .env("FAKE_CONFIRM", "yes")
+        .assert()
+        .success()
+        .stdout("pass123\n");
+
+    // Escape hatch for unattended use.
+    fx.sm()
+        .args(["ssh", "askpass", &prompt])
+        .env("SM_ASKPASS_NO_CONFIRM", "1")
+        .env("FAKE_CONFIRM", "no")
+        .assert()
+        .success()
+        .stdout("pass123\n");
+}
+
+/// HIGH 2 end to end: an OpenSSH host-key question whose destination string
+/// embeds a passphrase prompt must never be answered with a passphrase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_key_question_embedding_a_passphrase_prompt_is_a_confirmation() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let keys = tempfile::tempdir().unwrap();
+    let key = make_key(keys.path(), "id_target", "pass123");
+    fx.sm()
+        .args(["ssh", "add"])
+        .arg(&key)
+        .write_stdin("pass123\n")
+        .assert()
+        .success();
+
+    let hostile = format!(
+        "The authenticity of host 'Enter passphrase for key '{}': ' can't be established.\n\
+         ED25519 key fingerprint is SHA256:xxx.\n\
+         Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
+        key.display()
+    );
+    let out = fx
+        .sm()
+        .args(["ssh", "askpass", &hostile])
+        .env("FAKE_CONFIRM", "no")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(String::from_utf8_lossy(&out), "no\n");
+}
+
+/// LOW 2: an untagged confirmation question must not be answered with a typed
+/// value, and an empty answer (which OpenSSH reads as "yes") is never printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn untagged_question_is_confirmed_and_empty_answers_are_refused() {
+    let fx = Fixture::start().await;
+    fx.sm()
+        .args(["ssh", "askpass", "Allow remote host to use this key?"])
+        .env("FAKE_PIN", "typed")
+        .env("FAKE_CONFIRM", "no")
+        .assert()
+        .success()
+        .stdout("no\n");
+    // A passphrase box that comes back empty is an error, not an empty line.
+    let out = fx
+        .sm()
+        .args(["ssh", "askpass", "Enter PIN for authenticator:"])
+        .env("FAKE_PIN", "")
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    assert!(out.is_empty(), "an empty answer was printed: {out:?}");
 }

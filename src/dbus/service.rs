@@ -16,6 +16,7 @@ use zbus::interface;
 use zbus::message::Header;
 use zbus::object_server::{ObjectServer, SignalEmitter};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zeroize::Zeroizing;
 
 pub struct Service {
     state: Shared,
@@ -27,6 +28,18 @@ impl Service {
     }
 }
 
+/// Upper bound on the `items` array of one `GetSecrets` call. Every element
+/// costs a linear path resolution, a linear item lookup, and an AES
+/// encryption; without a cap a single ~128 MiB D-Bus message could occupy the
+/// global state mutex for a very long time. libsecret never sends more than a
+/// few hundred.
+pub const MAX_GET_SECRETS_ITEMS: usize = 1024;
+
+/// Upper bound on the attribute count of one search, for the same reason.
+pub const MAX_SEARCH_ATTRIBUTES: usize = 1024;
+
+/// A `SessionCipher` is not `Clone`; this copies one so the per-item
+/// encryption in `get_secrets` can run after the state lock is released.
 /// Append `id` unless it's already present.
 fn push_unique(ids: &mut Vec<String>, id: String) {
     if !ids.contains(&id) {
@@ -62,6 +75,7 @@ impl Service {
         let owner = require_sender(&header)?;
         let path = {
             let mut st = self.state.lock().await;
+            st.check_session_quota(&owner)?;
             let path = st.new_session_path();
             st.sessions
                 .insert(path.to_string(), SessionEntry { owner, cipher });
@@ -79,6 +93,11 @@ impl Service {
         &self,
         attributes: HashMap<String, String>,
     ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+        if attributes.len() > MAX_SEARCH_ATTRIBUTES {
+            return Err(Error::invalid_args(format!(
+                "too many attributes; at most {MAX_SEARCH_ATTRIBUTES} per call"
+            )));
+        }
         let query: BTreeMap<String, String> = attributes.into_iter().collect();
         Ok(self.state.lock().await.search_all(&query))
     }
@@ -91,41 +110,70 @@ impl Service {
             .unwrap_or_else(paths::root))
     }
 
+    /// Secrets of `items`, encrypted for `session`.
+    ///
+    /// `items` is caller-supplied and otherwise bounded only by the D-Bus
+    /// message size limit, so it is capped at [`MAX_GET_SECRETS_ITEMS`]; the
+    /// per-item encryption also runs after the state lock is released, so
+    /// only the (cheap) lookups happen under it.
     async fn get_secrets(
         &self,
         items: Vec<OwnedObjectPath>,
         session: OwnedObjectPath,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<HashMap<OwnedObjectPath, SecretStruct>> {
-        let mut st = self.state.lock().await;
-        st.touch();
-        let cipher = st.cipher(session.as_str(), &require_sender(&header)?)?;
+        if items.len() > MAX_GET_SECRETS_ITEMS {
+            return Err(Error::invalid_args(format!(
+                "too many items; at most {MAX_GET_SECRETS_ITEMS} per call"
+            )));
+        }
+        let sender = require_sender(&header)?;
+        type Plan = Vec<(OwnedObjectPath, Zeroizing<Vec<u8>>, String)>;
+        let (cipher, plan): (SessionCipher, Plan) = {
+            let mut st = self.state.lock().await;
+            st.touch();
+            let cipher = SessionCipher::clone(st.cipher(session.as_str(), &sender)?);
+            let mut plan = Vec::with_capacity(items.len());
+            for path in items {
+                let Some((cid, iid)) = st.resolve_item(path.as_str()) else {
+                    continue;
+                };
+                let Some(vault) = st.collections.get(&cid) else {
+                    continue;
+                };
+                // Locked items are omitted, as the spec allows.
+                let Ok(item) = vault.item(&iid) else {
+                    continue;
+                };
+                plan.push((path, item.secret.clone(), item.content_type.clone()));
+            }
+            (cipher, plan)
+        };
         let mut out = HashMap::new();
-        for path in items {
-            let Some((cid, iid)) = st.resolve_item(path.as_str()) else {
-                continue;
-            };
-            let Some(vault) = st.collections.get(&cid) else {
-                continue;
-            };
-            // Locked items are omitted, as the spec allows.
-            let Ok(item) = vault.item(&iid) else {
-                continue;
-            };
-            let (parameters, value) = cipher.encrypt(&item.secret);
+        for (path, secret, content_type) in plan {
+            let (parameters, value) = cipher.encrypt(&secret);
             out.insert(
                 path,
                 SecretStruct {
                     session: session.clone(),
                     parameters,
                     value,
-                    content_type: item.content_type.clone(),
+                    content_type,
                 },
             );
         }
         Ok(out)
     }
 
+    /// Point `name` at `collection`, or clear it when `collection` is `"/"`.
+    ///
+    /// As the freedesktop spec specifies (and every other implementation
+    /// does), an existing alias is overwritten silently. **Any client on the
+    /// session bus can repoint any alias, `default` included.** That is
+    /// inherent to the same-uid Secret Service model — the bus offers no
+    /// caller distinction to authorize against, and a client that could not
+    /// repoint an alias could simply clear it and set it again — so this
+    /// method is not, and cannot be, an integrity boundary.
     async fn set_alias(
         &self,
         name: &str,
@@ -143,18 +191,6 @@ impl Service {
                 let id = st
                     .resolve_collection(collection.as_str())
                     .ok_or(Error::NoSuchObject)?;
-                // Refuse to silently steal an alias that already points
-                // somewhere else: repointing to the same target is a no-op,
-                // and a first assignment (or removal via "/") is always
-                // allowed, but reassigning to a *different* existing
-                // collection must go through an explicit removal first.
-                if let Some(existing) = st.alias_target(name)
-                    && existing != id
-                {
-                    return Err(Error::invalid_args(
-                        "alias already points to another collection; remove it first with '/'",
-                    ));
-                }
                 st.aliases.insert(name.to_string(), id);
             }
             st.save_aliases().map_err(Error::failed)?;
@@ -197,9 +233,10 @@ impl Service {
         if collections.is_empty() {
             return Ok((unlocked, paths::root()));
         }
+        let owner = require_sender(&header)?;
+        st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
-        st.prompt_owners
-            .insert(prompt_path.to_string(), require_sender(&header)?);
+        st.prompt_owners.insert(prompt_path.to_string(), owner);
         drop(st);
         let prompt = Prompt::new(
             self.state.clone(),
@@ -264,9 +301,10 @@ impl Service {
         if let Some(existing) = alias.as_ref().and_then(|a| st.alias_target(a)) {
             return Ok((paths::collection(&existing), paths::root()));
         }
+        let owner = require_sender(&header)?;
+        st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
-        st.prompt_owners
-            .insert(prompt_path.to_string(), require_sender(&header)?);
+        st.prompt_owners.insert(prompt_path.to_string(), owner);
         drop(st);
         let prompt = Prompt::new(
             self.state.clone(),

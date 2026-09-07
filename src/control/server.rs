@@ -64,15 +64,29 @@ impl ControlServer {
     /// [`MAX_CONNECTIONS`] in flight, each bounded by the connection timeout.
     pub async fn run(self, handler: Handler) {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        let mut backoff = Duration::from_millis(0);
         loop {
             let permit = match slots.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return,
             };
             let (stream, _) = match self.listener.accept().await {
-                Ok(pair) => pair,
+                Ok(pair) => {
+                    backoff = Duration::from_millis(0);
+                    pair
+                }
                 Err(e) => {
-                    tracing::warn!("control socket accept failed: {e}");
+                    // A persistent condition such as EMFILE/ENFILE would
+                    // otherwise spin this loop at 100% CPU, one log line per
+                    // iteration. Back off, and keep the log quiet after the
+                    // first report of a run.
+                    if backoff.is_zero() {
+                        tracing::warn!("control socket accept failed: {e}");
+                        backoff = Duration::from_millis(100);
+                    } else {
+                        backoff = (backoff * 2).min(Duration::from_secs(1));
+                    }
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
             };
@@ -102,8 +116,10 @@ impl Drop for ControlServer {
 fn peer_allowed(stream: &UnixStream) -> bool {
     match stream.peer_cred() {
         Ok(cred) => {
-            // SAFETY: getuid has no preconditions and cannot fail.
-            let me = unsafe { libc::getuid() };
+            // SAFETY: geteuid has no preconditions and cannot fail. The
+            // effective uid is the one the client side checks for, so both
+            // ends compare the same identity.
+            let me = unsafe { libc::geteuid() };
             uid_allowed(me, cred.uid())
         }
         Err(_) => false,
@@ -142,7 +158,17 @@ async fn handle_connection(
         Ok(req) => handler(req).await,
         Err(e) => Response::Error(format!("malformed request: {e}")),
     };
-    let frame = encode_frame(&response).map_err(std::io::Error::other)?;
+    // A response too large to frame must still be diagnosable: send an error
+    // the peer can read rather than dropping the connection, which would
+    // surface as an unexplained EOF.
+    let frame = match encode_frame(&response) {
+        Ok(frame) => frame,
+        Err(e) => {
+            tracing::warn!("cannot encode a control response: {e}");
+            encode_frame(&Response::Error("response too large".into()))
+                .map_err(std::io::Error::other)?
+        }
+    };
     tokio::time::timeout(timeout, stream.write_all(&frame))
         .await
         .map_err(|_| std::io::Error::other("peer stopped reading"))??;

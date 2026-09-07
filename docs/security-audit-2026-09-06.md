@@ -366,3 +366,76 @@ Argon2 on the daemon's blocking pool, an up-front `RLIMIT_MEMLOCK` check
 before `mlockall`, `catch_unwind`-wrapped PAM hooks, the `vault_dir=` PAM
 option, the `SetAlias` deviation from silent overwrite, and the systemd unit
 and Makefile fixes described elsewhere in this branch's docs.
+
+
+---
+
+# Second audit — 2026-09-07
+
+A fresh review of the committed tree (six parallel domain audits plus direct
+verification) found 5 Critical, 12 High, and about 25 Medium and Low items.
+All are fixed. Findings were confirmed by test or by reading before being
+acted on; two agent findings that contradicted the code were checked and one
+turned out to be right about a fix that had never landed (below).
+
+## Two fixes the previous round claimed but did not make
+
+An edit script aborted on a failed assertion and its output was filtered, so
+two changes were reported as done and were not in the tree:
+
+* `create_collection` still ran Argon2 while holding the daemon's state
+  mutex, bypassing the derivation cap.
+* `delete_collection` still unlinked the vault file in one lock scope and
+  removed the collection from state in another, leaving the race the fix was
+  supposed to close.
+
+Both are fixed here, and the commit message for `26949d9` overstates them.
+
+## Critical
+
+| ID | Finding | Resolution |
+|----|---------|------------|
+| C1 | The control-socket deadline did not bound reads. `SO_RCVTIMEO` limits one `read(2)`, but `read_exact` loops, so a peer feeding one byte per tick held the caller forever. Measured: 179 s against an 800 ms budget, as root inside `sshd`. | A `Deadline`/`TimedStream` pair re-arms the socket timeout from the remaining budget before every syscall. Regression test drives a drip-feeding listener. |
+| C2 | A FIFO in place of the vault file hung root permanently. `O_NOFOLLOW` does not refuse FIFOs and the code never checked the file type, so `mkfifo default.vault` blocked `open(2)` inside the login forever. | `O_NONBLOCK | O_CLOEXEC` added and non-regular files rejected after `fstat`. Test asserts refusal within seconds. |
+| C3 | `cargo build --all-features` produced a PAM module containing tokio, zbus and clap, loaded as root, with no failure to warn the packager. | `compile_error!` makes `daemon` + `pam` mutually exclusive. The PAM build is library-only; the Makefile says so. |
+| C4 | `sm delete` deleted part of a set and exited 0 when one of several prompts was cancelled, because the strict path checked only the error, never coverage. | Coverage check against the locked set; nothing is deleted on a shortfall. Same fix applied to `sm ssh remove` and `ssh add`. |
+| C5 | Root unlinked `control.sock` through a path it re-resolved after validating, across a window spanning a file read and a 5 s connect, so a directory swap redirected the unlink. | Descriptor-based `SocketDir`: validated once by `fstat`, used via `unlinkat` and `/proc/self/fd`. Test proves a post-validation swap does not redirect it. |
+
+## High
+
+Login KDF ceiling lowered to 64 MiB / 4 passes / 2 lanes with a total-work
+bound, since the derivation runs as root once per session with no
+concurrency cap. A prompt with no owner entry was treated as authorized and
+could be taken over by any bus client after a dismissal; `check_owner` now
+fails closed and completion consumes the action. The `SetAlias` anti-steal
+guard was removed: it was bypassable by clearing the alias first, so it
+deviated from the spec for no gain. Consent dialogs no longer render a
+client-supplied label verbatim, and show the immutable collection id.
+`Reload` moved off the state mutex onto the blocking pool, serialized. The
+`mlockall` budget is sized from the maximum KDF a header can request rather
+than the configured one. `--collection` is validated instead of being pasted
+into a path. `sm ssh askpass` now asks for confirmation before releasing a
+passphrase, with `SM_ASKPASS_NO_CONFIRM=1` as the documented opt-out.
+
+## Medium and Low
+
+Hardening failures are fatal rather than logged, and the CLI makes itself
+non-dumpable too. Per-client caps on sessions and prompts; a `GetSecrets`
+item cap; a pinentry dialog timeout; session and prompt paths carry 64 random
+bits. `Vault::create` reserves its name exclusively before deriving; the
+header has a write-side size ceiling; `Vault::open` refuses oversized files;
+`change_key` rejects a reused salt and rotates the index salt; the temp-file
+sweep matches the real name shape and an age; the RNG no longer panics on the
+save path. Accept errors back off; oversized responses return a readable
+error; the bus watcher retries instead of abandoning cleanup. `make install`
+refuses a `PAMSO` without PAM symbols, installs it 0644, and only touches
+`sm` symlinks that belong to this package. Syslog input is sanitized inside
+`log` itself, including bidi overrides.
+
+## Verified sound, unchanged
+
+Total AEAD coverage over every header field, no nonce reuse across saves and
+rotations, no parser panic across 20,000 mutated inputs, no object-path
+escape, and a genuine safe prime for the DH group so the small-subgroup
+rejection is complete. These are now a permanent test (`tests/invariants.rs`)
+rather than a one-off check.

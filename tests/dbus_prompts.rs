@@ -350,6 +350,262 @@ async fn prompt_is_refused_to_a_non_owner() {
     );
 }
 
+/// A dismissed prompt must be dead: its action is consumed and its owner
+/// entry gone, so no other client can take it over in the window before the
+/// object is unexported and drive it to completion (HIGH 1). Historically
+/// `check_owner` treated a *missing* owner entry as authorized and `dismiss`
+/// left `action` intact, so a second client could call `Prompt` on the
+/// just-dismissed path and raise the dialog for itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dismissed_prompt_cannot_be_driven_by_another_client() {
+    let fx = Fixture::start().await; // pinentry would answer the correct password
+    let owner_conn = fx.client().await;
+    let intruder_conn = fx.client().await;
+    let service = ServiceProxy::new(&owner_conn).await.unwrap();
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+
+    let owner = PromptProxy::builder(&owner_conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = owner.receive_completed().await.unwrap();
+    owner.dismiss().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), completed.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .args()
+            .unwrap()
+            .dismissed
+    );
+
+    // Racing straight into the window between `Dismiss` and the object being
+    // unexported: every call must be refused, whichever side of it lands.
+    let intruder = PromptProxy::builder(&intruder_conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    for _ in 0..20 {
+        assert!(
+            intruder.prompt("").await.is_err(),
+            "a non-owner drove a dismissed prompt"
+        );
+        assert!(intruder.dismiss().await.is_err());
+    }
+    // The owner cannot re-arm it either.
+    assert!(owner.prompt("").await.is_err());
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !fx.pinentry_log().contains("GETPIN"),
+        "a dialog was raised for a dismissed prompt:\n{}",
+        fx.pinentry_log()
+    );
+    assert!(
+        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        "the collection was unlocked by a taken-over prompt"
+    );
+    assert!(fx.daemon.state.lock().await.prompt_owners.is_empty());
+}
+
+/// The same takeover, raced against the dismissal and aimed at a *delete*
+/// confirmation — the destructive case the missing-owner hole exposed. A
+/// second client hammers `Prompt` while the owner dismisses, so calls land
+/// inside the window where the owner entry is already gone but the object is
+/// still exported. None of them may raise a confirmation dialog, and the
+/// collection must survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dismissed_delete_prompt_cannot_be_taken_over() {
+    for _ in 0..8 {
+        // The fake pinentry would confirm the deletion if it were ever asked.
+        let fx = Fixture::start_with_pin_and_env(
+            Some(common::PASSWORD),
+            vec![("FAKE_CONFIRM".to_string(), "yes".to_string())],
+            Duration::ZERO,
+        )
+        .await;
+        fx.unlock_default().await;
+        let owner_conn = fx.client().await;
+        let intruder_conn = fx.client().await;
+        let coll = collection(&owner_conn, fx.default_collection()).await;
+        let prompt = coll.delete().await.unwrap();
+        let owner = PromptProxy::builder(&owner_conn)
+            .path(prompt.clone())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let intruder = PromptProxy::builder(&intruder_conn)
+            .path(prompt.clone())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let hammer = tokio::spawn(async move {
+            for _ in 0..200 {
+                let _ = intruder.prompt("").await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let _ = owner.dismiss().await;
+        let _ = hammer.await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let log = fx.pinentry_log();
+        assert!(
+            !log.contains("CONFIRM"),
+            "a non-owner raised the delete confirmation of a dismissed prompt:\n{log}"
+        );
+        assert!(
+            fx.data_dir
+                .path()
+                .join("secret-manager")
+                .join("default.vault")
+                .exists(),
+            "a taken-over prompt deleted the collection"
+        );
+        assert!(
+            fx.daemon
+                .state
+                .lock()
+                .await
+                .collections
+                .contains_key("default"),
+            "a taken-over prompt removed the collection from state"
+        );
+    }
+}
+
+/// `Dismiss` arriving *after* the commit gate was claimed (so it cannot abort
+/// the task) must still stop a multi-collection unlock from raising dialogs
+/// for the collections it has not reached yet (MEDIUM 2).
+///
+/// Three locked collections, so the dismissal can land inside the second
+/// dialog — past the commit gate, which the first collection's answer
+/// claimed — and be observed to suppress the third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dismiss_after_the_commit_gate_stops_the_remaining_collections() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_DELAY".to_string(), "2".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    for id in ["second", "third"] {
+        secret_manager::vault::Vault::create(
+            &dir.join(format!("{id}.vault")),
+            id,
+            common::PASSWORD.as_bytes(),
+            secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+        )
+        .unwrap();
+    }
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (_, prompt) = service
+        .unlock(&[
+            fx.default_collection(),
+            paths::collection("second"),
+            paths::collection("third"),
+        ])
+        .await
+        .unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+    // The first dialog answers at ~2s and claims the gate; dismiss inside the
+    // second one, which is therefore already past the point of no return.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        2,
+        "timing assumption: two dialogs raised by now:\n{}",
+        fx.pinentry_log()
+    );
+    proxy.dismiss().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), completed.next())
+        .await
+        .expect("the prompt still completes")
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let log = fx.pinentry_log();
+    assert_eq!(
+        log.matches("GETPIN").count(),
+        2,
+        "a dialog was raised after the dismissal:\n{log}"
+    );
+    assert!(
+        fx.daemon.state.lock().await.collections["third"].is_locked(),
+        "the third collection was unlocked despite the dismissal"
+    );
+}
+
+/// A collection label is attacker-controlled (any client can set it) and is
+/// interpolated into the delete-confirmation dialog. It must never be able to
+/// forge extra lines of dialog text, and the dialog must additionally name
+/// the immutable collection id (HIGH 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hostile_label_cannot_forge_the_delete_dialog() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_CONFIRM".to_string(), "yes".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    coll.set_label("Scratch\n(no secrets)\u{202E}")
+        .await
+        .unwrap();
+
+    let delete_prompt = coll.delete().await.unwrap();
+    let (dismissed, _) = perform(&conn, &delete_prompt).await;
+    assert!(!dismissed);
+
+    let log = fx.pinentry_log();
+    let desc = log
+        .lines()
+        .find(|l| l.starts_with("SETDESC"))
+        .expect("a SETDESC line");
+    assert!(
+        !desc.contains("%0A") && !desc.contains("%0D"),
+        "a label forged a line break into the dialog: {desc}"
+    );
+    assert!(
+        !desc.contains('\u{202E}'),
+        "a bidi override survived into the dialog: {desc}"
+    );
+    assert!(
+        desc.contains("Scratch (no secrets)"),
+        "the label should still be shown, flattened: {desc}"
+    );
+    assert!(
+        desc.contains("(id: default)"),
+        "the dialog must name the immutable collection id: {desc}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_collection_with_alias_and_delete() {
     let fx = Fixture::start_with_pin_and_env(

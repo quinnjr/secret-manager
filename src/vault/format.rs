@@ -12,6 +12,19 @@ pub const VERSION: u16 = 3;
 pub const MAX_HEADER: usize = 16 << 20;
 /// Magic plus the u32 header-length prefix.
 pub const PREFIX_LEN: usize = 12;
+/// Largest vault file that will be read into memory. `MAX_HEADER` bounds the
+/// header only; without this the ciphertext is unbounded and a single huge
+/// file dropped in the vault directory would exhaust the daemon's memory
+/// while it enumerates collections at startup.
+pub const MAX_VAULT_BYTES: u64 = 256 << 20;
+
+/// Refuse a file too large to load, from its `stat` size, before any read.
+pub fn check_vault_size(len: u64) -> Result<(), FormatError> {
+    if len > MAX_VAULT_BYTES {
+        return Err(FormatError::VaultTooLarge(len));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
@@ -139,6 +152,10 @@ pub enum FormatError {
     Encoding(#[from] postcard::Error),
     #[error("{0}")]
     UnsafeKdf(String),
+    #[error("vault header is too large to write ({0} bytes; limit is {MAX_HEADER})")]
+    HeaderTooLarge(usize),
+    #[error("vault file is too large to open ({0} bytes; limit is {MAX_VAULT_BYTES})")]
+    VaultTooLarge(u64),
 }
 
 fn describe_version(v: u16) -> String {
@@ -211,8 +228,19 @@ impl VaultFile {
         })
     }
 
+    /// Encodes the prefix and header body that precede the ciphertext.
+    ///
+    /// Enforces `MAX_HEADER` on the *write* side too: `decode` refuses a
+    /// larger header, so without this a collection whose index outgrew the
+    /// limit would be written successfully and then be permanently
+    /// unopenable — after the atomic rename had already replaced the last
+    /// good file. Refusing here routes through `save`'s header rollback
+    /// instead, and makes the `as u32` truncation below unreachable.
     pub fn header_bytes(header: &Header) -> Result<Vec<u8>, FormatError> {
         let body = postcard::to_allocvec(header)?;
+        if body.len() > MAX_HEADER {
+            return Err(FormatError::HeaderTooLarge(body.len()));
+        }
         let mut out = Vec::with_capacity(12 + body.len());
         out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -377,6 +405,44 @@ mod tests {
             VaultFile::decode(&bytes),
             Err(FormatError::UnsafeKdf(_))
         ));
+    }
+
+    /// `decode` refuses a header over `MAX_HEADER`, so `header_bytes` must
+    /// refuse to produce one: otherwise `save` writes a file that can never
+    /// be opened again, over the top of the last good copy.
+    #[test]
+    fn header_over_the_limit_is_refused_by_the_writer() {
+        let mut h = header(vec![]);
+        h.label = "x".repeat(MAX_HEADER + 1);
+        let err = VaultFile::header_bytes(&h).unwrap_err();
+        assert!(
+            matches!(err, FormatError::HeaderTooLarge(n) if n > MAX_HEADER),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("too large"), "{err}");
+        // The same refusal on the constructor, so no VaultFile can exist
+        // whose encoding `decode` would reject.
+        assert!(matches!(
+            VaultFile::new(h, vec![]),
+            Err(FormatError::HeaderTooLarge(_))
+        ));
+        // A header at the limit still encodes.
+        let ok = VaultFile::header_bytes(&header(vec![])).unwrap();
+        assert!(ok.len() < MAX_HEADER);
+    }
+
+    /// The ciphertext is unbounded on disk, so `Vault::open` must bound it
+    /// from the file size before reading; this is the boundary it uses.
+    #[test]
+    fn vault_size_limit_is_a_boundary_not_a_range() {
+        assert!(check_vault_size(0).is_ok());
+        assert!(check_vault_size(MAX_VAULT_BYTES).is_ok());
+        let err = check_vault_size(MAX_VAULT_BYTES + 1).unwrap_err();
+        assert!(
+            matches!(err, FormatError::VaultTooLarge(n) if n == MAX_VAULT_BYTES + 1),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 
     #[test]

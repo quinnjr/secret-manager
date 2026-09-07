@@ -23,6 +23,7 @@ pub enum SessionError {
     Dh(#[from] dh::DhError),
 }
 
+#[derive(Clone)]
 pub enum SessionCipher {
     Plain,
     Aes { key: Zeroizing<[u8; 16]> },

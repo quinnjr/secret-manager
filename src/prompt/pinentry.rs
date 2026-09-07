@@ -4,9 +4,16 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use zeroize::Zeroizing;
+
+/// How long one dialog may hold the process-wide pinentry lock. A client that
+/// raises a dialog and never answers would otherwise block every unlock in the
+/// daemon forever; on expiry the child is dropped (`kill_on_drop`) and the
+/// request reports a cancellation.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Default)]
 pub struct PinRequest {
@@ -54,6 +61,9 @@ pub struct Pinentry {
     /// One dialog at a time: clones share the lock, so every prompt raised
     /// through the daemon's `Pinentry` queues behind the one on screen.
     dialog: Arc<tokio::sync::Mutex<()>>,
+    /// Upper bound on a single dialog, so the shared `dialog` lock is always
+    /// released again (see [`DEFAULT_TIMEOUT`]).
+    timeout: Duration,
 }
 
 /// GPG_ERR_CANCELED is 99 in the low 16 bits of an Assuan error code.
@@ -107,7 +117,14 @@ impl Pinentry {
             program: program.into(),
             env: Vec::new(),
             dialog: Arc::new(tokio::sync::Mutex::new(())),
+            timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Override [`DEFAULT_TIMEOUT`] for this handle (and its clones).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
@@ -115,34 +132,55 @@ impl Pinentry {
         self
     }
 
+    /// Ask for a password. A dialog that outlives [`Pinentry::with_timeout`]
+    /// is abandoned — the child is dropped, which kills it — and reported as
+    /// a cancellation, so one unanswered dialog cannot wedge the daemon.
     pub async fn ask(&self, req: &PinRequest) -> Result<PinOutcome, PinentryError> {
         let _one_at_a_time = self.dialog.lock().await;
-        let mut conn = self.connect().await?;
-        conn.setup(req).await?;
-        if req.repeat {
-            conn.command_lenient("SETREPEAT Repeat:").await?;
-        }
-        let outcome = match conn.getpin().await {
-            Ok(pin) => PinOutcome::Pin(pin),
-            Err(PinentryError::Assuan { code, .. }) if is_cancel(code) => PinOutcome::Cancelled,
-            Err(e) => return Err(e),
+        let work = async {
+            let mut conn = self.connect().await?;
+            conn.setup(req).await?;
+            if req.repeat {
+                conn.command_lenient("SETREPEAT Repeat:").await?;
+            }
+            let outcome = match conn.getpin().await {
+                Ok(pin) => PinOutcome::Pin(pin),
+                Err(PinentryError::Assuan { code, .. }) if is_cancel(code) => PinOutcome::Cancelled,
+                Err(e) => return Err(e),
+            };
+            conn.bye().await;
+            Ok(outcome)
         };
-        conn.bye().await;
-        Ok(outcome)
+        match tokio::time::timeout(self.timeout, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("pinentry dialog timed out; treating it as cancelled");
+                Ok(PinOutcome::Cancelled)
+            }
+        }
     }
 
-    /// Yes/no question. Cancel or any pinentry error means "no".
+    /// Yes/no question. Cancel, a timeout, or any pinentry error means "no".
     pub async fn confirm(&self, req: &PinRequest) -> Result<bool, PinentryError> {
         let _one_at_a_time = self.dialog.lock().await;
-        let mut conn = self.connect().await?;
-        conn.setup(req).await?;
-        let ok = match conn.command("CONFIRM").await {
-            Ok(()) => true,
-            Err(PinentryError::Assuan { .. }) => false,
-            Err(e) => return Err(e),
+        let work = async {
+            let mut conn = self.connect().await?;
+            conn.setup(req).await?;
+            let ok = match conn.command("CONFIRM").await {
+                Ok(()) => true,
+                Err(PinentryError::Assuan { .. }) => false,
+                Err(e) => return Err(e),
+            };
+            conn.bye().await;
+            Ok(ok)
         };
-        conn.bye().await;
-        Ok(ok)
+        match tokio::time::timeout(self.timeout, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("pinentry confirmation timed out; treating it as refused");
+                Ok(false)
+            }
+        }
     }
 
     async fn connect(&self) -> Result<Assuan, PinentryError> {
@@ -181,18 +219,32 @@ impl Pinentry {
 
 /// Options that let pinentry-curses/tty find the terminal and locale.
 fn tty_options() -> Vec<String> {
-    let mut opts = Vec::new();
-    if let Ok(tty) = std::env::var("GPG_TTY") {
-        opts.push(format!("OPTION ttyname={tty}"));
+    tty_options_from(|name| std::env::var(name).ok())
+}
+
+/// `tty_options` over an arbitrary environment lookup, so it is testable
+/// without mutating the process environment.
+///
+/// Every value is Assuan-escaped like any other argument, and a value holding
+/// a control character is dropped entirely rather than escaped: these come
+/// from the daemon's environment, and an unescaped newline would end the
+/// `OPTION` line and inject a further Assuan command.
+fn tty_options_from(var: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    fn usable(v: &str) -> bool {
+        !v.is_empty() && !v.chars().any(char::is_control)
     }
-    if let Ok(term) = std::env::var("TERM") {
-        opts.push(format!("OPTION ttytype={term}"));
+    let mut opts = Vec::new();
+    if let Some(tty) = var("GPG_TTY").filter(|v| usable(v)) {
+        opts.push(format!("OPTION ttyname={}", escape(&tty)));
+    }
+    if let Some(term) = var("TERM").filter(|v| usable(v)) {
+        opts.push(format!("OPTION ttytype={}", escape(&term)));
     }
     let ctype = ["LC_ALL", "LC_CTYPE", "LANG"]
         .iter()
-        .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()));
+        .find_map(|v| var(v).filter(|s| usable(s)));
     if let Some(c) = ctype {
-        opts.push(format!("OPTION lc-ctype={c}"));
+        opts.push(format!("OPTION lc-ctype={}", escape(&c)));
     }
     opts
 }
@@ -441,6 +493,70 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// A dialog that never answers must not hold the process-wide pinentry
+    /// lock forever: it is abandoned at the timeout and reported as a
+    /// cancellation (MEDIUM 5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hanging_dialog_times_out_as_cancelled() {
+        let p = fake()
+            .env("FAKE_PIN", "x")
+            .env("FAKE_DELAY", "30")
+            .with_timeout(Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            p.ask(&req()).await.unwrap(),
+            PinOutcome::Cancelled
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "did not time out"
+        );
+        // The lock is free again, so the next dialog runs normally.
+        let ok = fake()
+            .env("FAKE_PIN", "y")
+            .with_timeout(Duration::from_secs(5));
+        assert!(matches!(ok.ask(&req()).await.unwrap(), PinOutcome::Pin(_)));
+    }
+
+    /// The timeout wrapper must not change the normal `confirm` outcome (the
+    /// fake pinentry answers CONFIRM immediately, so only the wrapper is
+    /// under test here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn confirm_still_answers_under_a_timeout() {
+        let p = fake()
+            .env("FAKE_CONFIRM", "yes")
+            .with_timeout(Duration::from_secs(5));
+        assert!(p.confirm(&req()).await.unwrap());
+    }
+
+    /// `GPG_TTY`/`TERM`/`LC_*` reach Assuan as escaped arguments, and a value
+    /// carrying a control character is dropped rather than injected as an
+    /// extra command line (LOW 2).
+    #[test]
+    fn tty_options_are_escaped_and_control_characters_dropped() {
+        let opts = tty_options_from(|name| match name {
+            "GPG_TTY" => Some("/dev/pts/%1".to_string()),
+            "TERM" => Some("xterm\nOPTION ttyname=/dev/evil".to_string()),
+            "LC_ALL" => Some("en_US.UTF-8".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            opts,
+            vec![
+                "OPTION ttyname=/dev/pts/%251".to_string(),
+                "OPTION lc-ctype=en_US.UTF-8".to_string(),
+            ]
+        );
+        assert!(
+            !opts
+                .iter()
+                .any(|o| o.contains('\n') || o.contains("ttytype")),
+            "a control character must drop the value, not escape into a line: {opts:?}"
+        );
+        assert!(tty_options_from(|_| None).is_empty());
+        assert!(tty_options_from(|_| Some(String::new())).is_empty());
     }
 
     #[tokio::test]

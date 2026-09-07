@@ -324,6 +324,58 @@ async fn locked_collection_behaviour() {
     );
 }
 
+/// `GetSecrets` and `SearchItems` do per-element work; a caller-supplied
+/// array bounded only by the D-Bus message size limit would hold the global
+/// state mutex for arbitrarily long, so both are capped (MEDIUM 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_secrets_and_search_are_capped() {
+    use secret_manager::dbus::service::{MAX_GET_SECRETS_ITEMS, MAX_SEARCH_ATTRIBUTES};
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("one", &[("a", "b")]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // At the cap: still answered (the real item repeated to fill the array).
+    let at_cap = vec![item_path.clone(); MAX_GET_SECRETS_ITEMS];
+    let got = service.get_secrets(&at_cap, &session).await.unwrap();
+    assert_eq!(got[&item_path].value, b"s");
+
+    let over = vec![item_path.clone(); MAX_GET_SECRETS_ITEMS + 1];
+    let err = service.get_secrets(&over, &session).await.unwrap_err();
+    assert!(
+        matches!(&err, zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs"),
+        "{err:?}"
+    );
+
+    let keys: Vec<String> = (0..=MAX_SEARCH_ATTRIBUTES)
+        .map(|i| format!("k{i}"))
+        .collect();
+    let too_many: HashMap<&str, &str> = keys.iter().map(|k| (k.as_str(), "v")).collect();
+    let err = service.search_items(too_many.clone()).await.unwrap_err();
+    assert!(
+        matches!(&err, zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs"),
+        "{err:?}"
+    );
+    let err = coll.search_items(too_many).await.unwrap_err();
+    assert!(
+        matches!(&err, zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs"),
+        "{err:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alias_path_and_set_alias() {
     let fx = Fixture::start().await;
@@ -384,8 +436,10 @@ async fn alias_path_and_set_alias() {
         fx.default_collection()
     );
 
-    // Reassigning it to a *different* existing collection must be refused
-    // (finding 8): the caller has to remove it via "/" first.
+    // Repointing an alias that already targets another collection is a
+    // silent overwrite, exactly as the freedesktop spec says (HIGH 2). The
+    // old refusal was no boundary at all: `SetAlias(name, "/")` followed by
+    // `SetAlias(name, other)` achieved the same thing unauthenticated.
     {
         let mut st = fx.daemon.state.lock().await;
         let vault = secret_manager::vault::Vault::create(
@@ -400,15 +454,17 @@ async fn alias_path_and_set_alias() {
         .unwrap();
         st.collections.insert("second".to_string(), vault);
     }
-    let err = service
-        .set_alias("work", &secret_manager::dbus::paths::collection("second"))
+    let second = secret_manager::dbus::paths::collection("second");
+    service.set_alias("work", &second).await.unwrap();
+    assert_eq!(service.read_alias("work").await.unwrap(), second);
+    // And back again.
+    service
+        .set_alias("work", &fx.default_collection())
         .await
-        .unwrap_err();
-    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+        .unwrap();
     assert_eq!(
         service.read_alias("work").await.unwrap(),
-        fx.default_collection(),
-        "a refused reassignment must leave the alias untouched"
+        fx.default_collection()
     );
 
     // Removal via "/" stays allowed, and clears the way for a fresh assignment.

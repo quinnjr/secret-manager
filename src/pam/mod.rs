@@ -9,12 +9,21 @@
 //! The login password itself never crosses the control socket, and nothing
 //! that answers the socket gets to influence the derivation: the salt and
 //! Argon2 parameters are read from the collection's own vault file on disk
-//! (see [`vault_header`]), which is opened `O_NOFOLLOW` and required to be
-//! owned by the target user and not group- or world-writable. The most an
+//! (see [`vault_header`]), which is opened `O_NOFOLLOW | O_NONBLOCK` and
+//! required to be a *regular* file owned by the target user and not group- or
+//! world-writable. The most an
 //! impostor daemon can learn is an Argon2id hash of the password under
 //! parameters this module bounds on both sides (see
 //! [`kdf_acceptable_for_login`]) — the same thing a thief of the vault file
 //! would hold, not a reusable password.
+//!
+//! The control socket's directory lives under the user's own
+//! `/run/user/<uid>`, so it is never addressed by name twice: it is opened
+//! once (`O_DIRECTORY | O_NOFOLLOW`), validated on the descriptor, and every
+//! later unlink, connect and re-check goes through that descriptor (see
+//! [`SocketDir`]). A whole hook is additionally bounded by one wall-clock
+//! deadline ([`HOOK_BUDGET`]), since every stage of it is influenced by the
+//! user being logged in.
 //!
 //! Every failure is logged to syslog and returns `PAM_SUCCESS`; a broken vault
 //! must never block login. Hook bodies additionally run inside
@@ -34,16 +43,19 @@
 #![cfg_attr(not(feature = "pam"), allow(dead_code))]
 
 use crate::protocol::{
-    KdfParams, ProtocolError, Request, Response, SALT_LEN, Zeroizing, call_expecting_uid,
-    socket_path_for_runtime_dir,
+    KdfParams, ProtocolError, Request, Response, SALT_LEN, Zeroizing,
+    call_expecting_uid_with_timeout, socket_path_for_runtime_dir,
 };
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
+use std::fs::File;
 use std::io::Read;
+use std::mem::ManuallyDrop;
+use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "pam")]
@@ -64,6 +76,18 @@ const MAX_LOGGED_ERROR: usize = 200;
 /// Vault directory relative to the target user's home, when `vault_dir=` is
 /// not given.
 const DEFAULT_VAULT_SUBDIR: &str = ".local/share/secret-manager";
+/// Wall-clock ceiling on everything a session or password hook does. The
+/// stages are serial and every one of them is influenced by the user being
+/// logged in (the vault header they wrote, the daemon that answers the
+/// socket, the systemd job that starts it), so their sum is login latency an
+/// attacker chooses. One deadline covers the lot; when it is spent the unlock
+/// is abandoned and the login proceeds without the vault.
+pub(crate) const HOOK_BUDGET: Duration = Duration::from_secs(8);
+/// Secondary budget for reaping a child that has already been killed.
+const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest `collection=` accepted, so the value cannot bloat a syslog line or
+/// a path.
+const MAX_COLLECTION_LEN: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Options {
@@ -82,8 +106,24 @@ pub(crate) fn parse_options(args: &[String]) -> Options {
     };
     for arg in args {
         match arg.split_once('=') {
-            Some(("collection", v)) => opts.collection = v.to_string(),
-            Some(("auto_start", v)) => opts.auto_start = !matches!(v, "no" | "false" | "0"),
+            Some(("collection", v)) => {
+                if collection_is_valid(v) {
+                    opts.collection = v.to_string();
+                } else {
+                    log(&format!(
+                        "ignoring unusable collection '{}'; using '{}'",
+                        v, opts.collection
+                    ));
+                }
+            }
+            Some(("auto_start", v)) => match parse_bool(v) {
+                Some(b) => opts.auto_start = b,
+                None => log(&format!(
+                    "ignoring unrecognised auto_start '{}'; leaving it {}",
+                    v,
+                    if opts.auto_start { "on" } else { "off" }
+                )),
+            },
             Some(("socket", v)) => opts.socket = Some(PathBuf::from(v)),
             Some(("vault_dir", v)) => {
                 let path = PathBuf::from(v);
@@ -102,17 +142,58 @@ pub(crate) fn parse_options(args: &[String]) -> Options {
     opts
 }
 
-/// Strips control characters (so a hostile string cannot forge syslog lines or
-/// terminal escapes) and bounds the length of text that came from the daemon.
-pub(crate) fn sanitize(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_LOGGED_ERROR)
-        .collect()
+/// `auto_start=` is a switch, not a "not one of these three words" test:
+/// `off`, `disabled` and `No` must never fall through to the branch that
+/// unlinks as root and runs `systemctl`. `None` means "unrecognised", which
+/// the caller logs and treats as "leave the default alone".
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "no" | "false" | "0" | "off" => Some(false),
+        "yes" | "true" | "1" | "on" => Some(true),
+        _ => None,
+    }
 }
 
+/// `collection=` is interpolated straight into `<vault_dir>/<id>.vault`, so a
+/// value containing `/` or `..` would escape the vault directory and an empty
+/// one would open `.vault`. Restrict it to the daemon's own id charset.
+fn collection_is_valid(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= MAX_COLLECTION_LEN
+        && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Strips control characters (so a hostile string cannot forge syslog lines or
+/// terminal escapes) and bounds the length of text that came from the daemon.
+///
+/// `char::is_control()` covers C0/C1 but not the Unicode *format* characters,
+/// which can reorder a log line as it is read; the bidi controls are dropped
+/// explicitly.
+pub(crate) fn sanitize(text: &str) -> String {
+    strip_unsafe(text).take(MAX_LOGGED_ERROR).collect()
+}
+
+/// The escaping half of [`sanitize`], without the length bound: [`log`]
+/// applies it to whole lines, which are already short but must not be
+/// truncated in the middle of a path.
+fn strip_unsafe(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .filter(|c| !c.is_control() && !is_bidi_format(*c))
+}
+
+/// The Unicode bidirectional formatting characters: embeddings and overrides
+/// (`U+202A..=U+202E`) and isolates (`U+2066..=U+2069`).
+fn is_bidi_format(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Sanitizing here rather than at each call site means no caller can forget:
+/// the PAM username, the vault path and the daemon's own error text all reach
+/// syslog through this one function. Already-sanitized arguments are
+/// unaffected, since [`sanitize`] is idempotent.
 pub(crate) fn log(msg: &str) {
-    let line = format!("pam_secret_manager: {msg}");
+    let clean: String = strip_unsafe(msg).collect();
+    let line = format!("pam_secret_manager: {clean}");
     // An interior NUL cannot be passed to syslog; escape it rather than
     // dropping the line entirely.
     let Ok(text) = CString::new(line.as_str())
@@ -208,33 +289,218 @@ fn default_vault_dir(home: &Path) -> PathBuf {
     home.join(DEFAULT_VAULT_SUBDIR)
 }
 
-/// Root only touches `dir` (`<runtime>/secret-manager`) when it is a plain
-/// directory owned by the target user. A symlink the user planted there
-/// would otherwise redirect `remove_file` and `connect` elsewhere. Absent is
-/// fine: there is nothing to follow yet.
-fn runtime_subdir_is_safe(dir: &Path, uid: u32) -> bool {
-    match std::fs::symlink_metadata(dir) {
-        Ok(meta) => meta.file_type().is_dir() && meta.uid() == uid,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
+/// Root only touches `<runtime>/secret-manager` when it is a plain directory
+/// owned by the target user and writable by nobody else. A symlink the user
+/// planted there would redirect an unlink or a connect elsewhere, and a
+/// group- or world-writable directory would let another local user plant the
+/// socket inode.
+fn runtime_subdir_is_safe(meta: &std::fs::Metadata, uid: u32) -> bool {
+    meta.file_type().is_dir() && meta.uid() == uid && meta.mode() & 0o022 == 0
+}
+
+/// An owned directory descriptor, closed exactly once on drop.
+struct DirFd(RawFd);
+
+impl DirFd {
+    fn as_raw(&self) -> RawFd {
+        self.0
+    }
+
+    /// `fstat` on the descriptor itself, so the answer is about the inode
+    /// that was validated when it was opened rather than about whatever the
+    /// name resolves to now.
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        // SAFETY: `self.0` is an open descriptor owned by `self`. The `File`
+        // is wrapped in `ManuallyDrop` so its destructor never runs and the
+        // descriptor is not closed here; it is only borrowed for the `fstat`
+        // and does not escape this function.
+        let file = ManuallyDrop::new(unsafe { File::from_raw_fd(self.0) });
+        file.metadata()
     }
 }
 
-/// [`runtime_subdir_is_safe`] for a socket path, with the refusal logged.
-/// Checked again after `wait_for`, because the daemon-start window gives the
-/// user time to replace the directory underneath us.
-pub(crate) fn runtime_dir_ok(sock: &Path, uid: u32) -> bool {
-    let Some(dir) = sock.parent() else {
-        return true;
-    };
-    if runtime_subdir_is_safe(dir, uid) {
-        return true;
+impl Drop for DirFd {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was returned by `open` and is owned by `self`, so
+        // it is closed exactly once and never used again afterwards.
+        unsafe { libc::close(self.0) };
     }
-    log(&format!(
-        "{} is not a directory owned by uid {uid}; refusing to use it",
-        dir.display()
-    ));
-    false
+}
+
+/// Opens `dir` without following a final symlink and without accepting a
+/// non-directory. `Ok(None)` means it simply does not exist yet.
+fn open_dir_fd(dir: &Path) -> std::io::Result<Option<DirFd>> {
+    let c = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: `c` is a NUL-terminated path that outlives the call, the flags
+    // are constants, and `open` takes no other arguments in this form. The
+    // returned descriptor is immediately given to `DirFd`, which owns it.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd >= 0 {
+        return Ok(Some(DirFd(fd)));
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::NotFound {
+        Ok(None)
+    } else {
+        Err(e)
+    }
+}
+
+/// The control socket, addressed through a descriptor for its directory
+/// rather than through its name.
+///
+/// `unlink(2)` does not follow the *final* component, but it does follow
+/// every parent — and the parent here (`/run/user/<uid>/secret-manager`) is
+/// user-owned. Validating the name and then removing through the name leaves
+/// a window (a whole vault read plus a connect attempt) in which the user can
+/// swap the directory for a symlink and have root delete somebody else's
+/// socket. So the directory is opened and validated once, and every later
+/// operation goes through that descriptor: `unlinkat` for the removal, a
+/// re-`fstat` of the same fd for the re-check, and a `/proc/self/fd/<n>/`
+/// path for the connect.
+pub(crate) struct SocketDir {
+    /// The name the socket was originally given, used when the directory does
+    /// not exist yet and there is therefore nothing to hold open.
+    sock: PathBuf,
+    /// Final component, for `unlinkat`.
+    name: CString,
+    uid: u32,
+    dir: Option<DirFd>,
+}
+
+impl SocketDir {
+    /// Validates the socket's directory and holds it open. `None` (already
+    /// logged) means root must not touch this path at all. An absent
+    /// directory is not a refusal: the daemon has yet to create it, and there
+    /// is nothing there to follow or to unlink.
+    pub(crate) fn open(sock: &Path, uid: u32) -> Option<Self> {
+        let Some(name) = sock
+            .file_name()
+            .and_then(|n| CString::new(n.as_bytes()).ok())
+        else {
+            log(&format!(
+                "{} has no usable file name; refusing to use it",
+                sock.display()
+            ));
+            return None;
+        };
+        let parent = sock.parent().unwrap_or(Path::new(""));
+        let dir = if parent.as_os_str().is_empty() {
+            None
+        } else {
+            match open_dir_fd(parent) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    log(&format!(
+                        "cannot open {} as a directory: {}; refusing to use it",
+                        parent.display(),
+                        sanitize(&e.to_string())
+                    ));
+                    return None;
+                }
+            }
+        };
+        if let Some(fd) = &dir {
+            match fd.metadata() {
+                Ok(meta) if runtime_subdir_is_safe(&meta, uid) => {}
+                Ok(meta) => {
+                    log(&format!(
+                        "{} is not a directory owned by uid {uid} and private to it \
+                         (owner {}, mode {:o}); refusing to use it",
+                        parent.display(),
+                        meta.uid(),
+                        meta.mode() & 0o7777
+                    ));
+                    return None;
+                }
+                Err(e) => {
+                    log(&format!(
+                        "cannot stat {}: {}; refusing to use it",
+                        parent.display(),
+                        sanitize(&e.to_string())
+                    ));
+                    return None;
+                }
+            }
+        }
+        Some(Self {
+            sock: sock.to_path_buf(),
+            name,
+            uid,
+            dir,
+        })
+    }
+
+    /// Whether the directory exists and is being held open.
+    #[cfg(test)]
+    fn is_open(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    /// Path to hand to `connect`. When the directory is held open this
+    /// resolves through the validated inode, so a swap of the name cannot
+    /// redirect it; the daemon-start window is exactly when that matters.
+    pub(crate) fn socket_path(&self) -> PathBuf {
+        match &self.dir {
+            Some(fd) => PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw()))
+                .join(OsStr::from_bytes(self.name.as_bytes())),
+            None => self.sock.clone(),
+        }
+    }
+
+    /// Re-checks after the daemon-start window. A held descriptor is
+    /// re-`fstat`ed — the same inode, so this catches a `chown`/`chmod` but
+    /// cannot be fooled by a rename. A directory that did not exist before is
+    /// opened and validated now; nothing was done through its name in the
+    /// meantime, so there is nothing for a swap to have redirected.
+    pub(crate) fn revalidate(&mut self) -> bool {
+        match &self.dir {
+            Some(fd) => match fd.metadata() {
+                Ok(meta) if runtime_subdir_is_safe(&meta, self.uid) => true,
+                Ok(_) => {
+                    log("the runtime directory changed owner or mode; refusing to use it");
+                    false
+                }
+                Err(e) => {
+                    log(&format!(
+                        "cannot re-check the runtime directory: {}",
+                        sanitize(&e.to_string())
+                    ));
+                    false
+                }
+            },
+            None => match Self::open(&self.sock.clone(), self.uid) {
+                Some(fresh) => {
+                    *self = fresh;
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    /// `unlinkat` relative to the validated directory. Absent directory means
+    /// there is nothing to remove.
+    fn remove_socket(&self) -> std::io::Result<()> {
+        let Some(fd) = &self.dir else {
+            return Ok(());
+        };
+        // SAFETY: `fd` is an open directory descriptor owned by `self`, and
+        // `self.name` is a NUL-terminated relative name that outlives the
+        // call. Flags of 0 means "unlink, not rmdir".
+        let rc = unsafe { libc::unlinkat(fd.as_raw(), self.name.as_ptr(), 0) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
 }
 
 /// The vault header supplies the KDF parameters, and it is not authenticated
@@ -245,17 +511,29 @@ pub(crate) fn runtime_dir_ok(sock: &Path, uid: u32) -> bool {
 fn kdf_acceptable_for_login(kdf: &KdfParams) -> bool {
     const MIN_M_COST_KIB: u32 = 19 * 1024;
     const MIN_T_COST: u32 = 2;
-    /// Below `KdfParams::MAX_T_COST`: 64 passes over 256 MiB is minutes of
-    /// login latency, which is a denial of service, not a security margin.
-    const MAX_T_COST: u32 = 8;
-    const MAX_P_COST: u32 = 4;
     kdf.validate().is_ok()
         && kdf.m_cost_kib >= MIN_M_COST_KIB
         && kdf.t_cost >= MIN_T_COST
-        && kdf.m_cost_kib <= KdfParams::MAX_M_COST_KIB
-        && kdf.t_cost <= MAX_T_COST
-        && kdf.p_cost <= MAX_P_COST
+        && kdf.m_cost_kib <= MAX_M_COST_KIB_LOGIN
+        && kdf.t_cost <= MAX_T_COST_LOGIN
+        && kdf.p_cost <= MAX_P_COST_LOGIN
+        && kdf.m_cost_kib as u64 * kdf.t_cost as u64 <= MAX_TOTAL_WORK_LOGIN
 }
+
+/// The login path needs its own ceiling, far below the vault's.
+/// `KdfParams::MAX_M_COST_KIB` (256 MiB) is sized for one interactive
+/// `secret-manager unlock`; here root runs the derivation inside every login,
+/// single-threaded, with no admission control. Forty parallel `ssh` logins
+/// against a 256 MiB header would ask this process for ~10 GB, and a failed
+/// Rust allocation *aborts* — which `catch_unwind` cannot contain, so the
+/// panic guard would not save the host process. 64 MiB still covers the
+/// shipped default of 64 MiB / t=3 / p=1.
+const MAX_M_COST_KIB_LOGIN: u32 = 64 * 1024;
+const MAX_T_COST_LOGIN: u32 = 4;
+const MAX_P_COST_LOGIN: u32 = 2;
+/// The per-axis ceilings also bound the product, so a header cannot combine
+/// the memory corner with the passes corner.
+const MAX_TOTAL_WORK_LOGIN: u64 = MAX_M_COST_KIB_LOGIN as u64 * MAX_T_COST_LOGIN as u64;
 
 /// Opens `<vault_dir>/<collection>.vault` and returns the salt and KDF
 /// parameters from its header, or `None` (already logged) if anything about
@@ -274,7 +552,13 @@ pub(crate) fn vault_header(
     let shown = path.display().to_string();
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        // O_NONBLOCK: `O_NOFOLLOW` refuses a symlink but not a FIFO, and
+        // `open(O_RDONLY)` on a FIFO blocks until a writer appears — so a
+        // `mkfifo <collection>.vault` would wedge root in the kernel and lock
+        // that user out of their own machine. It is a no-op for the regular
+        // file this is supposed to be. O_CLOEXEC: never leak the descriptor
+        // into the `systemctl` child.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(&path)
     {
         Ok(f) => f,
@@ -297,6 +581,15 @@ pub(crate) fn vault_header(
             return None;
         }
     };
+    // Type first: a FIFO, device or socket owned by the user with mode 0600
+    // passes both checks below, and reading one has nothing to do with
+    // reading a vault.
+    if !meta.file_type().is_file() {
+        log(&format!(
+            "{shown} is not a regular file; refusing to read it"
+        ));
+        return None;
+    }
     if meta.uid() != uid {
         log(&format!(
             "{shown} is owned by uid {}, expected {uid}; refusing to read it",
@@ -409,13 +702,66 @@ fn run_bounded(cmd: &mut std::process::Command, timeout: Duration) -> Result<Exi
                     if let Err(e) = child.kill() {
                         log(&format!("cannot kill timed-out child: {e}"));
                     }
-                    let _ = child.wait();
+                    if !reap_bounded(&mut child, REAP_TIMEOUT) {
+                        log("timed-out child did not die; leaving it to init to reap");
+                    }
                     return Err(format!("timed out after {timeout:?}"));
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
             Err(e) => return Err(format!("cannot wait: {e}")),
         }
+    }
+}
+
+/// Collects a child that has already been killed, within `timeout`.
+///
+/// `SIGKILL` is not instantaneous: a process in uninterruptible sleep stays
+/// there until its syscall finishes, and a plain `wait()` on it blocks
+/// forever — inside a login, as root. Giving up leaves a zombie until this
+/// process exits, which is far cheaper than a hung login.
+fn reap_bounded(child: &mut Child, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Err(_) => return false,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    return false;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+/// One wall-clock deadline shared by every stage of a hook, in the shape
+/// `call_inner` in [`crate::protocol`] uses: each stage asks what is left and
+/// is skipped once nothing is.
+pub(crate) struct Budget {
+    start: Instant,
+    total: Duration,
+}
+
+impl Budget {
+    pub(crate) fn new(total: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            total,
+        }
+    }
+
+    /// Time left, or `None` once the budget is spent.
+    pub(crate) fn remaining(&self) -> Option<Duration> {
+        self.total
+            .checked_sub(self.start.elapsed())
+            .filter(|d| !d.is_zero())
+    }
+
+    /// [`Budget::remaining`], but never more than a stage's own constant.
+    pub(crate) fn capped(&self, max: Duration) -> Option<Duration> {
+        self.remaining().map(|left| left.min(max))
     }
 }
 
@@ -427,7 +773,11 @@ fn systemctl_path() -> &'static Path {
         .unwrap_or_else(|| Path::new(SYSTEMCTL_PATHS[0]))
 }
 
-pub(crate) fn start_daemon(user: &str) {
+pub(crate) fn start_daemon(user: &str, budget: &Budget) {
+    let Some(timeout) = budget.capped(START_TIMEOUT) else {
+        log("no time left to start the daemon; vault stays locked");
+        return;
+    };
     let mut cmd = std::process::Command::new(systemctl_path());
     cmd.args([
         "--user",
@@ -441,7 +791,7 @@ pub(crate) fn start_daemon(user: &str) {
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null());
-    match run_bounded(&mut cmd, START_TIMEOUT) {
+    match run_bounded(&mut cmd, timeout) {
         Ok(s) if s.success() => {}
         Ok(s) => log(&format!("systemctl exited with {s}")),
         Err(e) => log(&format!("cannot run systemctl: {}", sanitize(&e))),
@@ -495,8 +845,9 @@ pub(crate) fn try_send(
     req: &Request,
     uid: u32,
     what: &str,
+    budget: Duration,
 ) -> Result<(), ProtocolError> {
-    match call_expecting_uid(sock, req, uid) {
+    match call_expecting_uid_with_timeout(sock, req, uid, budget) {
         Ok(Response::Ok) => Ok(()),
         Ok(Response::Error(e)) => {
             log(&format!("{what} failed: {}", sanitize(&e)));
@@ -530,6 +881,7 @@ fn derive(password: &str, salt: &[u8; SALT_LEN], kdf: KdfParams) -> Option<Key> 
 /// Derives the key locally from the header's own salt and parameters and
 /// unlocks with it. Only transport errors are returned; everything else is
 /// logged and treated as done.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn unlock_by_key(
     sock: &Path,
     collection: &str,
@@ -537,6 +889,7 @@ pub(crate) fn unlock_by_key(
     password: &str,
     salt: &[u8; SALT_LEN],
     kdf: KdfParams,
+    budget: Duration,
 ) -> Result<(), ProtocolError> {
     let Some(key) = derive(password, salt, kdf) else {
         return Ok(());
@@ -545,7 +898,7 @@ pub(crate) fn unlock_by_key(
         collection: collection.to_string(),
         key: Zeroizing::new(*key.as_bytes()),
     };
-    try_send(sock, &req, uid, "unlock")
+    try_send(sock, &req, uid, "unlock", budget)
 }
 
 /// Builds the `ChangeKey` request: `old_key` under the header's salt, and
@@ -588,17 +941,17 @@ pub(crate) fn log_transport(what: &str, e: &ProtocolError) {
 /// now be started. A failed unlink (other than "already gone") means the
 /// daemon could not bind the socket anyway, and may mean the path is not
 /// ours to remove — so give up rather than start a daemon that will fail.
-pub(crate) fn start_after_clearing(sock: &Path, action: StaleSocket) -> bool {
+pub(crate) fn start_after_clearing(dir: &SocketDir, action: StaleSocket) -> bool {
     if action == StaleSocket::LeaveAlone {
         return true;
     }
-    match std::fs::remove_file(sock) {
+    match dir.remove_socket() {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => {
             log(&format!(
                 "cannot remove the stale socket {}: {}; not starting the daemon",
-                sock.display(),
+                dir.sock.display(),
                 sanitize(&e.to_string())
             ));
             false
@@ -727,25 +1080,6 @@ mod tests {
         );
     }
 
-    /// Root must only touch `<runtime>/secret-manager` when it is a real
-    /// directory owned by the target user: never a symlink the user planted.
-    #[test]
-    fn runtime_subdir_is_safe_only_for_an_owned_real_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("secret-manager");
-        std::fs::create_dir(&real).unwrap();
-        assert!(runtime_subdir_is_safe(&real, me()));
-        assert!(!runtime_subdir_is_safe(&real, me() ^ 1));
-        let link = dir.path().join("linked");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(!runtime_subdir_is_safe(&link, me()));
-        let file = dir.path().join("file");
-        std::fs::write(&file, b"").unwrap();
-        assert!(!runtime_subdir_is_safe(&file, me()));
-        // Not existing yet is fine: nothing to follow.
-        assert!(runtime_subdir_is_safe(&dir.path().join("absent"), me()));
-    }
-
     /// The KDF parameters come from an unauthenticated vault header, so they
     /// are attacker-controlled: too weak means a cheap-to-crack hash of the
     /// login password, too strong means a login that stalls for minutes.
@@ -785,11 +1119,11 @@ mod tests {
             t_cost: 2,
             p_cost: 5
         }));
-        // The ceiling is exactly reachable.
+        // The login ceiling is exactly reachable.
         assert!(kdf_acceptable_for_login(&KdfParams {
-            m_cost_kib: KdfParams::MAX_M_COST_KIB,
-            t_cost: 8,
-            p_cost: 4
+            m_cost_kib: MAX_M_COST_KIB_LOGIN,
+            t_cost: MAX_T_COST_LOGIN,
+            p_cost: MAX_P_COST_LOGIN
         }));
     }
 
@@ -891,7 +1225,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("control.sock");
         let server = fake_daemon(&sock);
-        unlock_by_key(&sock, "work", me(), "hunter2", &SALT, LOGIN_KDF).expect("unlock");
+        unlock_by_key(
+            &sock,
+            "work",
+            me(),
+            "hunter2",
+            &SALT,
+            LOGIN_KDF,
+            Duration::from_secs(5),
+        )
+        .expect("unlock");
         let req = server.join().unwrap();
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match req {
@@ -909,8 +1252,16 @@ mod tests {
     fn unlock_by_key_reports_a_transport_error() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("nothing-listening.sock");
-        let err = unlock_by_key(&sock, "work", me(), "hunter2", &SALT, LOGIN_KDF)
-            .expect_err("nothing is listening");
+        let err = unlock_by_key(
+            &sock,
+            "work",
+            me(),
+            "hunter2",
+            &SALT,
+            LOGIN_KDF,
+            Duration::from_secs(5),
+        )
+        .expect_err("nothing is listening");
         assert!(matches!(err, ProtocolError::Connect(_)), "{err:?}");
     }
 
@@ -1043,5 +1394,290 @@ mod tests {
         assert!(!socket_override_allowed(0));
         assert!(socket_override_allowed(1000));
         assert!(socket_override_allowed(me().max(1)));
+    }
+
+    fn mkfifo_at(path: &Path) {
+        let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    }
+
+    /// `O_NOFOLLOW` does not refuse a FIFO, and `open(O_RDONLY)` on one blocks
+    /// until a writer appears — so a `mkfifo ~/.local/share/secret-manager/
+    /// default.vault` would wedge root inside the login forever. The open must
+    /// be non-blocking and the file type checked.
+    #[test]
+    fn refuses_a_fifo_in_place_of_the_vault_file() {
+        let dir = tempfile::tempdir().unwrap();
+        mkfifo_at(&dir.path().join("default.vault"));
+        let start = Instant::now();
+        assert_eq!(vault_header(dir.path(), "default", me()), None);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "opening a FIFO must not block root: took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A directory root will unlink inside must be a real directory, owned by
+    /// the target user, and writable by nobody else.
+    #[test]
+    fn runtime_subdir_is_safe_only_for_an_owned_private_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("secret-manager");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = |p: &Path| std::fs::symlink_metadata(p).unwrap();
+        assert!(runtime_subdir_is_safe(&meta(&real), me()));
+        assert!(!runtime_subdir_is_safe(&meta(&real), me() ^ 1));
+        // Group- or world-writable: another local user could plant the socket.
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(!runtime_subdir_is_safe(&meta(&real), me()));
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o707)).unwrap();
+        assert!(!runtime_subdir_is_safe(&meta(&real), me()));
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(!runtime_subdir_is_safe(&meta(&link), me()));
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!runtime_subdir_is_safe(&meta(&file), me()));
+    }
+
+    fn private_dir(parent: &Path, name: &str) -> PathBuf {
+        let p = parent.join(name);
+        std::fs::create_dir(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        p
+    }
+
+    #[test]
+    fn socket_dir_opens_an_owned_private_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sd = SocketDir::open(&rt.join("control.sock"), me()).expect("owned 0700 dir");
+        assert!(
+            sd.is_open(),
+            "the directory exists, so it must be held open"
+        );
+        // The path handed to `connect` resolves through the validated inode.
+        let via = sd.socket_path();
+        assert!(via.starts_with("/proc/self/fd/"), "{}", via.display());
+    }
+
+    #[test]
+    fn socket_dir_rejects_a_symlinked_runtime_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = private_dir(dir.path(), "real");
+        let link = dir.path().join("secret-manager");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(SocketDir::open(&link.join("control.sock"), me()).is_none());
+    }
+
+    #[test]
+    fn socket_dir_rejects_a_wrong_owner_or_group_writable_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        assert!(SocketDir::open(&sock, me() ^ 1).is_none());
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(SocketDir::open(&sock, me()).is_none());
+    }
+
+    /// Absent is not a refusal: the daemon has simply not created its runtime
+    /// directory yet, and there is nothing there to follow or to unlink.
+    #[test]
+    fn socket_dir_tolerates_an_absent_runtime_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("secret-manager").join("control.sock");
+        let sd = SocketDir::open(&sock, me()).expect("absent is fine");
+        assert!(!sd.is_open());
+        assert_eq!(sd.socket_path(), sock);
+        // Nothing to remove, and no error.
+        assert!(start_after_clearing(&sd, StaleSocket::Unlink));
+    }
+
+    /// The whole point of holding the descriptor: after validation the user
+    /// may swap the *name* for a symlink elsewhere, and root's unlink must
+    /// still land in the directory that was checked.
+    #[test]
+    fn a_directory_swap_after_validation_does_not_redirect_the_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let victim = private_dir(dir.path(), "someone-else");
+        std::fs::write(rt.join("control.sock"), b"stale").unwrap();
+        std::fs::write(victim.join("control.sock"), b"live").unwrap();
+
+        let sd = SocketDir::open(&rt.join("control.sock"), me()).expect("valid at open");
+        // Swap the validated name for a symlink to another user's directory.
+        let moved = dir.path().join("moved");
+        std::fs::rename(&rt, &moved).unwrap();
+        std::os::unix::fs::symlink(&victim, &rt).unwrap();
+
+        assert!(start_after_clearing(&sd, StaleSocket::Unlink));
+        assert!(
+            !moved.join("control.sock").exists(),
+            "the unlink must land in the validated directory"
+        );
+        assert!(
+            victim.join("control.sock").exists(),
+            "the swapped-in directory must be untouched"
+        );
+    }
+
+    /// 40 parallel logins each derive a key in this process's address space,
+    /// single-threaded; the login ceiling has to be far below the vault's own.
+    #[test]
+    fn login_kdf_ceiling_is_tighter_than_the_vaults() {
+        // The shipped default still fits.
+        assert!(kdf_acceptable_for_login(&KdfParams::default()));
+        assert!(kdf_acceptable_for_login(&LOGIN_KDF));
+        assert!(kdf_acceptable_for_login(&KdfParams {
+            m_cost_kib: MAX_M_COST_KIB_LOGIN,
+            t_cost: 2,
+            p_cost: 1
+        }));
+        // The vault's own ceiling is now far too expensive for a login.
+        assert!(!kdf_acceptable_for_login(&KdfParams {
+            m_cost_kib: KdfParams::MAX_M_COST_KIB,
+            t_cost: 8,
+            p_cost: 4
+        }));
+        assert!(!kdf_acceptable_for_login(&KdfParams {
+            m_cost_kib: MAX_M_COST_KIB_LOGIN + 1,
+            t_cost: 2,
+            p_cost: 1
+        }));
+        assert!(!kdf_acceptable_for_login(&KdfParams {
+            m_cost_kib: 19 * 1024,
+            t_cost: MAX_T_COST_LOGIN + 1,
+            p_cost: 1
+        }));
+        assert!(!kdf_acceptable_for_login(&KdfParams {
+            m_cost_kib: 19 * 1024,
+            t_cost: 2,
+            p_cost: MAX_P_COST_LOGIN + 1
+        }));
+        // Total work is bounded too: 64 MiB x 4 passes is the most a login may
+        // be asked for, and that corner is exactly reachable.
+        let corner = KdfParams {
+            m_cost_kib: MAX_M_COST_KIB_LOGIN,
+            t_cost: MAX_T_COST_LOGIN,
+            p_cost: MAX_P_COST_LOGIN,
+        };
+        assert!(kdf_acceptable_for_login(&corner));
+        assert_eq!(
+            corner.m_cost_kib as u64 * corner.t_cost as u64,
+            MAX_TOTAL_WORK_LOGIN,
+            "the work bound must be exactly the m/t corner, not slack above it"
+        );
+        // Nothing beyond it, on either axis.
+        assert!(!kdf_acceptable_for_login(&KdfParams {
+            m_cost_kib: corner.m_cost_kib + 1,
+            ..corner
+        }));
+        assert!(!kdf_acceptable_for_login(&KdfParams {
+            t_cost: corner.t_cost + 1,
+            ..corner
+        }));
+    }
+
+    /// `log` escapes only NUL, so an unsanitized PAM username could forge
+    /// syslog lines. Sanitizing inside `log` means no call site can forget.
+    #[test]
+    fn sanitize_strips_newlines_and_bidi_overrides() {
+        assert_eq!(
+            sanitize("alice\npam_secret_manager: unlocked root"),
+            "alicepam_secret_manager: unlocked root"
+        );
+        // `char::is_control()` misses the Unicode bidi format characters.
+        assert_eq!(sanitize("a\u{202e}b\u{2066}c\u{2069}d\u{202a}e"), "abcde");
+        // Already-sanitized text is unchanged.
+        assert_eq!(sanitize("plain text"), "plain text");
+        assert_eq!(sanitize(&sanitize("x\ny")), sanitize("x\ny"));
+    }
+
+    /// Every serial stage of the unlock is attacker-influenced; one deadline
+    /// covers them all.
+    #[test]
+    fn budget_shrinks_and_then_refuses() {
+        let b = Budget::new(Duration::from_secs(8));
+        let left = b.remaining().expect("fresh budget has time");
+        assert!(left <= Duration::from_secs(8) && left > Duration::from_secs(7));
+        assert_eq!(
+            b.capped(Duration::from_millis(50)),
+            Some(Duration::from_millis(50)),
+            "a stage never gets more than its own constant"
+        );
+        let spent = Budget::new(Duration::ZERO);
+        assert_eq!(spent.remaining(), None);
+        assert_eq!(spent.capped(START_TIMEOUT), None);
+    }
+
+    /// `off`/`disabled`/`No` must not turn into the branch that unlinks as
+    /// root and runs `systemctl`.
+    #[test]
+    fn auto_start_is_parsed_explicitly() {
+        for v in ["no", "false", "0", "off", "NO", "Off", "FALSE"] {
+            assert!(
+                !parse_options(&[format!("auto_start={v}")]).auto_start,
+                "auto_start={v} must disable"
+            );
+        }
+        for v in ["yes", "true", "1", "on", "YES", "On"] {
+            assert!(
+                parse_options(&[format!("auto_start={v}")]).auto_start,
+                "auto_start={v} must enable"
+            );
+        }
+        // Anything unrecognised keeps the default rather than guessing.
+        assert!(parse_options(&["auto_start=maybe".into()]).auto_start);
+        assert!(parse_options(&["auto_start=".into()]).auto_start);
+    }
+
+    /// `collection=` is interpolated straight into a file name, so it must be
+    /// restricted to the daemon's own id charset.
+    #[test]
+    fn rejects_a_collection_that_could_escape_the_vault_directory() {
+        for v in ["../x", "", "a/b", "a.b", "a b", "..", "a-b"] {
+            assert_eq!(
+                parse_options(&[format!("collection={v}")]).collection,
+                "default",
+                "collection={v} must fall back"
+            );
+        }
+        assert_eq!(
+            parse_options(&["collection=work_2".into()]).collection,
+            "work_2"
+        );
+    }
+
+    /// After `kill`, a plain `wait` blocks forever on a child stuck in
+    /// uninterruptible sleep; the reap gets its own short budget.
+    #[test]
+    fn reap_bounded_returns_promptly() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        child.kill().unwrap();
+        let start = Instant::now();
+        assert!(reap_bounded(&mut child, Duration::from_secs(2)));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // A live child is given up on rather than waited for.
+        let mut live = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        assert!(!reap_bounded(&mut live, Duration::from_millis(200)));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let _ = live.kill();
+        let _ = live.wait();
     }
 }

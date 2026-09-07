@@ -16,6 +16,18 @@ use zbus::zvariant::OwnedObjectPath;
 
 pub type Shared = Arc<tokio::sync::Mutex<ServiceState>>;
 
+/// A prompt's commit gate; see `ServiceState::prompt_commits`.
+pub type PromptCommit = Arc<tokio::sync::Mutex<bool>>;
+
+/// Sessions one bus client may hold open at once. Each costs an exported
+/// object (and, for `dh`, a 1024-bit modexp), and is only reclaimed on
+/// `Close` or disconnect, so an unbounded number is a memory/CPU DoS.
+pub const MAX_SESSIONS_PER_SENDER: usize = 32;
+
+/// Prompts one bus client may have outstanding at once. Each costs an
+/// exported object plus a `prompt_owners` entry until it completes.
+pub const MAX_PROMPTS_PER_OWNER: usize = 8;
+
 pub struct SessionEntry {
     /// Unique bus name of the client that opened the session.
     pub owner: String,
@@ -44,6 +56,13 @@ pub struct ServiceState {
     /// prompt object path -> the running pinentry task, so a prompt whose
     /// owner disconnects can be aborted (which also kills its pinentry).
     pub prompt_tasks: BTreeMap<String, AbortHandle>,
+    /// prompt object path -> that prompt's commit gate, alongside its entry
+    /// in `prompt_tasks`. `true` means the task has passed the point of no
+    /// return and is finishing irreversible work, so aborting it (as
+    /// `daemon::watch_clients` does when the owner disconnects) would drop a
+    /// change that has already been committed. Exposed so an abort can be
+    /// skipped for such a prompt.
+    pub prompt_commits: BTreeMap<String, PromptCommit>,
     pub started: Instant,
     pub last_activity: Instant,
     next_session: u64,
@@ -100,6 +119,7 @@ impl ServiceState {
             sessions: BTreeMap::new(),
             prompt_owners: BTreeMap::new(),
             prompt_tasks: BTreeMap::new(),
+            prompt_commits: BTreeMap::new(),
             started: now,
             last_activity: now,
             next_session: 0,
@@ -222,6 +242,24 @@ impl ServiceState {
             .and_then(|id| self.collections.get(&id))
             .map(|v| !v.is_locked())
             .unwrap_or(false)
+    }
+
+    /// Refuse a new session once this client already holds
+    /// [`MAX_SESSIONS_PER_SENDER`] of them.
+    pub fn check_session_quota(&self, owner: &str) -> Result<()> {
+        if self.sessions.values().filter(|e| e.owner == owner).count() >= MAX_SESSIONS_PER_SENDER {
+            return Err(Error::failed("too many open sessions"));
+        }
+        Ok(())
+    }
+
+    /// Refuse a new prompt once this client already has
+    /// [`MAX_PROMPTS_PER_OWNER`] outstanding.
+    pub fn check_prompt_quota(&self, owner: &str) -> Result<()> {
+        if self.prompt_owners.values().filter(|o| *o == owner).count() >= MAX_PROMPTS_PER_OWNER {
+            return Err(Error::failed("too many outstanding prompts"));
+        }
+        Ok(())
     }
 
     pub fn new_session_path(&mut self) -> OwnedObjectPath {
@@ -372,36 +410,67 @@ mod tests {
         assert_eq!(st.unique_collection_id("Work"), "work");
         std::fs::write(dir.path().join("work.vault"), b"").unwrap();
         assert_eq!(st.unique_collection_id("Work"), "work_2");
-        assert_eq!(
-            st.new_session_path().as_str(),
-            "/org/freedesktop/secrets/session/s1"
+        let first = st.new_session_path().to_string();
+        let second = st.new_session_path().to_string();
+        assert!(
+            first.starts_with("/org/freedesktop/secrets/session/s1_"),
+            "{first}"
         );
-        assert_eq!(
-            st.new_session_path().as_str(),
-            "/org/freedesktop/secrets/session/s2"
+        assert!(
+            second.starts_with("/org/freedesktop/secrets/session/s2_"),
+            "{second}"
         );
-        assert_eq!(
-            st.new_prompt_path().as_str(),
-            "/org/freedesktop/secrets/prompt/p1"
+        assert!(
+            st.new_prompt_path()
+                .as_str()
+                .starts_with("/org/freedesktop/secrets/prompt/p1_")
         );
         assert!(matches!(
             st.cipher("/org/freedesktop/secrets/session/s9", ":1.1"),
             Err(Error::NoSession)
         ));
         st.sessions.insert(
-            "/org/freedesktop/secrets/session/s1".into(),
+            first.clone(),
             SessionEntry {
                 owner: ":1.1".into(),
                 cipher: SessionCipher::plain(),
             },
         );
+        assert!(st.cipher(&first, ":1.1").is_ok());
+        assert!(matches!(st.cipher(&first, ":1.2"), Err(Error::NoSession)));
+    }
+
+    /// Per-client caps on sessions and outstanding prompts (MEDIUM 4): the
+    /// cap is per sender, so another client is unaffected.
+    #[test]
+    fn per_client_session_and_prompt_quotas() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = state(dir.path());
+        for i in 0..MAX_SESSIONS_PER_SENDER {
+            assert!(st.check_session_quota(":1.1").is_ok(), "at {i}");
+            let path = st.new_session_path().to_string();
+            st.sessions.insert(
+                path,
+                SessionEntry {
+                    owner: ":1.1".into(),
+                    cipher: SessionCipher::plain(),
+                },
+            );
+        }
+        let err = st.check_session_quota(":1.1").unwrap_err();
+        assert!(err.to_string().contains("too many open sessions"), "{err}");
+        assert!(st.check_session_quota(":1.2").is_ok());
+
+        for i in 0..MAX_PROMPTS_PER_OWNER {
+            assert!(st.check_prompt_quota(":1.1").is_ok(), "at {i}");
+            let path = st.new_prompt_path().to_string();
+            st.prompt_owners.insert(path, ":1.1".into());
+        }
+        let err = st.check_prompt_quota(":1.1").unwrap_err();
         assert!(
-            st.cipher("/org/freedesktop/secrets/session/s1", ":1.1")
-                .is_ok()
+            err.to_string().contains("too many outstanding prompts"),
+            "{err}"
         );
-        assert!(matches!(
-            st.cipher("/org/freedesktop/secrets/session/s1", ":1.2"),
-            Err(Error::NoSession)
-        ));
+        assert!(st.check_prompt_quota(":1.2").is_ok());
     }
 }

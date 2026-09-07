@@ -29,7 +29,7 @@ pub struct Cli {
 pub enum Command {
     /// Create a new collection vault
     Init {
-        /// Label of the collection; the file name is derived from it
+        /// Label of the collection; the id (and file name) is derived from it
         #[arg(long, default_value = "default")]
         collection: String,
     },
@@ -165,13 +165,25 @@ pub fn read_new_password(prompt: &str) -> Result<Zeroizing<String>, CliError> {
     Ok(first)
 }
 
+/// Largest secret accepted on stdin, matching the control protocol's frame
+/// cap. Without a cap, `sm set < /dev/zero` grows until the OOM killer fires,
+/// and a killed process's pages are never zeroized.
+pub const MAX_SECRET: usize = crate::protocol::MAX_FRAME;
+
 /// Read all of stdin as a secret, dropping one trailing newline.
 pub fn read_secret_from_stdin() -> Result<Zeroizing<Vec<u8>>, CliError> {
     if std::io::stdin().is_terminal() {
         return Ok(Zeroizing::new(read_password("Secret")?.as_bytes().to_vec()));
     }
+    // Read one byte past the limit so an oversized input is detected without
+    // ever holding more than that in memory.
     let mut buf = Zeroizing::new(Vec::new());
-    std::io::stdin().read_to_end(&mut buf)?;
+    std::io::stdin()
+        .take(MAX_SECRET as u64 + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() > MAX_SECRET {
+        return Err(CliError::Usage("secret exceeds 1 MiB".into()));
+    }
     if buf.last() == Some(&b'\n') {
         buf.pop();
     }

@@ -62,6 +62,8 @@ pub enum DaemonError {
     Control(std::io::Error),
     #[error("XDG_RUNTIME_DIR is not set; cannot locate the control socket")]
     NoRuntimeDir,
+    #[error("cannot apply the requested process hardening: {0}")]
+    Hardening(std::io::Error),
 }
 
 impl From<zbus::Error> for DaemonError {
@@ -99,10 +101,13 @@ pub fn disable_dumping() -> std::io::Result<()> {
 /// therefore checked up front and the option refused when it cannot be
 /// honoured: locking lazily (`MCL_ONFAULT`) would instead succeed here and
 /// then kill the daemon on the first derivation that exceeds the limit.
-pub fn lock_memory(m_cost_kib: u32) -> std::io::Result<()> {
-    // Room for the process itself plus two concurrent derivations.
-    let needed =
-        u64::from(m_cost_kib) * 1024 * crate::kdf::MAX_CONCURRENT as u64 + 64 * 1024 * 1024;
+pub fn lock_memory() -> std::io::Result<()> {
+    // Size the budget from the largest derivation the daemon can be asked to
+    // perform, not from the configured one: a collection's header carries its
+    // own KDF parameters and `ChangeKey` can raise them to the ceiling, so a
+    // config-sized check would pass here and fault later.
+    let needed = u64::from(KdfParams::MAX_M_COST_KIB) * 1024 * crate::kdf::MAX_CONCURRENT as u64
+        + 64 * 1024 * 1024;
     // SAFETY: getrlimit writes a plain rlimit struct through a valid pointer.
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
@@ -124,16 +129,13 @@ pub fn lock_memory(m_cost_kib: u32) -> std::io::Result<()> {
 
 impl Daemon {
     pub async fn start(opts: DaemonOptions) -> Result<Daemon, DaemonError> {
-        if let Err(e) = disable_dumping() {
-            tracing::warn!("cannot make the process non-dumpable: {e}");
-        }
+        // Both of these protect key material and both were asked for; a
+        // silent downgrade would leave the operator believing in a property
+        // the daemon is not providing.
+        disable_dumping().map_err(DaemonError::Hardening)?;
         if opts.config.vault.lock_memory {
-            match lock_memory(opts.config.kdf.m_cost_kib) {
-                Ok(()) => tracing::info!("memory locked; secrets will not be swapped"),
-                Err(e) => {
-                    tracing::warn!("[vault] lock_memory is set but could not be honoured: {e}")
-                }
-            }
+            lock_memory().map_err(DaemonError::Hardening)?;
+            tracing::info!("memory locked; secrets will not be swapped");
         }
         let mut pinentry = Pinentry::new(&opts.config.prompt.pinentry);
         for (k, v) in &opts.pinentry_env {
@@ -232,7 +234,7 @@ fn control_handler(state: Shared, conn: Connection) -> Handler {
 async fn handle_control(state: Shared, conn: Connection, req: Request) -> Response {
     match req {
         Request::UnlockWithKey { collection, key } => {
-            unlock_with_key(&state, &conn, &collection, &Key::from_bytes(*key)).await
+            unlock_with_key(&state, &conn, &collection, &Key::from_zeroizing(key)).await
         }
         Request::ChangeKey {
             collection,
@@ -245,10 +247,10 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                 &state,
                 &conn,
                 &collection,
-                &Key::from_bytes(*old_key),
+                &Key::from_zeroizing(old_key),
                 &new_salt,
                 new_kdf,
-                &Key::from_bytes(*new_key),
+                &Key::from_zeroizing(new_key),
             )
             .await
         }
@@ -260,6 +262,7 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                     None => st.collections.keys().cloned().collect(),
                 };
                 let mut changed = Vec::new();
+                let mut missing = None;
                 for id in targets {
                     match st.collections.get_mut(&id) {
                         Some(vault) => {
@@ -268,15 +271,25 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                                 changed.push(id);
                             }
                         }
-                        None => return Response::Error(format!("no collection '{id}'")),
+                        None => {
+                            missing = Some(id);
+                            break;
+                        }
                     }
                 }
-                changed
+                (changed, missing)
             };
+            // Announce whatever was locked before reporting the failure, so
+            // no client keeps a stale unlocked view of a collection this call
+            // actually locked.
+            let (changed, missing) = changed;
             for id in changed {
                 registry::notify_collection_changed(&conn, &id).await;
             }
-            Response::Ok
+            match missing {
+                Some(id) => Response::Error(format!("no collection '{id}'")),
+                None => Response::Ok,
+            }
         }
         Request::Status => {
             let st = state.lock().await;
@@ -304,11 +317,23 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
             }
         }
         Request::Reload => {
+            // Scanning the vault directory reads whole files from disk. Doing
+            // that under the state mutex, on an async worker, lets any peer
+            // stall every other request, and 16 connections multiply it. One
+            // reload at a time, on the blocking pool.
+            static RELOAD: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+            let _reload = RELOAD.acquire().await.expect("semaphore is never closed");
             let new_ids = {
-                let mut st = state.lock().await;
-                match st.load_vaults() {
-                    Ok(ids) => ids,
-                    Err(e) => return Response::Error(e.to_string()),
+                let state = state.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    let mut st = state.blocking_lock();
+                    st.load_vaults()
+                })
+                .await;
+                match joined {
+                    Ok(Ok(ids)) => ids,
+                    Ok(Err(e)) => return Response::Error(e.to_string()),
+                    Err(e) => return Response::Error(format!("reload failed: {e}")),
                 }
             };
             if let Err(e) = registry::register_all(&conn, &state).await {
@@ -336,12 +361,16 @@ async fn unlock_with_key(
     let result = {
         let mut st = state.lock().await;
         match st.collections.get_mut(collection) {
-            Some(vault) => vault.unlock_with_key(key).map_err(|e| e.to_string()),
-            // A collection that failed to load has no vault to unlock; report
-            // why it is broken rather than "no such collection".
+            // One message for both "no such collection" and "wrong key", so
+            // the socket is not an existence oracle for collection names.
+            Some(vault) => vault
+                .unlock_with_key(key)
+                .map_err(|_| "cannot unlock that collection".to_string()),
+            // A vault that failed to load is a different, non-secret
+            // condition the operator needs to see.
             None => match st.broken_error(collection) {
                 Some(e) => Err(e.to_string()),
-                None => Err(format!("no collection '{collection}'")),
+                None => Err("cannot unlock that collection".to_string()),
             },
         }
     };
@@ -385,24 +414,23 @@ async fn change_key(
 /// Drop sessions and prompts whose owning client left the bus, aborting any
 /// prompt task (and its pinentry) still running for that client.
 async fn watch_clients(conn: Connection, state: Shared) {
-    let dbus = match zbus::fdo::DBusProxy::new(&conn).await {
-        Ok(dbus) => dbus,
-        Err(e) => {
-            tracing::error!(
-                "cannot watch bus clients; sessions and prompts will not be cleaned up on disconnect: {e}"
-            );
-            return;
+    // Losing this watch means sessions and prompts are never reclaimed, so a
+    // failure is retried rather than logged once and abandoned.
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        match watch_clients_once(&conn, &state).await {
+            Ok(()) => tracing::warn!("bus client watch ended; restarting it"),
+            Err(e) => tracing::error!("bus client watch failed: {e}; retrying in {backoff:?}"),
         }
-    };
-    let mut stream = match dbus.receive_name_owner_changed().await {
-        Ok(stream) => stream,
-        Err(e) => {
-            tracing::error!(
-                "cannot watch bus clients; sessions and prompts will not be cleaned up on disconnect: {e}"
-            );
-            return;
-        }
-    };
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// One run of the watch, returning when the signal stream ends.
+async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<()> {
+    let dbus = zbus::fdo::DBusProxy::new(conn).await?;
+    let mut stream = dbus.receive_name_owner_changed().await?;
     while let Some(signal) = stream.next().await {
         let Ok(args) = signal.args() else { continue };
         if args.new_owner.is_some() {
@@ -428,8 +456,23 @@ async fn watch_clients(conn: Connection, state: Shared) {
                 .collect();
             for p in &prompts {
                 st.prompt_owners.remove(p);
+                let commit = st.prompt_commits.remove(p);
                 if let Some(task) = st.prompt_tasks.remove(p) {
-                    task.abort();
+                    // A prompt that has passed its commit gate is doing
+                    // irreversible work (unlinking a vault file, re-sealing a
+                    // collection). Aborting it there would drop a change the
+                    // user already confirmed and leave the daemon disagreeing
+                    // with the disk, so let it finish; its own `finish` call
+                    // completes the prompt exactly once.
+                    let committed = commit
+                        .as_ref()
+                        .and_then(|c| c.try_lock().ok().map(|g| *g))
+                        .unwrap_or(true);
+                    if committed {
+                        tracing::debug!("not aborting prompt {p}: it has already committed");
+                    } else {
+                        task.abort();
+                    }
                 }
             }
             (sessions, prompts)
@@ -441,6 +484,7 @@ async fn watch_clients(conn: Connection, state: Shared) {
             let _ = conn.object_server().remove::<Prompt, _>(p.as_str()).await;
         }
     }
+    Ok(())
 }
 
 async fn idle_lock(conn: Connection, state: Shared, after: Duration, check_every: Duration) {
@@ -464,6 +508,37 @@ async fn idle_lock(conn: Connection, state: Shared, after: Duration, check_every
         for id in ids {
             tracing::info!("auto-locked '{id}' after inactivity");
             registry::notify_collection_changed(&conn, &id).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `lock_memory` must refuse rather than lock lazily: `MCL_ONFAULT` would
+    /// succeed here and then kill the daemon on the first derivation that
+    /// exceeded the limit. Which branch runs depends on the host's limit, so
+    /// the test asserts the right one for whichever it is.
+    #[test]
+    fn lock_memory_refuses_when_the_limit_cannot_cover_a_derivation() {
+        // SAFETY: getrlimit writes a plain rlimit struct through a valid pointer.
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) },
+            0
+        );
+        let needed =
+            u64::from(KdfParams::MAX_M_COST_KIB) * 1024 * crate::kdf::MAX_CONCURRENT as u64
+                + 64 * 1024 * 1024;
+        let enough = lim.rlim_cur == libc::RLIM_INFINITY || lim.rlim_cur as u64 >= needed;
+        match lock_memory() {
+            Ok(()) => assert!(enough, "locked memory despite a limit of {}", lim.rlim_cur),
+            Err(e) => {
+                assert!(!enough, "refused despite a sufficient limit: {e}");
+                assert!(e.to_string().contains("RLIMIT_MEMLOCK"), "{e}");
+            }
         }
     }
 }

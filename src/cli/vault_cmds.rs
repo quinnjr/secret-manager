@@ -10,6 +10,22 @@ use crate::vault::{Vault, collection_id_from_label};
 use std::io::Read;
 use std::path::Path;
 
+/// `--collection` on a command that resolves an *existing* collection is
+/// pasted straight into `<dir>/<id>.vault`, so only an already-normalized id
+/// may be accepted. `../../../tmp/planted` would otherwise have the CLI read
+/// an arbitrary file's header and hash the user's master password with the
+/// salt and Argon2 parameters found there.
+fn validated_collection_id(value: &str) -> Result<String, CliError> {
+    if collection_id_from_label(value) == value {
+        Ok(value.to_string())
+    } else {
+        Err(CliError::Usage(format!(
+            "invalid collection id '{value}'; ids use [a-z0-9_] only \
+             (`sm init` prints the id it derives from a label)"
+        )))
+    }
+}
+
 pub fn init(collection: &str) -> Result<(), CliError> {
     let config = load_config()?;
     let id = collection_id_from_label(collection);
@@ -43,6 +59,9 @@ pub fn init(collection: &str) -> Result<(), CliError> {
         }
     }
     println!("Created collection '{collection}' at {}", path.display());
+    // The label is normalized into the id; every later command takes the id,
+    // so say what it is rather than let the user retype the label.
+    println!("Its id is '{id}' — use `sm unlock --collection {id}`.");
     Ok(())
 }
 
@@ -99,12 +118,16 @@ pub fn control(req: Request) -> Result<Response, CliError> {
 }
 
 pub fn lock(collection: Option<String>) -> Result<(), CliError> {
+    let collection = collection
+        .map(|c| validated_collection_id(&c))
+        .transpose()?;
     control(Request::Lock { collection })?;
     println!("Locked.");
     Ok(())
 }
 
 pub fn unlock(collection: String) -> Result<(), CliError> {
+    let collection = validated_collection_id(&collection)?;
     let config = load_config()?;
     let (salt, kdf) = header_params(&config, &collection)?;
     let password = read_password(&format!("Password for '{collection}'"))?;
@@ -147,6 +170,7 @@ pub fn status() -> Result<(), CliError> {
 }
 
 pub fn change_password(collection: String) -> Result<(), CliError> {
+    let collection = validated_collection_id(&collection)?;
     let config = load_config()?;
     let (salt, kdf) = header_params(&config, &collection)?;
     let old = read_password("Current password")?;
@@ -166,4 +190,31 @@ pub fn change_password(collection: String) -> Result<(), CliError> {
     })?;
     println!("Password changed for '{collection}'.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_ids_are_validated() {
+        for good in ["default", "my_work", "w0rk", "a"] {
+            assert_eq!(validated_collection_id(good).unwrap(), good);
+        }
+        // Path traversal is the reason this exists: `<dir>/<id>.vault`.
+        for bad in [
+            "../x",
+            "..",
+            "/etc/passwd",
+            "/tmp/planted",
+            "My Work",
+            "UPPER",
+            "trailing_",
+            "",
+        ] {
+            let err = validated_collection_id(bad).expect_err("{bad} must be rejected");
+            assert!(matches!(err, CliError::Usage(_)), "{bad}: {err:?}");
+            assert!(err.to_string().contains("[a-z0-9_]"));
+        }
+    }
 }

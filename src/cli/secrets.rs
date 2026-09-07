@@ -55,6 +55,18 @@ pub(crate) async fn find_all(
     find_inner(client, query, true).await
 }
 
+/// Message used whenever a strict search cannot account for every locked
+/// match. Named so `sm delete` and `sm ssh remove` report it identically.
+pub(crate) const INCOMPLETE_UNLOCK: &str = "could not unlock every match; nothing was deleted";
+
+/// Every path we asked to unlock must be present in the result. The daemon
+/// reports `dismissed = false` as soon as *one* collection in the prompt
+/// opened, listing only the paths that actually unlocked, so an `Ok` result is
+/// not by itself proof that the whole set is reachable.
+fn covers_all(items: &[OwnedObjectPath], locked: &[OwnedObjectPath]) -> bool {
+    locked.iter().all(|p| items.contains(p))
+}
+
 async fn find_inner(
     client: &Client,
     query: &BTreeMap<String, String>,
@@ -64,12 +76,33 @@ async fn find_inner(
     if !locked.is_empty() {
         let unlocked = client.unlock(&locked).await;
         if strict {
-            items.extend(unlocked?);
+            let more = unlocked?;
+            items.extend(more);
+            if !covers_all(&items, &locked) {
+                return Err(CliError::NotFound(INCOMPLETE_UNLOCK.into()));
+            }
         } else {
             merge_unlocked(&mut items, unlocked)?;
         }
     }
     Ok(items)
+}
+
+/// Render a string for a terminal: labels and attribute values come from argv
+/// or from any bus client, so a `\r` or an ANSI escape could erase or forge
+/// `sm list` rows. Anything below U+0020, plus DEL, becomes `\xNN`.
+fn escape_control(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            for b in ch.to_string().into_bytes() {
+                out.push_str(&format!("\\x{b:02x}"));
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -102,6 +135,30 @@ mod tests {
     }
 
     #[test]
+    fn covers_all_rejects_a_partial_unlock() {
+        let a = OwnedObjectPath::try_from("/a").unwrap();
+        let b = OwnedObjectPath::try_from("/b").unwrap();
+        // The daemon answered `dismissed = false` but only listed `/a`.
+        assert!(
+            !covers_all(std::slice::from_ref(&a), &[a.clone(), b.clone()]),
+            "a shortfall must not read as success"
+        );
+        assert!(covers_all(&[a.clone(), b.clone()], &[a, b]));
+        assert!(covers_all(&[], &[]));
+    }
+
+    #[test]
+    fn escape_control_hides_terminal_control_sequences() {
+        assert_eq!(escape_control("plain"), "plain");
+        assert_eq!(escape_control("a\rb"), "a\\x0db");
+        assert_eq!(escape_control("a\nb\tc"), "a\\x0ab\\x09c");
+        assert_eq!(escape_control("\u{1b}[2Kgone"), "\\x1b[2Kgone");
+        assert_eq!(escape_control("\u{7f}"), "\\x7f");
+        // Non-ASCII text is untouched.
+        assert_eq!(escape_control("clé"), "clé");
+    }
+
+    #[test]
     fn merge_unlocked_extends_on_success() {
         let mut items: Vec<OwnedObjectPath> = Vec::new();
         let more = vec![OwnedObjectPath::try_from("/b").unwrap()];
@@ -114,11 +171,13 @@ pub async fn get(attrs: Vec<String>, label: Option<String>) -> Result<(), CliErr
     let query = parse_attrs(&attrs)?;
     let client = Client::connect().await?;
     let mut best: Option<ItemInfo> = None;
+    let mut matches = 0usize;
     for path in find(&client, &query).await? {
         let info = client.item_info(&path).await?;
         if label.as_deref().is_some_and(|l| l != info.label) {
             continue;
         }
+        matches += 1;
         if best.as_ref().is_none_or(|b| info.modified > b.modified) {
             best = Some(info);
         }
@@ -126,6 +185,17 @@ pub async fn get(attrs: Vec<String>, label: Option<String>) -> Result<(), CliErr
     let Some(info) = best else {
         return Err(CliError::NotFound("no matching secret".into()));
     };
+    // `SearchItems` is subset matching, so an item carrying the queried
+    // attributes *plus* its own also matches; any process on the session bus
+    // can create one and win on `modified`. Keep secret-tool's "newest wins"
+    // behaviour and exit code, but never do it silently.
+    if matches > 1 {
+        eprintln!(
+            "warning: {matches} items match; using the most recently modified (\"{}\"). \
+             Pass --label to disambiguate.",
+            escape_control(&info.label)
+        );
+    }
     let secret = client.get_secret(&info.path).await?;
     let mut out = std::io::stdout().lock();
     out.write_all(&secret)?;
@@ -211,9 +281,9 @@ pub async fn list(attrs: Vec<String>, json: bool) -> Result<(), CliError> {
             let attrs: Vec<String> = e
                 .attributes
                 .iter()
-                .map(|(k, v)| format!("{k}={v}"))
+                .map(|(k, v)| format!("{}={}", escape_control(k), escape_control(v)))
                 .collect();
-            writeln!(out, "{}\t{}", e.label, attrs.join(" "))?;
+            writeln!(out, "{}\t{}", escape_control(&e.label), attrs.join(" "))?;
         }
     }
     Ok(())

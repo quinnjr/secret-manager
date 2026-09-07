@@ -103,6 +103,8 @@ pub enum ConfigError {
     },
     #[error("invalid config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("[kdf] is unusable: {0}")]
+    UnusableKdf(String),
 }
 
 impl Config {
@@ -124,6 +126,12 @@ impl Config {
     pub fn from_str(text: &str) -> Result<Config, ConfigError> {
         let mut c: Config = toml::from_str(text)?;
         c.vault.dir = expand_tilde(&c.vault.dir);
+        // Catch an out-of-range setting at startup rather than at the first
+        // `sm init` or password change.
+        let params: crate::vault::crypto::KdfParams = c.kdf.into();
+        params
+            .validate()
+            .map_err(|e| ConfigError::UnusableKdf(e.to_string()))?;
         if c.kdf.below_recommended_floor() {
             tracing::warn!(
                 "[kdf] is below the recommended floor ({} KiB, {} passes); vaults created with it are easier to brute-force",
@@ -230,6 +238,15 @@ pinentry = "/usr/bin/pinentry-tty"
         assert_eq!(c.vault.auto_lock_after, Duration::from_secs(900));
         assert_eq!(c.prompt.pinentry, "/usr/bin/pinentry-tty");
         assert_eq!(c.kdf.t_cost, 3);
+    }
+
+    #[test]
+    fn rejects_kdf_parameters_the_daemon_could_not_run() {
+        let err = Config::from_str("[kdf]\nm_cost_kib = 4000000\n").unwrap_err();
+        assert!(matches!(err, ConfigError::UnusableKdf(_)), "{err:?}");
+        // The shipped defaults and a deliberately weak-but-legal set both load.
+        assert!(Config::from_str("").is_ok());
+        assert!(Config::from_str("[kdf]\nm_cost_kib = 8\nt_cost = 1\np_cost = 1\n").is_ok());
     }
 
     #[test]

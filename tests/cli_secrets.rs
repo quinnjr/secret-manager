@@ -251,3 +251,159 @@ async fn interop_with_secret_tool() {
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "shared");
 }
+
+/// CRITICAL: `sm delete` must delete nothing unless every locked match could
+/// be unlocked. Two collections hold a matching item; only one of them can be
+/// opened with the password the prompt answers, so the daemon reports
+/// `dismissed = false` while listing only the paths it actually unlocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_refuses_a_partial_unlock() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    fx.sm()
+        .args(["set", "app=dup", "--label", "copy in default"])
+        .write_stdin("a")
+        .assert()
+        .success();
+
+    // A second collection whose password is *not* the one the fake pinentry
+    // answers, holding an item with the same attributes.
+    let dir = fx.data_dir.path().join("secret-manager");
+    let mut extra = secret_manager::vault::Vault::create(
+        &dir.join("extra.vault"),
+        "Extra",
+        b"other-password",
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    extra
+        .insert_item(
+            "copy in extra",
+            BTreeMap::from([("app".to_string(), "dup".to_string())]),
+            b"a".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+    drop(extra);
+    secret_manager::protocol::call(
+        &fx.control_socket(),
+        &secret_manager::protocol::Request::Reload,
+    )
+    .unwrap();
+    fx.lock_default().await;
+
+    fx.sm()
+        .args(["delete", "app=dup"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("nothing was deleted"));
+
+    // Both copies survive: the default one is now unlocked (its prompt was
+    // answered), the other is still locked.
+    fx.sm().args(["list", "app=dup"]).assert().success().stdout(
+        predicate::str::contains("copy in default").and(predicate::str::contains("[locked]")),
+    );
+}
+
+/// MEDIUM 1: a second matching item (which any bus client can create by
+/// adding attributes to the user's own) must be announced on stderr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_warns_when_more_than_one_item_matches() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    fx.sm()
+        .args(["set", "app=git", "--label", "github token"])
+        .write_stdin("mine")
+        .assert()
+        .success();
+    fx.sm()
+        .args(["get", "app=git"])
+        .assert()
+        .success()
+        .stdout("mine")
+        .stderr("");
+
+    // A shadowing item: same attributes plus one more, so it still matches.
+    fx.sm()
+        .args(["set", "app=git", "evil=1", "--label", "shadow"])
+        .write_stdin("theirs")
+        .assert()
+        .success();
+    fx.sm().args(["get", "app=git"]).assert().success().stderr(
+        predicate::str::contains("warning: 2 items match").and(predicate::str::contains("--label")),
+    );
+    // A --label filter that narrows to one item is silent again.
+    fx.sm()
+        .args(["get", "app=git", "--label", "github token"])
+        .assert()
+        .success()
+        .stdout("mine")
+        .stderr("");
+}
+
+/// MEDIUM 2: stdin is capped, so `sm set < /dev/zero` cannot exhaust memory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_rejects_an_oversized_secret() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    fx.sm()
+        .args(["set", "big=1", "--label", "big"])
+        .write_stdin(vec![b'x'; (1 << 20) + 1])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("exceeds 1 MiB"));
+    // Exactly at the limit still works.
+    fx.sm()
+        .args(["set", "big=1", "--label", "big"])
+        .write_stdin(vec![b'x'; 1 << 20])
+        .assert()
+        .success();
+}
+
+/// LOW 1: control characters in a label or an attribute value must not reach
+/// the terminal, or a hostile item could erase or forge `sm list` rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_escapes_control_characters() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    fx.sm()
+        .args([
+            "set",
+            "app=x\u{1b}[31mred",
+            "--label",
+            "sneaky\rHIDDEN\u{1b}[2K",
+        ])
+        .write_stdin("v")
+        .assert()
+        .success();
+    let out = fx
+        .sm()
+        .args(["list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(
+        !text.contains('\r') && !text.contains('\u{1b}'),
+        "raw control characters reached stdout: {text:?}"
+    );
+    assert!(
+        text.contains("\\x0d"),
+        "carriage return is rendered: {text:?}"
+    );
+    assert!(text.contains("\\x1b"), "escape is rendered: {text:?}");
+    // The --json path is unchanged and still carries the real bytes.
+    let json = fx
+        .sm()
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(parsed[0]["label"], "sneaky\rHIDDEN\u{1b}[2K");
+}

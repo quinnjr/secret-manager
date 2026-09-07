@@ -99,10 +99,14 @@ impl Key {
         &self.0
     }
 
-    /// Wrap key material that was derived elsewhere (e.g. by the PAM module
-    /// and sent over the control socket).
-    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Key {
-        Key(Zeroizing::new(bytes))
+    /// Wrap key material that was derived elsewhere (the PAM module or the
+    /// CLI, arriving over the control socket).
+    ///
+    /// Takes the buffer already wrapped so the bytes are never copied through
+    /// a bare array that nothing wipes: `Key::from_bytes(*zeroizing)` would
+    /// leave two unwiped stack copies behind.
+    pub fn from_zeroizing(bytes: Zeroizing<[u8; KEY_LEN]>) -> Key {
+        Key(bytes)
     }
 }
 
@@ -348,9 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn key_round_trips_through_bytes() {
+    fn key_round_trips_through_zeroizing() {
         let key = derive_key(b"pw", &SALT, KdfParams::FAST_FOR_TESTS).unwrap();
-        let again = Key::from_bytes(*key.as_bytes());
+        let again = Key::from_zeroizing(Zeroizing::new(*key.as_bytes()));
         assert_eq!(key.as_bytes(), again.as_bytes());
     }
 

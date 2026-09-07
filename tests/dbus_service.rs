@@ -100,6 +100,57 @@ async fn session_close_is_refused_to_a_non_owner() {
     );
 }
 
+/// Sessions are only reclaimed on `Close` or disconnect, and each costs an
+/// exported object (plus a 1024-bit modexp for `dh`), so one client may hold
+/// only so many at once (MEDIUM 4). The cap is per sender: another client is
+/// unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_session_is_capped_per_client() {
+    use secret_manager::dbus::state::MAX_SESSIONS_PER_SENDER;
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    for i in 0..MAX_SESSIONS_PER_SENDER {
+        service
+            .open_session(ALGORITHM_PLAIN, &Value::from(""))
+            .await
+            .unwrap_or_else(|e| panic!("session {i} must be allowed: {e}"));
+    }
+    let err = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap_err();
+    match &err {
+        zbus::Error::MethodError(name, desc, _) => {
+            assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.Failed");
+            assert!(
+                desc.as_deref()
+                    .unwrap_or_default()
+                    .contains("too many open sessions"),
+                "{desc:?}"
+            );
+        }
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.sessions.len(),
+        MAX_SESSIONS_PER_SENDER
+    );
+
+    // A different client is unaffected by the first one's exhausted quota.
+    let other_conn = fx.client().await;
+    ServiceProxy::new(&other_conn)
+        .await
+        .unwrap()
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.daemon.state.lock().await.sessions.len(),
+        MAX_SESSIONS_PER_SENDER + 1
+    );
+}
+
 #[tokio::test]
 async fn unsupported_algorithm_and_bad_input() {
     let fx = Fixture::start().await;

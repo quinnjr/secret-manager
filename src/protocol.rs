@@ -173,12 +173,22 @@ pub enum ProtocolError {
 pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Zeroizing<Vec<u8>>, ProtocolError> {
     // Serialise into a buffer that is Zeroizing from the start and never
     // grows, so postcard's reallocations cannot leave an unwiped copy of a
-    // key in freed memory.
-    let mut scratch = Zeroizing::new(vec![0u8; MAX_FRAME + 1]);
+    // key in freed memory. Start small — every real message is a few dozen
+    // bytes — and grow once to the cap only if that is genuinely too small,
+    // rather than allocating and wiping a megabyte per request.
+    const SCRATCH: usize = 8 * 1024;
+    let mut scratch = Zeroizing::new(vec![0u8; SCRATCH]);
     let body_len = match postcard::to_slice(msg, &mut scratch) {
         Ok(slice) => slice.len(),
         Err(postcard::Error::SerializeBufferFull) => {
-            return Err(ProtocolError::FrameTooLarge(MAX_FRAME + 1));
+            scratch = Zeroizing::new(vec![0u8; MAX_FRAME + 1]);
+            match postcard::to_slice(msg, &mut scratch) {
+                Ok(slice) => slice.len(),
+                Err(postcard::Error::SerializeBufferFull) => {
+                    return Err(ProtocolError::FrameTooLarge(MAX_FRAME + 1));
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Err(e) => return Err(e.into()),
     };
@@ -325,20 +335,26 @@ pub fn call_expecting_uid(path: &Path, req: &Request, uid: u32) -> Result<Respon
     call_inner(path, req, uid, CALL_TIMEOUT)
 }
 
+/// [`call_expecting_uid`] with an explicit deadline, for a caller that is
+/// already working to an overall budget — the PAM module bounds a whole login
+/// hook, and a fixed per-call timeout would let a few calls overrun it.
+pub fn call_expecting_uid_with_timeout(
+    path: &Path,
+    req: &Request,
+    uid: u32,
+    timeout: Duration,
+) -> Result<Response, ProtocolError> {
+    call_inner(path, req, uid, timeout)
+}
+
 fn call_inner(
     path: &Path,
     req: &Request,
     uid: u32,
     timeout: Duration,
 ) -> Result<Response, ProtocolError> {
-    let start = Instant::now();
-    let budget = || -> Result<Duration, ProtocolError> {
-        timeout
-            .checked_sub(start.elapsed())
-            .filter(|d| !d.is_zero())
-            .ok_or_else(deadline_error)
-    };
-    let mut stream = connect_with_deadline(path, budget()?)?;
+    let deadline = Deadline::new(timeout);
+    let mut stream = connect_with_deadline(path, deadline.remaining()?)?;
 
     let actual = peer_uid(&stream)?;
     if actual != uid {
@@ -349,12 +365,80 @@ fn call_inner(
     }
 
     let frame = encode_frame(req)?;
-    stream.set_write_timeout(Some(budget()?))?;
-    write_frame_sync(&mut stream, &frame).map_err(|e| normalize_timeout(e.into()))?;
-
-    stream.set_read_timeout(Some(budget()?))?;
-    let body = read_frame_sync(&mut stream).map_err(normalize_timeout)?;
+    let mut timed = TimedStream {
+        inner: &mut stream,
+        deadline: &deadline,
+    };
+    write_frame_sync(&mut timed, &frame).map_err(|e| normalize_timeout(e.into()))?;
+    let body = read_frame_sync(&mut timed).map_err(normalize_timeout)?;
     decode_frame(&body)
+}
+
+/// A wall-clock budget for one call.
+///
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` bound a single `read(2)`/`write(2)`, but
+/// `read_exact` and `write_all` loop, so a peer that trickles one byte per
+/// tick keeps every individual syscall inside its window while the operation
+/// runs forever. Re-arming the socket timeout from the *remaining* budget
+/// before each syscall makes the deadline mean what it says.
+struct Deadline {
+    start: Instant,
+    budget: Duration,
+}
+
+impl Deadline {
+    fn new(budget: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            budget,
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration, ProtocolError> {
+        self.budget
+            .checked_sub(self.start.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(deadline_error)
+    }
+
+    fn remaining_io(&self) -> std::io::Result<Duration> {
+        self.budget
+            .checked_sub(self.start.elapsed())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "control socket call exceeded its deadline",
+                )
+            })
+    }
+}
+
+/// Wraps a stream so every read and write is re-armed from the remaining
+/// budget, giving the whole transfer a single wall-clock deadline.
+struct TimedStream<'a> {
+    inner: &'a mut UnixStream,
+    deadline: &'a Deadline,
+}
+
+impl Read for TimedStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner
+            .set_read_timeout(Some(self.deadline.remaining_io()?))?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for TimedStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner
+            .set_write_timeout(Some(self.deadline.remaining_io()?))?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn deadline_error() -> ProtocolError {
@@ -371,6 +455,12 @@ fn unix_addr(path: &Path) -> Result<(libc::sockaddr_un, libc::socklen_t), Protoc
     // SAFETY: sockaddr_un is plain data; all-zero is a valid initial value.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if bytes.is_empty() {
+        return Err(ProtocolError::Connect(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty control socket path",
+        )));
+    }
     if bytes.len() >= addr.sun_path.len() {
         return Err(ProtocolError::Connect(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -571,6 +661,61 @@ mod tests {
         };
         let frame = encode_frame(&req).unwrap();
         read_frame_sync(&mut Cursor::new(frame.to_vec())).unwrap();
+    }
+
+    /// `SO_RCVTIMEO` bounds one `read(2)`, not the whole transfer, so a peer
+    /// that answers with one byte per tick would keep `read_exact` alive
+    /// indefinitely while never exceeding the per-syscall window. The call
+    /// must be bounded by wall-clock time, not by syscall inactivity.
+    #[test]
+    fn call_deadline_bounds_a_drip_feeding_listener() {
+        let dir = test_dir("drip");
+        let sock = dir.join("control.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut len = [0u8; 4];
+            if s.read_exact(&mut len).is_err() {
+                return;
+            }
+            let n = u32::from_be_bytes(len) as usize;
+            let mut body = vec![0u8; n];
+            if s.read_exact(&mut body).is_err() {
+                return;
+            }
+            // Announce a large frame, then dribble a byte at a time, always
+            // well inside the per-read window.
+            if s.write_all(&600u32.to_be_bytes()).is_err() {
+                return;
+            }
+            let _ = s.flush();
+            while stop_rx.try_recv().is_err() {
+                if s.write_all(&[0u8]).is_err() || s.flush().is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+
+        let start = Instant::now();
+        let err = call_with_timeout(&sock, &Request::Status, Duration::from_millis(500))
+            .expect_err("a drip-feeding peer must not satisfy the call");
+        let elapsed = start.elapsed();
+        let _ = stop_tx.send(());
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        match err {
+            ProtocolError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}"),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the deadline did not bound the read: {elapsed:?}"
+        );
     }
 
     /// A listener that never accepts, with a full backlog, stalls `connect(2)`

@@ -55,9 +55,9 @@ vault, config) · 2 usage error · 3 daemon or bus unreachable, or
 deletes nothing. `sm get` and `sm list` stay lenient and return the best
 already-unlocked match instead of prompting.
 
-`SetAlias` refuses to repoint an alias that already targets another
-collection; clear it with `/` first (a deliberate deviation from silent
-overwrite).
+`SetAlias` will repoint an alias that already targets another collection:
+any session-bus client can do this, which is inherent to the same-uid
+Secret Service model (see "Known gaps").
 
 ## Development
 
@@ -94,9 +94,14 @@ covers is libpam itself calling the hooks; see "Known gaps".
   (most distributions cap user sessions at 8 MiB, which is too small).
   Until you raise that limit, run on hosts with encrypted swap or no swap
   (see "Swap and memory exposure" in `docs/install-common.md`).
-* **Same-uid trust** — like every Secret Service, any process running as
-  you can read unlocked secrets over the bus, claim the bus name first, or
-  bind the control socket before the daemon. Both the PAM module and the CLI
+* **Same-uid trust** — the daemon trusts every process running as the same
+  user, which is what the Secret Service model requires: it is a session-bus
+  service, and the session bus itself does not distinguish between callers
+  of the same uid. The strongest boundary this project enforces is between
+  different uids, not between processes sharing one. Like every Secret
+  Service, any process running as you can read unlocked secrets over the
+  bus, claim the bus name first, repoint an alias, or bind the control
+  socket before the daemon. Both the PAM module and the CLI
   read the vault header straight from disk (salt and Argon2 parameters) and
   derive the vault key locally, sending only that key over the socket. A
   same-uid impostor that wins the socket race can receive that key — no

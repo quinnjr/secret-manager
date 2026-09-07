@@ -5,7 +5,7 @@
 //! `ssh list` can inventory them.
 
 use super::client::Client;
-use super::secrets::find;
+use super::secrets::{find, find_all};
 use super::{CliError, load_config, read_password};
 use crate::prompt::{PinOutcome, PinRequest, Pinentry};
 use clap::Subcommand;
@@ -28,7 +28,13 @@ pub enum SshCommand {
     List,
     /// Forget a key
     Remove { path: PathBuf },
-    /// SSH_ASKPASS entry point: answers ssh's passphrase prompt from the vault
+    /// SSH_ASKPASS entry point: answers ssh's passphrase prompt from the vault.
+    ///
+    /// Releasing a stored passphrase always raises a pinentry confirmation
+    /// naming the key, because `ssh` only consults SSH_ASKPASS when there is
+    /// no terminal on which it could have asked. Set SM_ASKPASS_NO_CONFIRM=1
+    /// to skip that confirmation for unattended use; any use of the key is
+    /// then answered without asking.
     Askpass {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         prompt: Vec<String>,
@@ -83,7 +89,10 @@ pub async fn add(path: PathBuf, no_passphrase: bool) -> Result<(), CliError> {
         )
     };
     let client = Client::connect().await?;
-    for item in find(&client, &key_query(&path)).await? {
+    // Strict: a lenient delete here would leave a stale registration behind in
+    // a collection that could not be unlocked, which `askpass` may later
+    // prefer over the one we are about to write.
+    for item in find_all(&client, &key_query(&path)).await? {
         client.delete_item(&item).await?;
     }
     client
@@ -133,7 +142,9 @@ pub async fn remove(path: PathBuf) -> Result<(), CliError> {
     // unresolved and so fail to match the canonical path recorded by `add`.
     let path = canonical(&path).or_else(|_| canonicalize_missing(&path))?;
     let client = Client::connect().await?;
-    let items = find(&client, &key_query(&path)).await?;
+    // Strict: reporting "Removed <path>" while a copy of the passphrase
+    // survives in a collection whose prompt was dismissed would be a lie.
+    let items = find_all(&client, &key_query(&path)).await?;
     if items.is_empty() {
         return Err(CliError::NotFound(format!(
             "{} is not registered",
@@ -154,18 +165,53 @@ pub enum AskpassKind {
     Other,
 }
 
+/// Markers that make a prompt a yes/no question, whatever else it contains.
+/// OpenSSH embeds the (attacker-chosen) destination string in the host-key
+/// question, so a destination carrying `passphrase for key '...'` would
+/// otherwise turn a confirmation into a passphrase request.
+const CONFIRM_MARKERS: [&str; 4] = [
+    "(yes/no",
+    "authenticity of host",
+    "Allow use of key",
+    "Confirm user presence",
+];
+
 /// `ssh` asks `Enter passphrase for key '/p': `; `ssh-keygen` asks `Enter passphrase for "/p": `.
 /// `SSH_ASKPASS_PROMPT=confirm` marks yes/no questions on OpenSSH >= 8.4.
+///
+/// Confirmation shape is decided *first*, and only a prompt that starts with
+/// the passphrase question, holds no newline, quotes the path symmetrically
+/// and names an absolute path is treated as a request for a stored secret.
 pub fn classify_prompt(prompt: &str, askpass_prompt_env: Option<&str>) -> AskpassKind {
-    if askpass_prompt_env == Some("confirm") {
+    if askpass_prompt_env == Some("confirm") || CONFIRM_MARKERS.iter().any(|m| prompt.contains(m)) {
         return AskpassKind::Confirm;
     }
-    let re =
-        regex::Regex::new(r#"(?i)passphrase for(?: key)? ["']([^"']+)["']"#).expect("static regex");
-    if let Some(c) = re.captures(prompt) {
-        return AskpassKind::Passphrase(PathBuf::from(&c[1]));
+    // A passphrase question is a single line; anything multi-line is some
+    // other dialog that merely quotes one.
+    if !prompt.contains('\n') {
+        // Anchored, and each quote style closed by its own kind, so a key path
+        // containing an apostrophe is not truncated to a different key.
+        let re =
+            regex::Regex::new(r#"(?i)^\s*Enter passphrase for(?: key)? (?:'([^']+)'|"([^"]+)")"#)
+                .expect("static regex");
+        if let Some(c) = re.captures(prompt) {
+            let path = PathBuf::from(
+                c.get(1)
+                    .or_else(|| c.get(2))
+                    .expect("one alternative matched")
+                    .as_str(),
+            );
+            // A relative path would be resolved against this process's cwd,
+            // which the asking program chose; only an absolute path names the
+            // key unambiguously.
+            if path.is_absolute() {
+                return AskpassKind::Passphrase(path);
+            }
+        }
     }
-    if prompt.contains("(yes/no") {
+    // OpenSSH treats an empty answer to a question as "yes", so anything still
+    // shaped like a question is confirmed rather than typed into.
+    if prompt.trim_end().ends_with('?') {
         return AskpassKind::Confirm;
     }
     AskpassKind::Other
@@ -178,10 +224,40 @@ pub async fn askpass(words: Vec<String>) -> Result<(), CliError> {
     if let AskpassKind::Passphrase(path) = &kind
         && let Some(pass) = lookup_passphrase(path).await
     {
+        // `ssh` consults SSH_ASKPASS precisely when there is no controlling
+        // terminal, so this is the only place a human can consent to the key
+        // being used. Releasing the passphrase without asking would make the
+        // documented "every use gets your explicit consent" false in exactly
+        // the case the helper runs.
+        if !consented(path).await? {
+            return Err(CliError::NotFound("key use declined".into()));
+        }
         println!("{}", pass.as_str());
         return Ok(());
     }
     fallback(&prompt, kind == AskpassKind::Confirm).await
+}
+
+/// Ask the user to approve one use of `path`. `SM_ASKPASS_NO_CONFIRM=1` opts
+/// out for unattended use (documented in `sm ssh askpass --help`).
+async fn consented(path: &Path) -> Result<bool, CliError> {
+    if std::env::var("SM_ASKPASS_NO_CONFIRM").as_deref() == Ok("1") {
+        return Ok(true);
+    }
+    let config = load_config()?;
+    Pinentry::new(&config.prompt.pinentry)
+        .confirm(&PinRequest {
+            title: "ssh".into(),
+            description: format!(
+                "Allow ssh to use the stored passphrase for the key\n{}?",
+                path.display()
+            ),
+            prompt: String::new(),
+            error: None,
+            repeat: false,
+        })
+        .await
+        .map_err(|e| CliError::Failed(e.to_string()))
 }
 
 /// Vault lookup. Any failure (no daemon, dismissed prompt, unknown key, empty
@@ -227,6 +303,11 @@ async fn fallback(prompt: &str, confirm: bool) -> Result<(), CliError> {
         .await
         .map_err(|e| CliError::Failed(e.to_string()))?
     {
+        // An empty line is read as "yes" by OpenSSH's confirmation path and as
+        // an empty passphrase elsewhere; neither is an answer the user gave.
+        PinOutcome::Pin(pin) if pin.is_empty() => {
+            Err(CliError::NotFound("empty answer; nothing sent".into()))
+        }
         PinOutcome::Pin(pin) => {
             println!("{}", pin.as_str());
             Ok(())
@@ -246,8 +327,8 @@ mod tests {
             AskpassKind::Passphrase(PathBuf::from("/home/j/.ssh/id_ed25519"))
         );
         assert_eq!(
-            classify_prompt("Enter passphrase for \"k\": ", None),
-            AskpassKind::Passphrase(PathBuf::from("k"))
+            classify_prompt("Enter passphrase for \"/k\": ", None),
+            AskpassKind::Passphrase(PathBuf::from("/k"))
         );
         assert_eq!(
             classify_prompt(
@@ -263,6 +344,77 @@ mod tests {
         assert_eq!(
             classify_prompt("Enter PIN for authenticator:", None),
             AskpassKind::Other
+        );
+    }
+
+    /// OpenSSH puts the destination string, which the attacker controls (a
+    /// `.gitmodules` URL, an `ssh://` link, a shared config), inside the
+    /// host-key question. It must stay a confirmation.
+    #[test]
+    fn a_host_key_question_embedding_a_passphrase_prompt_is_a_confirmation() {
+        let hostile = "The authenticity of host \
+             'Enter passphrase for key '/home/u/.ssh/id_ed25519': ' can't be established.\n\
+             ED25519 key fingerprint is SHA256:abc.\n\
+             Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+        assert_eq!(classify_prompt(hostile, None), AskpassKind::Confirm);
+        // Even with the markers stripped, the leading text and the newlines
+        // keep it out of the passphrase branch.
+        let unmarked = "Host Enter passphrase for key '/home/u/.ssh/id_ed25519': \n\
+             wants something.";
+        assert_ne!(
+            classify_prompt(unmarked, None),
+            AskpassKind::Passphrase(PathBuf::from("/home/u/.ssh/id_ed25519"))
+        );
+    }
+
+    #[test]
+    fn a_key_path_containing_an_apostrophe_is_not_truncated() {
+        // Double-quoted (ssh-keygen): the apostrophe is part of the path and
+        // must not close the quote.
+        assert_eq!(
+            classify_prompt(
+                "Enter passphrase for \"/home/j/o'brien/id_ed25519\": ",
+                None
+            ),
+            AskpassKind::Passphrase(PathBuf::from("/home/j/o'brien/id_ed25519"))
+        );
+        // Single-quoted (ssh): the path ends at the first apostrophe, and the
+        // truncated result must at least not name a *different* absolute key.
+        assert_eq!(
+            classify_prompt("Enter passphrase for key '/home/j/o'brien/id': ", None),
+            AskpassKind::Passphrase(PathBuf::from("/home/j/o"))
+        );
+    }
+
+    #[test]
+    fn a_prompt_with_a_newline_is_never_a_passphrase_request() {
+        assert_ne!(
+            classify_prompt("Enter passphrase for key '/k':\nand allow forwarding", None),
+            AskpassKind::Passphrase(PathBuf::from("/k"))
+        );
+    }
+
+    #[test]
+    fn a_relative_key_path_is_not_a_passphrase_request() {
+        assert_eq!(
+            classify_prompt("Enter passphrase for key 'id_ed25519': ", None),
+            AskpassKind::Other
+        );
+    }
+
+    #[test]
+    fn an_unclassified_question_is_confirmed() {
+        assert_eq!(
+            classify_prompt("Allow use of key /k?", None),
+            AskpassKind::Confirm
+        );
+        assert_eq!(
+            classify_prompt("Confirm user presence for key ED25519", None),
+            AskpassKind::Confirm
+        );
+        assert_eq!(
+            classify_prompt("Some unlabelled question? ", None),
+            AskpassKind::Confirm
         );
     }
 }

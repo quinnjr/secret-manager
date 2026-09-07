@@ -35,8 +35,13 @@ for systemd user sessions. Shells started outside a systemd session (for
 example a plain `startx`) need the same variable exported in your profile.
 
 By default `ssh` only invokes `SSH_ASKPASS` when it has no controlling
-terminal, so a terminal session still prompts you directly and each use of a
-stored key gets your explicit consent.
+terminal — that is precisely when there would otherwise be no prompt at
+all. To keep a use of a stored key from being silent in that case, the
+askpass helper itself asks for confirmation through `pinentry`, naming the
+key it is about to release the passphrase for. Set
+`SM_ASKPASS_NO_CONFIRM=1` in the environment to skip that confirmation and
+release the passphrase immediately, the way a bare askpass helper normally
+would.
 
 **`SSH_ASKPASS_REQUIRE=prefer` / `force` is an explicit, security-relevant
 opt-in, not a default we ship.** Setting it makes `ssh` call the askpass
@@ -99,11 +104,11 @@ unlocks.
 
 ## Swap and memory exposure
 
-Derived keys and decrypted secrets are held only in process memory. The
-daemon makes itself non-dumpable at start (no core files, and no `ptrace`
-or `/proc/<pid>/mem` access from other processes of your uid, whatever the
-kernel's Yama setting), and every buffer that carried a password or key is
-wiped when freed.
+Derived keys and decrypted secrets are held only in process memory. Both
+the daemon and the `sm` CLI make themselves non-dumpable at start (no core
+files, and no `ptrace` or `/proc/<pid>/mem` access from other processes of
+your uid, whatever the kernel's Yama setting), and every buffer that
+carried a password or key is wiped when freed.
 
 The kernel can still page that memory to swap. `[vault] lock_memory = true`
 calls `mlockall` so it cannot, but a user service may only lock as much as
@@ -117,7 +122,7 @@ in `/etc/security/limits.d/` (`@users - memlock 524288`) and uncomment
 encrypted swap, or no swap at all, if an attacker with access to the swap
 device is in your threat model.
 
-The daemon's own memory is non-dumpable, but the `pinentry` process it spawns
+The daemon's and the CLI's own memory are non-dumpable, but the `pinentry` process it spawns
 to collect a password is a separate, ordinary, dumpable process that briefly
 holds the typed password in its own address space. `kernel.yama.ptrace_scope`
 governs whether another same-uid process can `ptrace` it; distributions that
@@ -147,11 +152,16 @@ never your reusable login password, and never a hash computed under
 parameters or a salt of its own choosing.
 
 Login-time key derivation is bounded independently of the vault-wide
-ceiling: the header's parameters are clamped to 19 MiB–256 MiB, 2–8 passes,
-and at most 4 lanes before PAM will run Argon2id on them, so a tampered
-header cannot make a login hang or exhaust memory. The module also refuses
-to touch `$XDG_RUNTIME_DIR/secret-manager` unless it is a real directory
-owned by you.
+ceiling, and more tightly than it: the header's parameters are clamped to
+19 MiB–64 MiB, 2–4 passes, and at most 2 lanes before PAM will run Argon2id
+on them, so a tampered header cannot make a login hang or exhaust memory.
+The login path is tighter than the daemon's own 256 MiB/64-pass/16-lane
+ceiling because it runs as root, inside the login process itself, once per
+session, with no concurrency cap — the daemon can afford a higher ceiling
+because it serialises derivations (at most two at a time) and is bounded by
+`MemoryMax` in the unit, neither of which applies to a login attempt. The
+module also refuses to touch `$XDG_RUNTIME_DIR/secret-manager` unless it is
+a real directory owned by you.
 
 `passwd` works the same way: the CLI reads the header, derives the old and
 new keys locally, and the vault is re-keyed (`ChangeKey`) without the daemon

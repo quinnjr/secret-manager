@@ -44,6 +44,10 @@ fn unit_and_activation_files_agree() {
     assert!(unit.contains("UMask=0077"));
     assert!(unit.contains("MemoryMax=1G"));
     assert!(unit.contains("SystemCallArchitectures=native"));
+    // Comment block distinguishing load-bearing directives from defence in
+    // depth on a user unit.
+    assert!(unit.contains("load-bearing for"));
+    assert!(unit.contains("defence in depth"));
     let activation =
         std::fs::read_to_string(root().join("dist/org.freedesktop.secrets.service")).unwrap();
     assert!(activation.contains("Name=org.freedesktop.secrets"));
@@ -54,6 +58,22 @@ fn unit_and_activation_files_agree() {
     // A terminal must still prompt interactively; this line would silently
     // satisfy SSH_ASKPASS from any terminal session too.
     assert!(!env.contains("SSH_ASKPASS_REQUIRE"));
+}
+
+/// The pam build must use its own `CARGO_TARGET_DIR` so it can never share
+/// `target/release/libsecret_manager.so` with the default (daemon/CLI)
+/// build, and `PAMSO` must default to that isolated path.
+#[test]
+fn makefile_isolates_the_pam_build_target_dir() {
+    let makefile = std::fs::read_to_string(root().join("Makefile")).unwrap();
+    assert!(
+        makefile.contains("CARGO_TARGET_DIR=target/pam"),
+        "pam build must set its own CARGO_TARGET_DIR"
+    );
+    assert!(
+        makefile.contains("PAMSO   ?= target/pam/release/libsecret_manager.so"),
+        "PAMSO must default into the isolated pam target dir"
+    );
 }
 
 #[test]
@@ -154,6 +174,32 @@ fn both_install_guides_reference_the_common_doc() {
     }
 }
 
+/// Build a tiny real shared object exporting a defined `pam_sm_open_session`
+/// dynamic symbol, so the install guard (which greps `nm -D` output for that
+/// symbol) accepts it as a genuine PAM build. Requires `cc` on `PATH`.
+fn build_stub_pam_so(dir: &std::path::Path) -> PathBuf {
+    let src = dir.join("stub_pam.c");
+    let so = dir.join("stub-libpam_secret_manager.so");
+    std::fs::write(
+        &src,
+        "int pam_sm_open_session(void) { return 0; }\n\
+         int pam_sm_authenticate(void) { return 0; }\n",
+    )
+    .unwrap();
+    let out = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "failed to build stub pam .so:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    so
+}
+
 /// Real (non-dry-run) install into a staging dir, using stub binaries so the
 /// test does not need a release build, then a matching uninstall with
 /// `systemctl` absent from `PATH` (as on a minimal build box).
@@ -162,7 +208,6 @@ fn make_install_round_trips_into_a_staging_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let stage = tmp.path().join("stage");
     let bin = tmp.path().join("stub-secret-manager");
-    let pamso = tmp.path().join("stub-libpam_secret_manager.so");
     let completions = tmp.path().join("completions");
 
     // `install` no longer executes $(BIN) (root must not run a user-built
@@ -170,7 +215,7 @@ fn make_install_round_trips_into_a_staging_dir() {
     // would have generated them. Simulate that here.
     std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::write(&pamso, b"stub pam module\n").unwrap();
+    let pamso = build_stub_pam_so(tmp.path());
     std::fs::create_dir_all(&completions).unwrap();
     std::fs::write(completions.join("sm"), "# fake bash completion\n").unwrap();
     std::fs::write(completions.join("_sm"), "# fake zsh completion\n").unwrap();
@@ -181,6 +226,7 @@ fn make_install_round_trips_into_a_staging_dir() {
         .arg(format!("DESTDIR={}", stage.display()))
         .arg(format!("BIN={}", bin.display()))
         .arg(format!("PAMSO={}", pamso.display()))
+        .arg("PAMDIR=/usr/lib/security")
         .arg(format!("COMPLETIONS_DIR={}", completions.display()))
         .current_dir(root())
         .output()
@@ -195,6 +241,7 @@ fn make_install_round_trips_into_a_staging_dir() {
         "usr/bin/secret-manager",
         "usr/bin/sm",
         "usr/bin/sm-askpass",
+        "usr/lib/security/pam_secret_manager.so",
         "usr/lib/systemd/user/secret-manager.service",
         "usr/share/dbus-1/services/org.freedesktop.secrets.service",
         "usr/lib/environment.d/50-secret-manager.conf",
@@ -222,16 +269,26 @@ fn make_install_round_trips_into_a_staging_dir() {
         .mode()
         & 0o777;
     assert_eq!(bin_mode, 0o755);
+    // PAM modules are dlopened, never executed: 0644, not 0755.
+    let pamso_mode = std::fs::metadata(stage.join("usr/lib/security/pam_secret_manager.so"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        pamso_mode, 0o644,
+        "PAM module must be installed 0644, not executable"
+    );
     // PREFIX was not overridden, so the shipped /usr/bin/ literal survives untouched.
     let unit =
         std::fs::read_to_string(stage.join("usr/lib/systemd/user/secret-manager.service")).unwrap();
     assert!(unit.contains("ExecStart=/usr/bin/secret-manager daemon --foreground"));
 
     // Uninstall with systemctl unavailable (best-effort disable must not fail the run).
-    // The recipe itself only needs `rm`, so build a minimal PATH containing just
-    // that (found via the real PATH) and nothing named `systemctl`; resolve
-    // `make` to an absolute path first since Command looks it up in the PATH
-    // we are about to override.
+    // The recipe needs `rm` and `readlink` (for the symlink-safety check), so
+    // build a minimal PATH containing just those (found via the real PATH)
+    // and nothing named `systemctl`; resolve `make` to an absolute path first
+    // since Command looks it up in the PATH we are about to override.
     let which = |name: &str| -> PathBuf {
         let out = std::process::Command::new("sh")
             .args(["-c", &format!("command -v {name}")])
@@ -242,13 +299,16 @@ fn make_install_round_trips_into_a_staging_dir() {
     };
     let make_bin = which("make");
     let rm_bin = which("rm");
+    let readlink_bin = which("readlink");
     let stub_path = tmp.path().join("stub-path");
     std::fs::create_dir_all(&stub_path).unwrap();
     std::os::unix::fs::symlink(&rm_bin, stub_path.join("rm")).unwrap();
+    std::os::unix::fs::symlink(&readlink_bin, stub_path.join("readlink")).unwrap();
 
     let uninstall = std::process::Command::new(&make_bin)
         .args(["uninstall"])
         .arg(format!("DESTDIR={}", stage.display()))
+        .arg("PAMDIR=/usr/lib/security")
         .env("PATH", &stub_path)
         .current_dir(root())
         .output()
@@ -264,6 +324,123 @@ fn make_install_round_trips_into_a_staging_dir() {
         assert!(!p.exists(), "expected {rel} to be removed after uninstall");
     }
     assert!(!stage.join("usr/share/doc/secret-manager").exists());
+}
+
+/// `install` must refuse a `PAMSO` that isn't a real PAM build (no
+/// `pam_sm_open_session` dynamic symbol), rather than silently shipping it
+/// into the PAM directory.
+#[test]
+fn make_install_refuses_a_non_pam_build() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stage = tmp.path().join("stage");
+    let bin = tmp.path().join("stub-secret-manager");
+    let completions = tmp.path().join("completions");
+    let bad_pamso = tmp.path().join("not-a-pam-module.so");
+
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A daemon-flavoured (or just plain wrong) .so: no pam_sm_* symbols.
+    std::fs::write(&bad_pamso, b"not an elf, not a pam module\n").unwrap();
+    std::fs::create_dir_all(&completions).unwrap();
+    std::fs::write(completions.join("sm"), "# fake bash completion\n").unwrap();
+    std::fs::write(completions.join("_sm"), "# fake zsh completion\n").unwrap();
+    std::fs::write(completions.join("sm.fish"), "# fake fish completion\n").unwrap();
+
+    let install = std::process::Command::new("make")
+        .args(["install"])
+        .arg(format!("DESTDIR={}", stage.display()))
+        .arg(format!("BIN={}", bin.display()))
+        .arg(format!("PAMSO={}", bad_pamso.display()))
+        .arg("PAMDIR=/usr/lib/security")
+        .arg(format!("COMPLETIONS_DIR={}", completions.display()))
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(
+        !install.status.success(),
+        "install must fail when PAMSO is not a real PAM build"
+    );
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        stderr.contains("is not the PAM build"),
+        "expected the guard's refusal message, got:\n{stderr}"
+    );
+    assert!(
+        !stage
+            .join("usr/lib/security/pam_secret_manager.so")
+            .exists(),
+        "the bad module must not have been installed"
+    );
+}
+
+/// `install` must not clobber a `sm`/`sm-askpass` name that belongs to some
+/// other package, and `uninstall` must not remove one it did not create.
+#[test]
+fn install_and_uninstall_protect_foreign_sm_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stage = tmp.path().join("stage");
+    let bin = tmp.path().join("stub-secret-manager");
+    let completions = tmp.path().join("completions");
+    let pamso = build_stub_pam_so(tmp.path());
+
+    std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(&completions).unwrap();
+    std::fs::write(completions.join("sm"), "# fake bash completion\n").unwrap();
+    std::fs::write(completions.join("_sm"), "# fake zsh completion\n").unwrap();
+    std::fs::write(completions.join("sm.fish"), "# fake fish completion\n").unwrap();
+
+    // Pre-populate the target bindir with a `sm` that belongs to some other
+    // package (a real file, not a symlink to secret-manager).
+    let bindir = stage.join("usr/bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    std::fs::write(bindir.join("sm"), "#!/bin/sh\necho not secret-manager\n").unwrap();
+    std::fs::set_permissions(bindir.join("sm"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let install = std::process::Command::new("make")
+        .args(["install"])
+        .arg(format!("DESTDIR={}", stage.display()))
+        .arg(format!("BIN={}", bin.display()))
+        .arg(format!("PAMSO={}", pamso.display()))
+        .arg("PAMDIR=/usr/lib/security")
+        .arg(format!("COMPLETIONS_DIR={}", completions.display()))
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(
+        !install.status.success(),
+        "install must refuse to overwrite a foreign sm"
+    );
+    let stderr = String::from_utf8_lossy(&install.stderr);
+    assert!(
+        stderr.contains("refusing to overwrite") && stderr.contains("sm"),
+        "expected a refusal message, got:\n{stderr}"
+    );
+    // The foreign file must be untouched.
+    let content = std::fs::read_to_string(bindir.join("sm")).unwrap();
+    assert!(content.contains("not secret-manager"));
+
+    // Now point `sm` at some other real program (a symlink, but not to
+    // secret-manager): uninstall must leave it alone too.
+    std::fs::remove_file(bindir.join("sm")).unwrap();
+    std::os::unix::fs::symlink("some-other-program", bindir.join("sm")).unwrap();
+    let uninstall = std::process::Command::new("make")
+        .args(["uninstall"])
+        .arg(format!("DESTDIR={}", stage.display()))
+        .arg("PAMDIR=/usr/lib/security")
+        .current_dir(root())
+        .output()
+        .unwrap();
+    assert!(
+        uninstall.status.success(),
+        "uninstall failed:\n{}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    assert_eq!(
+        std::fs::read_link(bindir.join("sm")).unwrap(),
+        PathBuf::from("some-other-program"),
+        "uninstall must not remove a symlink it did not create"
+    );
 }
 
 /// The shipped unit must at least parse; the only expected diagnostic on a

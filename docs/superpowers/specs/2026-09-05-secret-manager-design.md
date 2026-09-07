@@ -157,10 +157,10 @@ Implemented with `zbus` `#[interface]` macros. Object paths:
 Service: `OpenSession`, `CreateCollection`, `SearchItems`, `Unlock`, `Lock`,
 `GetSecrets`, `ReadAlias`, `SetAlias`; property `Collections`; signals
 `CollectionCreated`, `CollectionDeleted`, `CollectionChanged`. `SetAlias`
-refuses to reassign an alias that already points to a different, still
-existing collection: repointing `default` requires clearing it (target `/`)
-first. Pointing an alias at the collection it already names, or at `/` to
-clear it, always succeeds.
+will repoint an alias that already points to a different, still existing
+collection: any session-bus client can do this, which is inherent to the
+same-uid Secret Service model (see "Amendment 2026-09-06: security audit
+fixes").
 
 Collection: `Delete`, `SearchItems`, `CreateItem`; properties `Items`,
 `Label` (writable), `Locked`, `Created`, `Modified`; signals `ItemCreated`,
@@ -297,7 +297,7 @@ everything they call sits in `mod.rs` and is unit-tested without it.
   `<home>/.local/share/secret-manager` by default) and read
   `<collection>.vault`'s header from disk. If the header cannot be read, log
   and skip the unlock. Otherwise clamp its KDF parameters to the login-time
-  bounds (19 MiB–256 MiB, 2–8 passes, ≤4 lanes), derive the vault key with
+  bounds (19 MiB–64 MiB, 2–4 passes, ≤2 lanes), derive the vault key with
   Argon2id, and wipe the password. Resolve the socket as
   `/run/user/<uid>/secret-manager/control.sock` from the PAM user's uid (the
   `socket=` option is honoured only when *not* running as root, i.e. never
@@ -493,16 +493,22 @@ paths pointing at `/usr/bin`.
   connections are bounded (16 in flight, 5 s each).
 * **Defaults.** `auto_lock_after` defaults to `15m`. KDF settings below
   19 MiB / 2 passes are accepted with a warning; login-time derivation is
-  additionally bounded at 19 MiB–256 MiB / 2–8 passes / ≤4 lanes.
+  bounded more tightly, at 19 MiB–64 MiB / 2–4 passes / ≤2 lanes, because it
+  runs as root inside the login process, once per session, with no
+  concurrency cap.
 * **Rotation.** `change-password` (and `ChangeKey`) leave a collection in the
   lock state it had on entry. Temp files use `O_EXCL` random names.
 * **One crate.** The daemon, the CLI, and the PAM module are a single crate
   with feature-gated modules (`daemon`, `pam`); see "Crate layout". The PAM
   `cdylib` still links no async runtime. DH uses `crypto-bigint`
   (constant-time exponentiation, zeroized exponent).
-* **`SetAlias`.** Refusing to repoint an alias that already targets a
-  different, still-existing collection (clear it with `/` first) is a
-  deliberate deviation from silent overwrite, not an oversight.
+* **`SetAlias`.** Any session-bus client can repoint an alias, including one
+  that already targets a different, still-existing collection. This was
+  previously refused as a deliberate deviation from silent overwrite, but
+  the guard was removed: it was bypassable by clearing the alias first and
+  it deviated from the spec for no security gain, since any same-uid client
+  can already read every collection's contents. This is inherent to the
+  same-uid Secret Service model — see "Known gaps" in the README.
 * **Testing.** The `pam_wrapper` harness was dropped when the crates merged:
   it never ran (the package is not installed here) and it would have made
   every `cargo test` pull `bindgen` and `libclang` through `pam-client`. The

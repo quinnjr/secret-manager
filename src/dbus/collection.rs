@@ -74,9 +74,10 @@ impl Collection {
         if self.vault(&st).map(|v| v.is_locked()).unwrap_or(true) {
             return Err(Error::IsLocked);
         }
+        let owner = require_sender(&header)?;
+        st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
-        st.prompt_owners
-            .insert(prompt_path.to_string(), require_sender(&header)?);
+        st.prompt_owners.insert(prompt_path.to_string(), owner);
         drop(st);
         let prompt = Prompt::new(
             self.state.clone(),
@@ -91,6 +92,12 @@ impl Collection {
         &self,
         attributes: HashMap<String, String>,
     ) -> Result<Vec<OwnedObjectPath>> {
+        if attributes.len() > super::service::MAX_SEARCH_ATTRIBUTES {
+            return Err(Error::invalid_args(format!(
+                "too many attributes; at most {} per call",
+                super::service::MAX_SEARCH_ATTRIBUTES
+            )));
+        }
         let st = self.state.lock().await;
         let id = self.id(&st)?;
         let query: BTreeMap<String, String> = attributes.into_iter().collect();
