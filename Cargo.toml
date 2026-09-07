@@ -1,21 +1,90 @@
-[workspace]
-resolver = "3"
-members = [
-    "crates/control-protocol",
-    "crates/secret-manager",
-    "crates/pam_secret_manager",
-]
-
-[workspace.package]
+[package]
+name = "secret-manager"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/quinnjr/secret-manager"
+description = "A freedesktop Secret Service daemon, CLI, and PAM module"
+default-run = "secret-manager"
 
-[workspace.dependencies]
+# One crate, two artifacts: the `rlib` the binary links, and the `cdylib`
+# PAM loads. The daemon and the PAM hooks are separate features so the
+# module that `sshd` dlopens as root never links tokio, zbus, or clap.
+[lib]
+name = "secret_manager"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "secret-manager"
+path = "src/main.rs"
+required-features = ["daemon"]
+
+[features]
+default = ["daemon"]
+# The service, its CLI, and everything async.
+daemon = [
+    "dep:zbus",
+    "dep:tokio",
+    "dep:futures-util",
+    "dep:clap",
+    "dep:clap_complete",
+    "dep:rpassword",
+    "dep:regex",
+    "dep:serde_json",
+    "dep:tracing-subscriber",
+    "dep:hkdf",
+    "dep:aes",
+    "dep:cbc",
+    "dep:crypto-bigint",
+]
+# The `pam_sm_*` entry points. Enabled only for the cdylib build; the PAM
+# logic itself (and its tests) compiles without it.
+pam = ["dep:pamsm"]
+# Test-only hooks used by the integration tests.
+test-util = []
+
+[dependencies]
+# Always present: vault format and crypto, config, control protocol, and the
+# PAM module's own logic.
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
 zeroize = { version = "1", features = ["serde", "derive"] }
 thiserror = "2"
-anyhow = "1"
 libc = "0.2"
+toml = "0.8"
+humantime-serde = "1"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+subtle = "2"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+
+# daemon
+zbus = { version = "5", default-features = false, features = ["tokio"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "fs", "signal"], optional = true }
+futures-util = { version = "0.3", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+clap_complete = { version = "4", optional = true }
+rpassword = { version = "7", optional = true }
+regex = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+hkdf = { version = "0.12", optional = true }
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", features = ["alloc", "block-padding"], optional = true }
+crypto-bigint = { version = "0.6", features = ["zeroize"], optional = true }
+
+# pam
+pamsm = { version = "0.5", features = ["libpam"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+# The integration tests need the test-only hooks; a self path-dependency is
+# the standard way to enable a feature for them without enabling it for the
+# shipped build.
+secret-manager = { path = ".", features = ["test-util"] }

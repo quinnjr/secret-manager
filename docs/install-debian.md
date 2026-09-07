@@ -5,16 +5,25 @@
 ```sh
 sudo apt install rustup pinentry-curses pinentry-gnome3 dbus openssh-client libpam0g-dev build-essential
 make
-sudo make install PAMDIR=/usr/lib/x86_64-linux-gnu/security
+sudo make install
 ```
 
-(`dpkg-architecture -qDEB_HOST_MULTIARCH` gives the correct triplet on other
-architectures, e.g. `aarch64-linux-gnu`.)
+`PAMDIR` defaults to `/usr/lib/<multiarch-triplet>/security` on Debian and
+derivatives, auto-detected via `dpkg-architecture -qDEB_HOST_MULTIARCH`
+(falling back to `/usr/lib/security` when that tool is unavailable). Override
+it explicitly for cross builds or an unusual layout, e.g.:
+
+```sh
+sudo make install PAMDIR=/usr/lib/aarch64-linux-gnu/security
+```
 
 `sudo make install` puts the binary at `/usr/bin/secret-manager` with the `sm`
 and `sm-askpass` symlinks, the PAM module in `$PAMDIR`, the systemd user unit,
 the D-Bus activation file, an `environment.d` file for `SSH_ASKPASS`, and
 shell completions.
+
+See "Building" in `docs/install-common.md` for why you should build as your
+normal user and only `sudo` the install step.
 
 ## Replace gnome-keyring or kwallet as the Secret Service
 
@@ -41,21 +50,16 @@ sudo apt purge gnome-keyring
 KWallet does not claim `org.freedesktop.secrets` unless `kwallet-secrets`
 (`ksecretd`) is enabled; disable that in System Settings › KDE Wallet.
 
-## Create your vault and start the daemon
-
-```sh
-sm init                       # creates the "default" collection
-systemctl --user enable --now secret-manager.service
-sm status
-```
+See `docs/install-common.md` (installed alongside this file at
+`/usr/share/doc/secret-manager/install-common.md`) for creating your vault,
+SSH passphrases, configuration, and troubleshooting — shared across
+distributions.
 
 ## Unlock at login (PAM)
 
-This module is exercised end to end by an integration test only on
-machines with `libpam-wrapper` and its `pam_matrix` test module installed
-(`sudo apt install libpam-wrapper`); it has not been run on the development
-machine. Test login unlock on a spare session before relying on it for
-your main login.
+This module's logic is unit-tested, but nothing drives it through a real
+libpam stack automatically (see "Known gaps" in the README). Test login
+unlock on a spare session before relying on it for your main login.
 
 Add the three lines from `/usr/share/doc/secret-manager/pam.d-snippet` to
 `common-auth`, `common-session`, and `common-password`. In `common-session`,
@@ -87,33 +91,16 @@ Log out and back in, then `sm status` should show `default` unlocked.
 Problems are logged to the journal: `journalctl -p warning -g pam_secret_manager`
 (the messages carry a `pam_secret_manager:` prefix in `authpriv`).
 
-## SSH passphrases
+For creating your vault, SSH passphrases (including the
+`SSH_ASKPASS_REQUIRE` opt-in and its risks), configuration, and
+troubleshooting, see `docs/install-common.md`.
+
+## Uninstalling
 
 ```sh
-sm ssh add ~/.ssh/id_ed25519          # prompts for the key's passphrase once
-sm ssh add ~/.ssh/id_deploy --no-passphrase
-sm ssh list
+sudo make uninstall PAMDIR=/usr/lib/aarch64-linux-gnu/security   # if you overrode PAMDIR at install
 ```
 
-The installed `environment.d` file sets `SSH_ASKPASS=/usr/bin/sm-askpass` and
-`SSH_ASKPASS_REQUIRE=prefer` for systemd user sessions. Shells started outside
-a systemd session (for example a plain `startx`) need the same two variables
-exported in your profile.
-
-## Configuration
-
-`~/.config/secret-manager/config.toml`, all keys optional:
-
-```toml
-[vault]
-dir = "~/.local/share/secret-manager"
-auto_lock_after = "0s"      # "15m" locks after 15 minutes of inactivity
-
-[prompt]
-pinentry = "pinentry"       # e.g. "/usr/bin/pinentry-qt"
-
-[kdf]
-m_cost_kib = 65536
-t_cost = 3
-p_cost = 1
-```
+`make uninstall` must repeat any `PREFIX` or `PAMDIR` override you passed to
+`make install` (the auto-detected default is reused automatically if you
+didn't), or it will look in the wrong place and leave files behind.
