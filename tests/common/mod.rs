@@ -274,6 +274,16 @@ impl Fixture {
         let mut cmd = assert_cmd::Command::new(env!("CARGO_BIN_EXE_secret-manager"));
         cmd.env_clear();
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+        // The CLI runs as a child process, so its coverage is only recorded if
+        // it can write its own profile. `env_clear` above is deliberate — the
+        // CLI must not inherit the test runner's environment — but it also
+        // removes the variable the profiler needs, which silently reports the
+        // whole CLI as unexercised however many times these tests drive it.
+        for key in ["LLVM_PROFILE_FILE", "LLVM_PROFILE_DIR"] {
+            if let Ok(v) = std::env::var(key) {
+                cmd.env(key, v);
+            }
+        }
         cmd.env("HOME", self.data_dir.path());
         for (k, v) in self.envs() {
             cmd.env(k, v);
