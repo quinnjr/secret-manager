@@ -396,8 +396,15 @@ async fn a_broken_collection_cannot_be_locked_or_batch_deleted() {
         .build()
         .await
         .unwrap();
-    // An empty batch is a no-op on any collection, broken or not.
-    admin.delete_items(&[]).await.unwrap();
+    // An empty batch changes nothing, but it must still answer for the state
+    // of the collection it was sent to. A broken collection reports
+    // `Locked = true` and has no vault behind it, so `DeleteItems([])` says
+    // `IsLocked` — the same thing `Item.Delete` and a one-item batch say —
+    // rather than reporting success for a collection nobody can write to.
+    assert_eq!(
+        error_name(&admin.delete_items(&[]).await.unwrap_err()),
+        "org.freedesktop.Secret.Error.IsLocked"
+    );
     let err = admin
         .delete_items(&[
             OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/bad/abc").unwrap(),
@@ -410,4 +417,239 @@ async fn a_broken_collection_cannot_be_locked_or_batch_deleted() {
         "a broken collection holds no items, so none of them can be named"
     );
     assert!(service.collections().await.unwrap().contains(&bad_path));
+}
+
+/// `GetSecrets` must not refresh the idle timer for a call it then refuses
+/// (HIGH 1). `st.touch()` used to run before `st.cipher(session, sender)?`,
+/// so `GetSecrets([], "/bogus")` — no session, no unlocked collection, no
+/// knowledge of any path — kept `last_activity` fresh and then failed with
+/// `NoSession`. `daemon::idle_lock` compares exactly that field, so a client
+/// calling it every few minutes stopped `auto_lock_after` (15 minutes, on by
+/// default) from ever locking the vault, and the keys stayed in daemon memory
+/// indefinitely.
+///
+/// Asserted on `last_activity` itself rather than on wall-clock behaviour, so
+/// it pins the ordering and not a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_secrets_does_not_refresh_the_idle_timer_before_the_session_check() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    let before = fx.daemon.state.lock().await.last_activity;
+    let bogus =
+        OwnedObjectPath::try_from("/org/freedesktop/secrets/session/s9_00000000deadbeef").unwrap();
+    let err = service.get_secrets(&[], &bogus).await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.NoSession");
+    assert_eq!(
+        fx.daemon.state.lock().await.last_activity,
+        before,
+        "an unauthorised GetSecrets refreshed the idle timer, defeating auto_lock_after"
+    );
+
+    // A session belonging to someone else is refused the same way, and must
+    // not touch either.
+    let (_, other) = ServiceProxy::new(&fx.client().await)
+        .await
+        .unwrap()
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+    let err = service.get_secrets(&[], &other).await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.NoSession");
+    assert_eq!(
+        fx.daemon.state.lock().await.last_activity,
+        before,
+        "another client's session must not refresh the idle timer either"
+    );
+
+    // A legitimate call still touches, exactly as before: the fix moves the
+    // touch past the authorisation check, it does not remove it.
+    let (_, mine) = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+    service.get_secrets(&[], &mine).await.unwrap();
+    assert!(
+        fx.daemon.state.lock().await.last_activity > before,
+        "an authorised GetSecrets must still refresh the idle timer"
+    );
+}
+
+/// `Lock` and `Unlock` take caller-supplied object arrays, and every element
+/// costs a `paths::parse` plus a `resolve_item` scan of the collection's item
+/// index, all under the global state mutex (HIGH 2). Uncapped, one legal
+/// D-Bus message carries over a million paths. The cap matches `GetSecrets`'s
+/// and is checked before the lock is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_and_unlock_cap_the_object_array() {
+    use secret_manager::dbus::service::MAX_LOCK_OBJECTS;
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    // The worst case the cap exists to bound: a real collection, so the path
+    // parses and resolves, with an item id that does not exist, so the scan
+    // never short-circuits.
+    let paths: Vec<OwnedObjectPath> = (0..MAX_LOCK_OBJECTS + 1)
+        .map(|n| {
+            OwnedObjectPath::try_from(format!(
+                "/org/freedesktop/secrets/collection/default/nosuchitem{n}"
+            ))
+            .unwrap()
+        })
+        .collect();
+
+    for (what, err) in [
+        ("Unlock", service.unlock(&paths).await.unwrap_err()),
+        ("Lock", service.lock(&paths).await.unwrap_err()),
+    ] {
+        assert_eq!(
+            error_name(&err),
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            "{what} accepted {} objects",
+            paths.len()
+        );
+    }
+
+    // Exactly the cap is still allowed, and still behaves as before: paths
+    // that name nothing are skipped, with no prompt.
+    let at_cap = &paths[..MAX_LOCK_OBJECTS];
+    let (unlocked, prompt) = service.unlock(at_cap).await.unwrap();
+    assert!(unlocked.is_empty());
+    assert_eq!(prompt.as_str(), "/");
+    let (locked, prompt) = service.lock(at_cap).await.unwrap();
+    assert!(locked.is_empty());
+    assert_eq!(prompt.as_str(), "/");
+}
+
+/// `SetAlias` was unbounded in three directions at once (HIGH 3): the name
+/// had no length limit (`paths::is_segment` constrains only the alphabet),
+/// nothing capped how many aliases could exist, and every name a client ever
+/// used kept two exported D-Bus objects forever, even after
+/// `SetAlias(name, "/")`. All of it was persisted to `aliases.toml` and
+/// re-registered at every daemon start, so it survived a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_alias_is_bounded_in_name_length_and_count() {
+    use secret_manager::dbus::service::{MAX_ALIAS_NAME, MAX_ALIASES};
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let target = fx.default_collection();
+
+    let long = "a".repeat(MAX_ALIAS_NAME + 1);
+    assert_eq!(
+        error_name(&service.set_alias(&long, &target).await.unwrap_err()),
+        "org.freedesktop.DBus.Error.InvalidArgs",
+        "an alias name of any length was accepted and written to disk"
+    );
+    assert_eq!(service.read_alias(&long).await.unwrap().as_str(), "/");
+    // Exactly the cap is fine.
+    let at_cap = "a".repeat(MAX_ALIAS_NAME);
+    service.set_alias(&at_cap, &target).await.unwrap();
+    service
+        .set_alias(&at_cap, &secret_manager::dbus::paths::root())
+        .await
+        .unwrap();
+
+    // The fixture already installs `default`, so fill the rest of the table.
+    let existing = fx.daemon.state.lock().await.aliases.len();
+    for n in existing..MAX_ALIASES {
+        service
+            .set_alias(&format!("bulk{n}"), &target)
+            .await
+            .unwrap_or_else(|e| panic!("alias {n} must be allowed: {e}"));
+    }
+    let err = service
+        .set_alias("one_too_many", &target)
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.Failed");
+    assert_eq!(
+        fx.daemon.state.lock().await.aliases.len(),
+        MAX_ALIASES,
+        "a refused SetAlias must not have grown the table"
+    );
+    // Repointing an existing alias is never refused, full table or not.
+    service.set_alias("bulk10", &target).await.unwrap();
+}
+
+/// Clearing an alias must reclaim the two objects `register_alias` exported
+/// for it (HIGH 3), and the alias file must be written atomically rather than
+/// truncated in place.
+///
+/// The inode check is the whole point of the second half: `std::fs::write`
+/// truncates and rewrites the same file, so a crash mid-write leaves a
+/// truncated `aliases.toml`, and `load_aliases` turns that into `InvalidData`,
+/// which refuses daemon startup. A temp file plus `rename` replaces the inode
+/// instead, which is exactly what this observes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clearing_an_alias_reclaims_its_objects_and_the_file_write_is_atomic() {
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let vault_dir = fx.data_dir.path().join("secret-manager");
+    let alias_file = vault_dir.join("aliases.toml");
+
+    service
+        .set_alias("scratch", &fx.default_collection())
+        .await
+        .unwrap();
+    let alias_path = secret_manager::dbus::paths::alias("scratch").unwrap();
+    let proxy = CollectionProxy::builder(&conn)
+        .path(alias_path.clone())
+        .unwrap()
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(proxy.label().await.unwrap(), "Default");
+
+    let before = std::fs::metadata(&alias_file).unwrap().ino();
+    service
+        .set_alias("scratch", &secret_manager::dbus::paths::root())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&alias_file).unwrap().ino(),
+        {
+            let after = std::fs::metadata(&alias_file).unwrap().ino();
+            assert_ne!(
+                after, before,
+                "aliases.toml was truncated and rewritten in place, not replaced atomically"
+            );
+            after
+        },
+        "metadata read twice must agree"
+    );
+    assert!(
+        !std::fs::read_to_string(&alias_file)
+            .unwrap()
+            .contains("scratch"),
+        "the cleared alias is still on disk"
+    );
+    assert!(
+        std::fs::read_dir(&vault_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+        "a temp file was left behind"
+    );
+
+    // The objects are gone, not merely resolving to nothing: an alias that was
+    // once set must not cost two exported objects for the life of the daemon.
+    let err = proxy.label().await.unwrap_err();
+    assert!(
+        matches!(&err, zbus::Error::FDO(e) if matches!(**e, zbus::fdo::Error::UnknownObject(_))),
+        "the alias objects were never unexported: {err:?}"
+    );
+
+    // And setting it again re-exports them, so the reclaim is not one-way.
+    service
+        .set_alias("scratch", &fx.default_collection())
+        .await
+        .unwrap();
+    assert_eq!(proxy.label().await.unwrap(), "Default");
 }

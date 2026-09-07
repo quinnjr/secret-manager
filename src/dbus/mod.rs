@@ -48,8 +48,16 @@ pub(crate) fn prop_attributes(
 ) -> errors::Result<BTreeMap<String, String>> {
     match props.get(key) {
         None => Ok(BTreeMap::new()),
-        Some(v) => HashMap::<String, String>::try_from(v.clone())
-            .map(|m| m.into_iter().collect())
-            .map_err(|_| errors::Error::invalid_args(format!("{key} must be a{{ss}}"))),
+        Some(v) => {
+            let m = HashMap::<String, String>::try_from(v.clone())
+                .map_err(|_| errors::Error::invalid_args(format!("{key} must be a{{ss}}")))?;
+            // Attributes are stored in the encrypted item blob and hashed into
+            // the vault header's search index, so an unbounded set is a way to
+            // push a collection past the vault size limit exactly as an
+            // unbounded secret was. `MAX_SEARCH_ATTRIBUTES` bounds queries,
+            // not what gets written.
+            collection::check_attributes(m.len(), m.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
+            Ok(m.into_iter().collect())
+        }
     }
 }

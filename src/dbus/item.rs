@@ -84,7 +84,6 @@ impl Item {
         #[zbus(header)] header: Header<'_>,
     ) -> Result<SecretStruct> {
         let mut st = self.state.lock().await;
-        st.touch();
         let cipher = st.cipher(session.as_str(), &require_sender(&header)?)?;
         let vault = st
             .collections
@@ -92,11 +91,19 @@ impl Item {
             .ok_or(Error::NoSuchObject)?;
         let item = vault.item(&self.id)?;
         let (parameters, value) = cipher.encrypt(&item.secret);
+        let content_type = item.content_type.clone();
+        // Only an authorised read counts as activity. Touching first meant any
+        // bus client could refresh `last_activity` with a bogus or another
+        // client's session path — no session, no unlocked collection and no
+        // real item path needed — so `idle_lock` never fired and the keys
+        // stayed in daemon memory indefinitely. A legitimate call still
+        // touches inside this same lock acquisition.
+        st.touch();
         Ok(SecretStruct {
             session,
             parameters,
             value,
-            content_type: item.content_type.clone(),
+            content_type,
         })
     }
 
@@ -106,10 +113,35 @@ impl Item {
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> Result<()> {
+        // The content type is written into the same item blob as the secret,
+        // so `CreateItem`'s cap on it has to hold here too, or the cap is a
+        // speed bump: create an item with a short one, then replace it.
+        collection::check_content_type(&secret.content_type)?;
         {
             let mut st = self.state.lock().await;
-            let plaintext = st
-                .cipher(secret.session.as_str(), &require_sender(&header)?)?
+            let cipher = st.cipher(secret.session.as_str(), &require_sender(&header)?)?;
+            // Cheap checks before the caller-sized decrypt, which runs with
+            // the global state mutex held: `secret.value` is bounded only by
+            // the bus message size (128 MiB), so decrypting first meant a
+            // client could stall every other client and only then be told the
+            // secret was over the cap, or the collection locked.
+            // `MAX_ITEM_CIPHERTEXT` bounds the plaintext from above only —
+            // the exact check on the plaintext is still below.
+            if secret.value.len() > collection::MAX_ITEM_CIPHERTEXT {
+                return Err(Error::invalid_args(format!(
+                    "secret is too large; at most {} bytes per item",
+                    collection::MAX_ITEM_SECRET
+                )));
+            }
+            if st
+                .collections
+                .get(&self.collection)
+                .ok_or(Error::NoSuchObject)?
+                .is_locked()
+            {
+                return Err(Error::IsLocked);
+            }
+            let plaintext = cipher
                 .decrypt(&secret.parameters, &secret.value)
                 .map_err(Error::failed)?;
             // The same cap `CreateItem` enforces. Without it here the cap is
@@ -163,6 +195,13 @@ impl Item {
 
     #[zbus(property)]
     async fn set_attributes(&self, attributes: HashMap<String, String>) -> zbus::fdo::Result<()> {
+        // Same caps as `CreateItem`: the attributes go into the same encrypted
+        // item blob, so a setter without them makes the create-path cap a
+        // speed bump — create a small item, then grow it here.
+        collection::check_attributes(
+            attributes.len(),
+            attributes.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        )?;
         self.update(|i| i.attributes = attributes.into_iter().collect())
             .await
     }
@@ -176,6 +215,8 @@ impl Item {
 
     #[zbus(property)]
     async fn set_label(&self, label: &str) -> zbus::fdo::Result<()> {
+        // Same cap as `CreateItem`, for the same reason as `set_attributes`.
+        collection::check_label(label)?;
         let label = label.to_string();
         self.update(|i| i.label = label).await
     }

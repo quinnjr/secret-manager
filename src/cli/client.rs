@@ -1,6 +1,7 @@
 //! Secret Service client used by the CLI: session setup, prompts, item helpers.
 
 use super::CliError;
+use super::secrets::escape_control;
 use crate::dbus::proxies::{
     CollectionAdminProxy, CollectionProxy, ItemProxy, PromptProxy, ServiceProxy,
 };
@@ -51,15 +52,26 @@ fn connect_timeout() -> Duration {
 /// the mapping is otherwise reachable only from a live bus. The exit code
 /// this decides is the CLI's contract with scripts — `Unreachable` is 3 and
 /// `Failed` is 1 — so which name lands in which arm is worth pinning.
+///
+/// Both the error name and its description come from whoever owns the bus
+/// name, and the CLI prints the result straight to a terminal with
+/// `eprintln!`. A same-uid impostor can own `org.freedesktop.secrets` first
+/// (accepted gap I3), so both halves are peer text and both go through
+/// [`escape_control`], like every other peer string the CLI prints.
 pub(crate) fn method_error_to_cli(name: &str, msg: &str) -> CliError {
     match name {
         "org.freedesktop.DBus.Error.ServiceUnknown"
         | "org.freedesktop.DBus.Error.NameHasNoOwner"
         | "org.freedesktop.DBus.Error.NoReply" => CliError::Unreachable(format!(
-            "secret service is not running ({msg}); start it with `systemctl --user start secret-manager`"
+            "secret service is not running ({}); start it with `systemctl --user start secret-manager`",
+            escape_control(msg)
         )),
         "org.freedesktop.Secret.Error.IsLocked" => CliError::Failed("collection is locked".into()),
-        other => CliError::Failed(format!("{other}: {msg}")),
+        other => CliError::Failed(format!(
+            "{}: {}",
+            escape_control(other),
+            escape_control(msg)
+        )),
     }
 }
 
@@ -399,5 +411,36 @@ mod tests {
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().contains("com.example.Whatever"));
         assert!(err.to_string().contains("went wrong"));
+    }
+
+    /// F3: the peer picks both the error name and its description, and the
+    /// CLI prints the result to a terminal. Escaping them is the mitigation
+    /// for a same-uid impostor owning the bus name first (accepted gap I3),
+    /// and every other peer string the CLI prints already goes through
+    /// `escape_control`.
+    #[test]
+    fn a_peer_error_reaches_the_terminal_escaped() {
+        let err = method_error_to_cli(
+            "com.example.Whatever",
+            "oops\n\u{1b}[2Ksecret-manager: everything is fine",
+        );
+        let text = err.to_string();
+        assert!(!text.contains('\n'), "raw newline forges a line: {text:?}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "raw escape injects ANSI: {text:?}"
+        );
+        assert!(text.contains("\\x0a") && text.contains("\\x1b"), "{text:?}");
+
+        // The name is peer text too, and lands in the same line.
+        let err = method_error_to_cli("com.example.\u{1b}[31mRed", "why");
+        assert!(!err.to_string().contains('\u{1b}'), "{err:?}");
+
+        // And the transport arm, which interpolates the description into its
+        // own advice, escapes it as well.
+        let err = method_error_to_cli("org.freedesktop.DBus.Error.NoReply", "a\rb");
+        let text = err.to_string();
+        assert!(!text.contains('\r'), "{text:?}");
+        assert!(text.contains("\\x0d"), "{text:?}");
     }
 }

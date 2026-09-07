@@ -25,6 +25,8 @@ pub enum VaultError {
     AlreadyExists(PathBuf),
     #[error("the new salt must differ from the current one")]
     SaltReused,
+    #[error("collection label is too long ({len} bytes; limit is {limit})")]
+    LabelTooLong { len: usize, limit: usize },
     #[error(transparent)]
     Format(#[from] FormatError),
     #[error(transparent)]
@@ -34,6 +36,18 @@ pub enum VaultError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+/// Refuse a collection label that would not fit comfortably in a `Status`
+/// frame or in the vault header. See [`format::MAX_LABEL`] for the reasoning.
+fn check_label(label: &str) -> Result<(), VaultError> {
+    if label.len() > format::MAX_LABEL {
+        return Err(VaultError::LabelTooLong {
+            len: label.len(),
+            limit: format::MAX_LABEL,
+        });
+    }
+    Ok(())
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> VaultError {
@@ -116,6 +130,10 @@ impl Vault {
         password: &[u8],
         kdf: KdfParams,
     ) -> Result<Vault, VaultError> {
+        // Bounded here as well as in `set_label`, so no path can put an
+        // oversized label in a header. Checked before the RNG and the KDF so
+        // a refusal costs nothing and leaves nothing behind.
+        check_label(label)?;
         let salt = crypto::try_random_bytes::<SALT_LEN>()?;
         let index_salt = crypto::try_random_bytes::<SALT_LEN>()?;
         let key = crypto::derive_key(password, &salt, kdf)?;
@@ -227,11 +245,28 @@ impl Vault {
     }
 
     /// Search by hashed attributes. Works while locked.
+    ///
+    /// The query's digests are computed **once**, before the scan, not once
+    /// per index entry. `format::attribute_hash` is a SHA-256 over
+    /// `salt || len(key) || key || value` and nothing bounds an attribute key
+    /// or value (`MAX_SEARCH_ATTRIBUTES` bounds the count, not the size), so
+    /// hashing inside the loop made a single ~64 MiB value cost
+    /// `items x 64 MiB` of hashing - minutes, under the daemon's state lock,
+    /// against a collection that is locked by default and needs no consent.
+    /// Hoisted, the hashing is linear in the query and paid once; the
+    /// per-entry work is `binary_search` over 32-byte digests.
     pub fn search_ids(&self, query: &BTreeMap<String, String>) -> Vec<String> {
+        // With `locked_search = false` every entry is id-only, so a non-empty
+        // query matches nothing however it hashes. Settle that from the index
+        // alone and the attacker-controlled bytes are never hashed at all.
+        if !query.is_empty() && !self.index_has_attributes() {
+            return Vec::new();
+        }
+        let query_hashes = format::hash_query(&self.header.index_salt, query);
         self.header
             .index
             .iter()
-            .filter(|e| e.matches(&self.header.index_salt, query))
+            .filter(|e| e.matches_hashes(&query_hashes))
             .map(|e| e.id.clone())
             .collect()
     }
@@ -496,24 +531,42 @@ impl Vault {
     /// Duplicate ids are harmless.
     ///
     /// An empty batch is a no-op and does not rewrite the file.
+    /// Both the validation and the removal go through one set built from the
+    /// items, so the cost is `O(items + ids)` hashes rather than the
+    /// `O(items x ids)` string comparisons a pair of linear scans would make -
+    /// ~10^8 comparisons at the 1024-id cap against a large collection, all of
+    /// it under the caller's state lock.
     pub fn delete_items(&mut self, ids: &[String]) -> Result<(), VaultError> {
         let items_before = self.items()?.to_vec();
+        let present: std::collections::HashSet<&str> =
+            items_before.iter().map(|i| i.id.as_str()).collect();
+        // Every id is checked before anything is removed, in the order given,
+        // so the reported id is the same one the linear scan reported.
         for id in ids {
-            if !items_before.iter().any(|i| &i.id == id) {
+            if !present.contains(id.as_str()) {
                 return Err(VaultError::NoSuchItem(id.clone()));
             }
         }
         if ids.is_empty() {
             return Ok(());
         }
+        let doomed: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
         {
             let items = self.items_mut()?;
-            items.retain(|i| !ids.contains(&i.id));
+            items.retain(|i| !doomed.contains(i.id.as_str()));
         }
         self.save_or_restore(items_before, Self::restore_items)
     }
 
+    /// Rename the collection.
+    ///
+    /// The label is bounded by [`format::MAX_LABEL`] before it reaches the
+    /// header: it is client-supplied, it is copied verbatim into every
+    /// `Status` response, and a `Status` frame over `protocol::MAX_FRAME`
+    /// makes `sm status` fail for *all* collections until the label is
+    /// shortened - which no CLI command can do. See `MAX_LABEL`.
     pub fn set_label(&mut self, label: &str) -> Result<(), VaultError> {
+        check_label(label)?;
         self.items_mut()?;
         let old_label = self.header.label.clone();
         self.header.label = label.to_string();
@@ -1871,8 +1924,14 @@ mod tests {
         let (_d, path) = tmp();
         let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
         let before = std::fs::read(&path).unwrap();
+        // `set_label` now caps the label at `format::MAX_LABEL`, so no public
+        // call can grow a header past `MAX_HEADER` any more. Drive the header
+        // guard directly instead, through the exact save-and-roll-back that
+        // `set_label` performs, so every assertion below is unchanged.
+        let old_label = v.header.label.clone();
+        v.header.label = "x".repeat(format::MAX_HEADER + 1);
         let err = v
-            .set_label(&"x".repeat(format::MAX_HEADER + 1))
+            .save_or_restore(old_label, |vault, old| vault.header.label = old)
             .unwrap_err();
         assert!(
             matches!(err, VaultError::Format(FormatError::HeaderTooLarge(_))),
@@ -2485,5 +2544,250 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+    }
+
+    /// F1 regression. `search_ids` used to call `IndexEntry::matches`, which
+    /// hashed every query pair *inside* the per-entry loop. `attribute_hash`
+    /// is a SHA-256 over the whole `(salt, key, value)` triple and nothing
+    /// bounds an attribute value, so one large value cost `items x value`
+    /// bytes of hashing under the daemon's state lock, on a collection that
+    /// is locked by default. The digests depend on nothing but the query, so
+    /// hoisting them must not change a single match.
+    #[test]
+    fn search_with_a_huge_query_value_still_matches_exactly() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let big = "v".repeat(1 << 20);
+        let mut plain = Vec::new();
+        for n in 0..20 {
+            plain.push(
+                v.insert_item(
+                    "p",
+                    attrs(&[("app", "git"), ("n", &n.to_string())]),
+                    b"s".to_vec(),
+                    "text/plain",
+                    false,
+                )
+                .unwrap()
+                .0,
+            );
+        }
+        let hit = v
+            .insert_item(
+                "hit",
+                [
+                    ("app".to_string(), "git".to_string()),
+                    ("big".to_string(), big.clone()),
+                ]
+                .into(),
+                b"s".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap()
+            .0;
+
+        let q = |k: &str, val: &str| -> BTreeMap<String, String> {
+            [(k.to_string(), val.to_string())].into()
+        };
+        assert_eq!(v.search_ids(&q("big", &big)), vec![hit.clone()]);
+        assert!(v.search_ids(&q("big", &"w".repeat(1 << 20))).is_empty());
+        assert!(v.search_ids(&q("big", &big[1..])).is_empty());
+        assert_eq!(v.search_ids(&q("app", "git")).len(), plain.len() + 1);
+        // Both pairs together, one of them huge, still narrow to the one item.
+        let both: BTreeMap<String, String> = [
+            ("app".to_string(), "git".to_string()),
+            ("big".to_string(), big.clone()),
+        ]
+        .into();
+        assert_eq!(v.search_ids(&both), vec![hit.clone()]);
+        // An empty query still lists every id, in index order.
+        assert_eq!(v.search_ids(&BTreeMap::new()), v.item_ids());
+
+        // The same answers while locked - this is the path that needs no
+        // consent and no unlock, which is what made the cost a DoS.
+        let locked = Vault::open(&path).unwrap();
+        assert!(locked.is_locked());
+        assert_eq!(locked.search_ids(&q("big", &big)), vec![hit]);
+    }
+
+    /// The other half of F1: the cost of one huge query value must no longer
+    /// scale with the number of items. Measured as a ratio against the same
+    /// search on a one-item vault, with a wide margin - before the fix the
+    /// ratio was the item count (~21x here), after it is ~1x.
+    #[test]
+    fn search_cost_does_not_scale_with_the_item_count() {
+        let big = "v".repeat(2 << 20);
+        let query: BTreeMap<String, String> = [("big".to_string(), big.clone())].into();
+        let build = |path: &Path, extra: usize| {
+            let mut v = Vault::create(path, "Default", b"pw", FAST).unwrap();
+            for n in 0..extra {
+                v.insert_item(
+                    "p",
+                    attrs(&[("n", &n.to_string())]),
+                    b"s".to_vec(),
+                    "text/plain",
+                    false,
+                )
+                .unwrap();
+            }
+            // Inserted last, so only one save pays for indexing it.
+            v.insert_item(
+                "hit",
+                [("big".to_string(), big.clone())].into(),
+                b"s".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap();
+            v
+        };
+        let best = |v: &Vault| {
+            (0..3)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    assert_eq!(v.search_ids(&query).len(), 1);
+                    t.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+
+        let (_d1, p1) = tmp();
+        let (_d2, p2) = tmp();
+        let one = build(&p1, 0);
+        let many = build(&p2, 200);
+        let t_one = best(&one);
+        let t_many = best(&many);
+        let bound = t_one * 20 + Duration::from_millis(50);
+        assert!(
+            t_many <= bound,
+            "search over 201 items took {t_many:?}, over 1 item {t_one:?}: \
+             the query digest is still being recomputed per entry"
+        );
+    }
+
+    /// F1's short-circuit: with `locked_search = false` the index carries ids
+    /// only, so a non-empty query matches nothing whatever it hashes to. That
+    /// is settled from the index alone, so the attacker-controlled bytes are
+    /// never hashed - and the answer is unchanged.
+    #[test]
+    fn an_id_only_index_answers_a_huge_query_without_hashing_it() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.set_index_attributes(false);
+        v.insert_item(
+            "a",
+            attrs(&[("app", "git")]),
+            b"s".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+        assert!(!v.index_has_attributes());
+        let ids = v.item_ids();
+        assert!(
+            v.search_ids(&attrs(&[("app", "git")])).is_empty(),
+            "an id-only index cannot answer an attribute query"
+        );
+        let huge: BTreeMap<String, String> = [("big".to_string(), "v".repeat(8 << 20))].into();
+        let t = std::time::Instant::now();
+        assert!(v.search_ids(&huge).is_empty());
+        assert!(
+            t.elapsed() < Duration::from_millis(200),
+            "an 8 MiB query value was hashed against an id-only index"
+        );
+        // The empty query still lists every id.
+        assert_eq!(v.search_ids(&BTreeMap::new()), ids);
+    }
+
+    /// F2 regression: the collection label is client-supplied and is copied
+    /// verbatim into every `Status` response, so an unbounded one makes
+    /// `sm status` fail for *all* collections, permanently and across
+    /// restarts, with no CLI command able to rename it back.
+    #[test]
+    fn an_oversized_label_is_refused_by_set_label_and_by_create() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let over = "x".repeat(format::MAX_LABEL + 1);
+        let err = v.set_label(&over).unwrap_err();
+        assert!(
+            matches!(err, VaultError::LabelTooLong { len, limit }
+                     if len == format::MAX_LABEL + 1 && limit == format::MAX_LABEL),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains(&format::MAX_LABEL.to_string()), "{text}");
+        assert_eq!(v.label(), "Default", "the label must be untouched");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "vault was rewritten");
+
+        // Exactly at the limit is still accepted, and survives a reopen.
+        let at = "y".repeat(format::MAX_LABEL);
+        v.set_label(&at).unwrap();
+        assert_eq!(Vault::open(&path).unwrap().label(), at);
+
+        // `create` refuses too, before touching the filesystem.
+        let (_d2, p2) = tmp();
+        let err = Vault::create(&p2, &over, b"pw", FAST).unwrap_err();
+        assert!(matches!(err, VaultError::LabelTooLong { .. }), "{err:?}");
+        assert!(!p2.exists(), "a refused create left a file behind");
+    }
+
+    /// F3 regression: `delete_items` validated with a linear scan per id and
+    /// removed with `Vec::contains` per item, which is `O(items x ids)` - at
+    /// the 1024-id cap against a large collection, ~10^8 string comparisons
+    /// under the caller's state lock. The set-based version must keep every
+    /// documented semantic at scale.
+    #[test]
+    fn delete_items_keeps_its_semantics_at_the_id_cap() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let ids: Vec<String> = (0..1200)
+            .map(|n| {
+                v.insert_item(
+                    "p",
+                    attrs(&[("n", &n.to_string())]),
+                    b"s".to_vec(),
+                    "text/plain",
+                    false,
+                )
+                .unwrap()
+                .0
+            })
+            .collect();
+        let before = std::fs::read(&path).unwrap();
+
+        // An unknown id anywhere in a full batch refuses the whole batch, and
+        // names that id.
+        let mut batch: Vec<String> = ids[..1023].to_vec();
+        batch.push("nope".into());
+        let err = v.delete_items(&batch).unwrap_err();
+        assert!(
+            matches!(&err, VaultError::NoSuchItem(id) if id == "nope"),
+            "{err:?}"
+        );
+        assert_eq!(v.item_ids(), ids);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "vault was rewritten");
+
+        // The first unknown id in order is the one reported.
+        let err = v
+            .delete_items(&["zzz".to_string(), "nope".to_string()])
+            .unwrap_err();
+        assert!(
+            matches!(&err, VaultError::NoSuchItem(id) if id == "zzz"),
+            "{err:?}"
+        );
+
+        // A full batch with duplicates removes exactly those ids, in one save.
+        let mut batch: Vec<String> = ids[..512].to_vec();
+        batch.extend_from_slice(&ids[..512]);
+        assert_eq!(batch.len(), 1024);
+        v.delete_items(&batch).unwrap();
+        assert_eq!(v.item_ids(), ids[512..]);
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        assert_eq!(reopened.item_ids(), ids[512..]);
     }
 }

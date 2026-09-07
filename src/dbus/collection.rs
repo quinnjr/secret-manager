@@ -21,6 +21,117 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 /// stops saving — with one `CreateItem` call.
 pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
 
+/// Upper bound on the *ciphertext* of one item's secret, checked before the
+/// decrypt rather than after it.
+///
+/// [`MAX_ITEM_SECRET`] is the exact cap and stays exactly where it was, on the
+/// plaintext. This one exists because the decrypt itself was the attack:
+/// `secret.value` arrives bounded only by the D-Bus message size limit
+/// (128 MiB) and is decrypted while the single global state mutex is held, so
+/// a client could stall every other client for the length of a 128 MiB
+/// decrypt and only then be told its secret was over the cap.
+///
+/// It must never refuse something the plaintext check would have accepted, so
+/// it bounds the plaintext from above rather than claiming to equal it. The
+/// AES session cipher is CBC with PKCS#7, which appends 1..=16 bytes, so
+/// `plaintext == ciphertext - pad >= ciphertext - 16`; a `plain` session's
+/// ciphertext is the plaintext itself, so the same bound holds with room to
+/// spare. Anything longer than `MAX_ITEM_SECRET + 16` therefore cannot
+/// possibly decrypt to something within the cap. Everything shorter is still
+/// measured exactly, after the decrypt, against `MAX_ITEM_SECRET`.
+pub const MAX_ITEM_CIPHERTEXT: usize = MAX_ITEM_SECRET + 16;
+
+/// Upper bound on one item's label.
+///
+/// The label is serialised into the same encrypted item blob as the secret,
+/// so it counts against the vault-level size limit in exactly the same way —
+/// capping only the secret left the cap reachable in two `CreateItem` calls
+/// through the label instead of 256 through the secret. 4 KiB is far more
+/// than any real client needs (libsecret labels are a line of UI text) while
+/// still leaving room for a long multi-byte one.
+pub const MAX_ITEM_LABEL: usize = 4 * 1024;
+
+/// Upper bound on the number of attribute pairs on one item. Attributes are
+/// stored in the item blob, and are also hashed into the header's search
+/// index, so each pair costs twice. Real schemas use a handful; libsecret's
+/// own built-in schemas top out well under ten.
+pub const MAX_ITEM_ATTRIBUTES: usize = 64;
+
+/// Upper bound on one attribute name. Attribute names are schema field names.
+pub const MAX_ATTRIBUTE_KEY: usize = 256;
+
+/// Upper bound on one attribute value. Values are identifiers, paths and
+/// usernames; this project's own largest is an ssh key path.
+///
+/// Together the three attribute caps bound one item's attribute set at
+/// 64 * (256 + 512) = 48 KiB, generous for a real client and small enough
+/// that reaching [`crate::vault::format::MAX_VAULT_BYTES`] through attributes takes
+/// as many calls as reaching it through capped secrets.
+pub const MAX_ATTRIBUTE_VALUE: usize = 512;
+
+/// Upper bound on one item's content type.
+///
+/// The last caller-supplied field that lands in the encrypted item blob, so
+/// the same reasoning as the label: uncapped, it is another way to push a
+/// collection past the vault size limit, just wearing a different field name.
+/// A content type is a MIME type — RFC 6838 caps a registered type or subtree
+/// name at 127 bytes each, so 255 covers `type/subtree` at the registry's own
+/// maximum, and 256 leaves room for a parameter such as `; charset=utf-8`.
+/// Real clients send `text/plain` or `application/octet-stream`.
+pub const MAX_ITEM_CONTENT_TYPE: usize = 256;
+
+/// Refuse an over-long content type. See [`check_label`] for the error type.
+pub(crate) fn check_content_type(content_type: &str) -> std::result::Result<(), zbus::fdo::Error> {
+    if content_type.len() > MAX_ITEM_CONTENT_TYPE {
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "content type is too large; at most {MAX_ITEM_CONTENT_TYPE} bytes per item"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an over-long item label.
+///
+/// Returns `zbus::fdo::Error::InvalidArgs` — what [`Error::invalid_args`]
+/// wraps — rather than [`Error`], because the `#[zbus(property)]` setters in
+/// [`super::item`] cannot return a custom `DBusError` (see
+/// [`super::errors::vault_error_to_fdo`]) and must share this check. `?`
+/// converts it to [`Error`] on the method paths.
+pub(crate) fn check_label(label: &str) -> std::result::Result<(), zbus::fdo::Error> {
+    if label.len() > MAX_ITEM_LABEL {
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "label is too large; at most {MAX_ITEM_LABEL} bytes per item"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an over-large attribute set: too many pairs, or a pair whose name
+/// or value is over its cap. See [`check_label`] for the error type.
+pub(crate) fn check_attributes<'a>(
+    count: usize,
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> std::result::Result<(), zbus::fdo::Error> {
+    if count > MAX_ITEM_ATTRIBUTES {
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "too many attributes; at most {MAX_ITEM_ATTRIBUTES} per item"
+        )));
+    }
+    for (k, v) in pairs {
+        if k.len() > MAX_ATTRIBUTE_KEY {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "attribute name is too large; at most {MAX_ATTRIBUTE_KEY} bytes per attribute"
+            )));
+        }
+        if v.len() > MAX_ATTRIBUTE_VALUE {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "attribute value is too large; at most {MAX_ATTRIBUTE_VALUE} bytes per attribute"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Upper bound on one `DeleteItems` batch, for the same reason as
 /// [`super::service::MAX_GET_SECRETS_ITEMS`]: every element costs a path
 /// resolution and a linear item lookup under the global state mutex.
@@ -152,14 +263,33 @@ impl Collection {
     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
         let label =
             prop_string(&properties, "org.freedesktop.Secret.Item.Label")?.unwrap_or_default();
+        // The label, the content type and the attributes all land in the same
+        // encrypted item blob as the secret, so they need the same kind of
+        // cap; `prop_attributes` bounds the attributes as it reads them.
+        check_label(&label)?;
+        check_content_type(&secret.content_type)?;
         let attributes = prop_attributes(&properties, "org.freedesktop.Secret.Item.Attributes")?;
         let (id, iid, replaced) = {
             let mut st = self.state.lock().await;
             let id = self.id(&st)?;
-            let plaintext = st
-                .cipher(secret.session.as_str(), &require_sender(&header)?)?
+            let cipher = st.cipher(secret.session.as_str(), &require_sender(&header)?)?;
+            // Everything cheap first: the decrypt below is caller-sized and
+            // runs with the global state mutex held, so it must not happen for
+            // a secret that is over the cap anyway, nor for a collection that
+            // is locked and would refuse the write regardless.
+            if secret.value.len() > MAX_ITEM_CIPHERTEXT {
+                return Err(Error::invalid_args(format!(
+                    "secret is too large; at most {MAX_ITEM_SECRET} bytes per item"
+                )));
+            }
+            if self.vault(&st).map(|v| v.is_locked()).unwrap_or(true) {
+                return Err(Error::IsLocked);
+            }
+            let plaintext = cipher
                 .decrypt(&secret.parameters, &secret.value)
                 .map_err(Error::failed)?;
+            // The exact check: `MAX_ITEM_CIPHERTEXT` only bounds the plaintext
+            // from above, it does not measure it.
             if plaintext.len() > MAX_ITEM_SECRET {
                 return Err(Error::invalid_args(format!(
                     "secret is too large; at most {MAX_ITEM_SECRET} bytes per item"
@@ -346,12 +476,18 @@ impl CollectionAdmin {
                     item_ids.push(iid);
                 }
             }
-            if item_ids.is_empty() {
-                return Ok(());
-            }
             // Not in `collections` despite `id()` having validated it: a
             // broken collection, which is always reported locked.
             let vault = st.collections.get_mut(&id).ok_or(Error::IsLocked)?;
+            // The lock is answered before the empty-batch shortcut, so
+            // `DeleteItems([])` cannot report success on a collection where
+            // `Item.Delete` — and a one-item batch — say `IsLocked`.
+            if vault.is_locked() {
+                return Err(Error::IsLocked);
+            }
+            if item_ids.is_empty() {
+                return Ok(());
+            }
             vault.delete_items(&item_ids)?;
             st.touch();
             (id, item_ids)

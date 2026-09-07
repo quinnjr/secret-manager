@@ -385,25 +385,23 @@ async fn run(
                 if !state.lock().await.prompt_owners.contains_key(path.as_str()) {
                     break;
                 }
-                match unlock_collection_inner(conn, state, id, &mut gate).await {
+                match unlock_collection_inner(conn, state, path, id, &mut gate).await {
                     Outcome::Unlocked => {
                         any_unlocked = true;
                         unlocked_now.push(id.clone());
-                        // Also record it where an abort cannot destroy it:
-                        // this task may be aborted before the next
-                        // collection's gate is claimed.
-                        state
-                            .lock()
-                            .await
-                            .prompt_unlocked
-                            .entry(path.to_string())
-                            .or_default()
-                            .push(id.clone());
                     }
+                    // Counts as success for the caller's result, but is not
+                    // ours to re-lock.
+                    Outcome::AlreadyUnlocked => any_unlocked = true,
                     Outcome::Failed => {}
                     // Cancel means cancel: do not raise a dialog for the next
                     // collection in the same prompt.
                     Outcome::Cancelled => break,
+                    // The dialog was never free; the next collection would
+                    // queue behind the same holder and wait all over again,
+                    // so stop. Logged where it happens, and — unlike a
+                    // cancellation — nothing here treats it as an answer.
+                    Outcome::Busy => break,
                 }
             }
             // An abort can only take effect at an await point, so a client
@@ -456,16 +454,33 @@ async fn run(
 /// How one collection's unlock attempt ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
+    /// This prompt decrypted the collection, so this prompt is responsible
+    /// for re-locking it if its owner goes away.
     Unlocked,
+    /// It was already open when we got here — someone else's doing. The
+    /// prompt succeeds, but must not claim it: re-locking a collection a
+    /// still-connected client is relying on would be a denial of service,
+    /// and reaching this arm costs no password and no dialog, so a client
+    /// could aim it deliberately.
+    AlreadyUnlocked,
     /// Could not be unlocked, but the user did not ask to stop.
     Failed,
     /// The user cancelled, or a racing `Dismiss` claimed the prompt.
     Cancelled,
+    /// No dialog could be raised at all: another one held the screen for
+    /// longer than this request's queue budget. Distinct from `Cancelled`
+    /// because the user was never asked anything — a client that parks an
+    /// unanswered dialog must not be able to make the daemon record the
+    /// user's own prompt as one they refused (F1).
+    Busy,
 }
 
 async fn unlock_collection_inner(
     conn: &Connection,
     state: &Shared,
+    // The prompt this unlock belongs to, so a collection it opens is
+    // recorded against it under the same lock that opened it.
+    path: &OwnedObjectPath,
     id: &str,
     commit_gate: &mut Option<&AtomicBool>,
 ) -> Outcome {
@@ -481,9 +496,31 @@ async fn unlock_collection_inner(
             return Outcome::Failed;
         };
         if !vault.is_locked() {
-            return Outcome::Unlocked;
+            return Outcome::AlreadyUnlocked;
         }
         (st.pinentry.clone(), display_label(vault.label()))
+    };
+    // One dialog slot for all three attempts. Taking it per attempt sent a
+    // user who mistyped their password to the back of the queue behind every
+    // dialog raised while they were typing, and made a retry fail for a reason
+    // that had nothing to do with them. The slot is held across the Argon2
+    // derivation between attempts too — that runs under the daemon-wide
+    // derivation cap, and the alternative is releasing the slot mid-retry,
+    // which is the thing being fixed. `QUEUE_TIMEOUT_FACTOR` is sized for
+    // this: one occupancy is worth up to three dialogs.
+    let dialog = match pinentry.session().await {
+        Ok(session) => session,
+        Err(crate::prompt::PinentryError::Busy) => {
+            tracing::warn!(
+                "cannot unlock '{id}': another pinentry dialog held the screen, \
+                 so no password prompt was shown"
+            );
+            return Outcome::Busy;
+        }
+        Err(e) => {
+            tracing::warn!("pinentry failed: {e}");
+            return Outcome::Failed;
+        }
     };
     let mut error = None;
     for _ in 0..3 {
@@ -499,9 +536,10 @@ async fn unlock_collection_inner(
             error: error.take(),
             repeat: false,
         };
-        let pin = match pinentry.ask(&req).await {
+        let pin = match dialog.ask(&req).await {
             Ok(PinOutcome::Pin(pin)) => pin,
             Ok(PinOutcome::Cancelled) => return Outcome::Cancelled,
+            Err(crate::prompt::PinentryError::Busy) => return Outcome::Busy,
             Err(e) => {
                 tracing::warn!("pinentry failed: {e}");
                 return Outcome::Failed;
@@ -533,10 +571,22 @@ async fn unlock_collection_inner(
         let result = match derived {
             Ok(key) => {
                 let mut st = state.lock().await;
-                match st.collections.get_mut(id) {
-                    Some(vault) => vault.unlock_with_key(&key),
-                    None => return Outcome::Failed,
+                let Some(vault) = st.collections.get_mut(id) else {
+                    return Outcome::Failed;
+                };
+                let opened = vault.unlock_with_key(&key);
+                if opened.is_ok() {
+                    // Under the *same* guard that opened it. An abort takes
+                    // effect at an await point, and there are two between
+                    // here and the caller's bookkeeping, so recording it
+                    // there leaves a window where the vault is decrypted and
+                    // nothing remembers who owns it.
+                    st.prompt_unlocked
+                        .entry(path.to_string())
+                        .or_default()
+                        .push(id.to_string());
                 }
+                opened
             }
             Err(e) => Err(VaultError::Crypto(e)),
         };
@@ -587,6 +637,17 @@ async fn create_collection(
     let pin = match pinentry.ask(&req).await {
         Ok(PinOutcome::Pin(pin)) if !pin.is_empty() => pin,
         Ok(_) => return None,
+        Err(crate::prompt::PinentryError::Busy) => {
+            // Not a refusal by the user: no dialog was ever drawn (F1). The
+            // `Completed` signal carries one bit and it has to be "dismissed"
+            // either way, so the distinction survives in the log.
+            tracing::warn!(
+                "cannot create collection '{}': another pinentry dialog held the screen, \
+                 so no password prompt was shown",
+                display_label(label)
+            );
+            return None;
+        }
         Err(e) => {
             tracing::warn!("pinentry failed: {e}");
             return None;
@@ -630,7 +691,11 @@ async fn create_collection(
                 tracing::debug!("collection id '{id}' was taken while creating it; retrying");
             }
             Err(e) => {
-                tracing::warn!("cannot create collection '{label}': {e}");
+                // The label is client-supplied, so it is sanitised before it
+                // reaches the log exactly as it is before it reaches a dialog:
+                // raw, its newlines and control characters forge journal lines
+                // and inject ANSI into an attached terminal (F2).
+                tracing::warn!("cannot create collection '{}': {e}", display_label(label));
                 return None;
             }
         }
@@ -707,6 +772,15 @@ async fn delete_collection(
     }
     let confirmed = match pinentry.confirm(&req).await {
         Ok(ok) => ok,
+        // Fail-closed either way — an unconfirmed delete never happens — but
+        // "nobody was asked" is not "the user said no" (F1).
+        Err(crate::prompt::PinentryError::Busy) => {
+            tracing::warn!(
+                "cannot delete '{id}': another pinentry dialog held the screen, \
+                 so no confirmation was shown"
+            );
+            false
+        }
         Err(e) => {
             tracing::warn!("pinentry failed: {e}");
             false
@@ -899,5 +973,40 @@ mod tests {
         let wide = "\u{4e2d}".repeat(100);
         let shown = display_label(&wide);
         assert_eq!(shown.chars().count(), 65);
+    }
+
+    /// F2: a client-supplied label must be sanitised before it reaches a log,
+    /// not only before it reaches a dialog (a stated invariant in
+    /// `CLAUDE.md`). `create_collection`'s failure path interpolated the raw
+    /// label, so a label carrying newlines forged journal lines and its
+    /// control characters reached an attached terminal as ANSI.
+    ///
+    /// Checked on the source of this file, because the line only runs when
+    /// `Vault::create` fails mid-prompt and a `tracing` capture around that
+    /// would test the harness rather than the call site. Every `tracing::`
+    /// line here must interpolate a label through `display_label`.
+    #[test]
+    fn no_log_line_interpolates_a_raw_client_label() {
+        let src = include_str!("prompt.rs");
+        // Assembled at runtime so this test's own source does not match it.
+        let log = format!("tracing{}", "::");
+        let raw = format!("{}label{}", '{', '}');
+        for (n, line) in src.lines().enumerate() {
+            let line = line.trim();
+            // Prose is not a call site.
+            if line.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(line.contains(&log) && line.contains(&raw)),
+                "line {}: a raw client label reaches the log: {line}",
+                n + 1
+            );
+        }
+        // And what does get logged cannot forge a line or move the cursor.
+        let hostile = "ok\nsecret-manager: nothing to see\u{1b}[2K";
+        let shown = display_label(hostile);
+        assert!(!shown.contains('\n'), "{shown:?}");
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
     }
 }

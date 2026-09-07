@@ -101,13 +101,56 @@ pub fn load_aliases(dir: &Path) -> std::io::Result<BTreeMap<String, String>> {
     }
 }
 
+/// Write the alias file atomically: a fresh `O_EXCL` temp file beside it,
+/// fsync, rename over the target, fsync the directory (HIGH 3).
+///
+/// The old implementation was `std::fs::write`, which truncates and then
+/// writes: a crash, a full disk, or a kill between the two left a truncated
+/// `aliases.toml` on disk, and `load_aliases` turns a truncated file into
+/// `InvalidData`, which refuses daemon startup. Vault saves have always used
+/// `vault::store::write_atomic` for exactly this reason; that helper is a
+/// private item of `vault::store` and returns `VaultError`, so it is not
+/// reachable from here — this is the same shape written against
+/// `std::io::Error`, not a copy of it.
 pub fn save_aliases_to(dir: &Path, aliases: &BTreeMap<String, String>) -> std::io::Result<()> {
+    use std::io::Write;
     std::fs::create_dir_all(dir)?;
     let text = toml::to_string(&AliasFile {
         aliases: aliases.clone(),
     })
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(dir.join(ALIAS_FILE), text)
+    let path = dir.join(ALIAS_FILE);
+    let suffix: String = crate::vault::crypto::random_bytes::<8>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let tmp = dir.join(format!("{ALIAS_FILE}.{suffix}.tmp"));
+    let write = || -> std::io::Result<()> {
+        // No explicit mode: `std::fs::write` created the file with the
+        // process umask applied to 0o666, and this must not change that.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    };
+    match write() {
+        Ok(()) => {
+            // Best effort, as in `vault::store`: the rename is already durable
+            // enough that a reader never sees a partial file.
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// What a directory scan found, before any of it is applied to the daemon's

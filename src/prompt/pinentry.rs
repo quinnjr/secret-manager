@@ -9,11 +9,41 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use zeroize::Zeroizing;
 
-/// How long one dialog may hold the process-wide pinentry lock. A client that
-/// raises a dialog and never answers would otherwise block every unlock in the
-/// daemon forever; on expiry the child is dropped (`kill_on_drop`) and the
-/// request reports a cancellation.
+/// How long one dialog may stay on screen while holding the process-wide
+/// pinentry lock. A client that raises a dialog and never answers would
+/// otherwise block every unlock in the daemon forever; on expiry the child is
+/// dropped (`kill_on_drop`) and the request reports a cancellation.
+///
+/// This is the *hold* budget. The *wait* budget is [`DEFAULT_QUEUE_TIMEOUT`],
+/// and the two must not be equal — see there.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How much longer a queued request waits for the dialog lock than a single
+/// dialog may hold it: `queue budget = dialog budget * QUEUE_TIMEOUT_FACTOR`.
+///
+/// It must be **greater than 1**, and that is the whole point of the
+/// constant. When the two budgets were equal, a client that raised a dialog
+/// nobody answered held the lock for the full hold budget while the user's own
+/// prompt — queued behind it, `tokio::sync::Mutex` being FIFO — ran out its
+/// identical budget at the same instant, and was reported as *dismissed by the
+/// user* without a dialog ever being drawn. A waiter can only win if its
+/// budget outlasts the holder's.
+///
+/// 5 is chosen against the worst case a *single* holder can construct:
+/// [`Pinentry::session`] keeps the lock across an unlock's three password
+/// attempts, so one occupancy is worth up to three hold budgets (6 min).
+/// Five hold budgets (10 min) clears that with room for the derivation
+/// between attempts, and stays finite so a waiter still cannot wedge forever.
+/// No finite budget can beat an unbounded *queue* of hostile waiters — FIFO
+/// puts the victim behind all of them — so the guarantee is one full hostile
+/// occupancy survived, not starvation-freedom.
+const QUEUE_TIMEOUT_FACTOR: u32 = 5;
+
+/// How long a request waits for the process-wide dialog lock before giving up
+/// with [`PinentryError::Busy`]. Deliberately several times
+/// [`DEFAULT_TIMEOUT`]; see [`QUEUE_TIMEOUT_FACTOR`].
+pub const DEFAULT_QUEUE_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_TIMEOUT.as_secs() * QUEUE_TIMEOUT_FACTOR as u64);
 
 #[derive(Debug, Clone, Default)]
 pub struct PinRequest {
@@ -52,6 +82,16 @@ pub enum PinentryError {
     Protocol(String),
     #[error("pinentry error {code}: {message}")]
     Assuan { code: u32, message: String },
+    /// Gave up waiting for the process-wide dialog lock: another dialog was on
+    /// screen for longer than this request's queue budget, so **no dialog was
+    /// ever shown to the user**.
+    ///
+    /// A separate variant on purpose. Reporting this as
+    /// [`PinOutcome::Cancelled`] told the user they had dismissed a prompt
+    /// they were never offered, which is exactly what a client that parks an
+    /// unanswered dialog wants the daemon to say.
+    #[error("no dialog could be shown: another pinentry dialog is still open")]
+    Busy,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +104,33 @@ pub struct Pinentry {
     /// Upper bound on a single dialog, so the shared `dialog` lock is always
     /// released again (see [`DEFAULT_TIMEOUT`]).
     timeout: Duration,
+    /// Upper bound on *waiting* for that lock. Strictly larger than `timeout`
+    /// (see [`QUEUE_TIMEOUT_FACTOR`]) so a queued request outlasts the holder
+    /// it is queued behind.
+    queue_timeout: Duration,
+}
+
+/// An acquired dialog slot: while this is alive no other dialog can be raised
+/// through the same [`Pinentry`] (or any clone of it).
+///
+/// Exists so a retry loop — "wrong password, try again" — keeps the slot it
+/// already won instead of releasing it between attempts and re-queueing
+/// behind everyone who arrived while the user was typing.
+pub struct DialogSession {
+    pinentry: Pinentry,
+    _slot: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl DialogSession {
+    /// Like [`Pinentry::ask`], but on the slot this session already holds.
+    pub async fn ask(&self, req: &PinRequest) -> Result<PinOutcome, PinentryError> {
+        self.pinentry.ask_held(req).await
+    }
+
+    /// Like [`Pinentry::confirm`], but on the slot this session already holds.
+    pub async fn confirm(&self, req: &PinRequest) -> Result<bool, PinentryError> {
+        self.pinentry.confirm_held(req).await
+    }
 }
 
 /// GPG_ERR_CANCELED is 99 in the low 16 bits of an Assuan error code.
@@ -127,12 +194,26 @@ impl Pinentry {
             env: Vec::new(),
             dialog: Arc::new(tokio::sync::Mutex::new(())),
             timeout: DEFAULT_TIMEOUT,
+            queue_timeout: DEFAULT_QUEUE_TIMEOUT,
         }
     }
 
     /// Override [`DEFAULT_TIMEOUT`] for this handle (and its clones).
+    ///
+    /// The queue budget moves with it, keeping the [`QUEUE_TIMEOUT_FACTOR`]
+    /// ratio: the two budgets exist in relation to each other, and setting one
+    /// down to a test-sized value while the other stayed at ten minutes would
+    /// be a trap. [`Pinentry::with_queue_timeout`] overrides it explicitly.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self.queue_timeout = timeout.saturating_mul(QUEUE_TIMEOUT_FACTOR);
+        self
+    }
+
+    /// Override the wait-for-the-dialog-lock budget alone. Call it *after*
+    /// [`Pinentry::with_timeout`], which resets it.
+    pub fn with_queue_timeout(mut self, queue_timeout: Duration) -> Self {
+        self.queue_timeout = queue_timeout;
         self
     }
 
@@ -141,20 +222,53 @@ impl Pinentry {
         self
     }
 
+    /// Take the process-wide dialog slot, so a caller that raises several
+    /// dialogs in a row (an unlock retrying a mistyped password) keeps it
+    /// across all of them.
+    ///
+    /// Bounded by the queue budget like [`Pinentry::ask`], and fails with
+    /// [`PinentryError::Busy`] rather than pretending the user answered.
+    pub async fn session(&self) -> Result<DialogSession, PinentryError> {
+        Ok(DialogSession {
+            pinentry: self.clone(),
+            _slot: self.acquire().await?,
+        })
+    }
+
+    /// Wait for the shared dialog slot, bounded by the *queue* budget.
+    ///
+    /// Waiting must be bounded — a client that raised a dialog and never
+    /// answered would otherwise block every other unlock in the daemon
+    /// forever (HIGH 3) — but the bound must not be the dialog's own budget:
+    /// the waiter then expires no later than the holder is killed and never
+    /// gets its turn. See [`QUEUE_TIMEOUT_FACTOR`].
+    async fn acquire(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, PinentryError> {
+        match tokio::time::timeout(self.queue_timeout, self.dialog.clone().lock_owned()).await {
+            Ok(slot) => Ok(slot),
+            Err(_) => {
+                tracing::warn!(
+                    "another pinentry dialog held the screen for longer than {:?}; \
+                     giving up without showing one",
+                    self.queue_timeout
+                );
+                Err(PinentryError::Busy)
+            }
+        }
+    }
+
     /// Ask for a password. A dialog that outlives [`Pinentry::with_timeout`]
     /// is abandoned — the child is dropped, which kills it — and reported as
     /// a cancellation, so one unanswered dialog cannot wedge the daemon.
+    ///
+    /// Failing to get a slot at all is [`PinentryError::Busy`], never a
+    /// cancellation: no dialog was shown, so the user cancelled nothing.
     pub async fn ask(&self, req: &PinRequest) -> Result<PinOutcome, PinentryError> {
-        // The wait for the shared dialog lock is bounded by the same timeout
-        // as the dialog itself. Acquiring it outside the timeout meant a
-        // client that raised a dialog and never answered blocked every other
-        // unlock in the daemon for the full timeout with no deadline of their
-        // own, and repeating that indefinitely blocked them forever (HIGH 3).
-        let Ok(_one_at_a_time) = tokio::time::timeout(self.timeout, self.dialog.lock()).await
-        else {
-            tracing::warn!("timed out waiting for the pinentry dialog lock; giving up");
-            return Ok(PinOutcome::Cancelled);
-        };
+        let _one_at_a_time = self.acquire().await?;
+        self.ask_held(req).await
+    }
+
+    /// [`Pinentry::ask`] with the dialog slot already held by the caller.
+    async fn ask_held(&self, req: &PinRequest) -> Result<PinOutcome, PinentryError> {
         let work = async {
             let mut conn = self.connect().await?;
             conn.setup(req).await?;
@@ -178,14 +292,17 @@ impl Pinentry {
         }
     }
 
-    /// Yes/no question. Cancel, a timeout, or any pinentry error means "no".
+    /// Yes/no question. Cancel or a timeout on the dialog itself means "no";
+    /// never getting a dialog at all is [`PinentryError::Busy`], which every
+    /// caller must still treat as "not confirmed" — the difference is what the
+    /// user is told, not whether the destructive thing happens.
     pub async fn confirm(&self, req: &PinRequest) -> Result<bool, PinentryError> {
-        // Bounded like `ask`'s (HIGH 3).
-        let Ok(_one_at_a_time) = tokio::time::timeout(self.timeout, self.dialog.lock()).await
-        else {
-            tracing::warn!("timed out waiting for the pinentry dialog lock; refusing");
-            return Ok(false);
-        };
+        let _one_at_a_time = self.acquire().await?;
+        self.confirm_held(req).await
+    }
+
+    /// [`Pinentry::confirm`] with the dialog slot already held by the caller.
+    async fn confirm_held(&self, req: &PinRequest) -> Result<bool, PinentryError> {
         let work = async {
             let mut conn = self.connect().await?;
             conn.setup(req).await?;
@@ -558,15 +675,20 @@ mod tests {
         assert!(matches!(ok.ask(&req()).await.unwrap(), PinOutcome::Pin(_)));
     }
 
-    /// The wait for the process-wide dialog lock is bounded by the same
-    /// timeout as the dialog itself (HIGH 3).
+    /// The wait for the process-wide dialog lock is bounded (HIGH 3).
     ///
-    /// The lock used to be taken *outside* the timeout, so a client that
+    /// The lock used to be taken *outside* any timeout, so a client that
     /// raised a dialog and never answered held it for the full timeout while
     /// every other unlock in the daemon queued behind it with no deadline of
     /// its own — repeat that and no unlock ever completes again. Here the
-    /// holder hangs for 5 s; the queued caller has a 300 ms timeout of its
-    /// own and must give up on that, not on the holder's.
+    /// holder hangs far past both budgets; the queued caller has a 100 ms
+    /// queue budget of its own and must give up on that, not on the holder's.
+    ///
+    /// It gives up with [`PinentryError::Busy`], **not** a cancellation: it
+    /// was never shown a dialog, so the user cancelled nothing (F1). The
+    /// queue budget is set explicitly here because that is the budget under
+    /// test; `a_queued_dialog_outlasts_a_holder_that_never_answers` covers
+    /// the default relationship between the two.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_queued_dialog_gives_up_rather_than_waiting_for_the_lock() {
         let p = fake()
@@ -574,25 +696,32 @@ mod tests {
             .with_timeout(Duration::from_secs(5));
         // A clone shares the `dialog` lock, exactly as the daemon's single
         // `Pinentry` does across concurrent prompts.
-        let queued = p.clone().with_timeout(Duration::from_millis(300));
+        let queued = p
+            .clone()
+            .with_timeout(Duration::from_secs(5))
+            .with_queue_timeout(Duration::from_millis(100));
         let holder = tokio::spawn(async move { p.ask(&req()).await });
         // Let the holder take the lock before the second caller queues.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let started = std::time::Instant::now();
         assert!(matches!(
-            queued.ask(&req()).await.unwrap(),
-            PinOutcome::Cancelled
+            queued.ask(&req()).await.unwrap_err(),
+            PinentryError::Busy
         ));
         let waited = started.elapsed();
         assert!(
             waited < Duration::from_secs(2),
-            "queued ask waited {waited:?} for the lock instead of its own 300ms timeout"
+            "queued ask waited {waited:?} for the lock instead of its own 100ms queue budget"
         );
 
-        // `confirm` bounds its wait the same way.
+        // `confirm` bounds its wait the same way, and is likewise not a "no
+        // from the user".
         let started = std::time::Instant::now();
-        assert!(!queued.confirm(&req()).await.unwrap());
+        assert!(matches!(
+            queued.confirm(&req()).await.unwrap_err(),
+            PinentryError::Busy
+        ));
         let waited = started.elapsed();
         assert!(
             waited < Duration::from_secs(2),
@@ -838,5 +967,120 @@ mod tests {
             PinOutcome::Pin(pin) => assert_eq!(pin.as_str(), "hunter2"),
             PinOutcome::Cancelled => panic!("cancelled"),
         }
+    }
+
+    /// F1: a queued request must be able to outlast a dialog that nobody
+    /// answers, and get its own dialog rather than being reported as
+    /// dismissed.
+    ///
+    /// The budgets used to be one and the same constant, so a queued caller's
+    /// deadline expired no later than the holder's — and with a second
+    /// unanswered dialog ahead of it (`tokio::sync::Mutex` is FIFO, so a
+    /// hostile client can always put one there) it expired *while that second
+    /// dialog was still up*, and completed as "the user dismissed it" without
+    /// ever having drawn one.
+    ///
+    /// Two holders that never answer, then the victim. Every handle shares
+    /// one `dialog` lock and one 500 ms dialog budget, exactly as the daemon's
+    /// single `Pinentry` does; the victim's queue budget is the default
+    /// multiple of that, so it must survive both holds (~1 s) and get a PIN.
+    /// Timing is decided by the two 500 ms dialog budgets, not by scheduling:
+    /// the victim's own deadline is 2.5 s, more than a second clear.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queued_dialog_outlasts_a_holder_that_never_answers() {
+        let dialog = Duration::from_millis(500);
+        let base = fake().env("FAKE_PIN", "x").with_timeout(dialog);
+        // Clones share the lock; the extra env var only affects the clone.
+        let stuck_a = base.clone().env("FAKE_DELAY", "30");
+        let stuck_b = base.clone().env("FAKE_DELAY", "30");
+        let victim = base.clone();
+
+        let a = tokio::spawn(async move { stuck_a.ask(&req()).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let b = tokio::spawn(async move { stuck_b.ask(&req()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let started = std::time::Instant::now();
+        let outcome = victim.ask(&req()).await;
+        match outcome {
+            Ok(PinOutcome::Pin(pin)) => assert_eq!(pin.as_str(), "x"),
+            other => panic!(
+                "the queued request was never shown a dialog after {:?}: {other:?}",
+                started.elapsed()
+            ),
+        }
+        // It really did wait behind both of them rather than racing ahead.
+        assert!(
+            started.elapsed() >= dialog,
+            "the victim did not queue behind the stuck dialogs"
+        );
+        // Both holders were abandoned at their own budget, as before.
+        assert!(matches!(a.await.unwrap().unwrap(), PinOutcome::Cancelled));
+        assert!(matches!(b.await.unwrap().unwrap(), PinOutcome::Cancelled));
+    }
+
+    /// F1: giving up on the wait is not a cancellation, and must not read
+    /// like one anywhere it reaches a user.
+    #[test]
+    fn busy_does_not_claim_the_user_cancelled() {
+        let text = PinentryError::Busy.to_string();
+        assert!(!text.to_lowercase().contains("cancel"), "{text}");
+        assert!(!text.to_lowercase().contains("dismiss"), "{text}");
+        assert!(text.contains("no dialog"), "{text}");
+    }
+
+    /// The queue budget is a multiple of the dialog budget, not equal to it —
+    /// the whole of F1. Pinned as a property of the defaults so the two
+    /// cannot silently drift back together.
+    #[test]
+    fn the_queue_budget_outlasts_the_dialog_budget() {
+        const { assert!(QUEUE_TIMEOUT_FACTOR > 1) };
+        assert!(DEFAULT_QUEUE_TIMEOUT > DEFAULT_TIMEOUT);
+        // `with_timeout` keeps the relationship rather than leaving the queue
+        // budget at ten minutes next to a 10 ms dialog.
+        let p = Pinentry::new("/nonexistent").with_timeout(Duration::from_millis(10));
+        assert_eq!(p.queue_timeout, Duration::from_millis(50));
+        assert_eq!(
+            p.with_queue_timeout(Duration::from_secs(1)).queue_timeout,
+            Duration::from_secs(1)
+        );
+    }
+
+    /// A retry loop keeps the dialog slot it already won: `session()` holds it
+    /// across every dialog raised through it, so a user who mistypes a
+    /// password is not sent to the back of the queue between attempts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_holds_the_slot_across_several_dialogs() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let p = fake()
+            .env("FAKE_PIN", "x")
+            .env("FAKE_LOG", log.path())
+            .with_timeout(Duration::from_secs(5));
+        let session = p.session().await.unwrap();
+
+        // Someone else cannot get in while the session is open, whatever it is
+        // doing between its dialogs.
+        let other = p.clone().with_queue_timeout(Duration::from_millis(100));
+        assert!(matches!(
+            other.ask(&req()).await.unwrap_err(),
+            PinentryError::Busy
+        ));
+
+        // The session itself raises dialog after dialog without re-queueing.
+        for _ in 0..3 {
+            assert!(matches!(
+                session.ask(&req()).await.unwrap(),
+                PinOutcome::Pin(_)
+            ));
+        }
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(text.matches("GETPIN").count(), 3, "{text}");
+
+        // And the slot is free again once it is dropped.
+        drop(session);
+        assert!(matches!(
+            other.ask(&req()).await.unwrap(),
+            PinOutcome::Pin(_)
+        ));
     }
 }

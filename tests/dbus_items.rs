@@ -1421,3 +1421,448 @@ async fn batch_delete_works_through_the_alias_object() {
         "the alias object deleted the wrong item, or none"
     );
 }
+
+/// Properties dict with an arbitrary label and attribute set, for the cap
+/// tests: `props` above only takes `&'static`-ish borrowed pairs, and these
+/// need owned, generated ones.
+fn props_owned(label: &str, attrs: Vec<(String, String)>) -> HashMap<&'static str, Value<'static>> {
+    let attrs: HashMap<String, String> = attrs.into_iter().collect();
+    HashMap::from([
+        (
+            "org.freedesktop.Secret.Item.Label",
+            Value::from(label.to_string()),
+        ),
+        ("org.freedesktop.Secret.Item.Attributes", Value::from(attrs)),
+    ])
+}
+
+/// `MAX_ITEM_SECRET` bounded the secret and nothing else, so the same DoS it
+/// exists to stop was reachable through the two other client-supplied fields
+/// that land in the very same encrypted item blob: the label and the
+/// attributes. A label is one `CreateItem` argument, so it took *two* calls to
+/// push a collection past the vault size limit where a capped secret takes
+/// 256; an attribute set is unbounded in pair count, name length and value
+/// length at once.
+///
+/// Every path that writes either field is capped: `CreateItem` (both), and the
+/// `Item.Label` / `Item.Attributes` property setters, which otherwise make the
+/// create-path cap a speed bump — create a one-byte item, then grow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn label_and_attributes_are_capped_on_every_write_path() {
+    use secret_manager::dbus::collection::{
+        MAX_ATTRIBUTE_KEY, MAX_ATTRIBUTE_VALUE, MAX_ITEM_ATTRIBUTES, MAX_ITEM_LABEL,
+    };
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let huge_label = "L".repeat(MAX_ITEM_LABEL + 1);
+    let too_many: Vec<(String, String)> = (0..=MAX_ITEM_ATTRIBUTES)
+        .map(|n| (format!("k{n}"), "v".to_string()))
+        .collect();
+    let huge_key = vec![("K".repeat(MAX_ATTRIBUTE_KEY + 1), "v".to_string())];
+    let huge_value = vec![("k".to_string(), "V".repeat(MAX_ATTRIBUTE_VALUE + 1))];
+
+    // --- CreateItem, label path ---
+    let err = coll
+        .create_item(
+            props_owned(&huge_label, vec![]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(
+        error_message(&err).contains(&MAX_ITEM_LABEL.to_string()),
+        "the refusal must name the limit: {}",
+        error_message(&err)
+    );
+
+    // --- CreateItem, attributes path: count, name length, value length ---
+    for (attrs, limit) in [
+        (too_many.clone(), MAX_ITEM_ATTRIBUTES),
+        (huge_key.clone(), MAX_ATTRIBUTE_KEY),
+        (huge_value.clone(), MAX_ATTRIBUTE_VALUE),
+    ] {
+        let err = coll
+            .create_item(
+                props_owned("ok", attrs),
+                &plain_secret(&session, b"s"),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+        assert!(
+            error_message(&err).contains(&limit.to_string()),
+            "the refusal must name the limit {limit}: {}",
+            error_message(&err)
+        );
+    }
+    assert!(
+        coll.items().await.unwrap().is_empty(),
+        "a refused CreateItem must not create the item"
+    );
+
+    // --- the setters, on an item created within the caps ---
+    let (item_path, _) = coll
+        .create_item(
+            props_owned("fine", vec![("k".into(), "v".into())]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+    let it = item(&conn, item_path.clone()).await;
+
+    let err = it.set_label(&huge_label).await.unwrap_err();
+    assert!(
+        error_message(&err).contains(&MAX_ITEM_LABEL.to_string()),
+        "set_label must refuse an over-long label naming the limit: {}",
+        error_message(&err)
+    );
+    assert_eq!(
+        it.label().await.unwrap(),
+        "fine",
+        "a refused set_label must not have changed the label"
+    );
+
+    for (attrs, limit) in [
+        (too_many, MAX_ITEM_ATTRIBUTES),
+        (huge_key, MAX_ATTRIBUTE_KEY),
+        (huge_value, MAX_ATTRIBUTE_VALUE),
+    ] {
+        let map: HashMap<&str, &str> = attrs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let err = it.set_attributes(map).await.unwrap_err();
+        assert!(
+            error_message(&err).contains(&limit.to_string()),
+            "set_attributes must refuse and name the limit {limit}: {}",
+            error_message(&err)
+        );
+        assert_eq!(
+            it.attributes().await.unwrap(),
+            HashMap::from([("k".to_string(), "v".to_string())]),
+            "a refused set_attributes must not have changed the attributes"
+        );
+    }
+
+    // Exactly at each limit is still accepted: these are bounds, not a
+    // tightening of the normal case.
+    let at_limit_label = "L".repeat(MAX_ITEM_LABEL);
+    it.set_label(&at_limit_label).await.unwrap();
+    assert_eq!(it.label().await.unwrap(), at_limit_label);
+    let at_limit_key = "K".repeat(MAX_ATTRIBUTE_KEY);
+    let at_limit_value = "V".repeat(MAX_ATTRIBUTE_VALUE);
+    it.set_attributes(HashMap::from([(
+        at_limit_key.as_str(),
+        at_limit_value.as_str(),
+    )]))
+    .await
+    .unwrap();
+    assert_eq!(
+        it.attributes().await.unwrap(),
+        HashMap::from([(at_limit_key, at_limit_value)])
+    );
+}
+
+/// The caller-sized decrypt used to run *before* the size cap and the locked
+/// check, with the global state mutex held: `secret.value` is bounded only by
+/// the bus message size (128 MiB), so a client could make the daemon decrypt
+/// 128 MiB — stalling every other client — before being told the secret was
+/// over the cap and the collection locked anyway.
+///
+/// Both refusals are observable because they now beat the decrypt: a
+/// deliberately undecryptable ciphertext gets `InvalidArgs` (too big) or
+/// `IsLocked` (locked) instead of the `Failed` that a performed decrypt
+/// produces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_and_locked_are_refused_before_the_decrypt() {
+    use secret_manager::dbus::collection::{MAX_ITEM_CIPHERTEXT, MAX_ITEM_SECRET};
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (cipher, session) = dh_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    // Garbage that no key can decrypt, and one byte past the ciphertext cap.
+    let undecryptable = |len: usize| SecretStruct {
+        session: session.clone(),
+        parameters: vec![7u8; 16],
+        value: vec![0xab; len],
+        content_type: "text/plain".into(),
+    };
+
+    let err = coll
+        .create_item(
+            props("huge", &[("k", "1")]),
+            &undecryptable(MAX_ITEM_CIPHERTEXT + 1),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_name(&err),
+        "org.freedesktop.DBus.Error.InvalidArgs",
+        "an over-cap ciphertext must be refused before it is decrypted"
+    );
+    assert!(error_message(&err).contains(&MAX_ITEM_SECRET.to_string()));
+    assert!(coll.items().await.unwrap().is_empty());
+
+    // A real item, to exercise Item.SetSecret's copy of the same ordering.
+    let (params, value) = cipher.encrypt(b"small");
+    let (item_path, _) = coll
+        .create_item(
+            props("real", &[("k", "2")]),
+            &SecretStruct {
+                session: session.clone(),
+                parameters: params,
+                value,
+                content_type: "text/plain".into(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let it = item(&conn, item_path.clone()).await;
+    let err = it
+        .set_secret(&undecryptable(MAX_ITEM_CIPHERTEXT + 1))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_name(&err),
+        "org.freedesktop.DBus.Error.InvalidArgs",
+        "SetSecret must refuse an over-cap ciphertext before decrypting it"
+    );
+
+    // The bound is an upper bound on the plaintext, not a tightening of it: a
+    // plaintext of exactly `MAX_ITEM_SECRET` pads to `MAX_ITEM_CIPHERTEXT`
+    // and must still be accepted, through the real cipher.
+    let big = vec![b'y'; MAX_ITEM_SECRET];
+    let (params, value) = cipher.encrypt(&big);
+    assert_eq!(value.len(), MAX_ITEM_CIPHERTEXT);
+    it.set_secret(&SecretStruct {
+        session: session.clone(),
+        parameters: params,
+        value,
+        content_type: "text/plain".into(),
+    })
+    .await
+    .unwrap();
+
+    // Locked: the lock is answered before the decrypt too, so an
+    // undecryptable but legally sized secret reports `IsLocked`, not the
+    // `Failed` of a decrypt that should never have run.
+    fx.lock_default().await;
+    let err = coll
+        .create_item(props("x", &[]), &undecryptable(64), false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_name(&err),
+        "org.freedesktop.Secret.Error.IsLocked",
+        "a locked collection must refuse before decrypting"
+    );
+    let err = it.set_secret(&undecryptable(64)).await.unwrap_err();
+    assert_eq!(
+        error_name(&err),
+        "org.freedesktop.Secret.Error.IsLocked",
+        "SetSecret on a locked collection must refuse before decrypting"
+    );
+}
+
+/// `DeleteItems([])` returned `Ok` on a locked collection because the
+/// empty-batch shortcut sat in front of the lock check, so an empty batch
+/// answered success exactly where `Item.Delete` — and a one-item batch —
+/// answer `IsLocked`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_batch_delete_still_answers_the_lock() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("a", &[("k", "1")]),
+            &plain_secret(&session, b"1"),
+            false,
+        )
+        .await
+        .unwrap();
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(fx.default_collection())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    fx.lock_default().await;
+
+    assert_eq!(
+        error_name(&admin.delete_items(&[]).await.unwrap_err()),
+        "org.freedesktop.Secret.Error.IsLocked",
+        "an empty batch must answer the lock like every other delete"
+    );
+    // The one-item batch and Item.Delete are what it has to agree with.
+    assert_eq!(
+        error_name(
+            &admin
+                .delete_items(std::slice::from_ref(&item_path))
+                .await
+                .unwrap_err()
+        ),
+        "org.freedesktop.Secret.Error.IsLocked"
+    );
+    assert_eq!(
+        error_name(&item(&conn, item_path).await.delete().await.unwrap_err()),
+        "org.freedesktop.Secret.Error.IsLocked"
+    );
+}
+
+/// The content type is the fourth caller-supplied field stored in the
+/// encrypted item blob, alongside the secret, the label and the attributes,
+/// so an uncapped one is the same vault-size DoS with a different field name:
+/// two `CreateItem` calls with a multi-megabyte "MIME type" push a collection
+/// past the size limit, past which it stops saving at all. Both paths that
+/// write it are capped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn content_type_is_capped_on_every_write_path() {
+    use secret_manager::dbus::collection::MAX_ITEM_CONTENT_TYPE;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let huge = "t".repeat(MAX_ITEM_CONTENT_TYPE + 1);
+    let typed = |content_type: &str| SecretStruct {
+        session: session.clone(),
+        parameters: vec![],
+        value: b"s".to_vec(),
+        content_type: content_type.to_string(),
+    };
+
+    let err = coll
+        .create_item(props("ct", &[("k", "1")]), &typed(&huge), false)
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(
+        error_message(&err).contains(&MAX_ITEM_CONTENT_TYPE.to_string()),
+        "the refusal must name the limit: {}",
+        error_message(&err)
+    );
+    assert!(
+        coll.items().await.unwrap().is_empty(),
+        "a refused CreateItem must not create the item"
+    );
+
+    // The setter is the other half: a short content type on create, then a
+    // huge one on SetSecret, would make the create-path cap a speed bump.
+    let (item_path, _) = coll
+        .create_item(props("ct", &[("k", "1")]), &typed("text/plain"), false)
+        .await
+        .unwrap();
+    let it = item(&conn, item_path.clone()).await;
+    let err = it.set_secret(&typed(&huge)).await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+    assert!(error_message(&err).contains(&MAX_ITEM_CONTENT_TYPE.to_string()));
+    assert_eq!(
+        service
+            .get_secrets(std::slice::from_ref(&item_path), &session)
+            .await
+            .unwrap()[&item_path]
+            .content_type,
+        "text/plain",
+        "a refused SetSecret must not have changed the content type"
+    );
+
+    // Exactly at the limit is still accepted: a bound, not a tightening.
+    let at_limit = "t".repeat(MAX_ITEM_CONTENT_TYPE);
+    it.set_secret(&typed(&at_limit)).await.unwrap();
+    assert_eq!(
+        service
+            .get_secrets(std::slice::from_ref(&item_path), &session)
+            .await
+            .unwrap()[&item_path]
+            .content_type,
+        at_limit
+    );
+}
+
+/// `Item.GetSecret` refreshed the idle timer before it checked the session,
+/// the twin of the bug fixed in `Service.GetSecrets`: any bus client could
+/// call it with a bogus (or another client's) session path, be refused, and
+/// still keep `last_activity` moving — so `idle_lock` never fired,
+/// `auto_lock_after` never locked the vault, and the keys stayed in daemon
+/// memory indefinitely. It needs no session, no unlocked collection and no
+/// knowledge of a real item path.
+///
+/// The assertion is on `last_activity` itself, not on a timeout: a refused
+/// call must leave it *identical*, and an authorised one must advance it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_get_secret_does_not_refresh_the_idle_timer() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("t", &[("k", "1")]),
+            &plain_secret(&session, b"s"),
+            false,
+        )
+        .await
+        .unwrap();
+    let it = item(&conn, item_path.clone()).await;
+    let last_activity = || async { fx.daemon.state.lock().await.last_activity };
+
+    // A session path that names nothing: refused, and must not count.
+    let before = last_activity().await;
+    assert_eq!(
+        error_name(
+            &it.get_secret(&secret_manager::dbus::paths::session(99))
+                .await
+                .unwrap_err()
+        ),
+        "org.freedesktop.Secret.Error.NoSession"
+    );
+    assert_eq!(
+        last_activity().await,
+        before,
+        "a refused GetSecret refreshed the idle timer"
+    );
+
+    // Another client's session is refused the same way, and must not count
+    // either — that one needs no session of the caller's own at all.
+    let other = fx.client().await;
+    let other_session = plain_session(&ServiceProxy::new(&other).await.unwrap()).await;
+    assert_eq!(
+        error_name(&it.get_secret(&other_session).await.unwrap_err()),
+        "org.freedesktop.Secret.Error.NoSession"
+    );
+    assert_eq!(
+        last_activity().await,
+        before,
+        "a GetSecret on a foreign session refreshed the idle timer"
+    );
+
+    // The authorised call still counts, in the same lock acquisition.
+    assert_eq!(it.get_secret(&session).await.unwrap().value, b"s");
+    assert!(
+        last_activity().await > before,
+        "an authorised GetSecret must still refresh the idle timer"
+    );
+}

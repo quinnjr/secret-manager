@@ -10,6 +10,34 @@ use zeroize::Zeroizing;
 pub const MAGIC: [u8; 8] = *b"SMVAULT\0";
 pub const VERSION: u16 = 3;
 pub const MAX_HEADER: usize = 16 << 20;
+/// Largest collection label, in bytes, that may be stored in a header.
+///
+/// The label is client-supplied and lives in the header, so it is bounded by
+/// nothing else but `MAX_HEADER` (16 MiB). Two things break well before that:
+///
+/// * `Request::Status` copies each collection's label verbatim into a
+///   `CollectionStatus`, and the control socket refuses any frame over
+///   `protocol::MAX_FRAME` (1 MiB). A single ~2 MiB label therefore makes the
+///   daemon answer *every* `Status` with "response too large" - for all
+///   collections, across restarts, since the label is on disk, and with no CLI
+///   command to rename a collection back.
+/// * A label near `MAX_HEADER` leaves no room for the index, so the next
+///   `CreateItem` overflows the header and every save is refused.
+///
+/// 4 KiB is orders of magnitude more than any real label ("Login", "Default")
+/// and cannot interact with either cap: 4 KiB is 1/256 of `MAX_FRAME`, so a
+/// `Status` frame would need more than 256 collections at the full limit
+/// before labels alone could approach the frame cap (real labels are tens of
+/// bytes, and the other `CollectionStatus` fields are small and fixed), and it
+/// is 1/4096 of `MAX_HEADER`, so it can never crowd out the index.
+pub const MAX_LABEL: usize = 4 << 10;
+
+// F2: the label cap only works if it stays clear of both ceilings it could
+// otherwise interact with. Checked at compile time so neither cap can be
+// raised, nor `MAX_LABEL` loosened, without this being revisited.
+const _: () = assert!(MAX_LABEL <= crate::protocol::MAX_FRAME / 256);
+const _: () = assert!(MAX_LABEL <= MAX_HEADER / 4096);
+const _: () = assert!(MAX_LABEL >= 1024);
 /// Magic plus the u32 header-length prefix.
 pub const PREFIX_LEN: usize = 12;
 /// Largest vault file that will be read into memory. `MAX_HEADER` bounds the
@@ -41,13 +69,50 @@ pub struct IndexEntry {
 
 impl IndexEntry {
     /// True when every query pair hashes to a value present in this entry.
+    ///
+    /// Convenience for a single entry; a search over many entries must use
+    /// [`hash_query`] once and then [`IndexEntry::matches_hashes`], because
+    /// the digests depend only on `(salt, key, value)` and hashing them per
+    /// entry makes an unbounded attribute value cost `O(items x value)`.
     pub fn matches(&self, salt: &[u8; SALT_LEN], query: &BTreeMap<String, String>) -> bool {
-        query.iter().all(|(k, v)| {
-            self.attr_hashes
-                .binary_search(&attribute_hash(salt, k, v))
-                .is_ok()
-        })
+        self.matches_hashes(&hash_query(salt, query))
     }
+
+    /// True when every digest in `query_hashes` is present in this entry.
+    ///
+    /// `query_hashes` comes from [`hash_query`]; `attr_hashes` is kept sorted
+    /// by [`build_index`], which is what makes the `binary_search` valid.
+    /// Cost is `O(q log a)` byte-array comparisons and no hashing at all, so
+    /// the per-entry work no longer depends on the size of the query values.
+    pub fn matches_hashes(&self, query_hashes: &[[u8; 32]]) -> bool {
+        // An empty query matches every entry, including an id-only one.
+        if query_hashes.is_empty() {
+            return true;
+        }
+        // An id-only entry (`locked_search = false`, or an item with no
+        // attributes) can never satisfy a non-empty query.
+        if self.attr_hashes.is_empty() {
+            return false;
+        }
+        query_hashes
+            .iter()
+            .all(|h| self.attr_hashes.binary_search(h).is_ok())
+    }
+}
+
+/// The digests a query is looking for, sorted the way [`build_index`] sorts an
+/// entry's own hashes.
+///
+/// Computed **once per search**, never once per item: `attribute_hash` is a
+/// SHA-256 over the whole `(salt, key, value)` triple and nothing bounds the
+/// key or value length, so a caller that hashes inside its per-entry loop lets
+/// one large attribute value be re-hashed once for every item in the
+/// collection. Hashing here is linear in the query's total size and paid once.
+pub fn hash_query(salt: &[u8; SALT_LEN], query: &BTreeMap<String, String>) -> Vec<[u8; 32]> {
+    query
+        .iter()
+        .map(|(k, v)| attribute_hash(salt, k, v))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -522,5 +587,64 @@ mod tests {
         assert_eq!(q(&[("app", "git"), ("user", "joe")]), vec!["a"]);
         assert!(q(&[("user", "bob")]).is_empty());
         assert_eq!(q(&[]), vec!["a", "b"]);
+    }
+
+    /// F1 regression: the hoisted path (`hash_query` + `matches_hashes`) must
+    /// agree with the per-entry `matches` on every shape of query, since
+    /// `search_ids` now uses it for real searches.
+    #[test]
+    fn hoisted_query_hashes_agree_with_the_per_entry_path() {
+        let salt = [7u8; SALT_LEN];
+        let items = vec![
+            item("a", &[("app", "git"), ("user", "joe")]),
+            item("b", &[("app", "git")]),
+            item("c", &[]),
+        ];
+        let indexed = build_index(&salt, &items, true);
+        let id_only = build_index(&salt, &items, false);
+        let queries: Vec<BTreeMap<String, String>> = [
+            vec![],
+            vec![("app", "git")],
+            vec![("app", "git"), ("user", "joe")],
+            vec![("user", "bob")],
+            // A value far larger than any real attribute: it must still be
+            // hashed exactly once, and still match exactly what it matched.
+            vec![("big", "x")],
+        ]
+        .into_iter()
+        .map(|pairs| {
+            pairs
+                .into_iter()
+                .map(|(k, v): (&str, &str)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .collect();
+        for index in [&indexed, &id_only] {
+            for q in &queries {
+                let hashes = hash_query(&salt, q);
+                assert_eq!(hashes.len(), q.len());
+                for e in index.iter() {
+                    assert_eq!(
+                        e.matches_hashes(&hashes),
+                        e.matches(&salt, q),
+                        "entry {} query {q:?}",
+                        e.id
+                    );
+                }
+            }
+        }
+    }
+
+    /// An id-only entry matches an empty query and nothing else, through the
+    /// hoisted path too - that is the short-circuit `search_ids` relies on.
+    #[test]
+    fn an_id_only_entry_short_circuits_a_non_empty_query() {
+        let salt = [3u8; SALT_LEN];
+        let index = build_index(&salt, &[item("a", &[("app", "git")])], false);
+        assert!(index[0].matches_hashes(&[]));
+        assert!(!index[0].matches_hashes(&hash_query(
+            &salt,
+            &[("app".to_string(), "git".to_string())].into()
+        )));
     }
 }
