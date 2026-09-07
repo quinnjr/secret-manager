@@ -174,6 +174,39 @@ fn assert_wire_order() {
     }
 }
 
+/// Rebuilds a request with a fixed collection name, keeping its secrets.
+///
+/// Only the name changes, so the `Debug` impl takes exactly the same branch
+/// and prints exactly the same fields; the one thing that differs is that the
+/// input can no longer choose text that appears in the output.
+fn with_benign_collection(req: &Request) -> Request {
+    const NAME: &str = "collection";
+    match req {
+        Request::Lock { .. } => Request::Lock {
+            collection: Some(NAME.to_string()),
+        },
+        Request::Status => Request::Status,
+        Request::Reload => Request::Reload,
+        Request::UnlockWithKey { key, .. } => Request::UnlockWithKey {
+            collection: NAME.to_string(),
+            key: key.clone(),
+        },
+        Request::ChangeKey {
+            old_key,
+            new_salt,
+            new_kdf,
+            new_key,
+            ..
+        } => Request::ChangeKey {
+            collection: NAME.to_string(),
+            old_key: old_key.clone(),
+            new_salt: *new_salt,
+            new_kdf: *new_kdf,
+            new_key: new_key.clone(),
+        },
+    }
+}
+
 fuzz_target!(|msg: Msg| {
     // Cheap and unconditional: the pinning must fail on the very first
     // execution after a reordering, not only once the fuzzer happens to
@@ -251,7 +284,18 @@ fuzz_target!(|msg: Msg| {
             // A key that reaches a log or a panic message is the whole point
             // of the hand-written `Debug`, so check it on the same values the
             // round trip just proved are really in there.
-            let shown = format!("{req:?}");
+            //
+            // The collection name is fuzzer-controlled and is legitimately
+            // printed unredacted, so a "does the output contain these bytes"
+            // check can be defeated by naming the collection after the
+            // rendering of the secret — which is exactly what the fuzzer did
+            // (`new_salt = [93; 15] ++ [62]` with a collection literally
+            // called "[93, 93, ..., 62]"). That is a false leak: the secret is
+            // in the output because the *name* is, not because the key was
+            // printed. So the redaction check runs against a copy carrying the
+            // same secrets under a fixed, benign name, which leaves no channel
+            // for the input to smuggle the expected text into the output.
+            let shown = format!("{:?}", with_benign_collection(&req));
             match &req {
                 Request::UnlockWithKey { key, .. } => {
                     assert!(shown.contains("<redacted>"), "UnlockWithKey Debug: {shown}");
