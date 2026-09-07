@@ -221,18 +221,35 @@ pub fn classify_prompt(prompt: &str, askpass_prompt_env: Option<&str>) -> Askpas
 /// The unquoted form has no delimiters, so it is restricted to an absolute
 /// path; a quoted relative path (`ssh -i ./key`) is returned as-is and
 /// resolved — and checked against the registered keys — by [`askpass`].
-fn passphrase_path(prompt: &str) -> Option<PathBuf> {
-    let re = regex::Regex::new(
-        r#"(?i)^\s*Enter passphrase for (?:key )?(?:'([^']+)'|"([^"]+)"|(/[^:]*?))(?: \(will confirm each use\))?: *$"#,
-    )
-    .expect("static regex");
-    let c = re.captures(prompt)?;
+pub(crate) fn passphrase_path(prompt: &str) -> Option<PathBuf> {
+    // Compiled once. `askpass` calls this a handful of times per invocation
+    // and the fuzz target calls it millions, where recompiling the regex was
+    // the whole cost of the run.
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)^\s*Enter passphrase for (?:key )?(?:'([^']+)'|"([^"]+)"|(/[^:]*?))(?: \(will confirm each use\))?: *$"#,
+        )
+        .expect("static regex")
+    });
+    let c = RE.captures(prompt)?;
     let m = c
         .get(1)
         .or_else(|| c.get(2))
         .or_else(|| c.get(3))
         .expect("one alternative matched");
-    Some(PathBuf::from(m.as_str()))
+    // The quoted alternatives are `[^']`/`[^"]`, which admit both line
+    // terminators, and `classify_prompt`'s single-line guard tests only `\n`.
+    // A carriage return survived both and reached the path: harmless where
+    // the path is *displayed* (every such site escapes it), but a key path is
+    // a filename and no real OpenSSH prompt carries one, so it is refused
+    // here — at the one place both callers go through — rather than left to
+    // each consumer to remember. Found by `fuzz_targets/askpass_prompt.rs`
+    // with `Enter passphrase for key 'a\rb': `.
+    let path = m.as_str();
+    if path.contains(['\n', '\r']) {
+        return None;
+    }
+    Some(PathBuf::from(path))
 }
 
 /// `ssh` prints the identity file with `%.100s`, so a longer registered path
@@ -577,6 +594,28 @@ mod tests {
             classify_prompt("Enter passphrase for id_ed25519: ", None),
             AskpassKind::Other
         );
+    }
+
+    /// A key path is a filename; a line terminator inside one means the
+    /// prompt was assembled by something other than OpenSSH. `\n` was already
+    /// refused by `classify_prompt`'s single-line guard, but `\r` reached the
+    /// returned path through the quoted alternatives, and `passphrase_path`
+    /// leaked both when called directly. Red before the fix.
+    #[test]
+    fn a_path_carrying_a_line_terminator_is_not_a_passphrase_request() {
+        for raw in ["a\rb", "a\nb", "/tmp/k\r", "/tmp/\nk"] {
+            for prompt in [
+                format!("Enter passphrase for key '{raw}': "),
+                format!("Enter passphrase for \"{raw}\": "),
+                format!("Enter passphrase for {raw}: "),
+            ] {
+                assert_eq!(passphrase_path(&prompt), None, "{prompt:?}");
+                assert!(
+                    !matches!(classify_prompt(&prompt, None), AskpassKind::Passphrase(_)),
+                    "{prompt:?}"
+                );
+            }
+        }
     }
 
     #[test]

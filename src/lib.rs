@@ -20,6 +20,8 @@ compile_error!(
 );
 
 pub mod config;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api;
 pub mod pam;
 pub mod protocol;
 pub mod vault;

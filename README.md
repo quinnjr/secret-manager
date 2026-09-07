@@ -64,6 +64,7 @@ Secret Service model (see "Known gaps").
 ```sh
 cargo test                                          # daemon, CLI, PAM logic
 cargo build --no-default-features --features pam    # the PAM cdylib
+make fuzz                                           # 60s on each fuzz target
 ```
 
 Everything is one crate. The binary and the PAM module are separated by
@@ -73,6 +74,11 @@ produces both.
 
 Integration tests start a private `dbus-daemon` and a scripted `pinentry`;
 `secret-tool` and `ssh-keygen` are used when present.
+
+Anything that parses bytes we did not write is fuzzed. `tests/prop_*.rs` are
+bounded property tests that run on stable in a normal `cargo test`; `fuzz/`
+holds the matching cargo-fuzz targets, which need nightly and run for as long
+as you give them. Both encode the same invariants — see `docs/fuzzing.md`.
 
 The PAM login-unlock path (see "Unlock at login" in `docs/install-arch.md`
 and `docs/install-debian.md`) has unit tests for everything it decides:

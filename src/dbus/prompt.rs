@@ -124,7 +124,7 @@ impl Prompt {
 /// ("de\u{200B}lete"). Enumerated explicitly rather than pulled from a unicode
 /// crate; the list is the set of `Cf`/`Cs`/`Co` ranges plus the `Cn`
 /// codepoints reserved for formatting use (MEDIUM 1).
-fn is_invisible_format(c: char) -> bool {
+pub(crate) fn is_invisible_format(c: char) -> bool {
     matches!(c,
         '\u{00AD}'
         | '\u{0600}'..='\u{0605}'

@@ -126,3 +126,31 @@ Argon2 at the real cost makes tests slow, so tests use
 
 `secret-tool` and `ssh-keygen` are used by some tests when present, which is
 how libsecret interop is checked.
+
+## Fuzzing
+
+Two layers, and `docs/fuzzing.md` is the full guide. `tests/prop_*.rs` are
+bounded proptest cases that run on stable in a plain `cargo test`;
+`fuzz/` holds cargo-fuzz/libFuzzer targets that need nightly and run for as
+long as you give them. Both encode the *same* invariants, so the fast layer
+guards every commit and the slow layer explores.
+
+```sh
+make fuzz                     # 60s per target
+make fuzz-one TARGET=vault_decode FUZZ_TIME=900
+make fuzz-long                # 1 hour per target, before a release
+```
+
+`fuzz/` is a standalone crate with its own `[workspace]`, and the parent
+manifest excludes it, so a normal `cargo build` never sees it. It enables the
+`fuzzing` feature, which exposes `src/fuzz_api.rs` — thin wrappers over
+`pub(crate)` helpers that sit on attacker-fed input. Nothing we ship sets
+that feature, and it must not be used to widen the real API.
+
+The targets are **structure-aware** on purpose: random bytes bounce off the
+magic number and the length prefix and never reach the interesting code, so
+`fuzz/src/lib.rs` generates inputs already well-formed in the boring respects
+and hostile in the interesting ones. Adding a target means writing the file,
+adding a `[[bin]]`, and adding it to `FUZZ_TARGETS` in the Makefile — all
+three are cross-checked by `tests/packaging.rs`, because a target that is
+never run looks like coverage and isn't.

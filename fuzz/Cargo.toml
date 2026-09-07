@@ -1,0 +1,148 @@
+[package]
+name = "secret-manager-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone: the parent is a single crate, not a workspace, and the fuzz
+# targets must never be pulled into a normal `cargo build` of it.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "smfuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+zeroize = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+
+# `fuzzing` exposes the internal helpers that sit on attacker-fed input;
+# `test-util` gives the cheap KDF parameters, without which every target that
+# touches a vault would spend its whole budget inside Argon2 instead of in the
+# parser we are trying to break.
+[dependencies.secret-manager]
+path = ".."
+features = ["fuzzing", "test-util"]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "vault_decode"
+path = "fuzz_targets/vault_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_roundtrip"
+path = "fuzz_targets/vault_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_open_unlock"
+path = "fuzz_targets/vault_open_unlock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_items_codec"
+path = "fuzz_targets/vault_items_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kdf_params"
+path = "fuzz_targets/kdf_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_frame"
+path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protocol_roundtrip"
+path = "fuzz_targets/protocol_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dh_peer_public"
+path = "fuzz_targets/dh_peer_public.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_cipher"
+path = "fuzz_targets/session_cipher.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "display_label"
+path = "fuzz_targets/display_label.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "escape_control_sanitize"
+path = "fuzz_targets/escape_control_sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pinentry_escape"
+path = "fuzz_targets/pinentry_escape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dbus_paths"
+path = "fuzz_targets/dbus_paths.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "askpass_prompt"
+path = "fuzz_targets/askpass_prompt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attribute_index"
+path = "fuzz_targets/attribute_index.rs"
+test = false
+doc = false
+bench = false
+

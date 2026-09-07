@@ -2,6 +2,15 @@
 
 use super::client::{Client, ItemInfo};
 use super::{CliError, read_secret_from_stdin};
+// A terminal row and a dialog line have the same problem, so they use the
+// same table: `crate::dbus::prompt::is_invisible_format`. This file used to
+// carry its own narrower copy, which omitted the private-use planes, the
+// Arabic number signs, the interlinear annotations and the tag characters —
+// all of which a font may render as anything at all, or as nothing — so a
+// planted item could hide part of an `sm ssh list` row that the dialogs
+// already refused to hide. Found by `fuzz_targets/escape_control_sanitize.rs`
+// on U+F0000; keeping one table is what stops the two drifting again.
+use crate::dbus::prompt::is_invisible_format;
 use std::collections::BTreeMap;
 use std::io::Write;
 use zbus::zvariant::OwnedObjectPath;
@@ -86,27 +95,6 @@ async fn find_inner(
         }
     }
     Ok(items)
-}
-
-/// Unicode formatting characters that are not category Cc, and so are not
-/// `char::is_control`, but still let a row hide or visually reorder itself:
-/// the soft hyphen, the bidirectional controls and marks, the zero-width
-/// space and joiners, the line and paragraph separators, the embeddings and
-/// overrides (U+202E RIGHT-TO-LEFT OVERRIDE among them), the invisible
-/// operators and the byte order mark.
-fn is_invisible_format(ch: char) -> bool {
-    matches!(ch,
-        '\u{00ad}'
-        | '\u{061c}'
-        | '\u{200b}'..='\u{200f}'
-        | '\u{2028}'
-        | '\u{2029}'
-        // The embedding/override controls U+202A..U+202E: U+202E alone is
-        // enough to render a row's text backwards.
-        | '\u{202a}'..='\u{202e}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{206f}'
-        | '\u{feff}')
 }
 
 /// Render a string for a terminal: labels and attribute values come from argv
@@ -204,6 +192,34 @@ mod tests {
             assert!(
                 escaped.starts_with("\\x"),
                 "U+{:04X}: {escaped:?}",
+                ch as u32
+            );
+        }
+        // The wider table the dialogs use, which this file once undercut: the
+        // private-use planes (a font renders these as whatever it likes), the
+        // Arabic number signs (which absorb the digits after them), the
+        // interlinear annotations and the invisible tag characters. Red
+        // before `is_invisible_format` became one shared table.
+        for ch in [
+            '\u{e000}',
+            '\u{f8ff}',
+            '\u{f0000}',
+            '\u{100000}',
+            '\u{0600}',
+            '\u{06dd}',
+            '\u{070f}',
+            '\u{180e}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{1d173}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+        ] {
+            let escaped = escape_control(&ch.to_string());
+            assert!(
+                !escaped.contains(ch),
+                "U+{:04X} reached the terminal: {escaped:?}",
                 ch as u32
             );
         }

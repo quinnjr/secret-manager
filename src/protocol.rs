@@ -161,6 +161,8 @@ pub enum ProtocolError {
     NoRuntimeDir,
     #[error("unsupported protocol version {0}")]
     UnsupportedVersion(u8),
+    #[error("{0} unexpected bytes after the message")]
+    TrailingBytes(usize),
     #[error("control socket is owned by uid {actual}, expected {expected}")]
     UntrustedPeer { expected: u32, actual: u32 },
 }
@@ -214,7 +216,19 @@ pub fn decode_frame<T: DeserializeOwned>(body: &[u8]) -> Result<T, ProtocolError
     if version != PROTOCOL_VERSION {
         return Err(ProtocolError::UnsupportedVersion(version));
     }
-    Ok(postcard::from_bytes(rest)?)
+    // `from_bytes` stops at the end of the first complete message and ignores
+    // whatever follows, so a peer could append arbitrary bytes to a valid
+    // request and have it accepted. Nothing downstream is harmed by that
+    // today — the length prefix is what delimits a frame, one message is read
+    // per frame, and no frame is ever hashed, signed or compared — but a
+    // frame that decodes must have been fully consumed, or "the frame that
+    // was received" and "the message that was acted on" are different
+    // objects. Found by the `protocol_frame` fuzz target.
+    let (value, rest) = postcard::take_from_bytes(rest)?;
+    if !rest.is_empty() {
+        return Err(ProtocolError::TrailingBytes(rest.len()));
+    }
+    Ok(value)
 }
 
 /// Reads one frame body. The buffer is [`Zeroizing`] because a request body
@@ -963,5 +977,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ProtocolError::Connect(_)));
+    }
+    /// postcard stops at the end of the first complete message, so before
+    /// this was fixed a peer could append anything it liked to a valid
+    /// request and have it accepted. Not exploitable as the protocol stands,
+    /// but a frame that decodes should have been consumed in full. Found by
+    /// the `protocol_frame` fuzz target.
+    #[test]
+    fn trailing_bytes_after_a_complete_message_are_refused() {
+        let frame = encode_frame(&Response::Ok).unwrap();
+        let body = &frame[4..];
+        assert!(matches!(decode_frame::<Response>(body), Ok(Response::Ok)));
+
+        let mut with_junk = body.to_vec();
+        with_junk.extend_from_slice(&[0xff, 0xff, 0xff]);
+        match decode_frame::<Response>(&with_junk) {
+            Err(ProtocolError::TrailingBytes(3)) => {}
+            other => panic!("expected TrailingBytes(3), got {other:?}"),
+        }
+
+        // A single stray byte counts too.
+        let mut one = body.to_vec();
+        one.push(0);
+        assert!(matches!(
+            decode_frame::<Response>(&one),
+            Err(ProtocolError::TrailingBytes(1))
+        ));
     }
 }

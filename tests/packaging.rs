@@ -468,3 +468,69 @@ fn systemd_analyze_verify_accepts_unit() {
         );
     }
 }
+
+/// A fuzz target that exists but is never run is the worst kind of test: it
+/// looks like coverage and provides none. Three places have to agree — the
+/// target file, the `[[bin]]` entry that makes it buildable, and the
+/// `FUZZ_TARGETS` list that makes `make fuzz` actually run it — and nothing
+/// but this test would notice them drifting apart.
+#[test]
+fn every_fuzz_target_is_declared_and_runnable() {
+    let manifest = std::fs::read_to_string(root().join("fuzz/Cargo.toml")).unwrap();
+    let makefile = std::fs::read_to_string(root().join("Makefile")).unwrap();
+
+    // `[[bin]] name = "x"` entries in the fuzz manifest.
+    let declared: std::collections::BTreeSet<String> = manifest
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("name = \""))
+        .filter_map(|l| l.strip_suffix('"'))
+        .map(str::to_string)
+        // The `[lib]` stanza also has a `name`, and it is not a target.
+        .filter(|n| n != "smfuzz" && n != "secret-manager-fuzz")
+        .collect();
+
+    // Files actually present in fuzz_targets/.
+    let present: std::collections::BTreeSet<String> =
+        std::fs::read_dir(root().join("fuzz/fuzz_targets"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".rs"))
+                    .map(str::to_string)
+            })
+            .collect();
+
+    // The Makefile's FUZZ_TARGETS list, which is what `make fuzz` iterates.
+    let start = makefile
+        .find("FUZZ_TARGETS = ")
+        .expect("FUZZ_TARGETS in Makefile");
+    let mut listed = String::new();
+    for line in makefile[start..].lines() {
+        listed.push_str(
+            line.trim_start_matches("FUZZ_TARGETS = ")
+                .trim_end_matches('\\'),
+        );
+        listed.push(' ');
+        if !line.trim_end().ends_with('\\') {
+            break;
+        }
+    }
+    let listed: std::collections::BTreeSet<String> =
+        listed.split_whitespace().map(str::to_string).collect();
+
+    assert_eq!(
+        present, declared,
+        "fuzz_targets/*.rs and the [[bin]] entries in fuzz/Cargo.toml disagree"
+    );
+    assert_eq!(
+        declared, listed,
+        "fuzz/Cargo.toml and the Makefile's FUZZ_TARGETS disagree, so `make fuzz` \
+         would skip or invent a target"
+    );
+    assert!(
+        !present.is_empty(),
+        "no fuzz targets found at all — did fuzz/fuzz_targets/ move?"
+    );
+}

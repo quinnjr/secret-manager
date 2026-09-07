@@ -13,7 +13,7 @@ BINDIR   = $(DESTDIR)$(PREFIX)/bin
 SHELL = /bin/sh
 .SHELLFLAGS = -ec
 
-.PHONY: build install uninstall test
+.PHONY: build install uninstall test fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list
 
 # Two builds of one crate: the default feature set gives the binary (no
 # libpam, no PAM entry points), and the `pam` feature alone gives the cdylib
@@ -82,3 +82,50 @@ uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/lib/environment.d/50-secret-manager.conf
 	rm -rf $(DESTDIR)$(PREFIX)/share/doc/secret-manager
 	rm -f $(DESTDIR)$(PREFIX)/share/bash-completion/completions/sm $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_sm $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/sm.fish
+
+# ---------------------------------------------------------------- fuzzing
+#
+# The targets live in fuzz/, a standalone crate with its own workspace so a
+# normal `cargo build` never sees them. They need nightly: libFuzzer is a
+# nightly-only sanitizer runtime.
+#
+# `cargo test` already runs the same invariants as bounded proptest cases
+# (tests/prop_*.rs). These targets are the unbounded version: run them for
+# minutes in CI, or hours when touching a parser.
+FUZZ_TARGETS = vault_decode vault_roundtrip vault_open_unlock vault_items_codec \
+               kdf_params protocol_frame protocol_roundtrip dh_peer_public \
+               session_cipher display_label escape_control_sanitize \
+               pinentry_escape dbus_paths askpass_prompt config_toml \
+               attribute_index
+# Seconds per target. The default is a smoke test — enough to catch a target
+# that no longer builds or that crashes on its own seed corpus.
+FUZZ_TIME ?= 60
+FUZZ_NIGHTLY ?= +nightly
+
+fuzz-list:
+	@for t in $(FUZZ_TARGETS); do echo $$t; done
+
+# Every target, briefly. Exits non-zero on the first crash, and the crashing
+# input is left in fuzz/artifacts/<target>/.
+fuzz:
+	for t in $(FUZZ_TARGETS); do \
+		echo "=== $$t ($(FUZZ_TIME)s)"; \
+		$(CARGO) $(FUZZ_NIGHTLY) fuzz run $$t -- -max_total_time=$(FUZZ_TIME) -print_final_stats=1; \
+	done
+
+# An hour per target. This is the one to run before a release, or after
+# changing anything that parses attacker-controlled bytes.
+fuzz-long:
+	$(MAKE) fuzz FUZZ_TIME=3600
+
+# A single target, for when one of them finds something:
+#   make fuzz-one TARGET=vault_decode FUZZ_TIME=600
+fuzz-one:
+	@test -n "$(TARGET)" || { echo "usage: make fuzz-one TARGET=<name> [FUZZ_TIME=secs]" >&2; exit 1; }
+	$(CARGO) $(FUZZ_NIGHTLY) fuzz run $(TARGET) -- -max_total_time=$(FUZZ_TIME) -print_final_stats=1
+
+# Coverage for one target, to see whether a corpus actually reaches the code
+# you think it does. Needs the llvm-tools-preview component on nightly.
+fuzz-coverage:
+	@test -n "$(TARGET)" || { echo "usage: make fuzz-coverage TARGET=<name>" >&2; exit 1; }
+	$(CARGO) $(FUZZ_NIGHTLY) fuzz coverage $(TARGET)

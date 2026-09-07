@@ -6,6 +6,11 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/quinnjr/secret-manager"
 description = "A freedesktop Secret Service daemon, CLI, and PAM module"
 default-run = "secret-manager"
+# The fuzz targets are a separate crate with their own workspace; they must
+# never be pulled into a build or a package of this one. This key is only
+# meaningful under [package] — under [lib] cargo ignores it with a warning
+# that is easy to miss.
+exclude = ["fuzz"]
 
 # One crate, two artifacts: the `rlib` the binary links, and the `cdylib`
 # PAM loads. The daemon and the PAM hooks are separate features so the
@@ -43,6 +48,10 @@ daemon = [
 pam = ["dep:pamsm"]
 # Test-only hooks used by the integration tests.
 test-util = []
+# Re-exports the internal helpers the fuzz targets drive (see src/fuzz_api.rs).
+# Not enabled by any build we ship; `cargo fuzz` turns it on for its own
+# build of the library only.
+fuzzing = []
 
 [dependencies]
 # Always present: vault format and crypto, config, control protocol, and the
@@ -84,7 +93,13 @@ pamsm = { version = "0.5", features = ["libpam"], optional = true }
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+# Property tests. The `fuzz/` targets need nightly and run for as long as you
+# give them; these encode the same invariants as bounded, deterministic cases
+# so a plain `cargo test` still enforces them on every commit.
+proptest = "1"
 # The integration tests need the test-only hooks; a self path-dependency is
 # the standard way to enable a feature for them without enabling it for the
-# shipped build.
-secret-manager = { path = ".", features = ["test-util"] }
+# shipped build. `fuzzing` comes along for the same reason: `tests/prop_text.rs`
+# drives the same internal sanitisers as the fuzz targets, through the same
+# `fuzz_api` wrappers, so the two cannot drift apart.
+secret-manager = { path = ".", features = ["test-util", "fuzzing"] }

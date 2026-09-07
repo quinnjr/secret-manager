@@ -581,3 +581,81 @@ the PAM path-swap hole was incomplete, and is corrected above.
 `pam`-only lib clippy are both clean, `cargo fmt --check` is clean, and
 `cargo audit` reports nothing. `make build` produces a daemon with no libpam
 linked and a PAM module with six `pam_sm_*` entry points and no tokio.
+
+---
+
+# Fuzzing — 2026-09-07
+
+Added after the third audit: 16 cargo-fuzz targets (`fuzz/`) and matching
+bounded property tests (`tests/prop_*.rs`) that run on stable in a normal
+`cargo test`. `docs/fuzzing.md` is the guide. Three findings came out of
+building them.
+
+## Finding — `escape_control` used a narrower invisible-character table
+
+The third audit's entry above claims invisible formatting characters are
+"stripped from anything shown in a dialog **or listed by `sm ssh list`**".
+Only the first half was true. `src/cli/secrets.rs` carried its *own* copy of
+the table, omitting the private-use planes (`U+E000–F8FF`,
+`U+F0000–10FFFD`), the Arabic number signs (`U+0600–0605`, `U+06DD`,
+`U+070F`), `U+180E`, the interlinear annotations (`U+FFF9–FFFB`), the musical
+controls, and the tag characters (`U+E0020–E007F`). A planted item could
+therefore hide or garble part of a listing row that the consent dialogs
+already refused to hide.
+
+Fixed by deleting the duplicate: `escape_control` now imports the one table
+in `src/dbus/prompt.rs`. Reproducing inputs `U+F0000` and `U+EEFF`; the
+regression case is in `escape_control_hides_unicode_format_characters`, red
+before the fix.
+
+**The lesson is about the fuzzer, not the bug.** Sixty seconds of fuzzing did
+not find this, and could not have: the shared generator built characters with
+`char::from(u8)`, so it could never emit anything above U+00FF. The proptest
+mirror, using `any::<char>()`, found it in milliseconds. The generator now
+draws from the whole scalar range on a dedicated arm. Any target that
+classifies characters must be fed the entire space, not a byte's worth of it.
+
+## Finding — a key path containing `\r` was released to askpass
+
+The property asserted after the second audit — any path released by
+`classify_prompt` is non-empty and free of line terminators — did not hold.
+The quoted alternatives in the prompt regex are `[^']+` and `[^"]+`, which
+admit `\r` and `\n`, and the single-line guard tested only `\n`. So
+`Enter passphrase for key 'a\rb': ` classified as a passphrase request for a
+path containing a carriage return. Not exploitable — every display site
+escapes the path — but the stated invariant was false. Fixed in
+`passphrase_path`, where both callers pass through.
+
+The "absolute" half of that invariant is false *by design* and was left
+alone: the quoted forms deliberately accept relative paths (`ssh -i ./key`),
+which `askpass` resolves and matches against registered keys. The targets
+assert absoluteness only for the unquoted `ssh-add` form, which is where the
+code actually promises it.
+
+## Finding — the control frame was not canonical
+
+`postcard::from_bytes` stops at the end of the first complete message and
+ignores what follows, so a peer could append arbitrary bytes to a valid
+request and have it accepted (`Response::Ok` plus `ff ff ff` decoded as
+`Ok`). Multiple varint encodings also decode to the same variant.
+
+Not exploitable as the protocol stands — the length prefix delimits a frame,
+one message is read per frame, and no frame is hashed, signed or compared —
+but a frame that decodes should have been consumed in full, or "the frame
+received" and "the message acted on" are different objects. `decode_frame`
+now uses `take_from_bytes` and rejects a non-empty remainder with
+`ProtocolError::TrailingBytes`. The non-canonical varint acceptance is inside
+postcard and is documented rather than forked; it matters only if anything
+ever starts signing or deduplicating frames.
+
+## Note on what the session cipher can promise
+
+`session_cipher` does **not** assert that corrupting a ciphertext produces an
+error, because that is not true. The Secret Service spec mandates
+`dh-ietf1024-sha256-aes128-cbc-pkcs7`, which is unauthenticated: roughly 255
+times in 256 the PKCS#7 check fails, and otherwise decryption succeeds and
+returns garbage. The target asserts the property that does hold — corruption
+never yields the original plaintext — which follows from CBC decryption being
+a bijection on (IV, ciphertext) and PKCS#7 being injective. This is a
+property of the spec's transport, not a defect in this crate, and it is why
+the vault format uses an AEAD instead.

@@ -1,0 +1,11 @@
+[vault]
+dir = "~/.local/share/secret-manager"
+auto_lock_after = "15m"
+lock_memory = false
+locked_search = true
+[prompt]
+pinentry = "pinentry-gtk-2"
+[kdf]
+m_cost_kib = 65536
+t_cost = 3
+p_cost = 1
