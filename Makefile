@@ -13,7 +13,7 @@ BINDIR   = $(DESTDIR)$(PREFIX)/bin
 SHELL = /bin/sh
 .SHELLFLAGS = -ec
 
-.PHONY: build install uninstall test fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list
+.PHONY: build install uninstall test test-pam fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list
 
 # Two builds of one crate: the default feature set gives the binary (no
 # libpam, no PAM entry points), and the `pam` feature alone gives the cdylib
@@ -34,6 +34,14 @@ test:
 	# crate back in with its default features, which the mutual-exclusion
 	# guard in src/lib.rs correctly rejects.
 	$(CARGO) build --no-default-features --features pam --lib
+
+# tests/pam_stack.rs drives the module through a real libpam stack, and it
+# loads $(PAMSO) rather than building it (a nested cargo would deadlock on the
+# build lock). It skips when that file is missing, so this target builds it
+# first; a plain `cargo test` runs it too, against whatever `make build` left.
+test-pam:
+	CARGO_TARGET_DIR=target/pam $(CARGO) build --release --no-default-features --features pam
+	$(CARGO) test --test pam_stack -- --nocapture
 
 install:
 	test -x $(BIN) && test -f $(PAMSO) && test -f $(COMPLETIONS_DIR)/sm && test -f $(COMPLETIONS_DIR)/_sm && test -f $(COMPLETIONS_DIR)/sm.fish || { echo "run 'make build' first (as your normal user)" >&2; exit 1; }

@@ -784,13 +784,65 @@ hard-coded `PAM_PRELIM_CHECK` constant matching the platform header; and the
 lossy UTF-8 conversion of an authtok, which lives on the untested side of the
 line. The second and third are the ones that fail silently.
 
+### Amendment — that list was closed too, with libpam
+
+It did not need `pam_wrapper`, root, or an edit to `/etc/pam.d`.
+`tests/pam_stack.rs` drives the shipped cdylib through a real libpam stack:
+
+* `pam_start_confdir` (Linux-PAM ≥ 1.4) points libpam at a temporary config
+  directory whose service file names `target/pam/release/libsecret_manager.so`
+  by absolute path, so libpam does the `dlopen` and the `pam_module!` ABI is
+  exercised for real.
+* libpam itself is loaded with `dlopen`/`dlsym`, not linked, so a machine
+  without it — or without the built cdylib — skips with a printed reason
+  instead of failing to build the suite.
+* An application may not `pam_set_item(PAM_AUTHTOK)`; Linux-PAM refuses it
+  from outside a module. `auth optional pam_unix.so nodelay` ahead of us does
+  it instead: `pam_get_authtok` prompts through the test's conversation
+  function and caches the answer into `PAM_AUTHTOK` *before* it verifies it,
+  so the token is there even though the verify then fails and `optional` lets
+  the stack continue.
+* Nothing goes through the environment — the module is dlopened into the test
+  process — so `vault_dir=` and `socket=` are module arguments in the service
+  file, and the suite asserts it is not root, since `socket=` is ignored for
+  root.
+
+The assertions are about the daemon, not the module: after `pam_authenticate`
+plus `pam_open_session` in one transaction the collection is *actually*
+unlocked, which is the round-trip. Re-locking it and running `open_session` a
+second time in the same transaction leaves it locked, which is
+`clear_stashed_password` landing rather than deciding to. Two transactions
+differing only in the name given to `pam_start_confdir` — one unresolvable,
+one real — pin `get_user`. A wrong password is refused with the same-shaped
+run using the right one as the control. `pam_chauthtok` rotates the key.
+
+Each was confirmed red by mutating the module: pointing `retrieve_data` at
+another key breaks the round-trip test, making `clear_stashed_password` a
+no-op breaks the second-`open_session` test, and setting `PAM_PRELIM_CHECK` to
+`PAM_UPDATE_AUTHTOK` breaks the rotation test.
+
+One thing libpam still will not show: a `PAM_PRELIM_CHECK` value that names no
+other flag is behaviourally invisible, because libpam sanitizes `PAM_AUTHTOK`
+and `PAM_OLDAUTHTOK` on entry to the password stack and pam_unix sets only the
+old one on the prelim pass, so the module never has a complete pair to act on
+whichever pass it thinks is real. `the_prelim_check_constant_matches_the_platform_header`
+covers the value directly instead, comparing the literal in `src/pam/mod.rs`
+with `<security/pam_modules.h>`.
+
+Still out of reach: the lossy UTF-8 conversion of an authtok (libpam's own
+prompt reader will not carry invalid UTF-8 into `PAM_AUTHTOK`), the
+`send_data`/`retrieve_data` error arms, and everything root-only — the real
+`/run/user/<uid>` socket path, `systemctl --machine`, and `socket=` being
+ignored.
+
 **`Client::connect`'s hang guard.** Closed by making the timeout injectable
 through the existing `test-util` feature — the same mechanism as
 `KdfParams::FAST_FOR_TESTS` — so the shipped build is unchanged.
 
 ## State
 
-406 tests pass, twice over. Clippy clean at `-D warnings` for the default,
+411 tests pass, twice over (`make test-pam` rebuilds the cdylib first, so
+`tests/pam_stack.rs` runs against a current one rather than skipping). Clippy clean at `-D warnings` for the default,
 `pam` and fuzz builds; `cargo fmt --check` and `cargo audit` clean; `make
 build` yields a daemon with no libpam linked and a PAM module with six
 `pam_sm_*` symbols.
