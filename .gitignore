@@ -19,3 +19,11 @@
 # Seeds are named seed-*; everything else libFuzzer writes is ignored.
 /fuzz/corpus/*/*
 !/fuzz/corpus/*/seed-*
+
+# Worktrees live inside the project (see CLAUDE.md); they are checkouts, not
+# content.
+/.worktrees
+
+# Raw coverage counters. `cargo llvm-cov` writes these into whatever directory
+# a profiled process happens to run in, including the repo root.
+*.profraw

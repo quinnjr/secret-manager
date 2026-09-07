@@ -318,6 +318,9 @@ async fn finish(
         let mut st = state.lock().await;
         st.prompt_tasks.remove(path.as_str());
         st.prompt_commits.remove(path.as_str());
+        // The prompt finished with its owner still present, so what it
+        // unlocked stays unlocked: forget the record rather than re-locking.
+        st.prompt_unlocked.remove(path.as_str());
         st.prompt_owners.remove(path.as_str()).is_none()
     };
     if already_done {
@@ -386,6 +389,16 @@ async fn run(
                     Outcome::Unlocked => {
                         any_unlocked = true;
                         unlocked_now.push(id.clone());
+                        // Also record it where an abort cannot destroy it:
+                        // this task may be aborted before the next
+                        // collection's gate is claimed.
+                        state
+                            .lock()
+                            .await
+                            .prompt_unlocked
+                            .entry(path.to_string())
+                            .or_default()
+                            .push(id.clone());
                     }
                     Outcome::Failed => {}
                     // Cancel means cancel: do not raise a dialog for the next
@@ -399,6 +412,7 @@ async fn run(
             // for an owner that is no longer there.
             if !state.lock().await.prompt_owners.contains_key(path.as_str()) {
                 let mut st = state.lock().await;
+                st.prompt_unlocked.remove(path.as_str());
                 for id in &unlocked_now {
                     if let Some(vault) = st.collections.get_mut(id) {
                         vault.lock();
@@ -447,12 +461,6 @@ enum Outcome {
     Failed,
     /// The user cancelled, or a racing `Dismiss` claimed the prompt.
     Cancelled,
-}
-
-/// Ask for the collection's password up to three times. True when unlocked.
-pub async fn unlock_collection(conn: &Connection, state: &Shared, id: &str) -> bool {
-    let mut gate = None;
-    unlock_collection_inner(conn, state, id, &mut gate).await == Outcome::Unlocked
 }
 
 async fn unlock_collection_inner(

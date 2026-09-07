@@ -659,3 +659,190 @@ never yields the original plaintext — which follows from CBC decryption being
 a bijection on (IV, ciphertext) and PKCS#7 being injective. This is a
 property of the spec's transport, not a defect in this crate, and it is why
 the vault format uses an AEAD instead.
+
+---
+
+# Negative-test coverage audit — 2026-09-07
+
+A different question from the three audits above: not "is this branch wrong"
+but "is this branch *tested*". Three read-only analysts enumerated every
+failure mode reachable in `src/` and cross-referenced the 181 inline unit
+tests, the 59 integration tests, the property tests and the 16 fuzz targets.
+48 findings; the tests are in the tree.
+
+## Finding — the per-item secret cap was bypassable
+
+`Collection::CreateItem` enforces `MAX_ITEM_SECRET` (1 MiB). `Item::SetSecret`
+did not. So the cap added as MEDIUM 6 in the third audit above was a speed
+bump: a client could create a one-byte item and then replace its secret with
+a hundred megabytes over the same session. The comment on the constant states
+the consequence exactly — a collection pushed past the vault size limit stops
+saving entirely — so this was a denial of service against the whole
+collection, reachable by any bus client, in two ordinary method calls.
+
+Fixed by applying the same check in `set_secret`. Regression test:
+`set_secret_rejects_an_oversized_secret` in `tests/dbus_items.rs`, which also
+pins that exactly `MAX_ITEM_SECRET` bytes is still accepted.
+
+This is the second incomplete fix from the third audit found by later work —
+`escape_control`'s duplicate invisible-character table was the first — and
+neither was found by review or by fuzzing. Both were found by asking which
+branches nothing exercises.
+
+## What the coverage analysis was worth
+
+The findings clustered where the *consequences* are worst rather than where
+the code is newest:
+
+- **`Vault::change_key`'s KDF ceilings had no test at all.** `new_kdf.validate()?`
+  is the only enforcement of the ceilings on the write path: the peer-chosen
+  `new_kdf` travels from the control socket through `handle_control` and
+  `daemon::change_key` into `Vault::change_key` with no intermediate check,
+  and every existing test passed `FAST`. Deleting that line would let a
+  same-uid client write a header whose parameters every later `open` must
+  refuse — permanently unopenable, on every host.
+- **A departed owner's prompt re-locking what it opened** was *executed* by an
+  existing test but its effect was never asserted. The `vault.lock()` loop
+  could have been deleted with the whole suite still green, leaving a
+  decrypted vault open in memory for a client that had disconnected.
+- **An empty stored secret released to askpass.** A key registered with
+  `--no-passphrase` stores an empty secret, and the suite already documents
+  that OpenSSH reads an empty answer as *approval*. The guard existed; nothing
+  tested it.
+- **`control::server::read_frame` is a second frame reader**, separate from
+  `protocol::read_frame_sync`. The property tests and fuzz target cover the
+  protocol copy; the daemon uses this one on every inbound connection, and its
+  allocation bound was untested.
+
+## Finding — an aborted prompt left vaults open for a departed owner
+
+`run`'s `Unlock` loop resets the commit gate at the top of **every**
+collection. So a client that disconnects while a *later* dialog is on screen
+leaves the gate `false`, and `watch_clients` aborts the task — correctly,
+since nothing is half-committed. But an abort only takes effect at an await
+point and never reaches the re-lock branch at the end of the loop, so any
+collection opened in an earlier iteration stayed decrypted in memory with no
+owner. That contradicts the intent stated in that branch's own comment.
+
+The existing `an_owner_disconnect_stops_the_remaining_unlock_dialogs` test
+sits in exactly this state and asserts only about a collection the prompt
+never opened, so it passed either way.
+
+Fixed by recording what each prompt has unlocked in shared state
+(`prompt_unlocked`), which an abort cannot destroy: the abort path re-locks
+those collections and emits the signals with the lock released, while a
+prompt that completes normally drops the record instead, since its owner is
+still there. Regression test
+`an_aborted_prompt_relocks_the_collections_it_had_already_opened`, confirmed
+red before the fix with "a vault the aborted prompt had already opened stayed
+unlocked with no owner".
+
+## The three gaps that were said to be uncloseable
+
+All three were closed. Two of the reasons they had been written off were
+wrong, which is worth recording.
+
+**The control socket's wrong-uid rejection.** Written off as needing root.
+It does not: `SO_PEERCRED` translates credentials into the *reading*
+process's user namespace. But the obvious recipe is a trap — with the usual
+`0 <uid> 1` map the connecting parent appears as uid **0**, which
+`uid_allowed` allows because root is allowed; with no map at all, listener
+and peer both read back as the overflow uid, so `peer == me` and that is
+allowed too. Either version passes while proving nothing. The real test uses
+`newuidmap` with a delegated `/etc/subuid` range to give the child a genuine
+second kernel uid: `a_connection_from_a_genuinely_foreign_uid_is_refused`
+reports "daemon uid 1000, peer uid 100000 (delegated sub-uid), refused
+unserved", and skips with a printed reason where no range is delegated. The
+`Err(_)` fail-closed arm, which had no coverage at all, is now tested through
+the extracted `peer_allowed_from`.
+
+**`hooks.rs` through libpam.** `pam_wrapper` is not installed and the answer
+was not to install it. The untestable part was never libpam — it was that the
+decisions were tangled up with the glue. The three hook bodies now call
+`authenticate_decision`, `open_session_decision` and `chauthtok_decision` in
+`src/pam/mod.rs`, which compile and test without the `pam` feature. Two
+seams only (target resolution and daemon start, both because *when* they run
+is part of the ordering); everything else uses the real `SocketDir`,
+`Budget`, vault files and listeners. 25 tests now cover the ordering: the
+stash cleared on all 16 exit paths, no derivation after the budget is spent,
+and the retry unlock gated on `waited && dir.revalidate()` in all four
+combinations — including the case that proves `revalidate` is never consulted
+when `waited` is false.
+
+Three of `open_session`'s four budget checks turn out to be unreachable
+defence in depth rather than live guards (the preceding call consults the
+same budget and refuses first), and one inner arm is dead outright. It was
+preserved verbatim and documented rather than deleted. `chauthtok`'s check is
+genuinely reachable — it is the one that sits after two non-interruptible
+Argon2 derivations — and is tested.
+
+What remains untestable without libpam is now specific rather than vague:
+the `pam_module!` ABI surface; the `PamData` round-trip between the auth and
+session stacks; whether `clear_stashed_password` actually overwrites the
+stash rather than deciding to; `get_user`/`get_cached_authtok` behaviour; the
+hard-coded `PAM_PRELIM_CHECK` constant matching the platform header; and the
+lossy UTF-8 conversion of an authtok, which lives on the untested side of the
+line. The second and third are the ones that fail silently.
+
+### Amendment — that list was closed too, with libpam
+
+It did not need `pam_wrapper`, root, or an edit to `/etc/pam.d`.
+`tests/pam_stack.rs` drives the shipped cdylib through a real libpam stack:
+
+* `pam_start_confdir` (Linux-PAM ≥ 1.4) points libpam at a temporary config
+  directory whose service file names `target/pam/release/libsecret_manager.so`
+  by absolute path, so libpam does the `dlopen` and the `pam_module!` ABI is
+  exercised for real.
+* libpam itself is loaded with `dlopen`/`dlsym`, not linked, so a machine
+  without it — or without the built cdylib — skips with a printed reason
+  instead of failing to build the suite.
+* An application may not `pam_set_item(PAM_AUTHTOK)`; Linux-PAM refuses it
+  from outside a module. `auth optional pam_unix.so nodelay` ahead of us does
+  it instead: `pam_get_authtok` prompts through the test's conversation
+  function and caches the answer into `PAM_AUTHTOK` *before* it verifies it,
+  so the token is there even though the verify then fails and `optional` lets
+  the stack continue.
+* Nothing goes through the environment — the module is dlopened into the test
+  process — so `vault_dir=` and `socket=` are module arguments in the service
+  file, and the suite asserts it is not root, since `socket=` is ignored for
+  root.
+
+The assertions are about the daemon, not the module: after `pam_authenticate`
+plus `pam_open_session` in one transaction the collection is *actually*
+unlocked, which is the round-trip. Re-locking it and running `open_session` a
+second time in the same transaction leaves it locked, which is
+`clear_stashed_password` landing rather than deciding to. Two transactions
+differing only in the name given to `pam_start_confdir` — one unresolvable,
+one real — pin `get_user`. A wrong password is refused with the same-shaped
+run using the right one as the control. `pam_chauthtok` rotates the key.
+
+Each was confirmed red by mutating the module: pointing `retrieve_data` at
+another key breaks the round-trip test, making `clear_stashed_password` a
+no-op breaks the second-`open_session` test, and setting `PAM_PRELIM_CHECK` to
+`PAM_UPDATE_AUTHTOK` breaks the rotation test.
+
+One thing libpam still will not show: a `PAM_PRELIM_CHECK` value that names no
+other flag is behaviourally invisible, because libpam sanitizes `PAM_AUTHTOK`
+and `PAM_OLDAUTHTOK` on entry to the password stack and pam_unix sets only the
+old one on the prelim pass, so the module never has a complete pair to act on
+whichever pass it thinks is real. `the_prelim_check_constant_matches_the_platform_header`
+covers the value directly instead, comparing the literal in `src/pam/mod.rs`
+with `<security/pam_modules.h>`.
+
+Still out of reach: the lossy UTF-8 conversion of an authtok (libpam's own
+prompt reader will not carry invalid UTF-8 into `PAM_AUTHTOK`), the
+`send_data`/`retrieve_data` error arms, and everything root-only — the real
+`/run/user/<uid>` socket path, `systemctl --machine`, and `socket=` being
+ignored.
+
+**`Client::connect`'s hang guard.** Closed by making the timeout injectable
+through the existing `test-util` feature — the same mechanism as
+`KdfParams::FAST_FOR_TESTS` — so the shipped build is unchanged.
+
+## State
+
+411 tests pass, twice over (`make test-pam` rebuilds the cdylib first, so
+`tests/pam_stack.rs` runs against a current one rather than skipping). Clippy clean at `-D warnings` for the default,
+`pam` and fuzz builds; `cargo fmt --check` and `cargo audit` clean; `make
+build` yields a daemon with no libpam linked and a PAM module with six
+`pam_sm_*` symbols.

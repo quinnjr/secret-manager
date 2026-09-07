@@ -1,6 +1,7 @@
 //! Configuration file and XDG path helpers.
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -114,10 +115,22 @@ impl Config {
         let path = std::env::var_os("SECRET_MANAGER_CONFIG")
             .map(PathBuf::from)
             .unwrap_or_else(config_file);
-        match std::fs::read_to_string(&path) {
+        Config::load_from(&path)
+    }
+
+    /// [`Config::load`] with the file chosen by the caller instead of by the
+    /// environment. `load` reads process-global state, which a test cannot
+    /// set without `unsafe` and cannot set at all while other tests run in
+    /// parallel; everything after the path is decided lives here so it can be
+    /// exercised directly.
+    fn load_from(path: &Path) -> Result<Config, ConfigError> {
+        match std::fs::read_to_string(path) {
             Ok(text) => Config::from_str(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(source) => Err(ConfigError::Read { path, source }),
+            Err(source) => Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            }),
         }
     }
 
@@ -158,7 +171,14 @@ pub fn home_dir() -> PathBuf {
 }
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
-    match std::env::var_os(var) {
+    xdg_value(std::env::var_os(var), fallback)
+}
+
+/// [`xdg`] with the environment value supplied by the caller, so the
+/// unset-or-empty fallback is reachable without mutating the process
+/// environment out from under tests running in parallel.
+fn xdg_value(value: Option<OsString>, fallback: &str) -> PathBuf {
+    match value {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => home_dir().join(fallback),
     }
@@ -180,7 +200,13 @@ pub fn config_file() -> PathBuf {
 /// or empty. There is no world-writable fallback: a runtime dir without a
 /// private `$XDG_RUNTIME_DIR` is not safe to use.
 pub fn runtime_dir() -> Option<PathBuf> {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
+    runtime_dir_from(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// [`runtime_dir`] with the environment value supplied by the caller. See
+/// [`xdg_value`] for why the environment read is separated out.
+fn runtime_dir_from(value: Option<OsString>) -> Option<PathBuf> {
+    match value {
         Some(v) if !v.is_empty() => Some(PathBuf::from(v).join("secret-manager")),
         _ => None,
     }
@@ -268,5 +294,69 @@ pinentry = "/usr/bin/pinentry-tty"
             assert!(dir.ends_with("secret-manager"));
         }
         assert!(config_file().ends_with("secret-manager/config.toml"));
+    }
+
+    /// No config file is the normal case on a fresh install, so it must be
+    /// indistinguishable from an empty one rather than an error.
+    #[test]
+    fn a_config_file_that_is_not_there_yields_the_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Config::load_from(&d.path().join("config.toml")).unwrap();
+        assert_eq!(c, Config::default());
+    }
+
+    /// A file that exists but cannot be read is the opposite case: silently
+    /// falling back to the defaults would run the daemon with settings the
+    /// operator did not choose, so it has to be an error that names the path.
+    #[test]
+    fn a_config_file_that_cannot_be_read_is_reported_with_its_path() {
+        let d = tempfile::tempdir().unwrap();
+        // A directory where the file should be: present, so not `NotFound`,
+        // and `read_to_string` refuses it.
+        let path = d.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = Config::load_from(&path).unwrap_err();
+        let ConfigError::Read { path: p, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(p, &path);
+    }
+
+    /// A file that is there and readable is parsed by the same path `load`
+    /// takes, so the seam cannot drift from `from_str`.
+    #[test]
+    fn a_readable_config_file_is_parsed() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("config.toml");
+        std::fs::write(&path, "[prompt]\npinentry = \"/usr/bin/pinentry-tty\"\n").unwrap();
+        let c = Config::load_from(&path).unwrap();
+        assert_eq!(c.prompt.pinentry, "/usr/bin/pinentry-tty");
+    }
+
+    /// An XDG variable that is unset *or* empty falls back under `$HOME`; an
+    /// empty one must not produce a path rooted at the filesystem root.
+    #[test]
+    fn an_unset_or_empty_xdg_variable_falls_back_under_home() {
+        let fallback = home_dir().join(".config");
+        assert_eq!(xdg_value(None, ".config"), fallback);
+        assert_eq!(xdg_value(Some(OsString::new()), ".config"), fallback);
+        assert_eq!(
+            xdg_value(Some(OsString::from("/xdg")), ".config"),
+            PathBuf::from("/xdg")
+        );
+    }
+
+    /// There is deliberately no fallback for the runtime directory: without a
+    /// private `$XDG_RUNTIME_DIR` there is nowhere safe to put the control
+    /// socket, so both unset and empty must yield `None` rather than a guess.
+    #[test]
+    fn no_runtime_directory_without_a_private_xdg_runtime_dir() {
+        assert_eq!(runtime_dir_from(None), None);
+        assert_eq!(runtime_dir_from(Some(OsString::new())), None);
+        assert_eq!(
+            runtime_dir_from(Some(OsString::from("/run/user/1000"))),
+            Some(PathBuf::from("/run/user/1000/secret-manager"))
+        );
     }
 }

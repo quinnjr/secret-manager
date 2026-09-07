@@ -1169,6 +1169,378 @@ pub(crate) fn start_after_clearing(dir: &SocketDir, action: StaleSocket) -> bool
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hook decisions
+//
+// The `pam_sm_*` entry points in `hooks.rs` only exist in the `--features pam`
+// cdylib, so nothing in that file is reachable from a normal `cargo test`. The
+// ordering each hook decides — what is checked before what, what is skipped
+// once the budget is spent, when the stashed password is cleared — is the part
+// that matters and the part that is easy to get wrong, so it lives here, where
+// it compiles and is tested without libpam.
+//
+// The split is: everything that needs a `PamHandle` stays in `hooks.rs`;
+// everything that decides stays here and returns an outcome value the hook
+// only has to translate into `PamError::SUCCESS`. The two things that cannot
+// be resolved up front are passed as closures rather than values, because
+// *when* they run is itself part of the ordering: resolving the target user
+// runs `getpwnam` and can log a refusal, and starting the daemon execs
+// `systemctl`. Nothing else is injected — `SocketDir`, `Budget`, `Target` and
+// the vault file are all real here.
+// ---------------------------------------------------------------------------
+
+/// Ceiling for one control-socket call. A whole hook is bounded by
+/// [`HOOK_BUDGET`]; this keeps a single stalled call from consuming all of it
+/// while still shrinking as the budget does.
+const CALL_BUDGET: Duration = Duration::from_secs(3);
+
+/// Logged when a hook's overall deadline runs out. The login itself always
+/// proceeds; only the vault work is abandoned.
+const SPENT: &str = "took too long; abandoning the unlock so the login can proceed";
+
+/// `PAM_PRELIM_CHECK` from <security/pam_modules.h>; pamsm does not expose it.
+pub(crate) const PAM_PRELIM_CHECK: i32 = 0x4000;
+
+/// What `authenticate` found in libpam's authentication-token cache.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuthOutcome {
+    /// A token is available and the hook must stash it for `open_session`.
+    Stash,
+    /// libpam has no token; there will be nothing to unlock with later.
+    NoToken,
+    /// libpam refused to hand the token over.
+    Unavailable,
+}
+
+/// `authenticate`'s whole decision: whether the token PAM already collected is
+/// worth stashing. `Err` carries the libpam error text; `Ok(None)` means there
+/// simply is no token, which is normal and logged differently.
+pub(crate) fn authenticate_decision(token: Result<Option<&str>, &str>) -> AuthOutcome {
+    match token {
+        Ok(Some(_)) => AuthOutcome::Stash,
+        Ok(None) => {
+            log("no authentication token available; nothing to unlock later");
+            AuthOutcome::NoToken
+        }
+        Err(e) => {
+            log(&format!("cannot read authentication token: {e}"));
+            AuthOutcome::Unavailable
+        }
+    }
+}
+
+/// What [`open_session_decision`] decided, separated from libpam so the
+/// ordering can be tested. The hook itself only turns this into
+/// `PamError::SUCCESS` and clears the stashed password.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionOutcome {
+    /// `authenticate` stashed nothing, so there is nothing to unlock with —
+    /// and nothing to clear either.
+    NoPassword,
+    /// The target user did not resolve, so there is no socket path.
+    NoTarget,
+    /// [`SocketDir::open`] refused the runtime directory; root must not touch
+    /// anything under it.
+    RefusedSocketDir,
+    /// The collection's vault header could not be read, so there is no salt
+    /// and no KDF to derive under.
+    NoVaultHeader,
+    /// The deadline ran out before the derivation could be started.
+    BudgetSpent,
+    /// Time is left, but not enough to give a control-socket call.
+    NoCallBudget,
+    /// The unlock call was made. "Made", not "succeeded": a daemon that
+    /// answers `Error`, and a derivation the budget cut off inside
+    /// [`unlock_by_key`], both land here — neither is a transport failure and
+    /// neither is retried.
+    Attempted,
+    /// The attempt failed in a way that is not "the daemon is not running":
+    /// any non-transport error, or a connect failure with `auto_start=no`.
+    Failed,
+    /// The connect failed, but not with an errno that proves nobody is behind
+    /// the socket, so the daemon is not started on the strength of it.
+    ConnectNotStale,
+    /// The daemon-start path was taken; see [`StartOutcome`].
+    Started(StartOutcome),
+}
+
+impl SessionOutcome {
+    /// Whether the hook must clear the password `authenticate` stashed.
+    ///
+    /// Every path does, which is the point: the stash outlives the hook
+    /// otherwise, in a process the target user is logging in to. The one
+    /// exception is the path where the retrieve itself found nothing, where
+    /// there is no stash to clear. Matched exhaustively on purpose — a new
+    /// exit path has to answer this question.
+    pub(crate) fn clears_stash(&self) -> bool {
+        match self {
+            Self::NoPassword => false,
+            Self::NoTarget
+            | Self::RefusedSocketDir
+            | Self::NoVaultHeader
+            | Self::BudgetSpent
+            | Self::NoCallBudget
+            | Self::Attempted
+            | Self::Failed
+            | Self::ConnectNotStale
+            | Self::Started(_) => true,
+        }
+    }
+}
+
+/// How far the `auto_start` path got. Everything here happens after a connect
+/// that proved the daemon is not answering.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartOutcome {
+    /// The deadline was already spent, so the daemon was not started.
+    NoStartBudget,
+    /// A stale socket was in the way and could not be removed. The daemon
+    /// could not bind it either, so it is not started.
+    StaleSocketStuck,
+    /// The target user's name was not available, so nothing was started and
+    /// nothing was retried.
+    NoUser,
+    /// The daemon was started but the retry was not attempted.
+    /// `revalidated` is `None` when the wait timed out, because the runtime
+    /// directory is then never re-checked at all.
+    NotRetried {
+        waited: bool,
+        revalidated: Option<bool>,
+    },
+    /// The socket appeared and the directory revalidated, but the deadline was
+    /// spent before the second derivation could start.
+    RetryBudgetSpent,
+    /// Time remains overall but not enough for a call. Unreachable in
+    /// practice — `remaining()` being `Some` makes `capped()` `Some` — and
+    /// kept only because the hook has the branch.
+    NoRetryCallBudget,
+    /// The second unlock was attempted.
+    Retried,
+}
+
+/// Everything `open_session` decides, in the order it decides it.
+///
+/// `resolve_target` and `start_daemon` are closures because the hook resolves
+/// both through the `PamHandle`, and because both must run *when* the hook
+/// runs them: `resolve_target` reaches NSS and logs, and `start_daemon` execs
+/// `systemctl`. The parsed options are handed to `resolve_target` rather than
+/// parsed by the hook, so `parse_options` — which logs — still runs exactly
+/// once. `start_daemon` returns whether it ran at all — the hook has no
+/// user name to start a daemon for if `pam_get_user` fails, and then nothing
+/// downstream happens either.
+pub(crate) fn open_session_decision(
+    password: Option<&str>,
+    args: &[String],
+    budget: &Budget,
+    resolve_target: &dyn Fn(&Options) -> Option<Target>,
+    start_daemon: &dyn Fn(&Budget) -> bool,
+) -> SessionOutcome {
+    let opts = parse_options(args);
+    let Some(password) = password else {
+        log("no stashed password for session; vault stays locked");
+        return SessionOutcome::NoPassword;
+    };
+    let Some(t) = resolve_target(&opts) else {
+        log("cannot determine the control socket path");
+        return SessionOutcome::NoTarget;
+    };
+    // The directory is held open from here on: every later unlink, connect and
+    // re-check goes through this descriptor rather than through a name the
+    // user can swap underneath root.
+    let Some(mut dir) = SocketDir::open(&t.sock, t.uid) else {
+        return SessionOutcome::RefusedSocketDir;
+    };
+    // Salt and parameters come from the vault file itself, never from whatever
+    // happens to answer the socket.
+    let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, budget) else {
+        return SessionOutcome::NoVaultHeader;
+    };
+    if budget.remaining().is_none() {
+        log(SPENT);
+        return SessionOutcome::BudgetSpent;
+    }
+    // A leftover socket from a crashed daemon looks exactly like a running
+    // one, so only a failed connect is a usable test.
+    let sock = dir.socket_path();
+    let Some(call) = budget.capped(CALL_BUDGET) else {
+        log("no time left in the login budget; vault stays locked");
+        return SessionOutcome::NoCallBudget;
+    };
+    // `connect_path` re-checks the socket *name* with `AT_SYMLINK_NOFOLLOW`:
+    // holding the directory open pins the parent, but `connect(2)` still
+    // resolves the final component, so a symlink planted there would redirect
+    // root. A refusal is reported as a connect failure, which is what it is.
+    let attempt = match dir.connect_path() {
+        Ok(path) => unlock_by_key(
+            &path,
+            &opts.collection,
+            t.uid,
+            password,
+            &salt,
+            kdf,
+            budget,
+            call,
+        ),
+        Err(e) => Err(ProtocolError::Connect(e)),
+    };
+    let e = match attempt {
+        Ok(()) => return SessionOutcome::Attempted,
+        Err(ProtocolError::Connect(e)) if opts.auto_start => e,
+        Err(e) => {
+            log_transport("unlock", &e);
+            return SessionOutcome::Failed;
+        }
+    };
+    let Some(action) = stale_socket_action(e.kind()) else {
+        log_transport("unlock", &ProtocolError::Connect(e));
+        return SessionOutcome::ConnectNotStale;
+    };
+    log(&format!("cannot reach the daemon ({e}); starting it"));
+    if budget.capped(START_TIMEOUT).is_none() {
+        log(SPENT);
+        return SessionOutcome::Started(StartOutcome::NoStartBudget);
+    }
+    if !start_after_clearing(&dir, action) {
+        return SessionOutcome::Started(StartOutcome::StaleSocketStuck);
+    }
+    if !start_daemon(budget) {
+        return SessionOutcome::Started(StartOutcome::NoUser);
+    }
+    // The runtime directory is re-checked: the wait spans a window in which
+    // the user could have replaced it. `revalidate` is only consulted when the
+    // socket actually turned up, so a timed-out wait leaves it unevaluated.
+    let waited = budget
+        .capped(START_TIMEOUT)
+        .is_some_and(|left| wait_for(&sock, left));
+    let revalidated = if waited { Some(dir.revalidate()) } else { None };
+    if revalidated != Some(true) {
+        log("daemon did not start in time; vault stays locked");
+        return SessionOutcome::Started(StartOutcome::NotRetried {
+            waited,
+            revalidated,
+        });
+    }
+    if budget.remaining().is_none() {
+        log(SPENT);
+        return SessionOutcome::Started(StartOutcome::RetryBudgetSpent);
+    }
+    let Some(left) = budget.capped(CALL_BUDGET) else {
+        log("no time left in the login budget");
+        return SessionOutcome::Started(StartOutcome::NoRetryCallBudget);
+    };
+    match dir.connect_path() {
+        Ok(path) => {
+            if let Err(e) = unlock_by_key(
+                &path,
+                &opts.collection,
+                t.uid,
+                password,
+                &salt,
+                kdf,
+                budget,
+                left,
+            ) {
+                log_transport("unlock", &e);
+            }
+        }
+        Err(e) => log_transport("unlock", &ProtocolError::Connect(e)),
+    }
+    SessionOutcome::Started(StartOutcome::Retried)
+}
+
+/// What [`chauthtok_decision`] decided.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChauthtokOutcome {
+    /// `PAM_PRELIM_CHECK`: the stack is only asking whether the change could
+    /// work. Nothing is read, derived or sent on this pass.
+    Prelim,
+    /// One or both passwords were unavailable. Carries the text logged, since
+    /// which one is missing is the whole content of the decision.
+    Missing(&'static str),
+    /// The target user did not resolve.
+    NoTarget,
+    /// [`SocketDir::open`] refused the runtime directory.
+    RefusedSocketDir,
+    /// The collection's vault header could not be read.
+    NoVaultHeader,
+    /// A derivation or the RNG failed, so there is no request to send.
+    NoRequest,
+    /// The deadline ran out after the derivations.
+    BudgetSpent,
+    /// Time is left, but not enough to give a control-socket call.
+    NoCallBudget,
+    /// The `ChangeKey` request was delivered.
+    Sent,
+    /// The request could not be delivered.
+    SendFailed,
+}
+
+/// Everything `chauthtok` decides, in the order it decides it.
+///
+/// `flags` is the raw bit set libpam passed, so the `PAM_PRELIM_CHECK` early
+/// return is part of what is tested. `budget` is created by the hook before
+/// this is called and is therefore live across the prelim return; that costs
+/// an `Instant::now()` and nothing else. Options are parsed *here* rather than
+/// by the hook, because parsing logs and a prelim pass must stay silent.
+pub(crate) fn chauthtok_decision(
+    flags: i32,
+    old: Option<&str>,
+    new: Option<&str>,
+    args: &[String],
+    budget: &Budget,
+    resolve_target: &dyn Fn(&Options) -> Option<Target>,
+) -> ChauthtokOutcome {
+    if flags & PAM_PRELIM_CHECK != 0 {
+        return ChauthtokOutcome::Prelim;
+    }
+    let opts = parse_options(args);
+    let (Some(old), Some(new)) = (old, new) else {
+        let missing = match (old.is_some(), new.is_some()) {
+            (false, false) => "old and new passwords",
+            (false, true) => "the old password",
+            _ => "the new password",
+        };
+        log(&format!(
+            "cannot forward the password change: {missing} unavailable"
+        ));
+        return ChauthtokOutcome::Missing(missing);
+    };
+    let Some(t) = resolve_target(&opts) else {
+        log("cannot determine the control socket path");
+        return ChauthtokOutcome::NoTarget;
+    };
+    let Some(dir) = SocketDir::open(&t.sock, t.uid) else {
+        return ChauthtokOutcome::RefusedSocketDir;
+    };
+    let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, budget) else {
+        return ChauthtokOutcome::NoVaultHeader;
+    };
+    let Some(req) = change_key_request(&opts.collection, old, new, &salt, kdf, budget) else {
+        return ChauthtokOutcome::NoRequest;
+    };
+    if budget.remaining().is_none() {
+        log(SPENT);
+        return ChauthtokOutcome::BudgetSpent;
+    }
+    let Some(left) = budget.capped(CALL_BUDGET) else {
+        log("no time left in the password-change budget");
+        return ChauthtokOutcome::NoCallBudget;
+    };
+    match dir.connect_path() {
+        Ok(path) => match try_send(&path, &req, t.uid, "password change", left) {
+            Ok(()) => ChauthtokOutcome::Sent,
+            Err(e) => {
+                log_transport("password change", &e);
+                ChauthtokOutcome::SendFailed
+            }
+        },
+        Err(e) => {
+            log_transport("password change", &ProtocolError::Connect(e));
+            ChauthtokOutcome::SendFailed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2151,5 +2523,998 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         let _ = live.kill();
         let _ = live.wait();
+    }
+
+    /// Answers one connection with a chosen [`Response`], for the arms
+    /// [`fake_daemon`] cannot reach: it always answers `Ok`.
+    fn fake_daemon_answering(sock: &Path, resp: Response) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_frame_sync(&mut stream).unwrap();
+            stream.write_all(&encode_frame(&resp).unwrap()).unwrap();
+        })
+    }
+
+    /// `revalidate` is what stands between the daemon-start window and the
+    /// retry unlock. A directory that was owned and private when it was
+    /// opened may have been opened up while `systemctl` ran, and the held
+    /// descriptor sees that: it is the same inode, so a `chmod` on it is
+    /// visible even though a rename would not be.
+    #[test]
+    fn revalidate_refuses_a_directory_opened_up_during_the_start_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let mut sd = SocketDir::open(&rt.join("control.sock"), me()).expect("valid at open");
+        assert!(sd.revalidate(), "nothing has changed yet");
+
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(
+            !sd.revalidate(),
+            "a group-writable runtime directory must not be used after the window"
+        );
+        // Restore, so the temp directory can still be torn down.
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The other arm of `revalidate`: nothing was held open because the
+    /// directory did not exist, and the daemon created it during the window.
+    /// It has never been used through its name, so there is nothing a swap
+    /// could have redirected — but it has also never been validated, so it
+    /// must be validated now rather than adopted on trust.
+    #[test]
+    fn revalidate_validates_a_directory_that_only_appeared_during_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = dir.path().join("secret-manager");
+        let mut sd = SocketDir::open(&rt.join("control.sock"), me()).expect("absent is fine");
+        assert!(!sd.is_open(), "there was nothing to hold open");
+
+        // Appears world-writable: another local user could plant the socket.
+        std::fs::create_dir(&rt).unwrap();
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o707)).unwrap();
+        assert!(
+            !sd.revalidate(),
+            "a directory that appears world-writable must be refused, not adopted"
+        );
+        assert!(!sd.is_open(), "a refused directory is not held open");
+
+        // Owned and private: adopted, and held open from here on.
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(sd.revalidate(), "an owned 0700 directory is adopted");
+        assert!(sd.is_open(), "the adopted directory must be held open");
+        assert!(
+            sd.socket_path().starts_with("/proc/self/fd/"),
+            "{}",
+            sd.socket_path().display()
+        );
+    }
+
+    /// A failed unlink means the daemon could not have bound that socket
+    /// either, and may mean the path is not ours to remove. `open_session`
+    /// reads `false` as "do not start the daemon", rather than launching one
+    /// that is certain to fail to bind.
+    ///
+    /// `0500` is the case that reaches the refusal: `runtime_subdir_is_safe`
+    /// only tests `mode & 0o022`, so a directory that is readable and
+    /// searchable but not writable passes validation and then denies the
+    /// `unlinkat` with `EACCES`.
+    #[test]
+    fn a_stale_socket_that_cannot_be_removed_stops_the_daemon_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        std::fs::write(&sock, b"stale").unwrap();
+
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let sd = SocketDir::open(&sock, me()).expect("0500 is not group- or world-writable");
+        let started = start_after_clearing(&sd, StaleSocket::Unlink);
+        // Restore before asserting, so a failure cannot leave an
+        // undeletable temp directory behind.
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !started,
+            "an unlink refused with EACCES must not be followed by a daemon start"
+        );
+        assert!(sock.exists(), "nothing was removed");
+    }
+
+    /// "Already gone" is not a failure: the daemon may have cleaned up, or
+    /// another login may have won the race. There is nothing left to bind
+    /// over, so the start proceeds.
+    #[test]
+    fn a_socket_that_vanished_under_us_is_not_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sd = SocketDir::open(&rt.join("control.sock"), me()).expect("owned 0700 dir");
+        assert!(
+            start_after_clearing(&sd, StaleSocket::Unlink),
+            "an absent socket is nothing to remove, not an error"
+        );
+    }
+
+    /// `LeaveAlone` is chosen when the connect said `NotFound`, and it must
+    /// stay a no-op: anything at the name is not ours to delete on that
+    /// evidence.
+    #[test]
+    fn leave_alone_never_touches_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        std::fs::write(&sock, b"someone else's").unwrap();
+        let sd = SocketDir::open(&sock, me()).expect("owned 0700 dir");
+        assert!(start_after_clearing(&sd, StaleSocket::LeaveAlone));
+        assert!(sock.exists(), "LeaveAlone must not unlink");
+    }
+
+    /// A daemon that answers is a daemon that is running, whatever it says.
+    /// An `Err` here would be read by `open_session` as "unreachable", and it
+    /// would then unlink a live daemon's socket and relaunch it.
+    #[test]
+    fn a_daemon_that_answers_error_is_still_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server = fake_daemon_answering(
+            &sock,
+            Response::Error("no such collection\nforged: unlocked root".into()),
+        );
+        try_send(
+            &sock,
+            &Request::Status,
+            me(),
+            "unlock",
+            Duration::from_secs(5),
+        )
+        .expect("a daemon that reports an error is still a running daemon");
+        server.join().unwrap();
+    }
+
+    /// The same for a reply this call never asked for. `Status` carries
+    /// peer-chosen collection ids, labels and warnings, so it is logged by
+    /// variant name only and none of it reaches the line.
+    #[test]
+    fn an_unexpected_response_variant_is_still_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let server = fake_daemon_answering(
+            &sock,
+            Response::Status {
+                collections: vec![crate::protocol::CollectionStatus {
+                    id: "default".into(),
+                    label: "\u{202e}forged label".into(),
+                    locked: false,
+                    items: 1,
+                    warning: Some("attacker text".into()),
+                }],
+                uptime_secs: 7,
+            },
+        );
+        try_send(
+            &sock,
+            &Request::Status,
+            me(),
+            "unlock",
+            Duration::from_secs(5),
+        )
+        .expect("an unexpected variant is still an answer");
+        server.join().unwrap();
+        assert_eq!(
+            Response::Status {
+                collections: Vec::new(),
+                uptime_secs: 0,
+            }
+            .variant_name(),
+            "Status",
+            "the log line is the variant name, never the peer's labels"
+        );
+    }
+
+    /// `parse_options` takes any `socket=` value verbatim, so these are all
+    /// reachable from a PAM config. A path with no final component gives
+    /// nothing to `unlinkat` or to `fstatat`, so it must be refused before
+    /// any directory is opened.
+    #[test]
+    fn socket_dir_refuses_a_path_with_no_usable_file_name() {
+        for p in ["/", "/run/user/0/..", "", "/run/user/0/."] {
+            assert!(
+                SocketDir::open(Path::new(p), me()).is_none(),
+                "socket={p} has no file name to address"
+            );
+        }
+    }
+
+    /// The length bound keeps `collection=` from bloating a syslog line or a
+    /// path; the boundary itself must be exactly `MAX_COLLECTION_LEN`.
+    #[test]
+    fn a_collection_longer_than_the_maximum_falls_back_to_the_default() {
+        let at_max = "a".repeat(MAX_COLLECTION_LEN);
+        assert!(collection_is_valid(&at_max));
+        assert_eq!(
+            parse_options(&[format!("collection={at_max}")]).collection,
+            at_max
+        );
+        let over = "a".repeat(MAX_COLLECTION_LEN + 1);
+        assert!(!collection_is_valid(&over));
+        assert_eq!(
+            parse_options(&[format!("collection={over}")]).collection,
+            "default"
+        );
+    }
+
+    /// `target_for` composes the user lookup with the vault-directory choice.
+    /// A name that does not resolve must yield nothing at all: a target
+    /// rooted at a bogus `/run/user/<uid>` would send root off to unlink and
+    /// connect inside a path chosen by whatever put that name in the config.
+    #[test]
+    fn target_for_refuses_a_user_that_does_not_resolve() {
+        let opts = parse_options(&[]);
+        assert!(target_for("definitely-not-a-user-9f2c", &opts).is_none());
+    }
+
+    #[test]
+    fn target_for_uses_the_vault_dir_override_and_the_users_runtime_dir() {
+        let user = std::env::var("USER").expect("USER set");
+        let t = target_for(&user, &parse_options(&[])).expect("current user resolves");
+        assert_eq!(t.uid, me());
+        assert!(
+            t.vault_dir.ends_with(DEFAULT_VAULT_SUBDIR),
+            "{}",
+            t.vault_dir.display()
+        );
+        assert_eq!(
+            t.sock,
+            socket_path_for_runtime_dir(Path::new(&format!("/run/user/{}", me())))
+        );
+
+        let t = target_for(&user, &parse_options(&["vault_dir=/srv/vaults".into()]))
+            .expect("current user resolves");
+        assert_eq!(t.vault_dir, PathBuf::from("/srv/vaults"));
+
+        // `socket=` is a test affordance, honoured only below root. This
+        // suite does not run as root, but say so rather than assume it.
+        if effective_uid() != 0 {
+            let t = target_for(&user, &parse_options(&["socket=/tmp/harness.sock".into()]))
+                .expect("current user resolves");
+            assert_eq!(t.sock, PathBuf::from("/tmp/harness.sock"));
+            assert_eq!(t.uid, effective_uid());
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Hook decisions
+    //
+    // `hooks.rs` only exists in the `--features pam` cdylib, so nothing below
+    // can go through libpam. What is tested here is what the hooks decide:
+    // the order of the checks, which paths clear the stashed password, and
+    // which paths are allowed to spend a derivation or a connect. Everything
+    // is real — a real `SocketDir` over a real directory, a real vault file, a
+    // real `Budget`, a real listener. The only injected parts are the two
+    // things the hook resolves through the `PamHandle`: the target user, and
+    // starting the daemon.
+    // -----------------------------------------------------------------
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// A target pointing at a runtime directory and a vault directory the
+    /// test controls, owned by whoever is running the test.
+    fn target_at(sock: PathBuf, vault_dir: &Path) -> Target {
+        Target {
+            sock,
+            uid: me(),
+            vault_dir: vault_dir.to_path_buf(),
+        }
+    }
+
+    /// A `resolve_target` that must never be called.
+    fn no_target_lookup(_: &Options) -> Option<Target> {
+        panic!("the target must not be resolved on this path");
+    }
+
+    /// A `start_daemon` that must never be called.
+    fn no_start(_: &Budget) -> bool {
+        panic!("the daemon must not be started on this path");
+    }
+
+    /// A listener that is bound but never accepts, so a test can assert
+    /// afterwards that nothing connected to it.
+    fn idle_listener(sock: &Path) -> UnixListener {
+        let l = UnixListener::bind(sock).unwrap();
+        l.set_nonblocking(true).unwrap();
+        l
+    }
+
+    fn nobody_connected(l: &UnixListener) {
+        match l.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("something connected to the control socket: {other:?}"),
+        }
+    }
+
+    /// A vault directory with a usable `default.vault`, plus a private runtime
+    /// directory to put the socket in.
+    fn session_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = private_dir(dir.path(), "vault");
+        write_vault(&vault, "default", header_with(LOGIN_KDF, SALT));
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        (dir, vault, sock)
+    }
+
+    /// The stash `authenticate` leaves behind is a login password sitting in
+    /// PAM data. Every path out of `open_session` has to clear it; the only
+    /// exception is the path that found nothing stashed in the first place.
+    #[test]
+    fn every_session_exit_path_clears_the_stashed_password() {
+        use SessionOutcome::*;
+        for outcome in [
+            NoTarget,
+            RefusedSocketDir,
+            NoVaultHeader,
+            BudgetSpent,
+            NoCallBudget,
+            Attempted,
+            Failed,
+            ConnectNotStale,
+            Started(StartOutcome::NoStartBudget),
+            Started(StartOutcome::StaleSocketStuck),
+            Started(StartOutcome::NoUser),
+            Started(StartOutcome::NotRetried {
+                waited: false,
+                revalidated: None,
+            }),
+            Started(StartOutcome::NotRetried {
+                waited: true,
+                revalidated: Some(false),
+            }),
+            Started(StartOutcome::RetryBudgetSpent),
+            Started(StartOutcome::NoRetryCallBudget),
+            Started(StartOutcome::Retried),
+        ] {
+            assert!(
+                outcome.clears_stash(),
+                "{outcome:?} would leave the login password in PAM data"
+            );
+        }
+        assert!(
+            !SessionOutcome::NoPassword.clears_stash(),
+            "there is nothing stashed to clear on this path"
+        );
+    }
+
+    /// No stash means `authenticate` never ran, or ran without a token. The
+    /// hook must stop immediately: no NSS lookup, no directory opened as root.
+    #[test]
+    fn a_session_with_no_stashed_password_does_nothing_at_all() {
+        let outcome =
+            open_session_decision(None, &[], &full_budget(), &no_target_lookup, &no_start);
+        assert_eq!(outcome, SessionOutcome::NoPassword);
+        assert!(!outcome.clears_stash());
+    }
+
+    #[test]
+    fn a_session_whose_target_does_not_resolve_clears_the_stash() {
+        let outcome =
+            open_session_decision(Some("hunter2"), &[], &full_budget(), &|_| None, &no_start);
+        assert_eq!(outcome, SessionOutcome::NoTarget);
+        assert!(outcome.clears_stash());
+    }
+
+    /// `SocketDir::open` is the gate on the user's own runtime directory. A
+    /// refusal there means root must not touch anything under that path — and
+    /// the stash still has to go.
+    #[test]
+    fn a_session_refusing_the_runtime_directory_clears_the_stash() {
+        let (dir, vault, _) = session_fixture();
+        let hostile = dir.path().join("world-writable");
+        std::fs::create_dir(&hostile).unwrap();
+        std::fs::set_permissions(&hostile, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let sock = hostile.join("control.sock");
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::RefusedSocketDir);
+        assert!(outcome.clears_stash());
+    }
+
+    /// No vault file means there is no salt and no KDF to derive under, so
+    /// there is nothing to send and nothing to start a daemon for.
+    #[test]
+    fn a_session_with_an_unreadable_vault_header_clears_the_stash() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = private_dir(dir.path(), "vault");
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &empty)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::NoVaultHeader);
+        assert!(outcome.clears_stash());
+    }
+
+    /// The ordinary case: the daemon is already listening, so one connect and
+    /// one derivation are all it takes, and the daemon receives the key rather
+    /// than the password.
+    #[test]
+    fn a_session_that_reaches_the_daemon_unlocks_on_the_first_connect() {
+        let (_dir, vault, sock) = session_fixture();
+        let server = fake_daemon(&sock);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        assert!(outcome.clears_stash());
+        let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
+        match server.join().unwrap() {
+            Request::UnlockWithKey { collection, key } => {
+                assert_eq!(collection, "default");
+                assert_eq!(&*key, expected.as_bytes());
+            }
+            ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// `auto_start=no` is a switch on unlinking and `systemctl` running as
+    /// root. A connect failure must not talk itself past it.
+    #[test]
+    fn auto_start_off_never_starts_the_daemon() {
+        let (_dir, vault, sock) = session_fixture();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &args(&["auto_start=no"]),
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::Failed);
+        assert!(outcome.clears_stash());
+    }
+
+    /// Only an errno that proves nobody is behind the socket may lead to a
+    /// start. A name that is not a socket at all is refused by `connect_path`
+    /// with `InvalidInput`, which proves nothing of the sort.
+    #[test]
+    fn a_connect_error_that_does_not_prove_the_daemon_is_gone_starts_nothing() {
+        let (_dir, vault, sock) = session_fixture();
+        std::fs::write(&sock, b"not a socket").unwrap();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::ConnectNotStale);
+        assert!(outcome.clears_stash());
+        assert!(
+            sock.exists(),
+            "a name that is not a socket must not be unlinked"
+        );
+    }
+
+    /// A stale socket that cannot be removed means the daemon could not bind
+    /// it either, so it is not started.
+    #[test]
+    fn a_stale_socket_that_cannot_be_removed_stops_the_session_start() {
+        let (dir, vault, sock) = session_fixture();
+        let rt = sock.parent().unwrap().to_path_buf();
+        // Bind and drop: the inode stays, so a connect is refused.
+        drop(UnixListener::bind(&sock).unwrap());
+        // Owned and private, so `SocketDir::open` accepts it, but not writable
+        // by us, so `unlinkat` fails.
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(dir);
+        assert_eq!(
+            outcome,
+            SessionOutcome::Started(StartOutcome::StaleSocketStuck)
+        );
+        assert!(outcome.clears_stash());
+    }
+
+    /// Without a user name there is nothing to hand `systemctl --machine=`,
+    /// and the hook does not go on to wait or retry either.
+    #[test]
+    fn a_session_with_no_user_name_starts_nothing_and_retries_nothing() {
+        let (_dir, vault, sock) = session_fixture();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &|_| false,
+        );
+        assert_eq!(outcome, SessionOutcome::Started(StartOutcome::NoUser));
+        assert!(outcome.clears_stash());
+    }
+
+    // The retry unlock is the second time root connects into a directory the
+    // logging-in user controls, and the daemon-start window is exactly when
+    // they could have changed it. It runs only if `waited && revalidate()`,
+    // and the four tests below are the four combinations.
+
+    /// waited = true, revalidate = true: the only combination that retries.
+    #[test]
+    fn the_retry_runs_when_the_socket_appeared_and_the_directory_still_checks_out() {
+        let (_dir, vault, sock) = session_fixture();
+        let started: std::sync::Mutex<Option<std::thread::JoinHandle<Request>>> =
+            std::sync::Mutex::new(None);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &|_| {
+                *started.lock().unwrap() = Some(fake_daemon(&sock));
+                true
+            },
+        );
+        assert_eq!(outcome, SessionOutcome::Started(StartOutcome::Retried));
+        assert!(outcome.clears_stash());
+        let server = started.lock().unwrap().take().expect("the daemon started");
+        let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
+        match server.join().unwrap() {
+            Request::UnlockWithKey { collection, key } => {
+                assert_eq!(collection, "default");
+                assert_eq!(&*key, expected.as_bytes());
+            }
+            ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// waited = false, directory fine: no retry, and `revalidate` is not even
+    /// consulted — `revalidated: None` is what records that.
+    #[test]
+    fn no_retry_when_the_socket_never_appeared() {
+        let (_dir, vault, sock) = session_fixture();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &Budget::new(Duration::from_millis(400)),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &|_| true,
+        );
+        assert_eq!(
+            outcome,
+            SessionOutcome::Started(StartOutcome::NotRetried {
+                waited: false,
+                revalidated: None,
+            })
+        );
+        assert!(outcome.clears_stash());
+    }
+
+    /// waited = false, directory *not* fine: still no retry, and still no
+    /// `revalidate` call. If the wait were not short-circuiting, this would
+    /// come back as `Some(false)` rather than `None`.
+    #[test]
+    fn no_retry_and_no_revalidation_when_the_socket_never_appeared() {
+        let (dir, vault, sock) = session_fixture();
+        let rt = sock.parent().unwrap().to_path_buf();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &Budget::new(Duration::from_millis(400)),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &|_| {
+                std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o777)).unwrap();
+                true
+            },
+        );
+        std::fs::set_permissions(
+            sock.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        drop(dir);
+        assert_eq!(
+            outcome,
+            SessionOutcome::Started(StartOutcome::NotRetried {
+                waited: false,
+                revalidated: None,
+            }),
+            "revalidate must not be consulted when the wait timed out"
+        );
+    }
+
+    /// waited = true, revalidate = false: the socket turned up, but the
+    /// directory it is in was opened to other local users while the daemon was
+    /// starting. Root must not connect into it, and nothing may be sent.
+    #[test]
+    fn no_retry_when_the_directory_was_opened_up_during_the_start_window() {
+        let (dir, vault, sock) = session_fixture();
+        let rt = sock.parent().unwrap().to_path_buf();
+        let listener = std::sync::Mutex::new(None);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &|_| {
+                *listener.lock().unwrap() = Some(idle_listener(&sock));
+                std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o777)).unwrap();
+                true
+            },
+        );
+        nobody_connected(listener.lock().unwrap().as_ref().expect("bound"));
+        std::fs::set_permissions(
+            sock.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        drop(dir);
+        assert_eq!(
+            outcome,
+            SessionOutcome::Started(StartOutcome::NotRetried {
+                waited: true,
+                revalidated: Some(false),
+            })
+        );
+        assert!(outcome.clears_stash());
+    }
+
+    /// A spent budget must stop the session before Argon2, before any connect,
+    /// and it must still clear the stash.
+    ///
+    /// The variant it stops at is `NoVaultHeader`, not `BudgetSpent`: the
+    /// header read consults the same budget and refuses first. The later
+    /// budget guards in the hook are therefore defence in depth — see
+    /// `SessionOutcome::BudgetSpent`.
+    #[test]
+    fn a_spent_session_budget_starts_no_derivation_and_no_call() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = idle_listener(&sock);
+        let start = Instant::now();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &Budget::new(Duration::ZERO),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        let elapsed = start.elapsed();
+        nobody_connected(&listener);
+        assert_eq!(outcome, SessionOutcome::NoVaultHeader);
+        assert!(outcome.clears_stash());
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "no Argon2 may run on a spent budget: took {elapsed:?}"
+        );
+    }
+
+    // ----- chauthtok -----
+
+    /// `PAM_PRELIM_CHECK` is the stack asking whether the change *could* work.
+    /// Nothing may be read, derived or sent on that pass — the resolver below
+    /// panics if it is reached, so returning at all is the assertion.
+    #[test]
+    fn a_prelim_check_returns_before_doing_any_work() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = idle_listener(&sock);
+        let start = Instant::now();
+        let outcome = chauthtok_decision(
+            PAM_PRELIM_CHECK,
+            Some("old-pw"),
+            Some("new-pw"),
+            &args(&["definitely-not-an-option"]),
+            &full_budget(),
+            &no_target_lookup,
+        );
+        let elapsed = start.elapsed();
+        let _ = &vault;
+        nobody_connected(&listener);
+        assert_eq!(outcome, ChauthtokOutcome::Prelim);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "the prelim pass must do nothing: took {elapsed:?}"
+        );
+    }
+
+    /// Only that one bit short-circuits: the update pass, and any other flag
+    /// libpam sets alongside it, must go on to do the work.
+    #[test]
+    fn other_chauthtok_flags_do_not_short_circuit() {
+        // PAM_UPDATE_AUTHTOK and PAM_CHANGE_EXPIRED_AUTHTOK.
+        for flags in [0, 0x2000, 0x1] {
+            assert_eq!(
+                chauthtok_decision(flags, None, None, &[], &full_budget(), &no_target_lookup),
+                ChauthtokOutcome::Missing("old and new passwords"),
+                "flags {flags:#x} must not be read as a prelim check"
+            );
+        }
+        assert_eq!(
+            chauthtok_decision(
+                PAM_PRELIM_CHECK | 0x2000,
+                None,
+                None,
+                &[],
+                &full_budget(),
+                &no_target_lookup
+            ),
+            ChauthtokOutcome::Prelim
+        );
+    }
+
+    /// A password change with a password missing is refused before the vault
+    /// file is opened: the resolver panics if it is reached.
+    #[test]
+    fn a_missing_old_or_new_password_is_refused_without_touching_the_vault() {
+        for (old, new, missing) in [
+            (None, None, "old and new passwords"),
+            (None, Some("new-pw"), "the old password"),
+            (Some("old-pw"), None, "the new password"),
+        ] {
+            assert_eq!(
+                chauthtok_decision(0, old, new, &[], &full_budget(), &no_target_lookup),
+                ChauthtokOutcome::Missing(missing),
+                "old={old:?} new={new:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_password_change_whose_target_does_not_resolve_stops() {
+        assert_eq!(
+            chauthtok_decision(
+                0,
+                Some("old-pw"),
+                Some("new-pw"),
+                &[],
+                &full_budget(),
+                &|_| None
+            ),
+            ChauthtokOutcome::NoTarget
+        );
+    }
+
+    #[test]
+    fn a_password_change_refuses_an_untrusted_runtime_directory() {
+        let (dir, vault, _) = session_fixture();
+        let hostile = dir.path().join("world-writable");
+        std::fs::create_dir(&hostile).unwrap();
+        std::fs::set_permissions(&hostile, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let sock = hostile.join("control.sock");
+        assert_eq!(
+            chauthtok_decision(
+                0,
+                Some("old-pw"),
+                Some("new-pw"),
+                &[],
+                &full_budget(),
+                &|_| { Some(target_at(sock.clone(), &vault)) }
+            ),
+            ChauthtokOutcome::RefusedSocketDir
+        );
+    }
+
+    #[test]
+    fn a_password_change_without_a_vault_header_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = private_dir(dir.path(), "vault");
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        assert_eq!(
+            chauthtok_decision(
+                0,
+                Some("old-pw"),
+                Some("new-pw"),
+                &[],
+                &full_budget(),
+                &|_| { Some(target_at(sock.clone(), &empty)) }
+            ),
+            ChauthtokOutcome::NoVaultHeader
+        );
+    }
+
+    /// The whole password hook: both keys derived locally, the old one under
+    /// the header's own salt and the new one under a fresh salt, and only keys
+    /// on the wire.
+    #[test]
+    fn a_password_change_sends_both_locally_derived_keys() {
+        let (_dir, vault, sock) = session_fixture();
+        let server = fake_daemon(&sock);
+        let outcome = chauthtok_decision(
+            0,
+            Some("old-pw"),
+            Some("new-pw"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+        );
+        assert_eq!(outcome, ChauthtokOutcome::Sent);
+        let expected_old = crypto::derive_key(b"old-pw", &SALT, LOGIN_KDF).unwrap();
+        match server.join().unwrap() {
+            Request::ChangeKey {
+                collection,
+                old_key,
+                new_salt,
+                new_kdf,
+                new_key,
+            } => {
+                assert_eq!(collection, "default");
+                assert_eq!(&*old_key, expected_old.as_bytes());
+                assert_ne!(new_salt, SALT, "the new key needs a fresh salt");
+                assert_eq!(new_kdf, LOGIN_KDF);
+                let expected_new = crypto::derive_key(b"new-pw", &new_salt, LOGIN_KDF).unwrap();
+                assert_eq!(&*new_key, expected_new.as_bytes());
+            }
+            ref other => panic!("expected ChangeKey, got {}", other.variant_name()),
+        }
+    }
+
+    #[test]
+    fn a_password_change_that_cannot_reach_the_daemon_reports_it() {
+        let (_dir, vault, sock) = session_fixture();
+        assert_eq!(
+            chauthtok_decision(
+                0,
+                Some("old-pw"),
+                Some("new-pw"),
+                &[],
+                &full_budget(),
+                &|_| { Some(target_at(sock.clone(), &vault)) }
+            ),
+            ChauthtokOutcome::SendFailed
+        );
+    }
+
+    /// Argon2 is not interruptible, so the budget can only be checked
+    /// *between* derivations — and `chauthtok` runs two. A budget that dies
+    /// during the second one must abandon the change rather than send it: the
+    /// socket below has nothing listening, so a send would come back as
+    /// `SendFailed` and a request that never left would not.
+    ///
+    /// Hitting that window means picking a total in `(d, 2d)` where `d` is one
+    /// derivation. `d` is measured rather than guessed, and re-measured for
+    /// each attempt, because a loaded machine moves it: an attempt whose first
+    /// derivation overran the whole budget stops one step earlier, at
+    /// `NoRequest`. Either way nothing is sent, which every attempt asserts.
+    #[test]
+    fn a_budget_that_dies_between_the_derivations_sends_nothing() {
+        let (_dir, vault, sock) = session_fixture();
+        // The fastest of a few runs, so a cold first allocation of the Argon2
+        // block does not inflate the estimate: overestimating `d` is the one
+        // error that would put the whole pair *inside* the budget.
+        let one_derivation = || {
+            (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    crypto::derive_key(b"calibrate", &SALT, LOGIN_KDF).unwrap();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        one_derivation();
+        let mut hit = false;
+        for _ in 0..8 {
+            let d = one_derivation();
+            let outcome = chauthtok_decision(
+                0,
+                Some("old-pw"),
+                Some("new-pw"),
+                &[],
+                &Budget::new(d + d / 3),
+                &|_| Some(target_at(sock.clone(), &vault)),
+            );
+            match outcome {
+                // The window was hit: both derivations ran, the request was
+                // built, and the spent budget stopped it before the socket.
+                ChauthtokOutcome::BudgetSpent => hit = true,
+                // The first derivation alone outran the budget, so the second
+                // was never started. Still nothing sent.
+                ChauthtokOutcome::NoRequest => {}
+                other => panic!(
+                    "a spent budget must not reach the socket, got {other:?} \
+                     (one derivation took {d:?})"
+                ),
+            }
+            if hit {
+                break;
+            }
+        }
+        assert!(
+            hit,
+            "the budget never expired between the two derivations in 8 attempts"
+        );
+    }
+
+    // ----- authenticate -----
+
+    /// `authenticate` stashes what PAM already collected and never prompts.
+    /// The three cases are distinguished because they are logged differently
+    /// and only one of them leaves a password behind to clear.
+    #[test]
+    fn authenticate_stashes_only_a_token_it_was_actually_given() {
+        assert_eq!(
+            authenticate_decision(Ok(Some("hunter2"))),
+            AuthOutcome::Stash
+        );
+        assert_eq!(authenticate_decision(Ok(None)), AuthOutcome::NoToken);
+        assert_eq!(
+            authenticate_decision(Err("PAM_AUTHTOK_ERR")),
+            AuthOutcome::Unavailable
+        );
+        // An empty token is still a token: PAM collected it, so it is stashed
+        // and `open_session` derives from it like any other.
+        assert_eq!(authenticate_decision(Ok(Some(""))), AuthOutcome::Stash);
+    }
+
+    /// `socket=` is taken verbatim from the PAM config, so it may be a bare
+    /// name with no directory component. There is then nothing to open,
+    /// validate or hold — and nothing a symlink swap could redirect — so
+    /// `SocketDir` keeps the name exactly as given and lets the connect fail
+    /// with the real errno, rather than refusing or inventing a directory.
+    #[test]
+    fn socket_dir_accepts_a_bare_name_with_no_directory_to_hold() {
+        let sd = SocketDir::open(Path::new("control.sock"), me()).expect("that is a file name");
+        assert!(!sd.is_open(), "there is no parent directory to hold open");
+        assert_eq!(sd.socket_path(), Path::new("control.sock"));
+        assert_eq!(
+            sd.connect_path().expect("nothing to check without a dirfd"),
+            Path::new("control.sock"),
+            "no dirfd means no /proc/self/fd rewrite"
+        );
+    }
+
+    /// A vault file whose header is cut short must be refused, not read
+    /// short: the prefix says how many bytes the header occupies, and a file
+    /// that ends before that is either truncated or a decoy. Reading what is
+    /// there and deriving from it would aim the login at an attacker-chosen
+    /// salt.
+    #[test]
+    fn refuses_a_vault_file_whose_header_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
+        let full = std::fs::read(&path).unwrap();
+        assert!(
+            full.len() > format::PREFIX_LEN + 1,
+            "the fixture must have a header to truncate"
+        );
+        // Long enough for the prefix (so the length is read and believed),
+        // far too short for the header it announces.
+        std::fs::write(&path, &full[..format::PREFIX_LEN + 1]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            vault_header(dir.path(), "default", me(), &full_budget()),
+            None
+        );
+    }
+
+    /// `derive` exists to be non-panicking: it is called as root inside a
+    /// login, with parameters that came off disk. Argon2 rejecting them must
+    /// produce `None` and a log line, never an unwind through the C boundary.
+    #[test]
+    fn derive_reports_parameters_argon2_rejects_instead_of_panicking() {
+        let unusable = KdfParams {
+            m_cost_kib: 0,
+            t_cost: 0,
+            p_cost: 0,
+        };
+        assert!(
+            crypto::derive_key(b"pw", &SALT, unusable).is_err(),
+            "the fixture must be parameters Argon2 refuses"
+        );
+        assert!(derive("pw", &SALT, unusable, &full_budget()).is_none());
     }
 }

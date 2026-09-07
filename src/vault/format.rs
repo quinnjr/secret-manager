@@ -385,6 +385,24 @@ mod tests {
         ));
     }
 
+    /// The declared length is attacker-controlled and is what a caller
+    /// allocates against, so `MAX_HEADER` must hold at the exact boundary —
+    /// a cap that drifts by one is a cap that can drift further.
+    #[test]
+    fn a_declared_header_length_over_the_limit_is_refused() {
+        let prefix = |len: u32| {
+            let mut p = MAGIC.to_vec();
+            p.extend_from_slice(&len.to_le_bytes());
+            p
+        };
+        let err = header_prefix_len(&prefix(MAX_HEADER as u32 + 1)).unwrap_err();
+        assert!(matches!(err, FormatError::Truncated), "got {err:?}");
+        assert_eq!(
+            header_prefix_len(&prefix(MAX_HEADER as u32)).unwrap(),
+            PREFIX_LEN + MAX_HEADER
+        );
+    }
+
     #[test]
     fn old_version_error_tells_the_user_to_recreate() {
         let mut h = header(vec![]);

@@ -13,7 +13,7 @@ BINDIR   = $(DESTDIR)$(PREFIX)/bin
 SHELL = /bin/sh
 .SHELLFLAGS = -ec
 
-.PHONY: build install uninstall test fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list
+.PHONY: build install uninstall test coverage coverage-html coverage-gaps test-pam fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list
 
 # Two builds of one crate: the default feature set gives the binary (no
 # libpam, no PAM entry points), and the `pam` feature alone gives the cdylib
@@ -34,6 +34,14 @@ test:
 	# crate back in with its default features, which the mutual-exclusion
 	# guard in src/lib.rs correctly rejects.
 	$(CARGO) build --no-default-features --features pam --lib
+
+# tests/pam_stack.rs drives the module through a real libpam stack, and it
+# loads $(PAMSO) rather than building it (a nested cargo would deadlock on the
+# build lock). It skips when that file is missing, so this target builds it
+# first; a plain `cargo test` runs it too, against whatever `make build` left.
+test-pam:
+	CARGO_TARGET_DIR=target/pam $(CARGO) build --release --no-default-features --features pam
+	$(CARGO) test --test pam_stack -- --nocapture
 
 install:
 	test -x $(BIN) && test -f $(PAMSO) && test -f $(COMPLETIONS_DIR)/sm && test -f $(COMPLETIONS_DIR)/_sm && test -f $(COMPLETIONS_DIR)/sm.fish || { echo "run 'make build' first (as your normal user)" >&2; exit 1; }
@@ -129,3 +137,27 @@ fuzz-one:
 fuzz-coverage:
 	@test -n "$(TARGET)" || { echo "usage: make fuzz-coverage TARGET=<name>" >&2; exit 1; }
 	$(CARGO) $(FUZZ_NIGHTLY) fuzz coverage $(TARGET)
+
+# ---------------------------------------------------------------- coverage
+#
+# `--no-fail-fast` because tests/packaging.rs drives `make install` against
+# target/release, which cargo-llvm-cov relocates; those tests are about the
+# Makefile rather than Rust code, so they contribute nothing to the figure and
+# a transient failure there must not abort the report.
+#
+# Note the figure counts the inline `#[cfg(test)]` modules as well as the code
+# under test, so a file's percentage is not purely a statement about how well
+# its production code is exercised. `coverage-gaps` is the useful one: it
+# lists the exact uncovered lines to look at.
+COV = $(CARGO) llvm-cov --no-fail-fast
+
+coverage:
+	$(COV) --summary-only
+
+coverage-html:
+	$(COV) --html
+	@echo "open target/llvm-cov/html/index.html"
+
+# Uncovered lines, per file. Reuses the last run's profile data.
+coverage-gaps:
+	$(CARGO) llvm-cov report --show-missing-lines

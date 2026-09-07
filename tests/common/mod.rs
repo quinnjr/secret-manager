@@ -113,6 +113,27 @@ impl Fixture {
         idle: Duration,
         mutate: impl FnOnce(&mut Config),
     ) -> Fixture {
+        Self::start_inner(pin, extra_pinentry_env, idle, mutate, true).await
+    }
+
+    /// The default fixture, except that the alias file is never written, so
+    /// `ReadAlias("default")` answers `/`.
+    ///
+    /// Every other constructor installs `default = "default"` before the
+    /// daemon starts, which makes the CLI's "no default collection" path
+    /// unreachable — and that path is what every `sm set` and `sm ssh add`
+    /// hits on a machine where `sm init` has never run.
+    pub async fn start_without_default_alias() -> Fixture {
+        Self::start_inner(Some(PASSWORD), Vec::new(), Duration::ZERO, |_| {}, false).await
+    }
+
+    async fn start_inner(
+        pin: Option<&str>,
+        extra_pinentry_env: Vec<(String, String)>,
+        idle: Duration,
+        mutate: impl FnOnce(&mut Config),
+        write_default_alias: bool,
+    ) -> Fixture {
         let bus = TestBus::start();
         let data_dir = tempfile::tempdir().unwrap();
         let runtime_dir = tempfile::tempdir().unwrap();
@@ -125,11 +146,13 @@ impl Fixture {
             KdfParams::FAST_FOR_TESTS,
         )
         .unwrap();
-        secret_manager::dbus::state::save_aliases_to(
-            &vault_dir,
-            &BTreeMap::from([("default".to_string(), "default".to_string())]),
-        )
-        .unwrap();
+        if write_default_alias {
+            secret_manager::dbus::state::save_aliases_to(
+                &vault_dir,
+                &BTreeMap::from([("default".to_string(), "default".to_string())]),
+            )
+            .unwrap();
+        }
         let pinentry_log = runtime_dir.path().join("pinentry.log");
         let mut config = Config {
             vault: VaultConfig {
@@ -251,6 +274,12 @@ impl Fixture {
         let mut cmd = assert_cmd::Command::new(env!("CARGO_BIN_EXE_secret-manager"));
         cmd.env_clear();
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+        // The CLI runs as a child process, so its coverage is only recorded if
+        // it can write its own profile. `env_clear` above is deliberate — the
+        // CLI must not inherit the test runner's environment — but it also
+        // removes the variable the profiler needs, which silently reports the
+        // whole CLI as unexercised however many times these tests drive it.
+        cmd.envs(profiling_env());
         cmd.env("HOME", self.data_dir.path());
         for (k, v) in self.envs() {
             cmd.env(k, v);
@@ -300,4 +329,20 @@ where
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     false
+}
+
+/// The coverage profiler's output path, to survive an `env_clear()`.
+///
+/// A profiled child process records nothing unless it is told where to write
+/// its counters, so a test that clears the environment before running the CLI
+/// silently reports that whole run as unexercised — however much of the CLI it
+/// actually drove. This is not hypothetical: it hid roughly eight points of
+/// measured coverage across the CLI until it was found.
+///
+/// Chain it after every `env_clear()`: `.env_clear().envs(common::profiling_env())`.
+pub fn profiling_env() -> Vec<(String, String)> {
+    ["LLVM_PROFILE_FILE", "LLVM_PROFILE_DIR"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
+        .collect()
 }

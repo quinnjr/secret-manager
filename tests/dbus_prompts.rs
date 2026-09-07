@@ -1020,3 +1020,1423 @@ async fn cancelling_one_collection_does_not_prompt_for_the_next() {
         "a second dialog was raised after cancel:\n{log}"
     );
 }
+
+/// `ServiceState::check_prompt_quota` is unit-tested directly, and its session
+/// twin is covered end to end, but nothing proved the prompt cap is actually
+/// wired into the three call sites that allocate a prompt, that its refusal
+/// survives the trip to the wire, that a refused call registers no owner, or
+/// that the cap is scoped to one sender rather than to the daemon.
+///
+/// `Unlock` is called `MAX_PROMPTS_PER_OWNER` times without ever running or
+/// dismissing a prompt, so every one of them stays outstanding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outstanding_prompts_are_capped_per_client() {
+    use secret_manager::dbus::state::MAX_PROMPTS_PER_OWNER;
+
+    let fx = Fixture::start().await; // `default` starts locked, so each Unlock prompts
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    for i in 0..MAX_PROMPTS_PER_OWNER {
+        let (unlocked, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+        assert!(unlocked.is_empty(), "call {i}");
+        assert!(
+            prompt
+                .as_str()
+                .starts_with("/org/freedesktop/secrets/prompt/"),
+            "call {i} got no prompt: {prompt}"
+        );
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER
+    );
+
+    let err = service
+        .unlock(&[fx.default_collection()])
+        .await
+        .unwrap_err();
+    match &err {
+        zbus::Error::MethodError(name, desc, _) => {
+            assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.Failed");
+            assert!(
+                desc.as_deref()
+                    .unwrap_or_default()
+                    .contains("too many outstanding prompts"),
+                "{desc:?}"
+            );
+        }
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER,
+        "a refused Unlock must not have registered a prompt owner"
+    );
+
+    // The cap counts prompts, not unlocks: `CreateCollection` draws on the
+    // same per-client budget and is refused by the same guard.
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Over Quota"),
+    )]);
+    let err = service
+        .create_collection(props.clone(), "")
+        .await
+        .unwrap_err();
+    match &err {
+        zbus::Error::MethodError(name, desc, _) => {
+            assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.Failed");
+            assert!(
+                desc.as_deref()
+                    .unwrap_or_default()
+                    .contains("too many outstanding prompts"),
+                "{desc:?}"
+            );
+        }
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER,
+        "a refused CreateCollection must not have registered a prompt owner"
+    );
+    assert_eq!(
+        service.collections().await.unwrap(),
+        vec![fx.default_collection()],
+        "a refused CreateCollection must not have created a collection"
+    );
+
+    // A second client has its own budget: one greedy application cannot deny
+    // the prompt surface to everybody else on the bus.
+    let other_conn = fx.client().await;
+    let other = ServiceProxy::new(&other_conn).await.unwrap();
+    let (_, prompt) = other.unlock(&[fx.default_collection()]).await.unwrap();
+    assert!(
+        prompt
+            .as_str()
+            .starts_with("/org/freedesktop/secrets/prompt/"),
+        "a second client was refused a prompt because of another client's quota"
+    );
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER + 1
+    );
+}
+
+/// `CreateCollection`'s alias validation is a separate code path from
+/// `SetAlias`'s, and it is the one that keeps a client-chosen name out of
+/// `paths::alias` (whose `expect` assumes a valid object-path segment) and out
+/// of `aliases.toml`. Every rejected name must fail before a prompt or a
+/// collection exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_collection_rejects_an_invalid_alias_name() {
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Bad Alias"),
+    )]);
+
+    for alias in ["bad name", "a/b", "../default", "with-dash"] {
+        let err = service
+            .create_collection(props.clone(), alias)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error_name(&err),
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            "alias {alias:?} was not rejected as invalid"
+        );
+        assert!(
+            fx.daemon.state.lock().await.prompt_owners.is_empty(),
+            "alias {alias:?} allocated a prompt before it was rejected"
+        );
+        assert_eq!(
+            service.collections().await.unwrap(),
+            vec![fx.default_collection()],
+            "alias {alias:?} created a collection"
+        );
+    }
+    assert!(
+        !fx.pinentry_log().contains("SETREPEAT"),
+        "a rejected alias raised a passphrase dialog:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// A prompt whose owner disconnects *after* it has claimed its commit gate is
+/// deliberately not aborted (`daemon::watch_clients` lets committed work
+/// finish), so it is the prompt itself that must undo what it opened: the
+/// re-lock loop at the end of `prompt::run`'s `Unlock` arm.
+///
+/// Reaching that branch needs the disconnect to land inside the gate's window,
+/// which is claimed the moment pinentry answers and reset at the top of the
+/// next collection. The window is widened deterministically by giving the
+/// first collection expensive KDF parameters: the disconnect happens while
+/// Argon2 is still running, which is provably after the answer (so the gate is
+/// claimed) and provably before the unlock completes (so it has not been
+/// reset). Both facts are asserted before the connection is closed.
+///
+/// The two `CollectionChanged` signals for `slow` are what distinguish this
+/// from a vacuous pass: they are the unlock and the re-lock. Without the
+/// re-lock loop the second one never arrives and the vault stays open with no
+/// owner left to close it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_departed_owners_prompt_relocks_the_collection_it_opened() {
+    // Roughly 1.7 s of Argon2 in a debug build — long enough that the
+    // disconnect lands squarely inside the derivation.
+    let slow_kdf = secret_manager::vault::crypto::KdfParams {
+        m_cost_kib: 256 * 1024,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_DELAY".to_string(), "1".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    secret_manager::vault::Vault::create(
+        &dir.join("slow.vault"),
+        "Slow",
+        common::PASSWORD.as_bytes(),
+        slow_kdf,
+    )
+    .unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    // A connection that outlives the owner, so the signals the daemon emits
+    // while the owner is gone are still observed.
+    let watcher_conn = fx.client().await;
+    let watcher = ServiceProxy::new(&watcher_conn).await.unwrap();
+    let mut changed = watcher.receive_collection_changed().await.unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (_, prompt) = service
+        .unlock(&[paths::collection("slow"), fx.default_collection()])
+        .await
+        .unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    proxy.prompt("").await.unwrap();
+
+    // The fake pinentry records END the instant it has answered the dialog.
+    let timing = std::path::PathBuf::from(format!("{}.timing", fx.pinentry_log.display()));
+    assert!(
+        common::wait_for(Duration::from_secs(15), || async {
+            std::fs::read_to_string(&timing)
+                .unwrap_or_default()
+                .contains("END")
+        })
+        .await,
+        "timing assumption: the first dialog is answered within 15s"
+    );
+    {
+        let st = fx.daemon.state.lock().await;
+        // Answered but not yet open: the derivation is in flight, so the
+        // commit gate is claimed and has not been reset for a next collection.
+        assert!(
+            st.collections["slow"].is_locked(),
+            "timing assumption: the derivation finished before the disconnect, \
+             so the commit gate may already have been reset"
+        );
+        assert!(
+            st.prompt_owners.contains_key(prompt.as_str()),
+            "timing assumption: the prompt is still outstanding"
+        );
+    }
+
+    drop(proxy);
+    drop(service);
+    conn.close().await.unwrap();
+
+    // Two changes for `slow`: unlocked by the running task, then re-locked by
+    // the branch under test.
+    let mut slow_changes = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while slow_changes < 2 {
+        let sig = tokio::time::timeout_at(deadline, changed.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("only {slow_changes} CollectionChanged for 'slow'; the vault it opened was never re-locked")
+            })
+            .unwrap();
+        if sig.args().unwrap().collection == paths::collection("slow") {
+            slow_changes += 1;
+        }
+    }
+
+    let st = fx.daemon.state.lock().await;
+    assert!(
+        st.collections["slow"].is_locked(),
+        "the prompt left a vault open for an owner that had gone away"
+    );
+    assert!(
+        st.collections["default"].is_locked(),
+        "a dialog was raised, and answered, for a collection after the owner disconnected"
+    );
+    assert!(st.prompt_owners.is_empty());
+    assert!(st.prompt_tasks.is_empty());
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        1,
+        "a dialog was raised for the second collection after the owner disconnected:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// A pinentry binary that cannot be started at all (bad path in the config, an
+/// uninstalled helper) must fail the prompt closed and promptly: one
+/// `Completed(true, [])`, no three-attempt retry loop, no vault opened, and no
+/// owner entry left behind to eat the client's prompt quota.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unlock_with_an_unstartable_pinentry_is_dismissed() {
+    let fx = Fixture::start_with_config(|c| {
+        c.prompt.pinentry = "/nonexistent/secret-manager-pinentry".to_string();
+    })
+    .await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let (unlocked, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    assert!(unlocked.is_empty());
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(dismissed, "an unstartable pinentry must dismiss the prompt");
+    assert!(Vec::<OwnedObjectPath>::try_from(result).unwrap().is_empty());
+    assert!(coll.locked().await.unwrap());
+    assert!(
+        fx.daemon.state.lock().await.prompt_owners.is_empty(),
+        "a failed prompt left its owner entry behind"
+    );
+    assert!(
+        fx.pinentry_log().is_empty(),
+        "the configured pinentry was overridden, so nothing should have run:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// `Collection.Delete` refuses a locked collection up front, but the
+/// confirmation dialog it raises is a human-scale wait, and the collection can
+/// be locked (`sm lock`, the idle timer) while it is on screen. The
+/// post-confirmation guard in `prompt::delete_collection` is what stops a
+/// confirmed delete from unlinking a vault that has since been re-sealed —
+/// and, because the check happens after the collection has been removed from
+/// `collections`, from leaving the daemon an entry short.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_confirmed_after_the_collection_relocks_is_refused() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![
+            ("FAKE_CONFIRM".to_string(), "yes".to_string()),
+            // Holds the confirmation dialog open, the way a human would.
+            ("FAKE_DELAY".to_string(), "2".to_string()),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    fx.unlock_default().await;
+    let vault_path = fx
+        .data_dir
+        .path()
+        .join("secret-manager")
+        .join("default.vault");
+    let before = std::fs::read(&vault_path).unwrap();
+
+    let conn = fx.client().await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let prompt = coll.delete().await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+
+    // The fake pinentry logs the command before it answers it, so a CONFIRM in
+    // the log means the dialog is up and still waiting.
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            fx.pinentry_log().contains("CONFIRM")
+        })
+        .await,
+        "timing assumption: the confirmation dialog is raised within 10s"
+    );
+    assert!(
+        fx.daemon
+            .state
+            .lock()
+            .await
+            .prompt_owners
+            .contains_key(prompt.as_str()),
+        "timing assumption: the dialog is still unanswered, so the prompt is outstanding"
+    );
+
+    // `sm lock` while the dialog waits.
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(
+            &sock,
+            &secret_manager::protocol::Request::Lock {
+                collection: Some("default".to_string()),
+            },
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        "timing assumption: the collection is locked before the confirmation lands"
+    );
+
+    let sig = tokio::time::timeout(Duration::from_secs(15), completed.next())
+        .await
+        .expect("the prompt completes")
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(
+        args.dismissed,
+        "a confirmed delete of a re-locked collection must report as dismissed"
+    );
+    assert_eq!(
+        OwnedObjectPath::try_from(args.result.try_to_owned().unwrap())
+            .unwrap()
+            .as_str(),
+        "/"
+    );
+    assert!(
+        fx.pinentry_log().contains("CONFIRM"),
+        "the confirmation was never asked for, so the guard under test was not reached"
+    );
+
+    let st = fx.daemon.state.lock().await;
+    assert!(
+        st.collections.contains_key("default"),
+        "the refused delete left the collection missing from state"
+    );
+    assert!(st.collections["default"].is_locked());
+    drop(st);
+    assert_eq!(
+        std::fs::read(&vault_path).unwrap(),
+        before,
+        "the refused delete altered the vault file"
+    );
+}
+
+/// A prompt whose owner disconnects must re-lock every collection it opened,
+/// **including when the task is aborted**.
+///
+/// The commit gate is reset at the top of every collection, so a client that
+/// vanishes while a *later* dialog is on screen leaves the gate `false`.
+/// `watch_clients` therefore aborts the task — correctly, since nothing is
+/// half-committed — but an abort takes effect at an await point and never
+/// reaches the re-lock branch at the end of the loop. Any collection opened in
+/// an earlier iteration was left decrypted in memory with no owner.
+///
+/// The sibling test `an_owner_disconnect_stops_the_remaining_unlock_dialogs`
+/// sits in exactly this state and only asserts about a collection the prompt
+/// never opened, so it passes either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aborted_prompt_relocks_the_collections_it_had_already_opened() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_DELAY".to_string(), "2".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    secret_manager::vault::Vault::create(
+        &dir.join("second.vault"),
+        "second",
+        common::PASSWORD.as_bytes(),
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let (_, prompt) = service
+        .unlock(&[fx.default_collection(), paths::collection("second")])
+        .await
+        .unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    proxy.prompt("").await.unwrap();
+
+    // The first dialog answers at ~2s and `default` is unlocked; the second
+    // dialog is then raised, which resets the gate to false.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        2,
+        "timing assumption: first dialog answered, second raised:\n{}",
+        fx.pinentry_log()
+    );
+    assert!(
+        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        "timing assumption: the prompt has actually opened `default` by now"
+    );
+
+    // The owner vanishes with the gate reset, so the task is aborted rather
+    // than being allowed to finish.
+    drop(proxy);
+    drop(service);
+    conn.close().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let st = fx.daemon.state.lock().await;
+    assert!(
+        st.collections["default"].is_locked(),
+        "a vault the aborted prompt had already opened stayed unlocked with no owner"
+    );
+    assert!(st.collections["second"].is_locked());
+    assert!(st.prompt_owners.is_empty());
+    assert!(
+        st.prompt_unlocked.is_empty(),
+        "the bookkeeping entry must not outlive the prompt"
+    );
+}
+
+/// A `CreateCollection` with an empty alias argument is the ordinary case for
+/// a client that just wants a keyring: the collection is created and *no*
+/// alias is touched. The alias-carrying path is well covered; this is the
+/// other half of both `if let Some(a) = alias` arms in
+/// `prompt::create_collection`, and it is what guarantees a create cannot
+/// quietly repoint someone else's alias.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_collection_without_an_alias_touches_no_alias() {
+    let fx = Fixture::start_with_pin(Some("newpw")).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Scratch"),
+    )]);
+    let (path, prompt) = service.create_collection(props, "").await.unwrap();
+    assert_eq!(path.as_str(), "/");
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(!dismissed);
+    let new_path = OwnedObjectPath::try_from(result).unwrap();
+    assert_eq!(new_path, paths::collection("scratch"));
+
+    let scratch = collection(&conn, new_path.clone()).await;
+    assert_eq!(scratch.label().await.unwrap(), "Scratch");
+    assert!(!scratch.locked().await.unwrap());
+    assert!(service.collections().await.unwrap().contains(&new_path));
+
+    assert_eq!(
+        service.read_alias("scratch").await.unwrap().as_str(),
+        "/",
+        "an empty alias argument must not invent an alias from the label"
+    );
+    assert_eq!(
+        service.read_alias("default").await.unwrap(),
+        fx.default_collection(),
+        "an unrelated alias was repointed"
+    );
+    assert_eq!(
+        fx.daemon.state.lock().await.aliases,
+        std::collections::BTreeMap::from([("default".to_string(), "default".to_string())]),
+        "the alias table changed although no alias was asked for"
+    );
+}
+
+/// The same fail-closed rule as `unlock_with_an_unstartable_pinentry_is_dismissed`,
+/// on the create path: with no way to ask for a password there is no consent,
+/// so nothing may be created and nothing may be left behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_collection_with_an_unstartable_pinentry_is_dismissed() {
+    let fx = Fixture::start_with_config(|c| {
+        c.prompt.pinentry = "/nonexistent/secret-manager-pinentry".to_string();
+    })
+    .await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (_, prompt) = service.create_collection(props, "work").await.unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(dismissed, "an unstartable pinentry must dismiss the prompt");
+    assert_eq!(OwnedObjectPath::try_from(result).unwrap().as_str(), "/");
+
+    assert_eq!(
+        service.collections().await.unwrap(),
+        vec![fx.default_collection()]
+    );
+    assert!(
+        !fx.data_dir
+            .path()
+            .join("secret-manager")
+            .join("work_keys.vault")
+            .exists(),
+        "a collection was created without a password ever being asked for"
+    );
+    assert_eq!(service.read_alias("work").await.unwrap().as_str(), "/");
+    assert!(
+        fx.daemon.state.lock().await.prompt_owners.is_empty(),
+        "a failed prompt left its owner entry behind"
+    );
+}
+
+/// And on the delete path: a confirmation that cannot be *asked* is not a
+/// confirmation. A pinentry that fails to start must read as "no", never as
+/// "yes", because the answer here unlinks a vault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_collection_with_an_unstartable_pinentry_is_dismissed() {
+    let fx = Fixture::start_with_config(|c| {
+        c.prompt.pinentry = "/nonexistent/secret-manager-pinentry".to_string();
+    })
+    .await;
+    fx.unlock_default().await;
+    let vault_path = fx
+        .data_dir
+        .path()
+        .join("secret-manager")
+        .join("default.vault");
+    let before = std::fs::read(&vault_path).unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let coll = collection(&conn, fx.default_collection()).await;
+    let prompt = coll.delete().await.unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(
+        dismissed,
+        "a confirmation that could not be asked must never count as given"
+    );
+    assert_eq!(OwnedObjectPath::try_from(result).unwrap().as_str(), "/");
+
+    assert_eq!(std::fs::read(&vault_path).unwrap(), before);
+    assert!(
+        service
+            .collections()
+            .await
+            .unwrap()
+            .contains(&fx.default_collection())
+    );
+    assert!(!coll.locked().await.unwrap());
+    assert!(fx.daemon.state.lock().await.prompt_owners.is_empty());
+}
+/// A dangling symlink at `<id>.vault` must not be able to reserve a name.
+///
+/// `unique_collection_id` used `Path::exists`, which follows symlinks, so a
+/// link pointing at nothing looked like a free name — and then `Vault::create`'s
+/// `RENAME_NOREPLACE` publish failed `EEXIST` against the link itself. The
+/// allocator handed back the same free-looking id every time, the retry loop
+/// exhausted, and the collection could never be created under that name. Any
+/// same-uid process could plant one and permanently deny a name, with no race
+/// required.
+///
+/// It now tests with `symlink_metadata`, so the link counts as taken and the
+/// next free id is used instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dangling_symlink_cannot_reserve_a_collection_name() {
+    let fx = Fixture::start_with_pin(Some("newpw")).await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    let planted = dir.join("work_keys.vault");
+    std::os::unix::fs::symlink("/nonexistent/target", &planted).unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (_, prompt) = service.create_collection(props, "work").await.unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(!dismissed, "the planted link must not block the create");
+
+    let created = OwnedObjectPath::try_from(result).unwrap();
+    assert_eq!(
+        created.as_str(),
+        "/org/freedesktop/secrets/collection/work_keys_2",
+        "the name the link occupies must be skipped, not reused"
+    );
+    assert_eq!(service.read_alias("work").await.unwrap(), created);
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        1,
+        "one password, claimed on the first attempt:\n{}",
+        fx.pinentry_log()
+    );
+
+    // The link is left exactly as it was: not followed, not replaced, and not
+    // resolved into a real vault.
+    let meta = std::fs::symlink_metadata(&planted).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "the planted link was disturbed"
+    );
+    assert!(!planted.exists(), "the link must still dangle");
+
+    let mut vaults: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".vault") && dir.join(n).is_file())
+        .collect();
+    vaults.sort();
+    assert_eq!(vaults, vec!["default.vault", "work_keys_2.vault"]);
+}
+
+/// The alias table is a convenience that lives beside the vaults; a create or
+/// a delete the user has already confirmed must not be undone because it could
+/// not be written out. Here `aliases.toml` is a *directory*, so every
+/// `save_aliases` fails, and both operations have to carry on regardless —
+/// with the in-memory alias table still correct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unwritable_alias_file_blocks_neither_create_nor_delete() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some("newpw"),
+        vec![("FAKE_CONFIRM".to_string(), "yes".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    let alias_file = dir.join("aliases.toml");
+    std::fs::remove_file(&alias_file).unwrap();
+    std::fs::create_dir(&alias_file).unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (_, prompt) = service.create_collection(props, "work").await.unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(
+        !dismissed,
+        "an unwritable alias file must not fail the create"
+    );
+    let new_path = OwnedObjectPath::try_from(result).unwrap();
+    assert!(dir.join("work_keys.vault").exists());
+    assert_eq!(
+        service.read_alias("work").await.unwrap(),
+        new_path,
+        "the alias must still take effect for this daemon's lifetime"
+    );
+
+    let work = collection(&conn, new_path.clone()).await;
+    let delete_prompt = work.delete().await.unwrap();
+    let (dismissed, result) = perform(&conn, &delete_prompt).await;
+    assert!(
+        !dismissed,
+        "an unwritable alias file must not fail the delete"
+    );
+    assert_eq!(OwnedObjectPath::try_from(result).unwrap(), new_path);
+    assert!(!dir.join("work_keys.vault").exists());
+    assert_eq!(
+        service.read_alias("work").await.unwrap().as_str(),
+        "/",
+        "the deleted collection's alias must be dropped from memory too"
+    );
+    assert!(
+        alias_file.is_dir(),
+        "fixture assumption: the alias file stayed unwritable throughout"
+    );
+}
+
+/// The confirmation dialog is a human-scale wait, and the vault file can go
+/// away underneath it (a restored backup, a second daemon, a cleaner). The
+/// removal of the collection from state and the `unlink` are one critical
+/// section precisely so the two can never disagree: if the unlink fails the
+/// collection goes straight back and the prompt reports as dismissed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_whose_unlink_fails_puts_the_collection_back() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![
+            ("FAKE_CONFIRM".to_string(), "yes".to_string()),
+            ("FAKE_DELAY".to_string(), "2".to_string()),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    fx.unlock_default().await;
+    let vault_path = fx
+        .data_dir
+        .path()
+        .join("secret-manager")
+        .join("default.vault");
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let coll = collection(&conn, fx.default_collection()).await;
+    let prompt = coll.delete().await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            fx.pinentry_log().contains("CONFIRM")
+        })
+        .await,
+        "timing assumption: the confirmation dialog is raised within 10s"
+    );
+    // Gone from under the daemon while the dialog is still on screen.
+    std::fs::remove_file(&vault_path).unwrap();
+
+    let sig = tokio::time::timeout(Duration::from_secs(15), completed.next())
+        .await
+        .expect("the prompt completes")
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(
+        args.dismissed,
+        "a delete whose unlink failed must report as dismissed"
+    );
+    assert_eq!(
+        OwnedObjectPath::try_from(args.result.try_to_owned().unwrap())
+            .unwrap()
+            .as_str(),
+        "/"
+    );
+
+    let st = fx.daemon.state.lock().await;
+    assert!(
+        st.collections.contains_key("default"),
+        "the collection was dropped from state although its file could not be unlinked"
+    );
+    assert!(!st.collections["default"].is_locked());
+    drop(st);
+    assert!(
+        service
+            .collections()
+            .await
+            .unwrap()
+            .contains(&fx.default_collection()),
+        "the collection stopped being advertised after a failed delete"
+    );
+}
+
+/// A collection can leave the daemon (a rotation, a reload after its file was
+/// replaced) while its unlock dialog is still on screen. The password that
+/// then arrives has nothing left to open: the attempt has to fail cleanly —
+/// one `Completed(true, [])`, no retry loop, no panic on the missing entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_removed_while_its_unlock_dialog_waits_fails_cleanly() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_DELAY".to_string(), "2".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (unlocked, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    assert!(unlocked.is_empty());
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            fx.pinentry_log().contains("GETPIN")
+        })
+        .await,
+        "timing assumption: the password dialog is raised within 10s"
+    );
+    assert!(
+        fx.daemon
+            .state
+            .lock()
+            .await
+            .collections
+            .remove("default")
+            .is_some(),
+        "timing assumption: the collection is still loaded while the dialog waits"
+    );
+
+    let sig = tokio::time::timeout(Duration::from_secs(15), completed.next())
+        .await
+        .expect("the prompt completes")
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(args.dismissed);
+    assert!(
+        Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        1,
+        "a vanished collection must not be asked about again:\n{}",
+        fx.pinentry_log()
+    );
+    assert!(
+        fx.daemon.state.lock().await.prompt_owners.is_empty(),
+        "the failed prompt left its owner entry behind"
+    );
+}
+
+/// A multi-collection unlock walks its list one dialog at a time, so a
+/// collection later in the list can be unlocked by someone else (`sm unlock`,
+/// PAM at login) while an earlier dialog is still waiting. It must then be
+/// reported as unlocked without a second, pointless password dialog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_unlocked_while_an_earlier_dialog_waits_is_not_asked_for() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_DELAY".to_string(), "2".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    secret_manager::vault::Vault::create(
+        &dir.join("second.vault"),
+        "Second",
+        common::PASSWORD.as_bytes(),
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let second_path = paths::collection("second");
+    let (_, prompt) = service
+        .unlock(&[fx.default_collection(), second_path.clone()])
+        .await
+        .unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            fx.pinentry_log().contains("GETPIN")
+        })
+        .await,
+        "timing assumption: the first dialog is raised within 10s"
+    );
+    fx.daemon
+        .state
+        .lock()
+        .await
+        .collections
+        .get_mut("second")
+        .unwrap()
+        .unlock(common::PASSWORD.as_bytes())
+        .unwrap();
+
+    let sig = tokio::time::timeout(Duration::from_secs(15), completed.next())
+        .await
+        .expect("the prompt completes")
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(!args.dismissed);
+    // `Unlock` preserves the order it was called with.
+    let got = Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap()).unwrap();
+    assert_eq!(
+        got,
+        vec![fx.default_collection(), second_path],
+        "both collections are unlocked, so both are owed"
+    );
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        1,
+        "an already-unlocked collection must not raise a dialog:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// The commit gate is a veto on *aborting*, and it covers exactly one
+/// collection. A `Dismiss` that lands while a collection is past its gate must
+/// therefore do two things at once: leave that collection's unlock alone —
+/// the prompt still completes with `dismissed = false` and that collection's
+/// path — and still stop every collection after it.
+///
+/// The window is the Argon2 derivation that follows the password, which is why
+/// this collection's vault is deliberately expensive: `FAST_FOR_TESTS` would
+/// make the gate open and shut faster than a bus round-trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dismiss_past_the_commit_gate_spares_the_collection_it_covers() {
+    let fx = Fixture::start().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    let slow = secret_manager::vault::crypto::KdfParams {
+        m_cost_kib: 131072,
+        t_cost: 4,
+        p_cost: 1,
+    };
+    secret_manager::vault::Vault::create(
+        &dir.join("slow.vault"),
+        "Slow",
+        common::PASSWORD.as_bytes(),
+        slow,
+    )
+    .unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let slow_path = paths::collection("slow");
+    let (_, prompt) = service
+        .unlock(&[slow_path.clone(), fx.default_collection()])
+        .await
+        .unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            fx.pinentry_log().contains("GETPIN")
+        })
+        .await,
+        "timing assumption: the first dialog is raised within 10s"
+    );
+    // The fake pinentry answers immediately, so by now the password is in and
+    // the gate is claimed; the expensive derivation is what is still running.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        fx.daemon
+            .state
+            .lock()
+            .await
+            .prompt_owners
+            .contains_key(prompt.as_str()),
+        "timing assumption: the derivation is still running, so the prompt is outstanding"
+    );
+    proxy.dismiss().await.unwrap();
+
+    let sig = tokio::time::timeout(Duration::from_secs(60), completed.next())
+        .await
+        .expect("the prompt completes")
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(
+        !args.dismissed,
+        "a Dismiss past the commit gate must not turn a committed unlock into a dismissal"
+    );
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap()).unwrap(),
+        vec![slow_path],
+        "the collection the gate covered is unlocked and owed to the caller"
+    );
+
+    let st = fx.daemon.state.lock().await;
+    assert!(!st.collections["slow"].is_locked());
+    assert!(
+        st.collections["default"].is_locked(),
+        "the dismissal must still stop the collections it did not cover"
+    );
+    drop(st);
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        1,
+        "a dialog was raised for a collection after the dismissal:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// Deleting a collection has to take its item objects off the bus with it.
+/// A client holding an item path from before the delete must get an error, not
+/// an object still answering out of a vault that no longer exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_collection_unexports_its_item_objects() {
+    use secret_manager::dbus::proxies::ItemProxy;
+    let fx = Fixture::start_with_pin_and_env(
+        Some("newpw"),
+        vec![("FAKE_CONFIRM".to_string(), "yes".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (_, prompt) = service.create_collection(props, "").await.unwrap();
+    let (_, result) = perform(&conn, &prompt).await;
+    let coll_path = OwnedObjectPath::try_from(result).unwrap();
+    let work = collection(&conn, coll_path.clone()).await;
+
+    let session = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap()
+        .1;
+    let attrs: HashMap<String, String> = HashMap::from([("k".to_string(), "v".to_string())]);
+    let item_props = HashMap::from([
+        ("org.freedesktop.Secret.Item.Label", Value::from("x")),
+        ("org.freedesktop.Secret.Item.Attributes", Value::from(attrs)),
+    ]);
+    let secret = SecretStruct {
+        session,
+        parameters: vec![],
+        value: b"s".to_vec(),
+        content_type: "text/plain".into(),
+    };
+    let (item_path, _) = work.create_item(item_props, &secret, false).await.unwrap();
+    let it = ItemProxy::builder(&conn)
+        .path(item_path.clone())
+        .unwrap()
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(
+        it.label().await.unwrap(),
+        "x",
+        "the item answers before the delete"
+    );
+
+    let delete_prompt = work.delete().await.unwrap();
+    let (dismissed, _) = perform(&conn, &delete_prompt).await;
+    assert!(!dismissed);
+
+    // The unexport runs in its own task once the file is gone.
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            it.label().await.is_err()
+        })
+        .await,
+        "the item object outlived the collection it belonged to"
+    );
+    assert!(
+        work.label().await.is_err(),
+        "the collection object outlived its own delete"
+    );
+    assert!(!service.collections().await.unwrap().contains(&coll_path));
+}
+
+/// `aliases.toml` is a plain file a user can edit, and an alias name that is
+/// not a legal D-Bus path segment has no object it could be exported at. It
+/// must be ignored where a path is needed and left alone everywhere else —
+/// never a failed `Reload`, and never a lock that stops emitting its change
+/// notifications because one alias in the table cannot be turned into a path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alias_name_that_is_not_a_path_segment_is_ignored_not_fatal() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    std::fs::write(
+        dir.join("aliases.toml"),
+        "[aliases]\ndefault = \"default\"\n\"bad-name\" = \"default\"\n",
+    )
+    .unwrap();
+    let sock = fx.control_socket();
+    let response = tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        response,
+        secret_manager::protocol::Response::Ok,
+        "an unexportable alias name must not fail the reload"
+    );
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    assert_eq!(
+        service.read_alias("bad-name").await.unwrap(),
+        fx.default_collection(),
+        "the alias still resolves; only its object path is impossible"
+    );
+    assert!(
+        paths::alias("bad-name").is_none(),
+        "fixture assumption: this name cannot be an object path"
+    );
+
+    // Locking walks every alias pointing at the collection to emit its
+    // `PropertiesChanged`; the unexportable one must not stop the rest.
+    let coll = collection(&conn, fx.default_collection()).await;
+    let mut changed = service.receive_collection_changed().await.unwrap();
+    let (locked, prompt) = service.lock(&[fx.default_collection()]).await.unwrap();
+    assert_eq!(locked, vec![fx.default_collection()]);
+    assert_eq!(prompt.as_str(), "/");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), changed.next())
+            .await
+            .expect("CollectionChanged is still emitted")
+            .unwrap()
+            .args()
+            .unwrap()
+            .collection,
+        fx.default_collection()
+    );
+    assert!(coll.locked().await.unwrap());
+}
+
+/// An alias object is registered once and never removed, because it resolves
+/// its target when it is called. When that target is deleted the object stays
+/// on the bus, so it has to degrade to an empty, locked collection rather than
+/// answering out of stale state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_alias_object_of_a_deleted_collection_answers_as_empty_and_locked() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some("newpw"),
+        vec![("FAKE_CONFIRM".to_string(), "yes".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (_, prompt) = service.create_collection(props, "work").await.unwrap();
+    let (_, result) = perform(&conn, &prompt).await;
+    let coll_path = OwnedObjectPath::try_from(result).unwrap();
+
+    let alias_obj = collection(&conn, paths::alias("work").unwrap()).await;
+    assert_eq!(alias_obj.label().await.unwrap(), "Work Keys");
+    assert!(!alias_obj.locked().await.unwrap());
+
+    let work = collection(&conn, coll_path.clone()).await;
+    let delete_prompt = work.delete().await.unwrap();
+    let (dismissed, _) = perform(&conn, &delete_prompt).await;
+    assert!(!dismissed);
+
+    assert_eq!(
+        alias_obj.label().await.unwrap(),
+        "",
+        "a dangling alias object must not keep reporting its old target's label"
+    );
+    assert!(alias_obj.items().await.unwrap().is_empty());
+    assert!(
+        alias_obj.locked().await.unwrap(),
+        "an alias that resolves to nothing must read as locked, never as open"
+    );
+    assert_eq!(service.read_alias("work").await.unwrap().as_str(), "/");
+}
+
+/// A collection can also leave the daemon *between* two dialogs of the same
+/// multi-collection unlock. The one that is gone is skipped — no dialog, and
+/// no failure for the collections either side of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_removed_between_two_dialogs_is_skipped() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some(common::PASSWORD),
+        vec![("FAKE_DELAY".to_string(), "2".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    secret_manager::vault::Vault::create(
+        &dir.join("second.vault"),
+        "Second",
+        common::PASSWORD.as_bytes(),
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let second_path = paths::collection("second");
+    let (_, prompt) = service
+        .unlock(&[fx.default_collection(), second_path])
+        .await
+        .unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            fx.pinentry_log().contains("GETPIN")
+        })
+        .await,
+        "timing assumption: the first dialog is raised within 10s"
+    );
+    assert!(
+        fx.daemon
+            .state
+            .lock()
+            .await
+            .collections
+            .remove("second")
+            .is_some(),
+        "timing assumption: the second collection is still loaded"
+    );
+
+    let sig = tokio::time::timeout(Duration::from_secs(15), completed.next())
+        .await
+        .expect("the prompt completes")
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(
+        !args.dismissed,
+        "the first collection was unlocked, so the prompt succeeded"
+    );
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap()).unwrap(),
+        vec![fx.default_collection()],
+        "a collection that is gone cannot be reported unlocked"
+    );
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        1,
+        "a dialog was raised for a collection that no longer exists:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// The derivation runs off the state lock on purpose, so the collection it is
+/// for can disappear while it is in flight. The key that then arrives must be
+/// dropped rather than used to resurrect an entry the daemon no longer has.
+///
+/// The vault is deliberately expensive so that "during the derivation" is a
+/// window a test can aim at; with `FAST_FOR_TESTS` the whole unlock lands
+/// between two bus messages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_removed_during_its_derivation_is_not_resurrected() {
+    let fx = Fixture::start().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    let slow = secret_manager::vault::crypto::KdfParams {
+        m_cost_kib: 131072,
+        t_cost: 4,
+        p_cost: 1,
+    };
+    secret_manager::vault::Vault::create(
+        &dir.join("slow.vault"),
+        "Slow",
+        common::PASSWORD.as_bytes(),
+        slow,
+    )
+    .unwrap();
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let (_, prompt) = service.unlock(&[paths::collection("slow")]).await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+
+    assert!(
+        common::wait_for(Duration::from_secs(10), || async {
+            fx.pinentry_log().contains("GETPIN")
+        })
+        .await,
+        "timing assumption: the dialog is raised within 10s"
+    );
+    // The password is in and the derivation is running by now.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        fx.daemon
+            .state
+            .lock()
+            .await
+            .collections
+            .remove("slow")
+            .is_some(),
+        "timing assumption: the derivation is still running"
+    );
+
+    let sig = tokio::time::timeout(Duration::from_secs(60), completed.next())
+        .await
+        .expect("the prompt completes")
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(args.dismissed);
+    assert!(
+        Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    let st = fx.daemon.state.lock().await;
+    assert!(
+        !st.collections.contains_key("slow"),
+        "a finished derivation put the removed collection back"
+    );
+    assert!(st.prompt_owners.is_empty());
+    drop(st);
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        1,
+        "the password was asked for again:\n{}",
+        fx.pinentry_log()
+    );
+}

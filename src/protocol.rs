@@ -528,7 +528,18 @@ fn connect_with_deadline(path: &Path, deadline: Duration) -> Result<UnixStream, 
         }
         let err = std::io::Error::last_os_error();
         match err.raw_os_error() {
-            // The connect is under way; wait for the socket to become writable.
+            // PORTABILITY ARMOUR — DEAD ON LINUX AF_UNIX. Do not read this
+            // arm as a path the daemon takes: it does not execute here, and
+            // it is not covered by any test. Linux's `unix_stream_connect`
+            // answers a non-blocking connect to a listener whose backlog is
+            // full with EAGAIN (the arm below), and every other outcome is
+            // either success or a terminal error. EINPROGRESS is what a
+            // non-blocking connect on a *connection-oriented network* socket
+            // returns, so the arm is kept for the day this path is reused for
+            // one, and because a kernel that did report it would otherwise
+            // fall into the catch-all and turn a connect in progress into a
+            // hard failure. `wait_writable` is unit-tested directly for the
+            // same reason: if this ever does execute, its logic is proven.
             Some(libc::EINPROGRESS) => {
                 wait_writable(fd, remaining_or_timeout(start, deadline)?)?;
                 let mut so_error: libc::c_int = 0;
@@ -593,6 +604,12 @@ fn wait_writable(fd: std::os::fd::RawFd, budget: Duration) -> Result<(), Protoco
         // SAFETY: one valid, live pollfd for the duration of the call.
         let rc = unsafe { libc::poll(&mut pfd, 1, millis.max(1)) };
         if rc > 0 {
+            // Deliberately `Ok` for any ready event, not only POLLOUT: a
+            // failed connect reports POLLERR (or POLLNVAL for a closed fd),
+            // and this returns "no longer waiting", not "connected". The one
+            // caller must therefore read SO_ERROR before treating the socket
+            // as usable — reusing this function without that check would turn
+            // a failed connect into a silently broken stream.
             return Ok(());
         }
         if rc == 0 {
@@ -978,6 +995,54 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ProtocolError::Connect(_)));
     }
+
+    /// The path comes from `XDG_RUNTIME_DIR`, which the PAM module treats as
+    /// hostile. Both shapes must be refused in `unix_addr`: the copy loop
+    /// below the guards writes no terminator of its own, so an over-long
+    /// path would leave `sun_path` unterminated and an empty one would name
+    /// the abstract namespace rather than the file we mean.
+    #[test]
+    fn a_socket_path_that_cannot_fit_sockaddr_un_is_refused() {
+        let invalid = |path: &Path| match call(path, &Request::Status).unwrap_err() {
+            ProtocolError::Connect(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}")
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        };
+        invalid(Path::new(""));
+        // 256 bytes: over the 108-byte `sun_path`, and never truncated into
+        // some shorter path that happens to exist.
+        let long = PathBuf::from(format!("/{}", "a".repeat(255)));
+        assert_eq!(long.as_os_str().len(), 256);
+        invalid(&long);
+    }
+
+    /// The PAM module passes the remaining slice of a whole-login budget, so
+    /// a call can be entered with nothing left. It must fail before
+    /// connecting rather than connect and then arm a zero — that is,
+    /// unbounded — socket timeout, even against a listener that would answer.
+    #[test]
+    fn a_call_entered_with_a_spent_budget_fails_before_connecting() {
+        let dir = test_dir("spent-budget");
+        let sock = dir.join("control.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let start = Instant::now();
+        let err = call_with_timeout(&sock, &Request::Status, Duration::ZERO).unwrap_err();
+        let elapsed = start.elapsed();
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+        match err {
+            ProtocolError::Io(e) | ProtocolError::Connect(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}")
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a spent budget must fail immediately, took {elapsed:?}"
+        );
+    }
     /// postcard stops at the end of the first complete message, so before
     /// this was fixed a peer could append anything it liked to a valid
     /// request and have it accepted. Not exploitable as the protocol stands,
@@ -1003,5 +1068,168 @@ mod tests {
             decode_frame::<Response>(&one),
             Err(ProtocolError::TrailingBytes(1))
         ));
+    }
+
+    #[test]
+    fn response_variant_name_names_every_variant() {
+        assert_eq!(Response::Ok.variant_name(), "Ok");
+        assert_eq!(
+            Response::Status {
+                collections: vec![],
+                uptime_secs: 0,
+            }
+            .variant_name(),
+            "Status"
+        );
+        assert_eq!(Response::Error("boom".into()).variant_name(), "Error");
+        // The point of the name is that it can be logged when the payload
+        // cannot: it must never carry any of it.
+        assert_eq!(
+            Response::Error("s3cret".into()).variant_name(),
+            Response::Error(String::new()).variant_name()
+        );
+    }
+
+    /// The encoder's own limit is on the *framed* length — the postcard body
+    /// plus the version byte — so a body of exactly `MAX_FRAME` is one byte
+    /// too long. Without that check the frame would go out with a length
+    /// prefix a byte short of its own body.
+    #[test]
+    fn a_body_of_exactly_max_frame_is_one_byte_too_long_to_frame() {
+        // Lock: 1 variant byte + 1 `Some` tag + 3 varint length bytes + payload.
+        let req = Request::Lock {
+            collection: Some("a".repeat(MAX_FRAME - 5)),
+        };
+        let mut scratch = vec![0u8; MAX_FRAME + 64];
+        let body = postcard::to_slice(&req, &mut scratch).unwrap();
+        assert_eq!(
+            body.len(),
+            MAX_FRAME,
+            "this test needs a body of exactly MAX_FRAME"
+        );
+        let err = encode_frame(&req).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::FrameTooLarge(n) if n == MAX_FRAME + 1),
+            "got {err:?}"
+        );
+    }
+
+    /// Serializes `self.0` filler bytes and then fails with an error that is
+    /// *not* `SerializeBufferFull`, so both scratch buffers in `encode_frame`
+    /// — the 8 KiB first attempt and the grown retry — can be driven into a
+    /// serializer failure that is not about size.
+    struct FailsAfter(usize);
+
+    impl Serialize for FailsAfter {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::{Error, SerializeSeq};
+            let mut seq = s.serialize_seq(Some(self.0))?;
+            for _ in 0..self.0 {
+                seq.serialize_element(&0u8)?;
+            }
+            Err(S::Error::custom("this type never finishes serializing"))
+        }
+    }
+
+    /// A serializer failure must be reported as what it is. `encode_frame`
+    /// retries in a larger buffer when the first attempt runs out of room, and
+    /// a failure in that retry must not be laundered into a size error — the
+    /// caller would go looking for an oversized message that does not exist.
+    #[test]
+    fn a_serializer_failure_is_reported_as_an_encoding_error_in_both_buffers() {
+        // Fails inside the first, 8 KiB buffer.
+        let err = encode_frame(&FailsAfter(0)).unwrap_err();
+        assert!(matches!(err, ProtocolError::Encoding(_)), "got {err:?}");
+
+        // Overruns the first buffer, then fails inside the grown one.
+        let big = FailsAfter(9000);
+        let mut small = [0u8; 8 * 1024];
+        assert!(
+            matches!(
+                postcard::to_slice(&big, &mut small),
+                Err(postcard::Error::SerializeBufferFull)
+            ),
+            "this test needs a value that overruns the first scratch buffer"
+        );
+        let err = encode_frame(&big).unwrap_err();
+        assert!(matches!(err, ProtocolError::Encoding(_)), "got {err:?}");
+    }
+
+    /// A blocking-socket deadline surfaces as `WouldBlock`, which reads like a
+    /// spurious failure; it is rewritten to `TimedOut`. Nothing else is: a
+    /// caller must still be able to tell a broken pipe from a slow daemon.
+    #[test]
+    fn normalize_timeout_rewrites_only_a_spent_deadline() {
+        for kind in [std::io::ErrorKind::WouldBlock, std::io::ErrorKind::TimedOut] {
+            match normalize_timeout(ProtocolError::Io(std::io::Error::new(kind, "x"))) {
+                ProtocolError::Io(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+                    assert!(e.to_string().contains("deadline"), "{e}");
+                }
+                other => panic!("expected Io, got {other:?}"),
+            }
+        }
+        match normalize_timeout(ProtocolError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "the daemon exited",
+        ))) {
+            ProtocolError::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+                assert!(e.to_string().contains("the daemon exited"), "{e}");
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+        let err = normalize_timeout(ProtocolError::UnsupportedVersion(9));
+        assert!(
+            matches!(err, ProtocolError::UnsupportedVersion(9)),
+            "got {err:?}"
+        );
+    }
+
+    /// `wait_writable` is only reached from the `EINPROGRESS` arm of
+    /// `connect_with_deadline`, which Linux never takes for `AF_UNIX` (a full
+    /// backlog is reported as `EAGAIN`), so it is exercised directly here.
+    #[test]
+    fn wait_writable_returns_at_once_for_a_writable_socket() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        wait_writable(a.as_raw_fd(), Duration::from_secs(5))
+            .expect("a fresh socketpair must be writable");
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The poll loop re-checks its own budget, so a socket that never becomes
+    /// writable fails on the deadline instead of waiting forever — this is the
+    /// case that would otherwise hang a login.
+    #[test]
+    fn wait_writable_gives_up_once_its_budget_is_spent() {
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        // Fill the send buffer: with no reader on `b`, the fd stops being
+        // writable and stays that way.
+        let chunk = [0u8; 64 * 1024];
+        loop {
+            match (&a).write(&chunk) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("unexpected write error: {e}"),
+            }
+        }
+        let start = Instant::now();
+        let err = wait_writable(a.as_raw_fd(), Duration::from_millis(50)).unwrap_err();
+        let elapsed = start.elapsed();
+        drop(b);
+        match err {
+            ProtocolError::Connect(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+                assert!(e.to_string().contains("deadline"), "{e}");
+            }
+            other => panic!("expected Connect, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the budget did not bound the wait: {elapsed:?}"
+        );
     }
 }

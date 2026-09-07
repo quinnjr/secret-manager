@@ -80,4 +80,34 @@ mod tests {
             peak.load(Ordering::SeqCst)
         );
     }
+
+    /// This module is the single funnel for every daemon derivation and
+    /// `run_bounded` `.expect()`s on a panicking task, so a ceiling refusal
+    /// has to arrive as an `Err` — not as an allocation that aborts a
+    /// blocking worker and takes the daemon with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kdf_over_the_ceiling_is_refused_without_running() {
+        let salt = [7u8; SALT_LEN];
+        let err = derive(
+            Zeroizing::new(b"pw".to_vec()),
+            salt,
+            KdfParams {
+                m_cost_kib: u32::MAX,
+                t_cost: 1,
+                p_cost: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CryptoError::UnsafeKdf(_)), "got {err:?}");
+        // A refusal must still release its slot, or a few bad headers would
+        // permanently exhaust the cap and wedge every later unlock.
+        derive(
+            Zeroizing::new(b"pw".to_vec()),
+            salt,
+            KdfParams::FAST_FOR_TESTS,
+        )
+        .await
+        .expect("the refused derivation must have released its slot");
+    }
 }

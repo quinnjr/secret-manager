@@ -300,3 +300,114 @@ async fn collections_alias_and_empty_search() {
         .unwrap();
     assert!(unlocked.is_empty() && locked.is_empty());
 }
+
+fn error_name(e: &zbus::Error) -> String {
+    match e {
+        zbus::Error::MethodError(name, _, _) => name.to_string(),
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+}
+
+/// `Lock` and `Unlock` take arrays of caller-supplied object paths. A path
+/// that names nothing is skipped, not an error and not a prompt: libsecret
+/// routinely passes paths it cached before a collection went away, and a
+/// prompt raised for one would put a password dialog on screen for a keyring
+/// that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_and_unlock_skip_paths_that_name_nothing() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let nowhere: Vec<OwnedObjectPath> = [
+        // A collection id that was never loaded.
+        "/org/freedesktop/secrets/collection/nope",
+        // An item under one.
+        "/org/freedesktop/secrets/collection/nope/abc",
+        // An alias that resolves to nothing.
+        "/org/freedesktop/secrets/aliases/nope",
+        // Paths outside the collection tree altogether.
+        "/org/freedesktop/secrets",
+        "/",
+    ]
+    .iter()
+    .map(|p| OwnedObjectPath::try_from(*p).unwrap())
+    .collect();
+
+    let (unlocked, prompt) = service.unlock(&nowhere).await.unwrap();
+    assert!(unlocked.is_empty());
+    assert_eq!(
+        prompt.as_str(),
+        "/",
+        "paths that name nothing must not raise a prompt"
+    );
+    assert!(
+        fx.daemon.state.lock().await.prompt_owners.is_empty(),
+        "a prompt object was exported for a collection that does not exist"
+    );
+
+    let (locked, prompt) = service.lock(&nowhere).await.unwrap();
+    assert!(locked.is_empty());
+    assert_eq!(prompt.as_str(), "/");
+    assert!(
+        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        "a Lock of unrelated paths locked the real collection"
+    );
+    assert!(
+        !fx.pinentry_log().contains("GETPIN"),
+        "nothing here may reach pinentry:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// A vault file that will not open is advertised as a permanently locked
+/// collection with no vault behind it, which is the one case where a path
+/// resolves but `collections` has no entry. `Lock` must leave it out of its
+/// reply (there is nothing to lock), and the private batch-delete interface,
+/// which is exported on it like on any other collection, must refuse rather
+/// than panic on the missing entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_collection_cannot_be_locked_or_batch_deleted() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    std::fs::write(
+        fx.data_dir.path().join("secret-manager").join("bad.vault"),
+        b"not a real vault file",
+    )
+    .unwrap();
+    assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let bad_path = secret_manager::dbus::paths::collection("bad");
+    assert!(service.collections().await.unwrap().contains(&bad_path));
+
+    let (locked, prompt) = service.lock(std::slice::from_ref(&bad_path)).await.unwrap();
+    assert!(
+        locked.is_empty(),
+        "a broken collection has no vault to lock, so it cannot be reported locked"
+    );
+    assert_eq!(prompt.as_str(), "/");
+
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(bad_path.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    // An empty batch is a no-op on any collection, broken or not.
+    admin.delete_items(&[]).await.unwrap();
+    let err = admin
+        .delete_items(&[
+            OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/bad/abc").unwrap(),
+        ])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_name(&err),
+        "org.freedesktop.Secret.Error.NoSuchObject",
+        "a broken collection holds no items, so none of them can be named"
+    );
+    assert!(service.collections().await.unwrap().contains(&bad_path));
+}

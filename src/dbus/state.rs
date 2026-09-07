@@ -68,6 +68,16 @@ pub struct ServiceState {
     /// change that has already been committed. Exposed so an abort can be
     /// skipped for such a prompt.
     pub prompt_commits: BTreeMap<String, PromptCommit>,
+    /// prompt object path -> collections that prompt has unlocked so far.
+    ///
+    /// The task keeps its own list, but an abort destroys it, and the abort
+    /// is exactly when the list is needed: the commit gate is reset at the
+    /// top of every collection, so a client that disconnects while a *later*
+    /// dialog is on screen has its task aborted, and anything unlocked in an
+    /// earlier iteration would otherwise stay decrypted in memory with no
+    /// owner. `daemon::watch_clients` re-locks these before it drops the
+    /// prompt.
+    pub prompt_unlocked: BTreeMap<String, Vec<String>>,
     pub started: Instant,
     pub last_activity: Instant,
     next_session: u64,
@@ -184,6 +194,7 @@ impl ServiceState {
             prompt_owners: BTreeMap::new(),
             prompt_tasks: BTreeMap::new(),
             prompt_commits: BTreeMap::new(),
+            prompt_unlocked: BTreeMap::new(),
             started: now,
             last_activity: now,
             next_session: 0,
@@ -367,7 +378,14 @@ impl ServiceState {
     pub fn unique_collection_id(&self, label: &str) -> String {
         let base = collection_id_from_label(label);
         let taken = |id: &str| {
-            self.collections.contains_key(id) || self.vault_dir.join(format!("{id}.vault")).exists()
+            // `symlink_metadata`, not `exists`: `exists` follows the link, so a
+            // dangling symlink at `<id>.vault` looks free here and then makes
+            // `Vault::create`'s RENAME_NOREPLACE publish fail EEXIST, retrying
+            // the same free-looking name until the attempts run out. Same-uid
+            // is only semi-trusted, so treat any entry at the name — link,
+            // directory, or file — as taken.
+            self.collections.contains_key(id)
+                || std::fs::symlink_metadata(self.vault_dir.join(format!("{id}.vault"))).is_ok()
         };
         if !taken(&base) {
             return base;
@@ -527,5 +545,86 @@ mod tests {
             "{err}"
         );
         assert!(st.check_prompt_quota(":1.2").is_ok());
+    }
+
+    /// `resolve_item` takes any path a bus client can send. A collection or
+    /// alias path is not an item path, and must not be mistaken for one -
+    /// `GetSecrets` and the batch delete both feed it caller-supplied paths.
+    #[test]
+    fn resolve_item_refuses_a_path_that_names_no_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = state(dir.path());
+        for path in [
+            "/org/freedesktop/secrets/collection/default",
+            "/org/freedesktop/secrets/aliases/default",
+            "/org/freedesktop/secrets",
+            "/",
+        ] {
+            assert_eq!(st.resolve_item(path), None, "{path}");
+        }
+    }
+
+    /// An unreadable alias file is not a missing one: only `NotFound` means
+    /// "no aliases yet". Anything else has to surface, or a `Reload` would
+    /// silently replace every alias with an empty map.
+    #[test]
+    fn an_unreadable_alias_file_is_an_error_not_an_empty_map() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_aliases(dir.path()).unwrap().is_empty(), "no file yet");
+        // A directory where the file belongs: readable metadata, unreadable
+        // contents, and not `NotFound`.
+        std::fs::create_dir(dir.path().join(ALIAS_FILE)).unwrap();
+        let err = load_aliases(dir.path()).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    }
+
+    /// A vault directory that cannot be scanned must fail `load_vaults`
+    /// rather than reporting an empty daemon.
+    #[test]
+    fn load_vaults_propagates_a_scan_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("file");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        let mut st = state(&not_a_dir);
+        assert!(st.load_vaults().is_err());
+        assert!(st.collections.is_empty());
+    }
+
+    /// Vault file names come from the filesystem, so they are arbitrary
+    /// bytes. One that is not UTF-8 has no id to load it under and is
+    /// skipped, without failing the scan for every other vault beside it.
+    #[test]
+    fn a_vault_file_with_a_non_utf8_name_is_skipped() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        Vault::create(
+            &dir.path().join("good.vault"),
+            "Good",
+            b"pw",
+            KdfParams::FAST_FOR_TESTS,
+        )
+        .unwrap();
+        let bad = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"\xff\xfe.vault"));
+        std::fs::write(&bad, b"whatever").unwrap();
+
+        let scan = scan_vault_dir(dir.path(), true, &Default::default()).unwrap();
+        assert_eq!(
+            scan.opened
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        assert!(
+            scan.broken.is_empty(),
+            "an unnameable file must be skipped, not advertised as a broken collection"
+        );
+        assert_eq!(
+            scan.seen.len(),
+            1,
+            "only the nameable file is accounted for"
+        );
     }
 }

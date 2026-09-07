@@ -556,3 +556,165 @@ async fn status_reports_an_index_that_could_not_be_rewritten() {
         other => panic!("{other:?}"),
     }
 }
+
+/// The CLI's own "no collection" message comes from reading the header off
+/// disk, so this daemon-side branch is not reached by any CLI test. A
+/// regression returning `Ok` here would let `sm lock --collection typo`
+/// report success while nothing was sealed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_reports_an_unknown_collection() {
+    let fx = Fixture::start().await;
+    assert_eq!(
+        control(&fx, unlock_with(&fx, "default", PASSWORD)).await,
+        Response::Ok
+    );
+    match control(
+        &fx,
+        Request::Lock {
+            collection: Some("nope".into()),
+        },
+    )
+    .await
+    {
+        Response::Error(msg) => assert!(msg.contains("no collection 'nope'"), "got {msg:?}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        "a lock for an unknown collection must not seal anything else"
+    );
+}
+
+/// `unlock_with_key` deliberately gives one uniform message for a wrong key
+/// and an absent collection; `change_key` is a distinct branch that names the
+/// collection. Pin the difference so neither message drifts into the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_key_names_a_collection_that_does_not_exist() {
+    let fx = Fixture::start().await;
+    let (_, kdf) = header_params(&fx, "default");
+    let new_salt = crypto::random_bytes::<SALT_LEN>();
+    let new_key = crypto::derive_key(b"new", &new_salt, kdf).unwrap();
+    let req = Request::ChangeKey {
+        collection: "missing".into(),
+        old_key: key_for(&fx, "default", PASSWORD),
+        new_salt,
+        new_kdf: kdf,
+        new_key: Zeroizing::new(*new_key.as_bytes()),
+    };
+    match control(&fx, req).await {
+        Response::Error(msg) => assert!(msg.contains("no collection 'missing'"), "got {msg:?}"),
+        other => panic!("{other:?}"),
+    }
+
+    match control(
+        &fx,
+        Request::UnlockWithKey {
+            collection: "missing".into(),
+            key: key_for(&fx, "default", PASSWORD),
+        },
+    )
+    .await
+    {
+        Response::Error(msg) => assert!(
+            !msg.contains("missing"),
+            "an unlock must not say which of the two failed: {msg:?}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A single unreadable vault file is recorded as `broken` and the scan still
+/// succeeds; a scan that fails outright is a different arm, and the
+/// collections already in memory must survive it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reload_reports_a_vault_directory_it_cannot_scan() {
+    let fx = Fixture::start().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    let saved = std::fs::read(dir.join("default.vault")).unwrap();
+
+    // A regular file where the vault directory belongs: the scan cannot even
+    // list it.
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+    assert!(matches!(
+        control(&fx, Request::Reload).await,
+        Response::Error(_)
+    ));
+    let still_loaded = |r: Response| match r {
+        Response::Status { collections, .. } => collections.iter().any(|c| c.id == "default"),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        still_loaded(control(&fx, Request::Status).await),
+        "a failed scan must not discard the collections already loaded"
+    );
+
+    // Same arm by a different route: the alias file is read as part of the
+    // scan, and one that does not parse fails the whole scan.
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("default.vault"), &saved).unwrap();
+    std::fs::write(dir.join("aliases.toml"), b"aliases = 5\n").unwrap();
+    assert!(matches!(
+        control(&fx, Request::Reload).await,
+        Response::Error(_)
+    ));
+    assert!(still_loaded(control(&fx, Request::Status).await));
+
+    std::fs::remove_file(dir.join("aliases.toml")).unwrap();
+    assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
+}
+
+/// SIGTERM must end `run_until_shutdown` and take the daemon's resources with
+/// it: the control socket file is unlinked and the bus name released, so a
+/// replacement daemon can start immediately. The terminate stream is
+/// installed here first, before the signal is raised, so the test process
+/// never sees an unhandled SIGTERM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sigterm_ends_run_until_shutdown_and_frees_the_name() {
+    let fx = Fixture::start().await;
+    let sock = fx.control_socket();
+    let conn = fx.client().await;
+    let dbus = zbus::fdo::DBusProxy::new(&conn).await.unwrap();
+    let name = zbus::names::BusName::try_from(paths::BUS_NAME).unwrap();
+    assert!(dbus.name_has_owner(name.clone()).await.unwrap());
+
+    // The bus, the vault directory and the runtime directory outlive the
+    // daemon, so what disappears below is the daemon's own doing and not a
+    // temporary directory being cleaned up.
+    let Fixture {
+        daemon,
+        bus: _bus,
+        data_dir: _data_dir,
+        runtime_dir: _runtime_dir,
+        ..
+    } = fx;
+    let mut _term =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+    let stopped = tokio::spawn(daemon.run_until_shutdown());
+
+    // `run_until_shutdown` registers its own handler; repeat the signal until
+    // it has, so the test cannot lose the race and hang.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !stopped.is_finished() && std::time::Instant::now() < deadline {
+        // SAFETY: `raise` takes a signal number and nothing else. SIGTERM is
+        // already handled process-wide by `_term` above.
+        unsafe { libc::raise(libc::SIGTERM) };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stopped
+        .await
+        .expect("run_until_shutdown returned on SIGTERM");
+
+    assert!(
+        wait_for(Duration::from_secs(5), || async { !sock.exists() }).await,
+        "the control socket file must be removed with the daemon"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || async {
+            !dbus.name_has_owner(name.clone()).await.unwrap_or(true)
+        })
+        .await,
+        "the bus name must be released with the daemon"
+    );
+}

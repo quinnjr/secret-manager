@@ -634,3 +634,39 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod canonicalize_missing_tests {
+    use super::*;
+
+    /// `sm ssh remove /nonexistent/..` reaches the fallback (the `canonical`
+    /// call fails) with a path whose `file_name()` is `None`. This resolver
+    /// decides which registered item `remove` deletes, so a path that names no
+    /// file must be refused rather than resolved to its parent directory --
+    /// which is not a key and would make `remove` report on the wrong item.
+    #[test]
+    fn canonicalize_missing_refuses_a_path_with_no_file_name() {
+        for bad in ["/nonexistent-9f2c/..", "/"] {
+            let err = canonicalize_missing(Path::new(bad)).unwrap_err();
+            assert!(matches!(err, CliError::Usage(_)), "{bad}: got {err:?}");
+            assert!(err.to_string().contains("no file name"), "{bad}: {err}");
+        }
+    }
+
+    /// The success case the refusal must not swallow: a key file that is gone
+    /// resolves through its canonicalized parent, so a registration made
+    /// through a symlinked directory is still matched after the file is
+    /// deleted.
+    #[test]
+    fn canonicalize_missing_resolves_a_gone_file_through_its_parent() {
+        let base = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(base.path()).unwrap().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            canonicalize_missing(&link.join("id_gone")).unwrap(),
+            real.join("id_gone")
+        );
+    }
+}
