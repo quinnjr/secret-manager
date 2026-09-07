@@ -1,1 +1,21 @@
 /target
+
+# The fuzz crate builds into its own target dir.
+/fuzz/target
+/fuzz/Cargo.lock
+
+# Crashing inputs found by a run. These are evidence, not source: when a run
+# finds one, minimize it and turn it into a regression test rather than
+# committing the raw artifact.
+/fuzz/artifacts
+
+# Coverage reports from `make fuzz-coverage`.
+/fuzz/coverage
+
+# libFuzzer grows the corpus as it explores. The hand-written seeds under
+# fuzz/corpus/<target>/ ARE committed — they are what gets a fuzzer past the
+# magic number and into the parser on a cold start — but a machine-grown
+# corpus is large, uninteresting to read, and regenerable, so it stays out.
+# Seeds are named seed-*; everything else libFuzzer writes is ignored.
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/seed-*

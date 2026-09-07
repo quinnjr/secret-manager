@@ -1,0 +1,44 @@
+# Control-socket wire tokens.
+#
+# These are the constants a mutational fuzzer cannot invent: a 4-byte
+# big-endian length that happens to land on the 1 MiB cap, the one version
+# byte the parser accepts, and the low varints that select an enum variant.
+# Without them a run spends its whole budget on frames that are rejected by
+# the length check before any parsing happens.
+
+# The only accepted protocol version, and its neighbours (the version gate
+# must refuse these, not fall through to postcard).
+version_current="\x03"
+version_prev="\x02"
+version_next="\x04"
+version_zero="\x00"
+version_max="\xff"
+
+# MAX_FRAME (1 << 20) and the two lengths either side of it, big-endian.
+len_max_frame="\x00\x10\x00\x00"
+len_max_frame_plus_1="\x00\x10\x00\x01"
+len_max_frame_minus_1="\x00\x0f\xff\xff"
+len_zero="\x00\x00\x00\x00"
+len_one="\x00\x00\x00\x01"
+len_u32_max="\xff\xff\xff\xff"
+len_high_bit="\x80\x00\x00\x00"
+
+# Complete minimal frames: length prefix, version, variant index.
+frame_status="\x00\x00\x00\x02\x03\x01"
+frame_reload="\x00\x00\x00\x02\x03\x02"
+frame_resp_ok="\x00\x00\x00\x02\x03\x00"
+
+# postcard variant indices for Request (Lock..ChangeKey) and Response.
+variant_0="\x00"
+variant_1="\x01"
+variant_2="\x02"
+variant_3="\x03"
+variant_4="\x04"
+# A non-canonical varint for 0: postcard accepts it, so a frame using it is
+# a distinct encoding of the same message and worth keeping in the corpus.
+variant_noncanonical="\x80\x00"
+
+# Lengths that matter to the postcard byte-array decoders on this protocol:
+# KEY_LEN, SALT_LEN, and the AES block/IV size.
+len_key_32="\x20"
+len_salt_16="\x10"

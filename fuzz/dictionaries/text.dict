@@ -1,0 +1,108 @@
+# libFuzzer dictionary for the text-facing targets: display_label,
+# escape_control_sanitize, pinentry_escape, dbus_paths, askpass_prompt and
+# config_toml.
+#
+# Every entry is either a token an attacker needs in order to forge something
+# — the punctuation the consent dialog's own sentence is built from, the
+# invisible characters that hide or reorder text, the fragments of the real
+# OpenSSH prompts — or a token the parsers key on. A mutator will not invent
+# a UTF-8 encoded RIGHT-TO-LEFT OVERRIDE on its own, and those are exactly
+# the inputs these sanitisers exist for.
+#
+# Use with: cargo +nightly fuzz run <target> -- -dict=dictionaries/text.dict
+
+# --- the dialog's own punctuation (the verified label forgery) -------------
+quote="\""
+open_paren="("
+close_paren=")"
+id_clause=" (id: "
+forged_clause="\" (id: default) and all 0 secrets? "
+delete_clause="Permanently delete the keyring "
+secrets_clause=" secrets?"
+
+# --- control characters and terminal escapes -------------------------------
+nul="\x00"
+bel="\x07"
+tab="\x09"
+lf="\x0a"
+cr="\x0d"
+esc="\x1b"
+del="\x7f"
+erase_line="\x1b[2K"
+erase_display="\x1b[2J"
+cursor_up="\x1b[A"
+csi_red="\x1b[31m"
+
+# --- invisible and bidi formatting, UTF-8 encoded --------------------------
+soft_hyphen="\xc2\xad"
+arabic_letter_mark="\xd8\x9c"
+zero_width_space="\xe2\x80\x8b"
+zero_width_non_joiner="\xe2\x80\x8c"
+zero_width_joiner="\xe2\x80\x8d"
+lrm="\xe2\x80\x8e"
+rlm="\xe2\x80\x8f"
+line_separator="\xe2\x80\xa8"
+paragraph_separator="\xe2\x80\xa9"
+lre="\xe2\x80\xaa"
+rle="\xe2\x80\xab"
+pdf="\xe2\x80\xac"
+lro="\xe2\x80\xad"
+rlo="\xe2\x80\xae"
+word_joiner="\xe2\x81\xa0"
+lri="\xe2\x81\xa6"
+pdi="\xe2\x81\xa9"
+bom="\xef\xbb\xbf"
+ellipsis="\xe2\x80\xa6"
+replacement="\xef\xbf\xbd"
+private_use="\xee\x80\x80"
+
+# --- Assuan / pinentry -----------------------------------------------------
+percent="%"
+pct_percent="%25"
+pct_lf="%0A"
+pct_cr="%0D"
+pct_nul="%00"
+pct_del="%7F"
+pct_truncated="%"
+pct_bad_hex="%zz"
+pct_high="%FF"
+assuan_ok="OK"
+assuan_err="ERR "
+assuan_data="D "
+
+# --- object paths ----------------------------------------------------------
+collections_prefix="/org/freedesktop/secrets/collection/"
+aliases_prefix="/org/freedesktop/secrets/aliases/"
+sessions_prefix="/org/freedesktop/secrets/session/"
+prompts_prefix="/org/freedesktop/secrets/prompt/"
+service_path="/org/freedesktop/secrets"
+default_id="default"
+slash="/"
+dotdot=".."
+pct_slash="%2f"
+
+# --- OpenSSH askpass prompts ----------------------------------------------
+ssh_prompt="Enter passphrase for key '"
+keygen_prompt="Enter passphrase for \""
+sshadd_prompt="Enter passphrase for /"
+will_confirm=" (will confirm each use): "
+prompt_tail="': "
+yes_no="(yes/no/[fingerprint])? "
+authenticity="The authenticity of host '"
+allow_use="Allow use of key "
+user_presence="Confirm user presence for key "
+ssh_dir="/home/u/.ssh/id_ed25519"
+
+# --- config.toml -----------------------------------------------------------
+kdf_table="[kdf]"
+vault_table="[vault]"
+prompt_table="[prompt]"
+m_cost="m_cost_kib = "
+t_cost="t_cost = "
+p_cost="p_cost = "
+auto_lock="auto_lock_after = "
+lock_memory="lock_memory = true"
+locked_search="locked_search = false"
+pinentry_key="pinentry = "
+tilde_dir="dir = \"~/"
+big_number="4294967295"
