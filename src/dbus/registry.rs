@@ -128,7 +128,11 @@ pub async fn register_all(conn: &Connection, state: &Shared) -> zbus::Result<()>
                 .chain(st.broken.keys())
                 .cloned()
                 .collect::<Vec<_>>(),
-            st.aliases.keys().cloned().collect::<Vec<_>>(),
+            // Every name the daemon knows of, which while the table is
+            // degraded is the last set it read successfully and, if it has
+            // never parsed, none at all. Registering an object here does not
+            // make it resolve: `Collection::id` asks the table again.
+            st.aliases.known().keys().cloned().collect::<Vec<_>>(),
         )
     };
     for id in ids {
@@ -165,6 +169,7 @@ pub async fn notify_collection_changed(conn: &Connection, id: &str) {
         let coll = iface.get().await;
         let st = coll.state().lock().await;
         st.aliases
+            .known()
             .iter()
             .filter(|(_, target)| target.as_str() == id)
             .map(|(name, _)| name.clone())

@@ -1564,7 +1564,10 @@ async fn create_collection_without_an_alias_touches_no_alias() {
     );
     assert_eq!(
         fx.daemon.state.lock().await.aliases,
-        std::collections::BTreeMap::from([("default".to_string(), "default".to_string())]),
+        secret_manager::dbus::state::AliasTable::Usable(std::collections::BTreeMap::from([(
+            "default".to_string(),
+            "default".to_string()
+        )])),
         "the alias table changed although no alias was asked for"
     );
 }
@@ -2433,4 +2436,67 @@ async fn a_collection_removed_during_its_derivation_is_not_resurrected() {
         "the password was asked for again:\n{}",
         fx.pinentry_log()
     );
+}
+
+/// The alias table can go bad *between* `CreateCollection` and the prompt
+/// that performs it, which is the one way the prompt still sees an alias it
+/// cannot record.
+///
+/// It must refuse the alias work outright. Inserting into the table and then
+/// only warning that the save was refused left the daemon holding a mapping
+/// it may never write: `ReadAlias` said the table was unreadable while the
+/// alias *object* resolved perfectly well — two different answers for one
+/// name — and the mapping vanished at the next reload. The collection itself
+/// is still created; it is the convenience mapping that is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_is_created_even_when_its_alias_cannot_be_recorded() {
+    let fx = Fixture::start_with_pin_and_env(
+        Some("newpw"),
+        vec![("FAKE_CONFIRM".to_string(), "yes".to_string())],
+        Duration::ZERO,
+    )
+    .await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Work Keys"),
+    )]);
+    let (_, prompt) = service
+        .create_collection(props, "work")
+        .await
+        .expect("the table is still readable at this point");
+
+    let path = fx
+        .data_dir
+        .path()
+        .join("secret-manager")
+        .join("aliases.toml");
+    let corrupt = b"aliases = 5\n";
+    std::fs::write(&path, corrupt).unwrap();
+    let sock = fx.control_socket();
+    let reply = tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reply, secret_manager::protocol::Response::Ok);
+
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(!dismissed);
+    let new_path = OwnedObjectPath::try_from(result).unwrap();
+    assert_eq!(new_path, paths::collection("work_keys"));
+    let work = collection(&conn, new_path.clone()).await;
+    assert_eq!(work.label().await.unwrap(), "Work Keys");
+
+    // The alias was not recorded anywhere: not in the file...
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    // ...and not in memory either, so there is only ever one answer for it.
+    let alias = collection(&conn, paths::alias("work").unwrap()).await;
+    assert!(
+        alias.label().await.is_err(),
+        "the alias resolved from a table the daemon has refused to write"
+    );
+    assert!(service.read_alias("work").await.is_err());
 }

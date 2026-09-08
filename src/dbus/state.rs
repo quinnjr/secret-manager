@@ -91,18 +91,10 @@ pub struct ServiceState {
     /// its label; `(path, error message)` for `Reload` retries and for
     /// `broken_error`.
     pub broken: BTreeMap<String, (PathBuf, String)>,
-    pub aliases: BTreeMap<String, String>,
-    /// Set when `aliases.toml` exists but could not be parsed.
-    ///
-    /// A corrupt vault file has always been tolerated — it becomes a
-    /// permanently locked collection carrying its error — while a corrupt
-    /// alias file refused to start the daemon at all, so the least valuable
-    /// file in the directory was the one that could brick it. This makes the
-    /// two symmetric: the daemon starts, the aliases are *unusable* rather
-    /// than silently empty, and every alias operation refuses while it is
-    /// set. Nothing rewrites the file in that state, because the operator may
-    /// still want to recover it.
-    pub alias_error: Option<String>,
+    /// The alias table, and whether it can be trusted. See [`AliasTable`]:
+    /// the "unusable" state is a *variant*, not a flag beside the map, so
+    /// every lookup has to answer the question rather than remember a rule.
+    pub aliases: AliasTable,
     /// session object path -> entry
     pub sessions: BTreeMap<String, SessionEntry>,
     /// prompt object path -> owner unique bus name
@@ -133,6 +125,166 @@ pub struct ServiceState {
     next_prompt: u64,
 }
 
+/// Why the alias table cannot be trusted, in a form that is safe to log, to
+/// put in a D-Bus error, and to carry in a `Status` reply.
+///
+/// `toml`'s error `Display` echoes the offending source line verbatim, so the
+/// text is attacker-shaped in both length and content. A 500 KB single-line
+/// `aliases.toml` yields a half-megabyte message: on its own that is larger
+/// than [`crate::protocol::MAX_FRAME`], so it destroys the whole `Status`
+/// reply and takes the collection table down along with the diagnostic. And
+/// the bytes come back raw, so a file the daemon only ever *reads* can forge
+/// journal lines the way a client-supplied label can — which is why
+/// `prompt::display_label` exists. Both are dealt with here, at the single
+/// point of construction, rather than at each of the places the reason is
+/// shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasError(String);
+
+/// Longest recorded alias-failure reason, in characters.
+///
+/// Sized the way [`crate::vault::format::MAX_LABEL`] is: large enough for the
+/// first line or two of a real TOML error ("expected `.`, `=`" and where),
+/// small enough that it can never crowd a `Status` frame even with one per
+/// reply.
+pub const MAX_ALIAS_ERROR: usize = 200;
+const _: () = assert!(MAX_ALIAS_ERROR <= crate::protocol::MAX_FRAME / 256);
+
+impl AliasError {
+    /// Name the file, then the bounded, sanitized reason.
+    fn new(e: &std::io::Error) -> Self {
+        let raw = format!("{ALIAS_FILE}: {e}");
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| !super::prompt::is_invisible_format(*c))
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.chars().count() > MAX_ALIAS_ERROR {
+            let mut out: String = collapsed.chars().take(MAX_ALIAS_ERROR).collect();
+            out.push('\u{2026}');
+            Self(out)
+        } else {
+            Self(collapsed)
+        }
+    }
+}
+
+impl std::fmt::Display for AliasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The alias table, in the two states it can actually be in.
+///
+/// A corrupt vault file has always been tolerated — it becomes a permanently
+/// locked collection carrying its error — while a corrupt `aliases.toml`
+/// refused to start the daemon at all, so the least valuable file in the
+/// directory was the one that could brick the service. The two are now
+/// symmetric: the daemon starts, and the alias table is **unusable rather
+/// than silently empty**, because "no such alias" is exactly the answer that
+/// invites a client to claim a name the user already owns.
+///
+/// That distinction was first written as a `bool` beside the map, and it held
+/// only by accident: every lookup that forgot to consult the flag got `None`
+/// out of the empty fallback, which is the wrong answer spelled correctly.
+/// It is a sum type now so that "unusable but non-empty" is unrepresentable
+/// and every caller is made by the compiler to say what it does about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AliasTable {
+    /// `aliases.toml` parsed. This is what is on disk.
+    Usable(BTreeMap<String, String>),
+    /// It could not be read, and `known` is the last table that *was* read
+    /// successfully — empty when it has never parsed, which is the state a
+    /// daemon starts in over a corrupt file.
+    ///
+    /// Nothing may be written back. A name in `known` still resolves, because
+    /// dropping a table we already hold would break every alias in a running
+    /// process over a file whose contents we have; a name that is not in it
+    /// is refused rather than reported free, because what is in the file
+    /// *now* is exactly what the daemon does not know. A daemon that started
+    /// over a corrupt file knows nothing at all, and its empty `known`
+    /// collapses onto the second of those on its own.
+    Degraded {
+        reason: AliasError,
+        known: BTreeMap<String, String>,
+    },
+}
+
+impl Default for AliasTable {
+    fn default() -> Self {
+        AliasTable::Usable(BTreeMap::new())
+    }
+}
+
+impl AliasTable {
+    /// Why the table cannot be written, when it cannot. `None` means healthy.
+    pub fn unusable(&self) -> Option<&AliasError> {
+        match self {
+            AliasTable::Usable(_) => None,
+            AliasTable::Degraded { reason, .. } => Some(reason),
+        }
+    }
+
+    /// The mappings the daemon knows about: the file's contents when healthy,
+    /// the last ones read when stale, and none at all when it has never
+    /// parsed.
+    ///
+    /// For enumeration only — registering D-Bus objects, listing the aliases
+    /// that point at a collection. A *lookup* must go through [`resolve`] or
+    /// [`ServiceState::alias_target`], which distinguish "not in the table"
+    /// from "the table cannot answer".
+    ///
+    /// [`resolve`]: AliasTable::resolve
+    pub fn known(&self) -> &BTreeMap<String, String> {
+        match self {
+            AliasTable::Usable(table) | AliasTable::Degraded { known: table, .. } => table,
+        }
+    }
+
+    /// The table, only when it is what is actually on disk. `Err` means it
+    /// must not be modified or written back: replacing a file the operator
+    /// may still be able to repair with one built from what we guessed turns
+    /// a recoverable parse error into silent data loss.
+    pub fn writable(&self) -> std::result::Result<&BTreeMap<String, String>, &AliasError> {
+        match self {
+            AliasTable::Usable(table) => Ok(table),
+            AliasTable::Degraded { reason, .. } => Err(reason),
+        }
+    }
+
+    /// Look one name up.
+    ///
+    /// `Ok(None)` is the only "no such alias" this type ever produces, and it
+    /// is produced only from a table we have actually read. While degraded, a
+    /// name we know still resolves (availability), and a name we do not is an
+    /// `Err` — never a `/`, which would invite a claim on a name the file may
+    /// well already hold.
+    pub fn resolve(&self, name: &str) -> std::result::Result<Option<&str>, &AliasError> {
+        match self {
+            AliasTable::Usable(table) => Ok(table.get(name).map(String::as_str)),
+            AliasTable::Degraded { reason, known } => {
+                known.get(name).map(String::as_str).ok_or(reason).map(Some)
+            }
+        }
+    }
+
+    /// Record that the file could not be read, keeping whatever was last read
+    /// successfully.
+    ///
+    /// Overwriting the table with the empty fallback here is what made a
+    /// single bad `Reload` permanent: every alias stopped resolving *and* the
+    /// table could never be written back, so nothing could put it right
+    /// except repairing the file by hand.
+    pub fn degrade(&mut self, reason: AliasError) {
+        let known = match std::mem::take(self) {
+            AliasTable::Usable(table) | AliasTable::Degraded { known: table, .. } => table,
+        };
+        *self = AliasTable::Degraded { reason, known };
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct AliasFile {
     aliases: BTreeMap<String, String>,
@@ -140,11 +292,42 @@ struct AliasFile {
 
 const ALIAS_FILE: &str = "aliases.toml";
 
+/// Largest `aliases.toml` that will be read into memory.
+///
+/// A vault file is bounded by [`crate::vault::format::MAX_VAULT_BYTES`] from
+/// its `stat` size before a byte of it is read; the alias file had no bound
+/// at all, so a multi-gigabyte one was slurped whole at startup — and, since
+/// `Reload` is reachable from any same-uid peer, again on demand. 1 MiB is
+/// four orders of magnitude more than [`super::service::MAX_ALIASES`] entries
+/// at [`super::service::MAX_ALIAS_NAME`] each could ever need.
+pub const MAX_ALIAS_BYTES: u64 = 1 << 20;
+
+/// Read `aliases.toml`.
+///
+/// `InvalidData` — and only `InvalidData` — means "the file is there and the
+/// daemon cannot make sense of it", which is the condition the caller may
+/// degrade over. Every other error (`EACCES`, `EIO`, `EISDIR`) is a fault
+/// with the *directory*, and "repair or delete aliases.toml" is meaningless
+/// advice for it.
 pub fn load_aliases(dir: &Path) -> std::io::Result<BTreeMap<String, String>> {
-    match std::fs::read_to_string(dir.join(ALIAS_FILE)) {
+    let path = dir.join(ALIAS_FILE);
+    // Bound the read before making it, exactly as `Vault::open` does.
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > MAX_ALIAS_BYTES => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("too large: {} bytes, at most {MAX_ALIAS_BYTES}", meta.len()),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e),
+    }
+    match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str::<AliasFile>(&text)
             .map(|f| f.aliases)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        // The file can be unlinked between the `stat` and the read.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
         Err(e) => Err(e),
     }
@@ -208,9 +391,10 @@ pub fn save_aliases_to(dir: &Path, aliases: &BTreeMap<String, String>) -> std::i
 pub struct VaultScan {
     pub opened: Vec<(String, Vault)>,
     pub broken: Vec<(String, PathBuf, String)>,
-    pub aliases: BTreeMap<String, String>,
-    /// See [`ServiceState::alias_error`].
-    pub alias_error: Option<String>,
+    /// The alias file's contents, or why they could not be had. A `Result`
+    /// rather than a map plus a flag, so [`ServiceState::merge_scan`] cannot
+    /// apply the one without deciding about the other.
+    pub aliases: std::result::Result<BTreeMap<String, String>, AliasError>,
     pub seen: std::collections::BTreeSet<String>,
 }
 
@@ -229,8 +413,7 @@ pub fn scan_vault_dir(
     let mut scan = VaultScan {
         opened: Vec::new(),
         broken: Vec::new(),
-        aliases: BTreeMap::new(),
-        alias_error: None,
+        aliases: Ok(BTreeMap::new()),
         seen: std::collections::BTreeSet::new(),
     };
     for entry in std::fs::read_dir(dir)? {
@@ -265,15 +448,26 @@ pub fn scan_vault_dir(
     // holds nothing but convenience mappings, and anything that truncates it —
     // a backup tool, a full disk, a hand edit — would take the service down.
     match load_aliases(dir) {
-        Ok(aliases) => scan.aliases = aliases,
-        Err(e) => {
+        Ok(aliases) => scan.aliases = Ok(aliases),
+        // A file that is present and unparseable is the tolerated case.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            let reason = AliasError::new(&e);
+            // Sanitized and bounded: the text is the `toml` crate's echo of a
+            // line of an attacker-writable file (F2).
             tracing::error!(
-                "{} could not be read ({e}); alias lookups will refuse until it is \
-                 repaired or removed, and nothing will overwrite it meanwhile",
-                dir.join(ALIAS_FILE).display()
+                "{}: {reason}; alias lookups will refuse for names not already \
+                 known, and nothing will overwrite the file, until it is \
+                 repaired or removed",
+                dir.display()
             );
-            scan.alias_error = Some(e.to_string());
+            scan.aliases = Err(reason);
         }
+        // Anything else is a fault with the directory, not with the TOML in
+        // it, and is reported the same way `read_dir` above is: a permission
+        // error is not something the operator fixes by editing the file, and
+        // degrading over it would start a daemon whose `SetAlias` can never
+        // recreate it.
+        Err(e) => return Err(e),
     }
     Ok(scan)
 }
@@ -401,8 +595,7 @@ impl ServiceState {
             pinentry,
             collections: BTreeMap::new(),
             broken: BTreeMap::new(),
-            aliases: BTreeMap::new(),
-            alias_error: None,
+            aliases: AliasTable::default(),
             sessions: BTreeMap::new(),
             prompt_owners: BTreeMap::new(),
             prompt_tasks: BTreeMap::new(),
@@ -461,8 +654,15 @@ impl ServiceState {
         // A `broken` entry whose file has since been deleted or repaired stops
         // being advertised as a locked collection.
         self.broken.retain(|id, _| scan.seen.contains(id));
-        self.aliases = scan.aliases;
-        self.alias_error = scan.alias_error;
+        match scan.aliases {
+            Ok(aliases) => self.aliases = AliasTable::Usable(aliases),
+            // A failed scan must not discard what is already loaded — the
+            // rule `tests/daemon.rs` pins for collections. Assigning the
+            // empty fallback here broke every alias in the running daemon
+            // *and* forbade writing the table back, so one bad `Reload` was
+            // permanent.
+            Err(reason) => self.aliases.degrade(reason),
+        }
         new_ids
     }
 
@@ -474,33 +674,42 @@ impl ServiceState {
     }
 
     /// Why the alias table cannot be used, when it cannot.
-    pub fn aliases_unusable(&self) -> Option<&str> {
-        self.alias_error.as_deref()
+    pub fn aliases_unusable(&self) -> Option<&AliasError> {
+        self.aliases.unusable()
     }
 
+    /// Write the table back. Refuses unless it is the file's own contents;
+    /// see [`AliasTable::writable`]. The callers refuse first, with a better
+    /// message; this is the backstop.
     pub fn save_aliases(&self) -> std::io::Result<()> {
-        // Writing here would replace a file the operator may still be able to
-        // repair with one built from the empty table we fell back to, turning
-        // a recoverable parse error into silent data loss. The callers refuse
-        // first; this is the backstop.
-        if let Some(e) = self.aliases_unusable() {
-            return Err(std::io::Error::new(
+        let table = self.aliases.writable().map_err(|e| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("refusing to overwrite an unreadable alias table: {e}"),
-            ));
-        }
-        save_aliases_to(&self.vault_dir, &self.aliases)
+            )
+        })?;
+        save_aliases_to(&self.vault_dir, table)
     }
 
-    /// Collection id an alias currently resolves to, or `None` if it names
-    /// no collection (unset, or targeting one that no longer exists).
-    /// Shared by `Collection::id`, `Service::read_alias`, and
-    /// `Service::create_collection` so alias resolution lives in one place.
-    pub(crate) fn alias_target(&self, name: &str) -> Option<String> {
-        self.aliases
-            .get(name)
+    /// Collection id an alias currently resolves to.
+    ///
+    /// `Ok(None)` is "no such alias": either unset, or set to a collection
+    /// that no longer exists. `Err` is "this table cannot answer", which is a
+    /// different thing and which every caller has to handle — the single
+    /// funnel for alias resolution returns a `Result` precisely so that the
+    /// compiler, not a future reader's memory, enumerates the places that
+    /// have to decide (`Collection::id`, `CollectionAdmin::id`,
+    /// `resolve_collection`, `resolve_path`, `Service::read_alias`,
+    /// `Service::create_collection`).
+    pub(crate) fn alias_target(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<String>, &AliasError> {
+        Ok(self
+            .aliases
+            .resolve(name)?
             .filter(|id| self.collections.contains_key(*id))
-            .cloned()
+            .map(str::to_string))
     }
 
     /// Collection id for a collection or alias path. Recognises a broken
@@ -513,7 +722,14 @@ impl ServiceState {
             {
                 Some(id)
             }
-            Target::Alias(name) => self.alias_target(&name),
+            // An object path that cannot be resolved is refused as
+            // `NoSuchObject`, which is the safe answer: it reaches no vault
+            // and touches no secret. It is also the *only* answer available
+            // here — the D-Bus surface this feeds turns `None` into an error
+            // and has nowhere to put a reason — so the reason is dropped
+            // deliberately, and `Collection::id` carries it instead for the
+            // paths that have a `Result` to put it in.
+            Target::Alias(name) => self.alias_target(&name).unwrap_or(None),
             _ => None,
         }
     }
@@ -534,9 +750,17 @@ impl ServiceState {
     pub fn resolve_path(&self, path: &str) -> Option<PathTarget> {
         let (cid, iid) = match paths::parse(path)? {
             Target::Collection(id) => (id, None),
-            Target::Alias(name) => (self.alias_target(&name)?, None),
+            // As in `resolve_collection`: an unusable table resolves to
+            // nothing at all, so no path silently reaches a different
+            // collection than the caller meant. This is the arm that carries
+            // `GetSecrets`, `CreateItem`, `SetSecret` and `Delete` under an
+            // alias path, so "resolves to nothing" is a refusal, not a
+            // fallback.
+            Target::Alias(name) => (self.alias_target(&name).unwrap_or(None)?, None),
             Target::Item { collection, item } => (collection, Some(item)),
-            Target::AliasItem { alias, item } => (self.alias_target(&alias)?, Some(item)),
+            Target::AliasItem { alias, item } => {
+                (self.alias_target(&alias).unwrap_or(None)?, Some(item))
+            }
         };
         match (self.collections.get(&cid), iid) {
             (Some(v), None) => Some(PathTarget::Collection {
@@ -863,18 +1087,36 @@ mod tests {
         let scan = scan_vault_dir(dir.path(), true, &Default::default())
             .expect("a corrupt alias file must not fail the scan");
         assert_eq!(scan.opened.len(), 1, "the vault still loads");
-        assert!(scan.aliases.is_empty());
-        let reason = scan.alias_error.as_deref().expect("the reason is recorded");
-        assert!(!reason.is_empty());
+        let reason = scan.aliases.clone().expect_err("the reason is recorded");
+        assert!(!reason.to_string().is_empty());
 
         let mut st = state(dir.path());
         st.load_vaults().expect("the daemon still starts");
         assert!(st.collections.contains_key("default"));
-        assert_eq!(st.aliases_unusable(), Some(reason));
+        assert_eq!(st.aliases_unusable(), Some(&reason));
 
-        // Unusable, not empty: nothing resolves, so no client is told a name
-        // is free and invited to claim it.
-        assert_eq!(st.alias_target("default"), None);
+        // Unusable, not empty. The assertion that used to stand here was
+        // `alias_target("default") == None`, which passed with or without any
+        // guard at all — the fixture cannot parse, so the map was empty
+        // either way, and the property it claimed to pin held by accident.
+        // Nothing has ever been read here, so the answer is an *error*: "no
+        // such alias" is what would invite a client to claim the name.
+        assert!(
+            st.aliases.known().is_empty(),
+            "a file that has never parsed leaves nothing known"
+        );
+        assert_eq!(st.alias_target("default").unwrap_err(), &reason);
+        // And that refusal reaches the paths that carry secrets, not just
+        // the read-only introspection: an alias object path resolves to
+        // nothing rather than to some other collection.
+        assert!(
+            st.resolve_path("/org/freedesktop/secrets/aliases/default/item")
+                .is_none()
+        );
+        assert!(
+            st.resolve_collection("/org/freedesktop/secrets/aliases/default")
+                .is_none()
+        );
     }
 
     /// The file the operator still needs must not be replaced by one built
@@ -923,7 +1165,7 @@ mod tests {
 
         st.load_vaults().unwrap();
         assert_eq!(st.aliases_unusable(), None, "the condition must clear");
-        assert_eq!(st.alias_target("default"), Some("work".to_string()));
+        assert_eq!(st.alias_target("default"), Ok(Some("work".to_string())));
     }
 
     /// A vault directory that cannot be scanned must fail `load_vaults`
@@ -974,5 +1216,116 @@ mod tests {
             1,
             "only the nameable file is accounted for"
         );
+    }
+
+    /// A failed scan must not discard the alias table already loaded.
+    ///
+    /// `tests/daemon.rs` pins the equivalent contract for collections; this
+    /// is the same rule for aliases, and it was broken by the fallback: a
+    /// `Reload` after the file went corrupt replaced a good in-memory table
+    /// with the empty fallback *and* forbade writing it back, so every alias
+    /// stopped resolving, permanently.
+    #[test]
+    fn a_corrupt_alias_file_does_not_discard_the_table_already_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        Vault::create(
+            &dir.path().join("work.vault"),
+            "Work",
+            b"pw",
+            KdfParams::FAST_FOR_TESTS,
+        )
+        .unwrap();
+        save_aliases_to(
+            dir.path(),
+            &BTreeMap::from([("default".to_string(), "work".to_string())]),
+        )
+        .unwrap();
+        let mut st = state(dir.path());
+        st.load_vaults().unwrap();
+        assert_eq!(
+            st.resolve_collection("/org/freedesktop/secrets/aliases/default"),
+            Some("work".to_string())
+        );
+
+        std::fs::write(dir.path().join(ALIAS_FILE), b"aliases = 5\n").unwrap();
+        st.load_vaults().unwrap();
+        assert_eq!(
+            st.resolve_collection("/org/freedesktop/secrets/aliases/default"),
+            Some("work".to_string()),
+            "a failed reload must not discard the aliases already loaded"
+        );
+        assert_eq!(st.alias_target("default"), Ok(Some("work".to_string())));
+        // A name we have never read is still refused: what is in the file now
+        // is the thing we do not know, so "no such alias" is not ours to say.
+        assert!(st.alias_target("login").is_err());
+        // And the table stays unwritable while it is in that state.
+        assert!(st.save_aliases().is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join(ALIAS_FILE)).unwrap(),
+            b"aliases = 5\n",
+            "the unreadable file was overwritten"
+        );
+    }
+
+    /// The recorded reason is bounded and carries no control characters.
+    ///
+    /// `toml`'s `Display` echoes the offending source line, so a large
+    /// single-line file produced an error larger than `MAX_FRAME` — which
+    /// destroys the whole `Status` reply, losing the collection table as well
+    /// as the diagnostic — and reproduced raw control bytes, which forge
+    /// journal lines from a file the daemon only ever reads.
+    #[test]
+    fn the_alias_error_is_bounded_and_sanitized() {
+        let dir = tempfile::tempdir().unwrap();
+        // One long line, so `toml`'s echo of it is the whole 500 KB, with
+        // control and bidi characters in it.
+        let mut text = String::from("k = \"\x1b[2K\u{202e}");
+        text.push_str(&"A".repeat(500 * 1024));
+        std::fs::write(dir.path().join(ALIAS_FILE), text.as_bytes()).unwrap();
+        let scan = scan_vault_dir(dir.path(), true, &Default::default()).unwrap();
+        let reason = scan.aliases.expect_err("recorded").to_string();
+        assert!(
+            reason.len() <= 4 * MAX_ALIAS_ERROR,
+            "the reason is {} bytes, which alone can overflow a Status frame",
+            reason.len()
+        );
+        assert!(
+            !reason.chars().any(|c| c.is_control()),
+            "raw control characters forge log lines: {reason:?}"
+        );
+        assert!(
+            reason.contains(ALIAS_FILE),
+            "the reason must name the file to repair: {reason:?}"
+        );
+    }
+
+    /// An oversized alias file is refused from its `stat` size, before it is
+    /// read, exactly as a vault file is: `Reload` is reachable from any
+    /// same-uid peer, so a multi-gigabyte file would otherwise be slurped
+    /// whole on demand.
+    #[test]
+    fn an_oversized_alias_file_is_refused_before_it_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut text = String::from("k = \"");
+        text.push_str(&"a".repeat(MAX_ALIAS_BYTES as usize));
+        text.push('"');
+        std::fs::write(dir.path().join(ALIAS_FILE), text.as_bytes()).unwrap();
+        let err = load_aliases(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    /// Only a *parse* failure degrades. An `EACCES`/`EIO`/`EISDIR` file is
+    /// not a file the operator can repair by editing TOML, and starting into
+    /// a permanently degraded state where `SetAlias` can never recreate the
+    /// file is worse than saying so.
+    #[test]
+    fn an_unreadable_alias_file_fails_the_scan_rather_than_degrading() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(ALIAS_FILE)).unwrap();
+        let Err(err) = scan_vault_dir(dir.path(), true, &Default::default()) else {
+            panic!("a file that cannot be read is not a parse failure");
+        };
+        assert_ne!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
     }
 }

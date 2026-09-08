@@ -7,7 +7,7 @@ use crate::dbus::prompt::Prompt;
 use crate::dbus::registry;
 use crate::dbus::service::{Service, ServiceSignals};
 use crate::dbus::session::Session;
-use crate::dbus::state::{ServiceState, Shared, block_in_place};
+use crate::dbus::state::{AliasError, ServiceState, Shared, block_in_place};
 use crate::prompt::Pinentry;
 use crate::protocol::{CollectionStatus, Request, Response};
 use crate::vault::crypto::{KdfParams, Key};
@@ -334,7 +334,7 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                         .map(|(id, (_, err))| (id.clone(), err.clone()))
                         .collect::<Vec<_>>(),
                     st.started,
-                    st.aliases_unusable().map(str::to_string),
+                    st.aliases_unusable().map(AliasError::to_string),
                 )
             };
             let mut collections: Vec<CollectionStatus> = Vec::with_capacity(vaults.len());

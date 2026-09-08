@@ -42,7 +42,11 @@ enum Msg {
         [u8; KEY_LEN],
     ),
     RespOk,
-    RespStatus(Vec<(String, String, bool, u16, Option<String>)>, u64),
+    RespStatus(
+        Vec<(String, String, bool, u16, Option<String>)>,
+        u64,
+        Option<String>,
+    ),
     RespError(String),
 }
 
@@ -157,6 +161,7 @@ fn assert_wire_order() {
             Response::Status {
                 collections: Vec::new(),
                 uptime_secs: 0,
+                aliases_error: None,
             },
             1,
             "Status",
@@ -217,7 +222,8 @@ fuzz_target!(|msg: Msg| {
         Msg::RespOk | Msg::RespStatus(..) | Msg::RespError(_) => {
             let resp = match msg {
                 Msg::RespOk => Response::Ok,
-                Msg::RespStatus(rows, uptime_secs) => Response::Status {
+                Msg::RespStatus(rows, uptime_secs, aliases_error) => Response::Status {
+                    aliases_error,
                     collections: rows
                         .into_iter()
                         .map(|(id, label, locked, items, warning)| CollectionStatus {

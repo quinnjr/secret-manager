@@ -27,6 +27,7 @@ cargo test --lib vault::                             # one module's unit tests
 cargo test --test cli_ssh remove_refuses             # one test by name
 cargo clippy --all-targets -- -D warnings
 cargo clippy --no-default-features --features pam --lib -- -D warnings
+cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets
 make build                                           # both release artifacts
 ```
 
@@ -184,7 +185,12 @@ make fuzz-long                # 1 hour per target, before a release
 ```
 
 `fuzz/` is a standalone crate with its own `[workspace]`, and the parent
-manifest excludes it, so a normal `cargo build` never sees it. It enables the
+manifest excludes it, so a normal `cargo build` never sees it — **and neither
+does any gate**: `cargo test`, `cargo clippy --all-targets` and
+`cargo fmt --check` all stay green while the fuzz crate does not compile.
+Adding a field to a type the targets construct is enough to break it. Run the
+`cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets` above, or
+`make test`, which now does. It enables the
 `fuzzing` feature, which exposes `src/fuzz_api.rs` — thin wrappers over
 `pub(crate)` helpers that sit on attacker-fed input. Nothing we ship sets
 that feature, and it must not be used to widen the real API.

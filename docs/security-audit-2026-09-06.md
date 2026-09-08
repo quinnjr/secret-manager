@@ -1134,3 +1134,95 @@ than failing as though the round trip were broken.
 
 528 tests pass, twice over. Clippy clean at `-D warnings` for the default and
 `pam` builds; `cargo fmt --check` clean.
+
+## Review of the alias fix — 2026-09-07
+
+The fix above held its headline property *by accident*, and a review found
+nine further defects in it. All are fixed here, each with a test confirmed red
+first.
+
+**The guard was on two of eleven call sites.** `ServiceState::alias_target` is
+the single funnel for alias resolution and was unguarded; it returned `None`
+while degraded only because the map happened to be empty. The paths that
+carry `GetSecrets`, `CreateItem`, `SetSecret` and `Delete` under an alias
+object path were among the nine that never asked. "Unusable but non-empty" is
+now unrepresentable rather than guarded: `ServiceState::aliases` is an
+`AliasTable` — `Usable(map)` or `Degraded { reason, known }` — and
+`alias_target` returns a `Result`, so the compiler enumerated every site that
+had to decide, and each one says in a comment what it decided.
+
+**A `Reload` wiped a live, working table.** `merge_scan` assigned the empty
+fallback unconditionally, so a file that went bad under a running daemon
+broke every alias in it *permanently* — the same table was then forbidden
+from ever being written back. `tests/daemon.rs` pins that rule for
+collections; nothing pinned it for aliases. The last table read successfully
+is now kept, which is what `Degraded`'s `known` is for, and that answers the
+question of what `ReadAlias` should say: a name the daemon has already read
+still resolves (availability), a name it has not is refused — never `/`,
+which is the answer that invites a claim. At startup with a corrupt file
+`known` is empty, so every name falls into the second case on its own.
+
+**The prompt path mutated the table and only warned.** `create_collection`
+and `delete_collection` inserted into `st.aliases`, then logged the refusal
+from `save_aliases` and carried on, so the daemon gave two different answers
+for one name and the mapping vanished at the next reload. The alias work is
+refused up front now; the collection operation still succeeds. A *write*
+failure with a readable table is unchanged and still deliberate — see
+`an_unwritable_alias_file_blocks_neither_create_nor_delete`, which pins it.
+
+**`SetAlias`'s guard was on the wrong side of the branch.** It sat inside the
+repointing branch, so `SetAlias(name, "/")` removed the entry, bounced off the
+`save_aliases` backstop, and returned before `registry::unregister_alias` —
+leaking the two exported objects that clearing exists to reclaim, with the
+entry gone from memory anyway. The guard is above the split, and the write
+now happens *before* the in-memory commit, so an I/O failure on the healthy
+path can no longer leave the daemon disagreeing with its own file after
+telling the client the call failed.
+
+**The error string was unbounded and unsanitized.** `toml`'s `Display` echoes
+the offending source line, so a 500 KB single-line `aliases.toml` produced a
+512 KB error — larger than `MAX_FRAME` on its own, destroying the whole
+`Status` reply and losing the collection table along with the diagnostic —
+and it reproduced raw control bytes into `tracing::error!` and into D-Bus
+errors, forging journal lines from a file the daemon only reads. It is now an
+`AliasError`: sanitized and bounded to `MAX_ALIAS_ERROR` at its single point
+of construction, and prefixed with `aliases.toml`, which the message never
+named.
+
+**The file was read with no size cap.** Vault files get `check_vault_size`
+from `stat` before any read; `aliases.toml` got nothing, so a multi-gigabyte
+file was read whole at startup — and `Reload` is reachable from any same-uid
+peer, so on demand thereafter. `MAX_ALIAS_BYTES` mirrors the vault's
+stat-before-read.
+
+**It degraded on every error, not just a parse failure.** `EACCES`, `EIO` and
+`EISDIR` came back as "repair or delete aliases.toml", which is meaningless
+advice for a permission fault, and started the daemon into a state where
+`SetAlias` could never recreate the file. Only `ErrorKind::InvalidData`
+degrades; everything else propagates, as `read_dir` two lines above does.
+
+**`sm init` still treated it as fatal**, and did so *after* `Vault::create`
+had written the vault: a half-finished init that never printed the id the
+user needs, never sent the `Reload`, and reported "collection already exists"
+on the re-run. It warns and carries on.
+
+**The recovery instruction named a command that did not exist.** There is now
+an `sm reload`; it is independently useful, and `sm init` — the only other
+`Reload` sender — is exactly the command this state used to break.
+
+**One test was vacuous.** `assert_eq!(st.alias_target("default"), None)`
+passed with or without any guard, because the fixture cannot parse and the
+map was empty either way. It asserts the refusal now, and reaches the paths
+that carry secrets. Two integration tests drive `ReadAlias`, `SetAlias` and
+`CreateCollection` against a daemon whose alias file went bad under it —
+which is what nothing did before, and why the misplaced `SetAlias` guard
+survived.
+
+`PROTOCOL_VERSION` stays 4: `Response::Status::aliases_error` is unchanged on
+the wire.
+
+## State
+
+537 tests pass, twice over. Clippy clean at `-D warnings` for the default and
+`pam` builds; `cargo fmt --check` clean; `cargo +nightly check` clean on the
+excluded `fuzz/` crate.

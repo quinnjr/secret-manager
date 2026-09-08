@@ -194,3 +194,36 @@ fn a_stdin_that_cannot_be_read_is_not_an_empty_password() {
         "a vault was created from a password that was never read"
     );
 }
+
+/// A corrupt `aliases.toml` must not fail `sm init`.
+///
+/// The alias write happens *after* `Vault::create`, so a fatal error there
+/// left a half-finished init: the vault on disk, the id the user needs never
+/// printed, no `Reload` sent, and a re-run reporting "collection already
+/// exists". That is the same asymmetry the daemon had, one layer up — the
+/// file holding nothing but convenience mappings deciding whether the real
+/// work counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn init_survives_an_unreadable_alias_file() {
+    let fx = Fixture::start().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    let corrupt = b"aliases = 5\n";
+    std::fs::write(dir.join("aliases.toml"), corrupt).unwrap();
+
+    fx.sm()
+        .args(["init", "--collection", "Work"])
+        .write_stdin("hunter2\n")
+        .assert()
+        .success()
+        // The id is what every later command takes, so it has to be printed.
+        .stdout(predicate::str::contains("Its id is 'work'"))
+        .stderr(predicate::str::contains("aliases.toml"));
+
+    let mut v = Vault::open(&dir.join("work.vault")).unwrap();
+    v.unlock(b"hunter2").unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("aliases.toml")).unwrap(),
+        corrupt,
+        "the file the operator still has to repair was overwritten"
+    );
+}

@@ -40,10 +40,34 @@ pub fn init(collection: &str) -> Result<(), CliError> {
     let password = read_new_password(&format!("Choose a password for collection '{collection}'"))?;
     Vault::create(&path, collection, password.as_bytes(), config.kdf.into())?;
 
-    let mut aliases = load_aliases(&config.vault.dir)?;
-    if !aliases.contains_key("default") {
-        aliases.insert("default".to_string(), id.clone());
-        save_aliases_to(&config.vault.dir, &aliases)?;
+    // The vault is already on disk, so nothing about the alias file may fail
+    // the command from here on. It used to: an `aliases.toml` that did not
+    // parse left a half-finished init — the collection created, the id the
+    // user needs never printed, no `Reload` sent — and a re-run then reported
+    // "collection already exists". The daemon tolerates that file; so does
+    // this.
+    match load_aliases(&config.vault.dir) {
+        Ok(mut aliases) => {
+            if !aliases.contains_key("default")
+                && let Err(e) = {
+                    aliases.insert("default".to_string(), id.clone());
+                    save_aliases_to(&config.vault.dir, &aliases)
+                }
+            {
+                eprintln!(
+                    "warning: collection '{id}' was created, but the default alias could \
+                     not be saved: {}",
+                    escape_control(&e.to_string())
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "warning: collection '{id}' was created, but {} could not be read ({}), so it \
+             did not claim the `default` alias. Repair or delete that file and run \
+             `sm reload`.",
+            config.vault.dir.join("aliases.toml").display(),
+            escape_control(&e.to_string())
+        ),
     }
     // XDG_RUNTIME_DIR unset means there's nowhere a daemon could have bound
     // its socket; treat it the same as "no daemon running".
@@ -180,14 +204,32 @@ pub fn status() -> Result<(), CliError> {
             // repaired.
             if let Some(e) = &aliases_error {
                 eprintln!(
-                    "secret-manager: the alias table is unreadable ({}); \
-                     alias lookups are refused and nothing will overwrite it. \
-                     Repair or delete aliases.toml, then run `sm reload`.",
+                    "secret-manager: the alias table is unreadable ({}); names the daemon \
+                     has not already read are refused, no alias is created or cleared, and \
+                     nothing will overwrite the file. Repair or delete it, then run \
+                     `sm reload`.",
                     escape_control(e)
                 );
             }
             Ok(())
         }
+        other => Err(CliError::Failed(format!("unexpected reply {other:?}"))),
+    }
+}
+
+/// Tell a running daemon to rescan the vault directory.
+///
+/// `sm init` sends the same request after creating a collection, but that is
+/// the one command a half-broken vault directory gets in the way of — and it
+/// is the command the recovery instruction for an unreadable `aliases.toml`
+/// has to name, so it exists on its own.
+pub fn reload() -> Result<(), CliError> {
+    match control(Request::Reload)? {
+        Response::Ok => {
+            println!("Reloaded.");
+            Ok(())
+        }
+        Response::Error(e) => Err(CliError::Failed(escape_control(&e))),
         other => Err(CliError::Failed(format!("unexpected reply {other:?}"))),
     }
 }
