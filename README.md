@@ -110,6 +110,17 @@ What is left uncovered is the root-only half; see "Known gaps".
   likewise unreached — libpam does not fail them in a healthy transaction.
   Test login-unlock on a spare session or user before trusting it in your
   main session.
+* **The on-disk format is not stable yet** — a vault file carries a version
+  (`format::VERSION`, currently 3) and the daemon refuses one it does not
+  understand rather than guessing at it: a file older than the build is
+  reported with "recreate it with `sm init`", a newer one by naming both
+  versions. There is no migration code behind that refusal. v0.1.0 is the
+  first release, so nothing has needed migrating yet; if a later release
+  bumps the version, the vault has to be recreated and its contents
+  re-entered. There is no bulk export — `sm list` shows labels and
+  attributes but never secrets, and `sm get` retrieves one at a time — so
+  keep anything you cannot retype recoverable from somewhere other than this
+  vault until the format settles.
 * **Swap** — `[vault] lock_memory = true` pins the daemon in RAM, but it
   only works when the session's `RLIMIT_MEMLOCK` hard limit allows it
   (most distributions cap user sessions at 8 MiB, which is too small).
