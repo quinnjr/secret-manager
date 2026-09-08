@@ -103,3 +103,13 @@ proptest = "1"
 # drives the same internal sanitisers as the fuzz targets, through the same
 # `fuzz_api` wrappers, so the two cannot drift apart.
 secret-manager = { path = ".", features = ["test-util", "fuzzing"] }
+# `tests/dbus_locking.rs` scans `src/dbus/` and `src/daemon.rs` for the lock
+# rules `CLAUDE.md` states. It parses them with the real Rust grammar rather
+# than matching text: a hand-rolled lexer got the `//` stripper, char
+# literals, line continuations and brace counting wrong in eight separate
+# ways, and a scan that silently stops matching reads as proof. Test-only —
+# nothing shipped gains a dependency. `span-locations` is what turns a
+# `syn` node back into a `file:line` a reader can go to.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"

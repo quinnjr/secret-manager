@@ -1890,7 +1890,7 @@ async fn reload(fx: &Fixture) {
 ///
 /// Nothing here was covered before, which is why the guard could sit inside
 /// `SetAlias`'s repointing branch — leaving the clearing path to mutate the
-/// table first and bounce off the `save_aliases` backstop afterwards, with
+/// table first and bounce off the `update_aliases` backstop afterwards, with
 /// the entry gone from memory and the two exported objects it exists to
 /// reclaim still on the bus.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

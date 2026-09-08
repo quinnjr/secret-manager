@@ -826,28 +826,6 @@ impl ServiceState {
         self.aliases.unusable()
     }
 
-    /// Write the table back. Refuses unless it is the file's own contents;
-    /// see [`AliasTable::writable`].
-    ///
-    /// **No production caller.** It used to be described as the backstop the
-    /// writers relied on, and it never was: `SetAlias` and both collection
-    /// prompts go through [`update_aliases`], which has to clone the table
-    /// out and drop the state guard before writing — something a `&self`
-    /// method on the state cannot do, since holding `&self` *is* holding the
-    /// guard. Routing them back through here would put the `fsync` under the
-    /// state mutex again, so the doc is what changed, not the callers. Kept
-    /// for tests and for a future writer that already has the guard and can
-    /// afford the write.
-    pub fn save_aliases(&self) -> std::io::Result<()> {
-        let table = self.aliases.writable().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("refusing to overwrite an unreadable alias table: {e}"),
-            )
-        })?;
-        save_aliases_to(&self.vault_dir, table)
-    }
-
     /// Collection id an alias currently resolves to.
     ///
     /// `Ok(None)` is "no such alias": either unset, or set to a collection
@@ -1273,12 +1251,35 @@ mod tests {
         st.load_vaults().unwrap();
         assert!(st.aliases_unusable().is_some());
 
-        let err = st.save_aliases().expect_err("must refuse");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // The refusal is in front of `save_aliases_to`, not inside it: a
+        // degraded table is not the file's own contents, so no writer may
+        // take a snapshot to hand it. `update_aliases` turns this same `Err`
+        // into `AliasUpdate::Unusable` and writes nothing.
+        let reason = st
+            .aliases
+            .writable()
+            .expect_err("a degraded table must refuse to be written back")
+            .to_string();
+        assert!(
+            !reason.is_empty(),
+            "the refusal must carry why the file could not be read"
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             corrupt,
             "the unreadable file was overwritten"
+        );
+        // And that assertion is not vacuous: the writer the refusal stands in
+        // front of does replace the file, given a table to write.
+        save_aliases_to(
+            dir.path(),
+            &BTreeMap::from([("default".to_string(), "work".to_string())]),
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            corrupt,
+            "`save_aliases_to` did not write, so nothing above was being prevented"
         );
     }
 
@@ -1399,8 +1400,9 @@ mod tests {
         // A name we have never read is still refused: what is in the file now
         // is the thing we do not know, so "no such alias" is not ours to say.
         assert!(st.alias_target("login").is_err());
-        // And the table stays unwritable while it is in that state.
-        assert!(st.save_aliases().is_err());
+        // And the table stays unwritable while it is in that state, so no
+        // writer can reach `save_aliases_to` with it.
+        assert!(st.aliases.writable().is_err());
         assert_eq!(
             std::fs::read(dir.path().join(ALIAS_FILE)).unwrap(),
             b"aliases = 5\n",
@@ -1495,9 +1497,12 @@ mod tests {
         const BLOCKING: &[&str] = &[
             "std::fs::",
             "save_aliases_to(",
-            "save_aliases(",
             "load_aliases(",
-            "unique_collection_id",
+            // The free function. The `&self` wrapper this used to name was
+            // deleted; the entry survived only because `contains` matched
+            // inside this longer name, which is not a check, it is a
+            // coincidence that the next rename would silently undo.
+            "unique_collection_id_in(",
             "block_in_place(",
             "sync_all(",
             "scan_vault_dir(",
