@@ -234,11 +234,13 @@ async fn dh_session_end_to_end() {
         b"encrypted on the wire"
     );
     assert_eq!(
-        fx.daemon.state.lock().await.collections["default"]
+        secret_manager::dbus::state::with_vault(&fx.daemon.state, "default", |v| v
             .items()
             .unwrap()[0]
             .secret
-            .as_slice(),
+            .to_vec())
+        .await
+        .as_slice(),
         b"encrypted on the wire"
     );
 }
@@ -452,7 +454,10 @@ async fn alias_path_and_set_alias() {
             secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
         )
         .unwrap();
-        st.collections.insert("second".to_string(), vault);
+        st.collections.insert(
+            "second".to_string(),
+            secret_manager::dbus::state::vault_ref(vault),
+        );
     }
     let second = secret_manager::dbus::paths::collection("second");
     service.set_alias("work", &second).await.unwrap();
@@ -1314,15 +1319,11 @@ async fn batch_delete_refuses_an_item_of_another_collection() {
     .await
     .unwrap()
     .unwrap();
-    fx.daemon
-        .state
-        .lock()
-        .await
-        .collections
-        .get_mut("second")
-        .unwrap()
-        .unlock(common::PASSWORD.as_bytes())
-        .unwrap();
+    secret_manager::dbus::state::with_vault(&fx.daemon.state, "second", |v| {
+        v.unlock(common::PASSWORD.as_bytes())
+    })
+    .await
+    .unwrap();
 
     let conn = fx.client().await;
     let service = ServiceProxy::new(&conn).await.unwrap();

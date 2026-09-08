@@ -407,7 +407,7 @@ async fn a_dismissed_prompt_cannot_be_driven_by_another_client() {
         fx.pinentry_log()
     );
     assert!(
-        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "the collection was unlocked by a taken-over prompt"
     );
     assert!(fx.daemon.state.lock().await.prompt_owners.is_empty());
@@ -555,7 +555,7 @@ async fn dismiss_after_the_commit_gate_stops_the_remaining_collections() {
         "a dialog was raised after the dismissal:\n{log}"
     );
     assert!(
-        fx.daemon.state.lock().await.collections["third"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "third").await,
         "the third collection was unlocked despite the dismissal"
     );
 }
@@ -732,11 +732,11 @@ async fn an_owner_disconnect_stops_the_remaining_unlock_dialogs() {
         2,
         "a dialog was raised for a collection after the owner disconnected:\n{log}"
     );
-    let st = fx.daemon.state.lock().await;
     assert!(
-        st.collections["third"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "third").await,
         "an orphaned prompt unlocked a collection for nobody"
     );
+    let st = fx.daemon.state.lock().await;
     assert!(st.prompt_owners.is_empty());
     assert!(st.prompt_tasks.is_empty());
 }
@@ -975,7 +975,7 @@ async fn prompt_is_aborted_when_its_owner_disconnects() {
     conn.close().await.unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(
-        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "orphaned pinentry answered and unlocked the vault"
     );
     assert!(fx.daemon.state.lock().await.prompt_owners.is_empty());
@@ -1246,14 +1246,14 @@ async fn a_departed_owners_prompt_relocks_the_collection_it_opened() {
         "timing assumption: the first dialog is answered within 15s"
     );
     {
-        let st = fx.daemon.state.lock().await;
         // Answered but not yet open: the derivation is in flight, so the
         // commit gate is claimed and has not been reset for a next collection.
         assert!(
-            st.collections["slow"].is_locked(),
+            secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "slow").await,
             "timing assumption: the derivation finished before the disconnect, \
              so the commit gate may already have been reset"
         );
+        let st = fx.daemon.state.lock().await;
         assert!(
             st.prompt_owners.contains_key(prompt.as_str()),
             "timing assumption: the prompt is still outstanding"
@@ -1280,15 +1280,15 @@ async fn a_departed_owners_prompt_relocks_the_collection_it_opened() {
         }
     }
 
-    let st = fx.daemon.state.lock().await;
     assert!(
-        st.collections["slow"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "slow").await,
         "the prompt left a vault open for an owner that had gone away"
     );
     assert!(
-        st.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "a dialog was raised, and answered, for a collection after the owner disconnected"
     );
+    let st = fx.daemon.state.lock().await;
     assert!(st.prompt_owners.is_empty());
     assert!(st.prompt_tasks.is_empty());
     assert_eq!(
@@ -1402,7 +1402,7 @@ async fn a_delete_confirmed_after_the_collection_relocks_is_refused() {
     .unwrap()
     .unwrap();
     assert!(
-        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "timing assumption: the collection is locked before the confirmation lands"
     );
 
@@ -1431,8 +1431,8 @@ async fn a_delete_confirmed_after_the_collection_relocks_is_refused() {
         st.collections.contains_key("default"),
         "the refused delete left the collection missing from state"
     );
-    assert!(st.collections["default"].is_locked());
     drop(st);
+    assert!(secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
     assert_eq!(
         std::fs::read(&vault_path).unwrap(),
         before,
@@ -1501,7 +1501,7 @@ async fn an_aborted_prompt_relocks_the_collections_it_had_already_opened() {
         fx.pinentry_log()
     );
     assert!(
-        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "timing assumption: the prompt has actually opened `default` by now"
     );
 
@@ -1512,12 +1512,12 @@ async fn an_aborted_prompt_relocks_the_collections_it_had_already_opened() {
     conn.close().await.unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let st = fx.daemon.state.lock().await;
     assert!(
-        st.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "a vault the aborted prompt had already opened stayed unlocked with no owner"
     );
-    assert!(st.collections["second"].is_locked());
+    assert!(secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "second").await);
+    let st = fx.daemon.state.lock().await;
     assert!(st.prompt_owners.is_empty());
     assert!(
         st.prompt_unlocked.is_empty(),
@@ -1833,8 +1833,8 @@ async fn a_delete_whose_unlink_fails_puts_the_collection_back() {
         st.collections.contains_key("default"),
         "the collection was dropped from state although its file could not be unlinked"
     );
-    assert!(!st.collections["default"].is_locked());
     drop(st);
+    assert!(!secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
     assert!(
         service
             .collections()
@@ -1962,15 +1962,11 @@ async fn a_collection_unlocked_while_an_earlier_dialog_waits_is_not_asked_for() 
         .await,
         "timing assumption: the first dialog is raised within 10s"
     );
-    fx.daemon
-        .state
-        .lock()
-        .await
-        .collections
-        .get_mut("second")
-        .unwrap()
-        .unlock(common::PASSWORD.as_bytes())
-        .unwrap();
+    secret_manager::dbus::state::with_vault(&fx.daemon.state, "second", |v| {
+        v.unlock(common::PASSWORD.as_bytes())
+    })
+    .await
+    .unwrap();
 
     let sig = tokio::time::timeout(Duration::from_secs(15), completed.next())
         .await
@@ -2078,13 +2074,11 @@ async fn a_dismiss_past_the_commit_gate_spares_the_collection_it_covers() {
         "the collection the gate covered is unlocked and owed to the caller"
     );
 
-    let st = fx.daemon.state.lock().await;
-    assert!(!st.collections["slow"].is_locked());
+    assert!(!secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "slow").await);
     assert!(
-        st.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "the dismissal must still stop the collections it did not cover"
     );
-    drop(st);
     assert_eq!(
         fx.pinentry_log().matches("GETPIN").count(),
         1,

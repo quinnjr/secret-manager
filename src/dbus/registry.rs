@@ -24,13 +24,13 @@ pub async fn register_collection(conn: &Connection, state: &Shared, id: &str) ->
             CollectionAdmin::new(state.clone(), CollectionRef::Id(id.to_string())),
         )
         .await?;
-    let item_ids = state
-        .lock()
-        .await
-        .collections
-        .get(id)
-        .map(|v| v.item_ids())
-        .unwrap_or_default();
+    // The `Arc` is cloned out of the state lock and the vault is locked only
+    // after that guard is dropped; see `state::VaultRef`.
+    let vault = state.lock().await.vault(id);
+    let item_ids = match vault {
+        Some(v) => v.lock().await.item_ids(),
+        None => Vec::new(),
+    };
     for iid in item_ids {
         server
             .at(

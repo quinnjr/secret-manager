@@ -108,7 +108,7 @@ async fn control_socket_status_unlock_lock_change_password() {
         control(&fx, Request::Lock { collection: None }).await,
         Response::Ok
     );
-    assert!(fx.daemon.state.lock().await.collections["default"].is_locked());
+    assert!(secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
 
     assert!(matches!(
         control(&fx, change_key_req(&fx, "default", "bad", "x")).await,
@@ -216,10 +216,10 @@ async fn idle_lock_locks_after_inactivity() {
     let fx = Fixture::start_with_idle(Duration::from_millis(500)).await;
     fx.unlock_default().await;
     fx.daemon.state.lock().await.touch();
-    assert!(!fx.daemon.state.lock().await.collections["default"].is_locked());
+    assert!(!secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
     assert!(
         wait_for(Duration::from_secs(5), || async {
-            fx.daemon.state.lock().await.collections["default"].is_locked()
+            secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await
         })
         .await
     );
@@ -332,7 +332,7 @@ async fn control_socket_key_based_unlock_and_rotation() {
         .await,
         Response::Ok
     );
-    assert!(!fx.daemon.state.lock().await.collections["default"].is_locked());
+    assert!(!secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
 
     let new_salt = crypto::random_bytes::<SALT_LEN>();
     let new_key = crypto::derive_key(b"rotated", &new_salt, kdf).unwrap();
@@ -351,7 +351,7 @@ async fn control_socket_key_based_unlock_and_rotation() {
         Response::Ok
     );
     assert!(
-        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "was unlocked on entry, stays unlocked"
     );
     assert_eq!(
@@ -403,7 +403,7 @@ async fn control_socket_key_based_unlock_and_rotation() {
         .await,
         Response::Ok
     );
-    assert!(fx.daemon.state.lock().await.collections["default"].is_locked());
+    assert!(secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
     // An unsafe KDF in a rotation request is refused outright.
     assert!(matches!(
         control(
@@ -515,9 +515,7 @@ async fn status_reports_an_index_that_could_not_be_rewritten() {
 
     // Give the collection an item with attributes, so its header carries
     // hashes and switching the policy owes a rewrite.
-    {
-        let mut st = fx.daemon.state.lock().await;
-        let vault = st.collections.get_mut("default").unwrap();
+    secret_manager::dbus::state::with_vault(&fx.daemon.state, "default", |vault| {
         vault.unlock(PASSWORD.as_bytes()).unwrap();
         vault
             .insert_item(
@@ -531,19 +529,19 @@ async fn status_reports_an_index_that_could_not_be_rewritten() {
         assert!(vault.index_has_attributes());
         vault.lock();
         vault.set_index_attributes(false);
-    }
+    })
+    .await;
 
     // Make the rewrite fail: a directory where the vault file belongs means
     // the final rename cannot succeed, whatever the permissions.
     let saved = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
-    {
-        let mut st = fx.daemon.state.lock().await;
-        let vault = st.collections.get_mut("default").unwrap();
+    secret_manager::dbus::state::with_vault(&fx.daemon.state, "default", |vault| {
         vault.unlock(PASSWORD.as_bytes()).unwrap();
         assert!(vault.index_warning().is_some());
-    }
+    })
+    .await;
     std::fs::remove_dir(&path).unwrap();
     std::fs::write(&path, saved).unwrap();
 
@@ -580,7 +578,7 @@ async fn lock_reports_an_unknown_collection() {
         other => panic!("{other:?}"),
     }
     assert!(
-        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "a lock for an unknown collection must not seal anything else"
     );
 }

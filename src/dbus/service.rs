@@ -7,7 +7,7 @@ use super::prop_string;
 use super::registry;
 use super::require_sender;
 use super::session::{SecretStruct, Session};
-use super::state::{SessionEntry, Shared};
+use super::state::{PathTarget, SessionEntry, Shared};
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
 use std::collections::{BTreeMap, HashMap};
@@ -168,7 +168,7 @@ impl Service {
             )));
         }
         let query: BTreeMap<String, String> = attributes.into_iter().collect();
-        Ok(self.state.lock().await.search_all(&query))
+        Ok(super::state::search_all(&self.state, &query).await)
     }
 
     async fn read_alias(&self, name: &str) -> Result<OwnedObjectPath> {
@@ -205,26 +205,44 @@ impl Service {
         }
         let sender = require_sender(&header)?;
         type Plan = Vec<(OwnedObjectPath, Zeroizing<Vec<u8>>, String)>;
-        let (cipher, plan): (SessionCipher, Plan) = {
+        // Resolve the paths under the state lock, then read the items with it
+        // released — one vault lock at a time, and the requests for the same
+        // collection grouped so a batch costs one acquisition per collection
+        // rather than one per item (see `state::VaultRef`).
+        type Wanted = Vec<(
+            String,
+            Vec<(OwnedObjectPath, String)>,
+            super::state::VaultRef,
+        )>;
+        let (cipher, wanted): (SessionCipher, Wanted) = {
             let mut st = self.state.lock().await;
             let cipher = SessionCipher::clone(st.cipher(session.as_str(), &sender)?);
             st.touch();
-            let mut plan = Vec::with_capacity(items.len());
+            let mut wanted: Wanted = Vec::new();
             for path in items {
-                let Some((cid, iid)) = st.resolve_item(path.as_str()) else {
+                let Some(PathTarget::Item { id, vault, item }) = st.resolve_path(path.as_str())
+                else {
                     continue;
                 };
-                let Some(vault) = st.collections.get(&cid) else {
-                    continue;
-                };
-                // Locked items are omitted, as the spec allows.
+                match wanted.iter_mut().find(|(cid, _, _)| *cid == id) {
+                    Some((_, paths, _)) => paths.push((path, item)),
+                    None => wanted.push((id, vec![(path, item)], vault)),
+                }
+            }
+            (cipher, wanted)
+        };
+        let mut plan: Plan = Vec::new();
+        for (_, paths, vault) in wanted {
+            let vault = vault.lock().await;
+            for (path, iid) in paths {
+                // An item that does not exist, and a locked collection, are
+                // both omitted, as the spec allows.
                 let Ok(item) = vault.item(&iid) else {
                     continue;
                 };
                 plan.push((path, item.secret.clone(), item.content_type.clone()));
             }
-            (cipher, plan)
-        };
+        }
         let mut out = HashMap::new();
         for (path, secret, content_type) in plan {
             let (parameters, value) = cipher.encrypt(&secret);
@@ -306,21 +324,30 @@ impl Service {
         #[zbus(object_server)] server: &ObjectServer,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
         check_object_count(objects.len())?;
-        let mut st = self.state.lock().await;
         let mut unlocked = Vec::new();
         let mut collections: Vec<String> = Vec::new();
         let mut requested = Vec::new();
         for path in objects {
-            let Some(cid) = st.collection_id_of_path(path.as_str()) else {
+            let Some(target) = self.state.lock().await.resolve_path(path.as_str()) else {
                 continue;
             };
             // A broken collection (no entry in `collections`; see
             // `state::ServiceState::broken`) is always locked.
-            let is_locked = st
-                .collections
-                .get(&cid)
-                .map(|v| v.is_locked())
-                .unwrap_or(true);
+            let is_locked = match &target {
+                PathTarget::Broken { .. } => true,
+                PathTarget::Collection { vault, .. } => vault.lock().await.is_locked(),
+                PathTarget::Item { vault, item, .. } => {
+                    let v = vault.lock().await;
+                    // An item path that names no item resolves to nothing, as
+                    // it did when the item index was reachable from the state
+                    // lock itself.
+                    if !v.has_item(item) {
+                        continue;
+                    }
+                    v.is_locked()
+                }
+            };
+            let cid = target.id().to_string();
             if !is_locked {
                 unlocked.push(path);
                 continue;
@@ -331,6 +358,7 @@ impl Service {
         if collections.is_empty() {
             return Ok((unlocked, paths::root()));
         }
+        let mut st = self.state.lock().await;
         let owner = require_sender(&header)?;
         st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
@@ -365,20 +393,30 @@ impl Service {
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
         check_object_count(objects.len())?;
         let (locked, changed) = {
-            let mut st = self.state.lock().await;
             let mut locked = Vec::new();
             let mut changed: Vec<String> = Vec::new();
             for path in objects {
-                let Some(cid) = st.collection_id_of_path(path.as_str()) else {
+                let Some(target) = self.state.lock().await.resolve_path(path.as_str()) else {
                     continue;
                 };
-                if let Some(vault) = st.collections.get_mut(&cid) {
-                    if !vault.is_locked() {
-                        vault.lock();
-                        push_unique(&mut changed, cid);
-                    }
-                    locked.push(path);
+                // A broken collection has no vault to lock and is left out of
+                // the reply, exactly as when `collections.get_mut` missed it.
+                let (cid, vault, item) = match target {
+                    PathTarget::Broken { .. } => continue,
+                    PathTarget::Collection { id, vault } => (id, vault, None),
+                    PathTarget::Item { id, vault, item } => (id, vault, Some(item)),
+                };
+                let mut vault = vault.lock().await;
+                if let Some(iid) = item
+                    && !vault.has_item(&iid)
+                {
+                    continue;
                 }
+                if !vault.is_locked() {
+                    vault.lock();
+                    push_unique(&mut changed, cid);
+                }
+                locked.push(path);
             }
             (locked, changed)
         };

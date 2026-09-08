@@ -17,6 +17,8 @@ use zeroize::Zeroizing;
 pub enum VaultError {
     #[error("collection is locked")]
     Locked,
+    #[error("collection has been deleted")]
+    Retired,
     #[error("wrong password")]
     WrongPassword,
     #[error("no such item: {0}")]
@@ -79,6 +81,18 @@ pub struct Vault {
     /// [`format::MAX_VAULT_BYTES`]. Overridable only in tests, so the
     /// refusal can be exercised without building a quarter-gigabyte vault.
     size_limit: u64,
+    /// Set once this vault's file has been unlinked by a confirmed delete.
+    /// Every save refuses afterwards, so a writer that had already taken a
+    /// reference to this vault - and is only now getting its turn on the
+    /// vault's own lock - cannot recreate the file it just deleted.
+    ///
+    /// The daemon holds each vault behind its own lock and the global state
+    /// lock is never held across one (see `CLAUDE.md`), so "remove from the
+    /// collection map" and "unlink the file" can no longer happen under a
+    /// single guard. This flag is what keeps them equivalent to one: it is
+    /// set under the same guard that unlinks, so a save either ran strictly
+    /// before the delete or refuses.
+    retired: bool,
 }
 
 impl std::fmt::Debug for Vault {
@@ -161,6 +175,7 @@ impl Vault {
             index_attributes: true,
             index_warning: None,
             size_limit: format::MAX_VAULT_BYTES,
+            retired: false,
         };
         Ok(vault)
     }
@@ -183,6 +198,7 @@ impl Vault {
             index_attributes: true,
             index_warning: None,
             size_limit: format::MAX_VAULT_BYTES,
+            retired: false,
         })
     }
 
@@ -236,6 +252,28 @@ impl Vault {
         matches!(self.state, State::Locked)
     }
 
+    /// Mark this vault's file as gone, so every later save refuses with
+    /// [`VaultError::Retired`] instead of writing it back.
+    ///
+    /// Called by the daemon's confirmed-delete path under the same guard that
+    /// unlinks the file; see the `retired` field for why that is what makes
+    /// the delete atomic against a concurrent write.
+    pub fn retire(&mut self) {
+        self.retired = true;
+    }
+
+    /// Undo [`Vault::retire`], for a delete whose unlink failed and which
+    /// therefore leaves the collection in place.
+    pub fn unretire(&mut self) {
+        self.retired = false;
+    }
+
+    /// Whether [`Vault::retire`] has been called: the collection's file has
+    /// been deleted and this handle can no longer be written.
+    pub fn is_retired(&self) -> bool {
+        self.retired
+    }
+
     pub fn item_ids(&self) -> Vec<String> {
         self.header.index.iter().map(|e| e.id.clone()).collect()
     }
@@ -281,6 +319,11 @@ impl Vault {
     /// password entirely (the PAM module). Verifies the key even when the vault
     /// is already unlocked.
     pub fn unlock_with_key(&mut self, key: &Key) -> Result<(), VaultError> {
+        // A retired vault's file is already gone; opening it would decrypt a
+        // collection that no longer exists and could never be saved again.
+        if self.retired {
+            return Err(VaultError::Retired);
+        }
         if !self.is_locked() {
             return if self.verify_key(key)? {
                 Ok(())
@@ -696,6 +739,11 @@ impl Vault {
         &mut self,
         publish: impl FnOnce(&Path, &[u8]) -> Result<(), VaultError>,
     ) -> Result<(), VaultError> {
+        // Before the lock check, and before anything is mutated: a deleted
+        // collection has no file to write and must not grow one back.
+        if self.retired {
+            return Err(VaultError::Retired);
+        }
         let State::Unlocked { key, items } = &self.state else {
             return Err(VaultError::Locked);
         };

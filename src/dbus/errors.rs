@@ -47,6 +47,12 @@ impl From<VaultError> for Error {
     fn from(e: VaultError) -> Self {
         match e {
             VaultError::Locked => Error::IsLocked,
+            // The collection's file was unlinked by a confirmed delete
+            // between this caller taking a reference to the vault and
+            // getting its turn on the vault's lock. From the caller's point
+            // of view the object it named is gone, which is exactly what it
+            // would have been told a moment later.
+            VaultError::Retired => Error::NoSuchObject,
             VaultError::NoSuchItem(_) => Error::NoSuchObject,
             other => {
                 tracing::warn!("vault error reported to a bus caller: {other}");

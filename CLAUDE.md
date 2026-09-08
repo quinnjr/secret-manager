@@ -79,10 +79,43 @@ a locked collection. That is a documented trade: it lets a file holder, and
 any bus client, confirm attribute guesses. `[vault] locked_search = false`
 stores ids only.
 
-**Daemon state** (`src/dbus/state.rs`) lives behind one async mutex. Two rules
-follow: never hold it across an `.await` that can block, and never run Argon2
-under it — every derivation goes through `src/kdf.rs`, which caps concurrency
-and moves the work to the blocking pool.
+**Daemon state** (`src/dbus/state.rs`) lives behind one async mutex, and each
+collection's `Vault` behind its own — `collections: BTreeMap<String,
+Arc<tokio::sync::Mutex<Vault>>>`. Three rules follow.
+
+*Nothing slow or blocking may happen under the state mutex.* Not an `.await`
+that can block, and **not a synchronous blocking call either**: a `write`, an
+`fsync`, a whole-vault re-encrypt, an Argon2 arena. The rule used to be
+phrased for `.await` alone, and a plain blocking syscall walked straight
+through it — every item write did a whole-collection re-encrypt and two
+`fsync`s under the global mutex, which at a large collection is about a second
+during which every other bus call, every control request and the housekeeping
+tasks are stopped. If work is bounded by the *data*, not by a constant, it
+does not belong under this lock.
+
+*Lock order is global-then-collection, and nothing ever holds both.* Take the
+state lock, clone out the `Arc`s (`ServiceState::vault`, `all_vaults`,
+`resolve_path`), **drop the state guard**, and only then lock a vault. Never
+await a collection's lock while holding the state lock; never take the state
+lock while holding a collection's. Anything that walks every collection —
+`Status`, `search_all`, `idle_lock`, `Reload`, `register_all`, `Lock` with no
+argument — snapshots the `Arc`s under the state lock, releases it, and works
+through them one at a time. The mutation *and* the save it triggers belong to
+the collection's lock, wrapped in `state::block_in_place` so the save's
+`fsync`s release the async worker instead of parking it. A write still
+finishes before its caller is answered: a successful `CreateItem` means the
+item is on disk.
+
+Two consequences of splitting the locks are load-bearing. Confirming an item
+*exists* needs the collection's lock, so `resolve_path` stops at the
+collection and every caller finishes the resolution itself (see
+`state::PathTarget::Item`). And "remove from the map" and "unlink the file"
+can no longer share one guard, so a confirmed delete calls `Vault::retire`
+under the vault's own lock before unlinking: every later save refuses with
+`VaultError::Retired` rather than recreating the file it just deleted.
+
+*Never run Argon2 under the state mutex* — every derivation goes through
+`src/kdf.rs`, which caps concurrency and moves the work to the blocking pool.
 
 **Prompts** (`src/dbus/prompt.rs`) are the consent gate and the subtlest part
 of the codebase. Each is owned by the client that obtained it, checked
@@ -119,6 +152,15 @@ assert on what the dialog said) and `FAKE_DELAY` (to race a dialog).
 `tests/invariants.rs` holds property tests that reading cannot settle: parser
 fuzzing, AEAD coverage of every header field, nonce uniqueness, object-path
 escape. `tests/packaging.rs` locks in the Makefile and unit file.
+
+`tests/dbus_locking.rs` guards the lock rules above. It holds one
+collection's lock by hand — a save in flight holds exactly that and nothing
+else — and asserts a write to another collection and a state-only property
+still answer, so the proof needs no duration and cannot flake. Beside it, a
+source scan over `src/dbus/` and `src/daemon.rs` refuses any statement that
+takes a lock while a `let`-bound guard is still alive, in either direction;
+that is what a green run cannot establish and the next edit could break. Run
+`cargo fmt` before trusting a failure from it — it reads formatted source.
 
 Argon2 at the real cost makes tests slow, so tests use
 `KdfParams::FAST_FOR_TESTS`, exposed to integration tests through the

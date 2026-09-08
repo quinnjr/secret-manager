@@ -350,7 +350,7 @@ async fn lock_and_unlock_skip_paths_that_name_nothing() {
     assert!(locked.is_empty());
     assert_eq!(prompt.as_str(), "/");
     assert!(
-        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "a Lock of unrelated paths locked the real collection"
     );
     assert!(

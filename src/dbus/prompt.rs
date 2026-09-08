@@ -5,7 +5,7 @@ use super::paths;
 use super::registry;
 use super::require_sender;
 use super::service::ServiceSignals;
-use super::state::{PromptCommit, Shared};
+use super::state::{PromptCommit, Shared, VaultRef, block_in_place, vault_ref};
 use crate::prompt::{PinOutcome, PinRequest};
 use crate::vault::{Vault, VaultError};
 use std::sync::Arc;
@@ -409,15 +409,20 @@ async fn run(
             // vault was already opened. Re-lock anything this prompt opened
             // for an owner that is no longer there.
             if !state.lock().await.prompt_owners.contains_key(path.as_str()) {
-                let mut st = state.lock().await;
-                st.prompt_unlocked.remove(path.as_str());
-                for id in &unlocked_now {
-                    if let Some(vault) = st.collections.get_mut(id) {
-                        vault.lock();
+                let vaults = {
+                    let mut st = state.lock().await;
+                    st.prompt_unlocked.remove(path.as_str());
+                    unlocked_now
+                        .iter()
+                        .map(|id| (id.clone(), st.vault(id)))
+                        .collect::<Vec<_>>()
+                };
+                // The vaults are locked with the state guard released; see
+                // `state::VaultRef`.
+                for (id, vault) in &vaults {
+                    if let Some(v) = vault {
+                        v.lock().await.lock();
                     }
-                }
-                drop(st);
-                for id in &unlocked_now {
                     registry::notify_collection_changed(conn, id).await;
                 }
                 return (true, no_paths());
@@ -425,13 +430,12 @@ async fn run(
             if !any_unlocked {
                 return (true, no_paths());
             }
-            let unlocked: Vec<OwnedObjectPath> = {
-                let st = state.lock().await;
-                requested
-                    .into_iter()
-                    .filter(|p| st.is_unlocked_path(p.as_str()))
-                    .collect()
-            };
+            let mut unlocked: Vec<OwnedObjectPath> = Vec::new();
+            for p in requested {
+                if super::state::is_unlocked_path(state, p.as_str()).await {
+                    unlocked.push(p);
+                }
+            }
             (false, owned(Value::from(unlocked)))
         }
         PromptAction::CreateCollection { label, alias } => {
@@ -475,6 +479,23 @@ enum Outcome {
     Busy,
 }
 
+/// Whether `vault` is *still* the collection loaded under `id`.
+///
+/// A collection can leave the daemon while a dialog or a derivation is
+/// running — a confirmed delete, a rotation, a reload. The `Arc` this prompt
+/// took at the start would open perfectly happily afterwards and resurrect a
+/// collection nobody has any more, so the map is re-checked at every point
+/// the old single-guard code re-read it. By identity, not by name: a
+/// collection re-created under the same id is a different vault, and this
+/// prompt has no claim on it.
+async fn still_loaded(state: &Shared, id: &str, vault: &VaultRef) -> bool {
+    state
+        .lock()
+        .await
+        .vault(id)
+        .is_some_and(|v| Arc::ptr_eq(&v, vault))
+}
+
 async fn unlock_collection_inner(
     conn: &Connection,
     state: &Shared,
@@ -484,7 +505,7 @@ async fn unlock_collection_inner(
     id: &str,
     commit_gate: &mut Option<&AtomicBool>,
 ) -> Outcome {
-    let (pinentry, label) = {
+    let (pinentry, vault) = {
         let st = state.lock().await;
         if let Some(err) = st.broken_error(id) {
             // Never worked; no password can fix this. Skip pinentry
@@ -492,13 +513,17 @@ async fn unlock_collection_inner(
             tracing::warn!("cannot unlock '{id}': vault is broken: {err}");
             return Outcome::Failed;
         }
-        let Some(vault) = st.collections.get(id) else {
+        let Some(vault) = st.vault(id) else {
             return Outcome::Failed;
         };
-        if !vault.is_locked() {
+        (st.pinentry.clone(), vault)
+    };
+    let label = {
+        let v = vault.lock().await;
+        if !v.is_locked() {
             return Outcome::AlreadyUnlocked;
         }
-        (st.pinentry.clone(), display_label(vault.label()))
+        display_label(v.label())
     };
     // One dialog slot for all three attempts. Taking it per attempt sent a
     // user who mistyped their password to the back of the queue behind every
@@ -553,14 +578,14 @@ async fn unlock_collection_inner(
         {
             return Outcome::Cancelled;
         }
-        // Argon2 runs off the state lock and under the daemon-wide derivation
-        // cap; only the cheap AEAD open takes the lock.
+        // Argon2 runs off both locks and under the daemon-wide derivation
+        // cap; only the AEAD open takes this collection's lock.
+        if !still_loaded(state, id, &vault).await {
+            return Outcome::Failed;
+        }
         let params = {
-            let st = state.lock().await;
-            match st.collections.get(id) {
-                Some(vault) => (*vault.salt(), vault.kdf()),
-                None => return Outcome::Failed,
-            }
+            let v = vault.lock().await;
+            (*v.salt(), v.kdf())
         };
         let derived = crate::kdf::derive(
             zeroize::Zeroizing::new(pin.as_bytes().to_vec()),
@@ -570,21 +595,40 @@ async fn unlock_collection_inner(
         .await;
         let result = match derived {
             Ok(key) => {
-                let mut st = state.lock().await;
-                let Some(vault) = st.collections.get_mut(id) else {
+                if !still_loaded(state, id, &vault).await {
                     return Outcome::Failed;
+                }
+                // The ownership record is written *before* the open, not
+                // after it: the two live behind different locks now, and an
+                // abort takes effect at any await point between them. Claimed
+                // early the record is at worst a collection this prompt did
+                // not manage to open — which `daemon::watch_clients` sees as
+                // already locked and leaves alone — where claimed late it
+                // would be a decrypted vault with nobody recorded as its
+                // owner.
+                state
+                    .lock()
+                    .await
+                    .prompt_unlocked
+                    .entry(path.to_string())
+                    .or_default()
+                    .push(id.to_string());
+                let opened = {
+                    let mut v = vault.lock().await;
+                    block_in_place(|| v.unlock_with_key(&key))
                 };
-                let opened = vault.unlock_with_key(&key);
-                if opened.is_ok() {
-                    // Under the *same* guard that opened it. An abort takes
-                    // effect at an await point, and there are two between
-                    // here and the caller's bookkeeping, so recording it
-                    // there leaves a window where the vault is decrypted and
-                    // nothing remembers who owns it.
-                    st.prompt_unlocked
-                        .entry(path.to_string())
-                        .or_default()
-                        .push(id.to_string());
+                if opened.is_err() {
+                    // Not ours after all; drop the claim so a later abort
+                    // does not walk a collection this prompt never opened.
+                    let mut st = state.lock().await;
+                    if let Some(ids) = st.prompt_unlocked.get_mut(path.as_str()) {
+                        if let Some(pos) = ids.iter().rposition(|i| i == id) {
+                            ids.remove(pos);
+                        }
+                        if ids.is_empty() {
+                            st.prompt_unlocked.remove(path.as_str());
+                        }
+                    }
                 }
                 opened
             }
@@ -706,7 +750,7 @@ async fn create_collection(
         // take a third for the insert (MEDIUM 4).
         let mut st = state.lock().await;
         vault.set_index_attributes(st.index_attributes);
-        st.collections.insert(id.clone(), vault);
+        st.collections.insert(id.clone(), vault_ref(vault));
         if let Some(a) = alias {
             st.aliases.insert(a.to_string(), id.clone());
             if let Err(e) = st.save_aliases() {
@@ -740,14 +784,13 @@ async fn delete_collection(
     committed: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Option<OwnedObjectPath> {
-    let (pinentry, label, item_count) = {
+    let (pinentry, vault) = {
         let st = state.lock().await;
-        let vault = st.collections.get(id)?;
-        (
-            st.pinentry.clone(),
-            display_label(vault.label()),
-            vault.item_ids().len(),
-        )
+        (st.pinentry.clone(), st.vault(id)?)
+    };
+    let (label, item_count) = {
+        let v = vault.lock().await;
+        (display_label(v.label()), v.item_ids().len())
     };
     let req = PinRequest {
         title: "secret-manager".into(),
@@ -792,34 +835,47 @@ async fn delete_collection(
     if !claim(committed) {
         return None;
     }
-    // Removing the collection from state and unlinking its file happen under
-    // ONE guard, with no await between them. Two guards would let a
-    // concurrent `CreateItem`/`SetSecret` re-create the file (via
-    // `Vault::save`) in the gap, so the delete would silently do nothing and
-    // leave an orphaned vault on disk; it would also let an abort land
-    // between the two halves. A failing unlink puts the collection straight
-    // back, so state and disk never disagree.
+    // Retiring the vault and unlinking its file happen under ONE guard —
+    // this collection's own — with no await between them. That is what makes
+    // the delete atomic against a concurrent `CreateItem`/`SetSecret`: a
+    // writer that already holds a reference to this vault and is waiting for
+    // its turn on this very lock would otherwise re-create the file through
+    // `Vault::save` after the unlink, leaving an orphan on disk and a delete
+    // that silently did nothing. `Vault::retire` makes every later save
+    // refuse instead, which is the same answer the writer would have got a
+    // moment later. A failing unlink undoes the retirement, so nothing is
+    // lost when the collection stays.
+    //
+    // The entry leaves `collections` afterwards rather than under the same
+    // guard, because taking the state lock while holding a collection's is
+    // exactly the ordering that would deadlock (see `state::VaultRef`).
+    // Between the two the collection is still listed but unwritable, which
+    // is what "being deleted" now looks like for the one lock acquisition it
+    // lasts.
     let item_ids = {
-        let mut st = state.lock().await;
-        let vault = st.collections.remove(id)?;
-        if vault.is_locked() {
+        let mut v = vault.lock().await;
+        if v.is_locked() {
             tracing::warn!(
                 "cannot delete '{id}': it is locked; treating the confirmed delete as dismissed"
             );
-            st.collections.insert(id.to_string(), vault);
             return None;
         }
-        if let Err(e) = std::fs::remove_file(vault.path()) {
+        v.retire();
+        if let Err(e) = block_in_place(|| std::fs::remove_file(v.path())) {
             tracing::warn!("cannot delete vault file for '{id}': {e}");
-            st.collections.insert(id.to_string(), vault);
+            v.unretire();
             return None;
         }
+        v.item_ids()
+    };
+    {
+        let mut st = state.lock().await;
+        st.collections.remove(id);
         st.aliases.retain(|_, target| target != id);
         if let Err(e) = st.save_aliases() {
             tracing::warn!("cannot save aliases: {e}");
         }
-        vault.item_ids()
-    };
+    }
     let conn2 = conn.clone();
     let id2 = id.to_string();
     tokio::spawn(async move {

@@ -16,6 +16,42 @@ use zbus::zvariant::OwnedObjectPath;
 
 pub type Shared = Arc<tokio::sync::Mutex<ServiceState>>;
 
+/// One collection's vault, behind its own lock.
+///
+/// **Lock order (see `CLAUDE.md`): the global [`Shared`] lock is taken first,
+/// the `Arc`s needed are cloned out of it, the global guard is dropped, and
+/// only then is a vault locked.** Nothing ever holds both, so there is no
+/// cycle to deadlock on, and the whole-vault re-encrypt and the two `fsync`s
+/// a save performs happen with the global state lock free.
+pub type VaultRef = Arc<tokio::sync::Mutex<Vault>>;
+
+/// Wrap a freshly opened or created [`Vault`] in its own lock.
+pub fn vault_ref(vault: Vault) -> VaultRef {
+    Arc::new(tokio::sync::Mutex::new(vault))
+}
+
+/// Run a blocking closure without parking the async worker it is called on.
+///
+/// A vault save clones every item, encodes and seals the whole plaintext, and
+/// then does two `fsync`s; at a large collection that is on the order of a
+/// second of CPU and synchronous I/O. Left as a plain call it holds the
+/// worker thread for the whole time, so a bounded pool of workers is a
+/// bounded number of concurrent saves before *every* task on the runtime
+/// stalls behind them. [`tokio::task::block_in_place`] hands the worker's
+/// remaining queue to another thread first.
+///
+/// `block_in_place` panics on a current-thread runtime and is meaningless
+/// with no runtime at all (the CLI drives the same `Vault` code
+/// synchronously), so the flavour is checked and the closure is otherwise
+/// simply run in place. The daemon and every integration test use a
+/// multi-threaded runtime, so the fast path is the real one.
+pub fn block_in_place<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 /// A prompt's commit gate; see `ServiceState::prompt_commits`.
 ///
 /// An atomic rather than a mutex: `daemon::watch_clients` has to read it
@@ -46,7 +82,9 @@ pub struct ServiceState {
     /// hashes. Applied to every vault as it is loaded or created.
     pub index_attributes: bool,
     pub pinentry: Pinentry,
-    pub collections: BTreeMap<String, Vault>,
+    /// Loaded collections, each behind its own lock. See [`VaultRef`] for the
+    /// ordering rule that makes this safe.
+    pub collections: BTreeMap<String, VaultRef>,
     /// `<id>.vault` files that failed to open (corrupt or unreadable),
     /// keyed by the same id a healthy vault would have used: its file
     /// stem. Reported as a permanently-locked collection with that id as
@@ -212,6 +250,109 @@ pub fn scan_vault_dir(
     Ok(scan)
 }
 
+/// What a client-supplied object path resolves to, as far as
+/// [`ServiceState::resolve_path`] can take it without touching a vault.
+pub enum PathTarget {
+    /// A collection or alias path naming a loaded collection.
+    Collection { id: String, vault: VaultRef },
+    /// A collection or alias path naming a collection whose file would not
+    /// open (see [`ServiceState::broken`]): permanently locked, no vault.
+    Broken { id: String },
+    /// An item path under a loaded collection. **The item is not yet known to
+    /// exist**: the caller must confirm it with `Vault::has_item` (or by the
+    /// lookup it was going to do anyway) under `vault`'s lock, and treat a
+    /// miss exactly as it would have treated an unresolvable path.
+    Item {
+        id: String,
+        vault: VaultRef,
+        item: String,
+    },
+}
+
+impl PathTarget {
+    /// The collection id, whichever kind of target this is.
+    pub fn id(&self) -> &str {
+        match self {
+            PathTarget::Collection { id, .. }
+            | PathTarget::Broken { id }
+            | PathTarget::Item { id, .. } => id,
+        }
+    }
+}
+
+/// Whether the collection behind `path` is currently unlocked.
+///
+/// A free async function, not a method: it has to lock the collection, which
+/// may only happen once the state guard is released.
+pub async fn is_unlocked_path(state: &Shared, path: &str) -> bool {
+    let Some(target) = state.lock().await.resolve_path(path) else {
+        return false;
+    };
+    match target {
+        PathTarget::Broken { .. } => false,
+        PathTarget::Collection { vault, .. } => !vault.lock().await.is_locked(),
+        PathTarget::Item { vault, item, .. } => {
+            let v = vault.lock().await;
+            v.has_item(&item) && !v.is_locked()
+        }
+    }
+}
+
+/// Search every collection. Returns `(unlocked item paths, locked item paths)`.
+///
+/// The collections are snapshotted under the state lock and searched with it
+/// released, one vault lock at a time.
+pub async fn search_all(
+    state: &Shared,
+    query: &BTreeMap<String, String>,
+) -> (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) {
+    let vaults = state.lock().await.all_vaults();
+    let mut unlocked = Vec::new();
+    let mut locked = Vec::new();
+    for (cid, vault) in vaults {
+        let vault = vault.lock().await;
+        let target = if vault.is_locked() {
+            &mut locked
+        } else {
+            &mut unlocked
+        };
+        target.extend(
+            search_collection(&vault, query)
+                .into_iter()
+                .map(|iid| paths::item(&cid, &iid)),
+        );
+    }
+    (unlocked, locked)
+}
+
+/// Test helper: whether collection `id` is locked. A collection that is not
+/// loaded counts as locked, matching what every bus and socket caller sees.
+///
+/// Tests used to read `state.lock().await.collections[id]` directly. They
+/// cannot any more, and should not: the vault is behind its own lock, and
+/// reaching it means the same global-then-collection ordering the daemon
+/// itself obeys (see [`VaultRef`]).
+#[cfg(any(test, feature = "test-util"))]
+pub async fn collection_is_locked(state: &Shared, id: &str) -> bool {
+    match state.lock().await.vault(id) {
+        Some(v) => v.lock().await.is_locked(),
+        None => true,
+    }
+}
+
+/// Test helper: run `f` against collection `id`'s vault, under the daemon's
+/// own lock ordering. Panics if `id` names no loaded collection.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn with_vault<R>(state: &Shared, id: &str, f: impl FnOnce(&mut Vault) -> R) -> R {
+    let vault = state
+        .lock()
+        .await
+        .vault(id)
+        .unwrap_or_else(|| panic!("no collection '{id}'"));
+    let mut vault = vault.lock().await;
+    f(&mut vault)
+}
+
 /// Item ids matching `query`: from the plaintext items when unlocked, from
 /// the hashed header index otherwise (which is empty under
 /// `locked_search = false`).
@@ -272,7 +413,12 @@ impl ServiceState {
         let mut new_ids = Vec::new();
         for (id, vault) in scan.opened {
             let previously_broken = self.broken.remove(&id).is_some();
-            if self.collections.insert(id.clone(), vault).is_none() && !previously_broken {
+            if self
+                .collections
+                .insert(id.clone(), vault_ref(vault))
+                .is_none()
+                && !previously_broken
+            {
                 new_ids.push(id);
             }
         }
@@ -327,30 +473,43 @@ impl ServiceState {
         }
     }
 
-    /// `(collection id, item id)` for an item path under a collection or alias.
-    pub fn resolve_item(&self, path: &str) -> Option<(String, String)> {
+    /// The vault behind a loaded collection id.
+    pub fn vault(&self, id: &str) -> Option<VaultRef> {
+        self.collections.get(id).cloned()
+    }
+
+    /// What a client-supplied object path names, resolved as far as the
+    /// global state alone can take it.
+    ///
+    /// It deliberately stops short of touching a vault: confirming that an
+    /// item path names an item that exists needs that collection's own lock,
+    /// which must never be awaited while this one is held. The caller locks
+    /// the returned [`VaultRef`] after dropping the state guard and finishes
+    /// the resolution there — see [`PathTarget::Item`].
+    pub fn resolve_path(&self, path: &str) -> Option<PathTarget> {
         let (cid, iid) = match paths::parse(path)? {
-            Target::Item { collection, item } => (collection, item),
-            Target::AliasItem { alias, item } => (self.alias_target(&alias)?, item),
-            _ => return None,
+            Target::Collection(id) => (id, None),
+            Target::Alias(name) => (self.alias_target(&name)?, None),
+            Target::Item { collection, item } => (collection, Some(item)),
+            Target::AliasItem { alias, item } => (self.alias_target(&alias)?, Some(item)),
         };
-        self.collections
-            .get(&cid)
-            .filter(|v| v.has_item(&iid))
-            .map(|_| (cid, iid))
-    }
-
-    /// Collection id behind any collection, alias, or item path.
-    pub fn collection_id_of_path(&self, path: &str) -> Option<String> {
-        self.resolve_collection(path)
-            .or_else(|| self.resolve_item(path).map(|(c, _)| c))
-    }
-
-    pub fn is_unlocked_path(&self, path: &str) -> bool {
-        self.collection_id_of_path(path)
-            .and_then(|id| self.collections.get(&id))
-            .map(|v| !v.is_locked())
-            .unwrap_or(false)
+        match (self.collections.get(&cid), iid) {
+            (Some(v), None) => Some(PathTarget::Collection {
+                id: cid,
+                vault: v.clone(),
+            }),
+            (Some(v), Some(item)) => Some(PathTarget::Item {
+                id: cid,
+                vault: v.clone(),
+                item,
+            }),
+            // A broken collection (see `broken`) has no vault; it resolves as
+            // a permanently locked, empty collection. An *item* path under
+            // one names nothing, exactly as before: it has no item index to
+            // match against.
+            (None, None) if self.broken.contains_key(&cid) => Some(PathTarget::Broken { id: cid }),
+            _ => None,
+        }
     }
 
     /// Refuse a new session once this client already holds
@@ -395,26 +554,15 @@ impl ServiceState {
         self.last_activity = Instant::now();
     }
 
-    /// Search every collection. Returns `(unlocked item paths, locked item paths)`.
-    pub fn search_all(
-        &self,
-        query: &BTreeMap<String, String>,
-    ) -> (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) {
-        let mut unlocked = Vec::new();
-        let mut locked = Vec::new();
-        for (cid, vault) in &self.collections {
-            let target = if vault.is_locked() {
-                &mut locked
-            } else {
-                &mut unlocked
-            };
-            target.extend(
-                search_collection(vault, query)
-                    .into_iter()
-                    .map(|iid| paths::item(cid, &iid)),
-            );
-        }
-        (unlocked, locked)
+    /// Every loaded collection and its vault, in id order, for a caller that
+    /// has to walk all of them. Snapshotting the `Arc`s under this lock and
+    /// working through them after it is released is the only permitted shape:
+    /// see [`VaultRef`].
+    pub fn all_vaults(&self) -> Vec<(String, VaultRef)> {
+        self.collections
+            .iter()
+            .map(|(id, v)| (id.clone(), v.clone()))
+            .collect()
     }
 
     /// Path-safe id derived from a label, made unique against loaded collections and files.
@@ -452,8 +600,13 @@ mod tests {
         )
     }
 
-    #[test]
-    fn loads_vaults_and_aliases_and_resolves_paths() {
+    /// `resolve_path` stops at the item *index*, which lives behind the
+    /// collection's own lock: it reports what a path names, and the caller
+    /// confirms an item exists after the state guard is dropped. The
+    /// existence half of what `resolve_item` used to answer in one step is
+    /// asserted here through `has_item`, on the same paths.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loads_vaults_and_aliases_and_resolves_paths() {
         let dir = tempfile::tempdir().unwrap();
         let mut v = Vault::create(
             &dir.path().join("default.vault"),
@@ -491,30 +644,47 @@ mod tests {
             None
         );
         let item_path = paths::item("default", &iid);
+        let alias_item = format!("/org/freedesktop/secrets/aliases/default/{iid}");
+        for path in [item_path.as_str(), alias_item.as_str()] {
+            match st.resolve_path(path) {
+                Some(PathTarget::Item { id, item, vault }) => {
+                    assert_eq!((id.as_str(), item.as_str()), ("default", iid.as_str()));
+                    assert!(vault.try_lock().unwrap().has_item(&iid), "{path}");
+                }
+                _ => panic!("{path} must resolve to an item"),
+            }
+        }
+        // A path under a real collection naming an item that does not exist
+        // still resolves *to that collection* — the miss is the caller's to
+        // notice, under the vault's lock, and every caller does.
+        match st.resolve_path("/org/freedesktop/secrets/collection/default/missing") {
+            Some(PathTarget::Item { id, item, vault }) => {
+                assert_eq!(id, "default");
+                assert!(!vault.try_lock().unwrap().has_item(&item));
+            }
+            _ => panic!("an item path under a loaded collection resolves to it"),
+        }
         assert_eq!(
-            st.resolve_item(item_path.as_str()),
-            Some(("default".into(), iid.clone()))
-        );
-        assert_eq!(
-            st.resolve_item(&format!("/org/freedesktop/secrets/aliases/default/{iid}")),
-            Some(("default".into(), iid.clone()))
-        );
-        assert_eq!(
-            st.resolve_item("/org/freedesktop/secrets/collection/default/missing"),
-            None
-        );
-        assert_eq!(
-            st.collection_id_of_path(item_path.as_str()),
+            st.resolve_path(item_path.as_str())
+                .map(|t| t.id().to_string()),
             Some("default".into())
         );
-        assert!(!st.is_unlocked_path(item_path.as_str()));
-        st.collections
-            .get_mut("default")
-            .unwrap()
-            .unlock(b"pw")
+
+        let shared: Shared = Arc::new(tokio::sync::Mutex::new(st));
+        assert!(!is_unlocked_path(&shared, item_path.as_str()).await);
+        assert!(
+            !is_unlocked_path(
+                &shared,
+                "/org/freedesktop/secrets/collection/default/missing"
+            )
+            .await,
+            "a path naming no item is not an unlocked one"
+        );
+        with_vault(&shared, "default", |v| v.unlock(b"pw"))
+            .await
             .unwrap();
-        assert!(st.is_unlocked_path(item_path.as_str()));
-        let (u, l) = st.search_all(&BTreeMap::new());
+        assert!(is_unlocked_path(&shared, item_path.as_str()).await);
+        let (u, l) = search_all(&shared, &BTreeMap::new()).await;
         assert_eq!(u, vec![item_path]);
         assert!(l.is_empty());
     }
@@ -590,11 +760,12 @@ mod tests {
         assert!(st.check_prompt_quota(":1.2").is_ok());
     }
 
-    /// `resolve_item` takes any path a bus client can send. A collection or
+    /// `resolve_path` takes any path a bus client can send. A collection or
     /// alias path is not an item path, and must not be mistaken for one -
-    /// `GetSecrets` and the batch delete both feed it caller-supplied paths.
+    /// `GetSecrets` and the batch delete both feed it caller-supplied paths
+    /// and act only on the `Item` variant.
     #[test]
-    fn resolve_item_refuses_a_path_that_names_no_item() {
+    fn resolve_path_never_calls_a_collection_path_an_item() {
         let dir = tempfile::tempdir().unwrap();
         let st = state(dir.path());
         for path in [
@@ -603,7 +774,10 @@ mod tests {
             "/org/freedesktop/secrets",
             "/",
         ] {
-            assert_eq!(st.resolve_item(path), None, "{path}");
+            assert!(
+                !matches!(st.resolve_path(path), Some(PathTarget::Item { .. })),
+                "{path}"
+            );
         }
     }
 

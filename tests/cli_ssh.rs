@@ -538,7 +538,7 @@ async fn declining_does_not_unlock_the_collection() {
         .clone();
     assert!(out.is_empty(), "declined confirmation leaked output");
     assert!(
-        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "a declined key use left the collection unlocked for every bus client"
     );
 
@@ -847,7 +847,7 @@ async fn a_dismissed_unlock_after_consent_falls_back_to_a_typed_answer() {
         "a dismissed unlock did not fall through to the typed prompt"
     );
     assert!(
-        fx.daemon.state.lock().await.collections["default"].is_locked(),
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "a dismissed master password prompt left the collection unlocked"
     );
 }

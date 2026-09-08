@@ -5,7 +5,8 @@ use super::errors::{Error, Result};
 use super::paths;
 use super::require_sender;
 use super::session::SecretStruct;
-use super::state::Shared;
+use super::state::{Shared, VaultRef, block_in_place};
+use crate::session::SessionCipher;
 use std::collections::HashMap;
 use zbus::Connection;
 use zbus::interface;
@@ -29,27 +30,33 @@ impl Item {
         }
     }
 
+    /// This item's collection, looked up under one brief acquisition of the
+    /// state lock. The vault is locked only after that guard is dropped; see
+    /// `state::VaultRef`.
+    async fn vault(&self) -> Option<VaultRef> {
+        self.state.lock().await.vault(&self.collection)
+    }
+
     /// Read one field of the decrypted item; `None` while locked or missing.
     async fn with_item<T>(&self, f: impl FnOnce(&crate::vault::format::Item) -> T) -> Option<T> {
-        let st = self.state.lock().await;
-        st.collections
-            .get(&self.collection)
-            .and_then(|v| v.item(&self.id).ok())
-            .map(f)
+        let vault = self.vault().await?;
+        let vault = vault.lock().await;
+        vault.item(&self.id).ok().map(f)
     }
 
     async fn update(
         &self,
         f: impl FnOnce(&mut crate::vault::format::Item),
     ) -> zbus::fdo::Result<()> {
-        let mut st = self.state.lock().await;
-        let vault = st
-            .collections
-            .get_mut(&self.collection)
+        let vault = self
+            .vault()
+            .await
             .ok_or_else(|| zbus::fdo::Error::UnknownObject("no such collection".into()))?;
-        vault
-            .update_item(&self.id, f)
-            .map_err(super::errors::vault_error_to_fdo)
+        // The edit is a whole-vault re-encrypt and two `fsync`s, so it runs
+        // on this collection's lock with the state lock free, and off the
+        // async worker.
+        let mut vault = vault.lock().await;
+        block_in_place(|| vault.update_item(&self.id, f)).map_err(super::errors::vault_error_to_fdo)
     }
 }
 
@@ -58,14 +65,11 @@ impl Item {
     #[zbus(out_args("prompt"))]
     async fn delete(&self, #[zbus(connection)] conn: &Connection) -> Result<OwnedObjectPath> {
         {
-            let mut st = self.state.lock().await;
-            let vault = st
-                .collections
-                .get_mut(&self.collection)
-                .ok_or(Error::NoSuchObject)?;
-            vault.delete_item(&self.id)?;
-            st.touch();
+            let vault = self.vault().await.ok_or(Error::NoSuchObject)?;
+            let mut vault = vault.lock().await;
+            block_in_place(|| vault.delete_item(&self.id))?;
         }
+        self.state.lock().await.touch();
         let path = paths::item(&self.collection, &self.id);
         let conn2 = conn.clone();
         let p = path.clone();
@@ -83,22 +87,25 @@ impl Item {
         session: OwnedObjectPath,
         #[zbus(header)] header: Header<'_>,
     ) -> Result<SecretStruct> {
-        let mut st = self.state.lock().await;
-        let cipher = st.cipher(session.as_str(), &require_sender(&header)?)?;
-        let vault = st
-            .collections
-            .get(&self.collection)
-            .ok_or(Error::NoSuchObject)?;
-        let item = vault.item(&self.id)?;
-        let (parameters, value) = cipher.encrypt(&item.secret);
-        let content_type = item.content_type.clone();
+        let (cipher, vault) = {
+            let st = self.state.lock().await;
+            let cipher =
+                SessionCipher::clone(st.cipher(session.as_str(), &require_sender(&header)?)?);
+            let vault = st.vault(&self.collection).ok_or(Error::NoSuchObject)?;
+            (cipher, vault)
+        };
+        let (parameters, value, content_type) = {
+            let vault = vault.lock().await;
+            let item = vault.item(&self.id)?;
+            let (parameters, value) = cipher.encrypt(&item.secret);
+            (parameters, value, item.content_type.clone())
+        };
         // Only an authorised read counts as activity. Touching first meant any
         // bus client could refresh `last_activity` with a bogus or another
         // client's session path — no session, no unlocked collection and no
         // real item path needed — so `idle_lock` never fired and the keys
-        // stayed in daemon memory indefinitely. A legitimate call still
-        // touches inside this same lock acquisition.
-        st.touch();
+        // stayed in daemon memory indefinitely.
+        self.state.lock().await.touch();
         Ok(SecretStruct {
             session,
             parameters,
@@ -118,27 +125,29 @@ impl Item {
         // speed bump: create an item with a short one, then replace it.
         collection::check_content_type(&secret.content_type)?;
         {
-            let mut st = self.state.lock().await;
-            let cipher = st.cipher(secret.session.as_str(), &require_sender(&header)?)?;
-            // Cheap checks before the caller-sized decrypt, which runs with
-            // the global state mutex held: `secret.value` is bounded only by
-            // the bus message size (128 MiB), so decrypting first meant a
-            // client could stall every other client and only then be told the
-            // secret was over the cap, or the collection locked.
-            // `MAX_ITEM_CIPHERTEXT` bounds the plaintext from above only —
-            // the exact check on the plaintext is still below.
-            if secret.value.len() > collection::MAX_ITEM_CIPHERTEXT {
-                return Err(Error::invalid_args(format!(
-                    "secret is too large; at most {} bytes per item",
-                    collection::MAX_ITEM_SECRET
-                )));
-            }
-            if st
-                .collections
-                .get(&self.collection)
-                .ok_or(Error::NoSuchObject)?
-                .is_locked()
-            {
+            let (cipher, vault) = {
+                let st = self.state.lock().await;
+                let cipher = SessionCipher::clone(
+                    st.cipher(secret.session.as_str(), &require_sender(&header)?)?,
+                );
+                // Cheap checks before the caller-sized decrypt: `secret.value`
+                // is bounded only by the bus message size (128 MiB), so
+                // decrypting first meant a client could spend that work and
+                // only then be told the secret was over the cap, or the
+                // collection locked. `MAX_ITEM_CIPHERTEXT` bounds the
+                // plaintext from above only — the exact check on the
+                // plaintext is still below.
+                if secret.value.len() > collection::MAX_ITEM_CIPHERTEXT {
+                    return Err(Error::invalid_args(format!(
+                        "secret is too large; at most {} bytes per item",
+                        collection::MAX_ITEM_SECRET
+                    )));
+                }
+                let vault = st.vault(&self.collection).ok_or(Error::NoSuchObject)?;
+                (cipher, vault)
+            };
+            let mut vault = vault.lock().await;
+            if vault.is_locked() {
                 return Err(Error::IsLocked);
             }
             let plaintext = cipher
@@ -155,17 +164,15 @@ impl Item {
                     collection::MAX_ITEM_SECRET
                 )));
             }
-            let vault = st
-                .collections
-                .get_mut(&self.collection)
-                .ok_or(Error::NoSuchObject)?;
             let content_type = secret.content_type.clone();
-            vault.update_item(&self.id, move |i| {
-                i.secret = Zeroizing::new(plaintext.to_vec());
-                i.content_type = content_type;
+            block_in_place(|| {
+                vault.update_item(&self.id, move |i| {
+                    i.secret = Zeroizing::new(plaintext.to_vec());
+                    i.content_type = content_type;
+                })
             })?;
-            st.touch();
         }
+        self.state.lock().await.touch();
         SignalEmitter::new(conn, paths::collection(&self.collection))?
             .item_changed(paths::item(&self.collection, &self.id))
             .await?;
@@ -174,11 +181,10 @@ impl Item {
 
     #[zbus(property)]
     async fn locked(&self) -> bool {
-        let st = self.state.lock().await;
-        st.collections
-            .get(&self.collection)
-            .map(|v| v.is_locked())
-            .unwrap_or(true)
+        match self.vault().await {
+            Some(v) => v.lock().await.is_locked(),
+            None => true,
+        }
     }
 
     #[zbus(property)]

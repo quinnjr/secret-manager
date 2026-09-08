@@ -989,3 +989,94 @@ write to a different collection, which is worse. Worth a deliberate choice.
 
 522 tests pass. Clippy clean at `-D warnings` for the default and `pam`
 builds; `cargo fmt --check` clean.
+
+---
+
+# The two deferred findings — 2026-09-07
+
+Both findings the fourth audit documented rather than patched are now fixed.
+
+## Vault I/O no longer runs under the global state mutex
+
+Each collection's `Vault` sits behind its own lock (`Arc<Mutex<Vault>>`); the
+state mutex covers map lookups, aliases, sessions and prompt bookkeeping and
+nothing else. A mutation and the save it triggers both happen under the
+collection's lock, wrapped in `block_in_place` so the two `fsync`s release the
+async worker rather than parking it. Writes are still synchronous with
+respect to the caller — a successful `CreateItem` still means the item is on
+disk, because returning earlier would trade a denial of service for silent
+data loss.
+
+**The rule that failed is restated in `CLAUDE.md`.** It said the state mutex
+is never held across an `.await` that can block. That was true at all 47
+sites, and useless: it is phrased for `.await`, and a synchronous `fsync`
+walks straight through it. It now says nothing slow or blocking may happen
+under that lock — not an `.await`, and not a blocking syscall either — with
+the test that "if work is bounded by the data rather than by a constant, it
+does not belong under this lock".
+
+Two consequences of splitting the locks were not obvious in advance and are
+load-bearing:
+
+- Confirming an item *exists* needs the collection's lock, so path resolution
+  stops at the collection and each caller finishes it (`PathTarget::Item`).
+- "Remove from the map" and "unlink the file" can no longer share one guard.
+  A confirmed delete now calls `Vault::retire` under the vault's own lock
+  before unlinking, and every later save refuses with `VaultError::Retired`
+  rather than recreating the file that was just deleted. Without that, a
+  `CreateItem` racing a delete resurrects the collection.
+
+The ordering rule enforced is stronger than global-before-collection:
+**nothing ever holds two locks at once**, so there is no cycle to reason
+about. `tests/dbus_locking.rs` guards it two ways — a source scan that
+refuses any statement taking a lock while a `let`-bound guard is alive, in
+either direction, and a runtime test that *holds* a collection's lock by hand
+(exactly what a save in flight holds) and asserts an unrelated write and a
+state-only property still answer. The second measures no duration: each check
+is "immediately, or never", so it cannot flake. Both were confirmed to fail
+against a deliberately reintroduced regression.
+
+## A squatted control socket no longer keeps the daemon down
+
+`bind` refused to take a socket anything was still answering, to avoid
+unlinking a live daemon's. That reasoning does not survive the startup order:
+`Daemon::start` acquires the bus name first, refusing replacement in both
+directions, and D-Bus makes that name unique — so a second *legitimate*
+daemon can never reach the bind. The only party the refusal ever met was a
+same-uid impostor, and for that party it was a permanent denial of service:
+the unit fails, `Restart=on-failure` retries into `StartLimitBurst`, and it
+stays failed *after the squatter exits* until someone runs
+`systemctl --user reset-failed`.
+
+The daemon now takes the path over, and does it atomically: bind a private
+`.control.<random>.sock` and `rename(2)` it across, rather than
+unlink-then-bind. There is no instant in which the path is absent or unbound,
+so a squatter cannot win by re-binding in a gap — losing that race is what
+made a squat stick. A second test watches the path throughout the bind and
+fails if it ever vanishes.
+
+The impostor keeps its own socket and any client already connected to it —
+the accepted residue of gap I3, unchanged. What it loses is the ability to
+keep the real daemon from starting.
+
+## One unexplained test failure, recorded rather than dismissed
+
+The first full-suite run after the host recovered from process exhaustion
+reported 454 passed and 1 failed, with 71 tests missing — a binary that
+aborted early rather than a test that asserted wrongly, which is the shape of
+a failed `spawn`. It was not captured, and it has not recurred in **15
+consecutive full-suite runs**, 15 runs of the five locking-sensitive suites
+(96 tests each, no early aborts), or 10 runs of `cli_init` alone.
+
+The environmental explanation fits — the host had just been unable to
+`posix_spawn` at all, and the suites that failed spawn both a `dbus-daemon`
+and the CLI — but it was not reproduced, so it is written down rather than
+explained away. If it returns, the thing to look at first is
+`registry::register_collection`, which now takes each vault's lock during a
+`Reload`; it cannot deadlock, since nothing holds the state lock there, but
+it can queue behind a save.
+
+## State
+
+525 tests pass. Clippy clean at `-D warnings` for the default and `pam`
+builds; `cargo fmt --check` clean.
