@@ -1,0 +1,217 @@
+//! Register and unregister collection, alias, and item objects; shared notifications.
+
+use super::collection::{Collection, CollectionAdmin, CollectionRef};
+use super::item::Item;
+use super::paths;
+use super::service::{Service, ServiceSignals};
+use super::state::Shared;
+use zbus::Connection;
+use zbus::object_server::SignalEmitter;
+
+pub async fn register_collection(conn: &Connection, state: &Shared, id: &str) -> zbus::Result<()> {
+    let server = conn.object_server();
+    server
+        .at(
+            paths::collection(id),
+            Collection::new(state.clone(), CollectionRef::Id(id.to_string())),
+        )
+        .await?;
+    // The private batch interface rides on the same object; see
+    // `collection::CollectionAdmin`.
+    server
+        .at(
+            paths::collection(id),
+            CollectionAdmin::new(state.clone(), CollectionRef::Id(id.to_string())),
+        )
+        .await?;
+    // The `Arc` is cloned out of the state lock and the vault is locked only
+    // after that guard is dropped; see `state::VaultRef`.
+    let vault = state.lock().await.vault(id);
+    let item_ids = match vault {
+        Some(v) => v.lock().await.item_ids(),
+        None => Vec::new(),
+    };
+    for iid in item_ids {
+        server
+            .at(
+                paths::item(id, &iid),
+                Item::new(state.clone(), id.to_string(), iid),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn unregister_collection(conn: &Connection, id: &str, item_ids: &[String]) {
+    let server = conn.object_server();
+    for iid in item_ids {
+        if let Err(e) = server.remove::<Item, _>(paths::item(id, iid)).await {
+            tracing::debug!("removing item '{iid}' of '{id}': {e}");
+        }
+    }
+    if let Err(e) = server
+        .remove::<CollectionAdmin, _>(paths::collection(id))
+        .await
+    {
+        tracing::debug!("removing admin interface of '{id}': {e}");
+    }
+    if let Err(e) = server.remove::<Collection, _>(paths::collection(id)).await {
+        tracing::debug!("removing collection '{id}': {e}");
+    }
+}
+
+/// Idempotent: an alias object resolves its target at call time, so
+/// repointing an alias needs no re-registration. It *is* removed again when
+/// the alias is cleared — see [`unregister_alias`] — because otherwise every
+/// name a client ever passed to `SetAlias` cost two exported objects forever
+/// (HIGH 3).
+pub async fn register_alias(conn: &Connection, state: &Shared, name: &str) -> zbus::Result<()> {
+    if let Some(path) = paths::alias(name) {
+        let server = conn.object_server();
+        server
+            .at(
+                path.clone(),
+                Collection::new(state.clone(), CollectionRef::Alias(name.to_string())),
+            )
+            .await?;
+        server
+            .at(
+                path,
+                CollectionAdmin::new(state.clone(), CollectionRef::Alias(name.to_string())),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Drop the two objects [`register_alias`] exported for `name`. Idempotent
+/// and infallible in the same way as [`unregister_collection`]: a name that
+/// was never registered just logs.
+pub async fn unregister_alias(conn: &Connection, name: &str) {
+    let Some(path) = paths::alias(name) else {
+        return;
+    };
+    let server = conn.object_server();
+    if let Err(e) = server.remove::<CollectionAdmin, _>(path.clone()).await {
+        tracing::debug!("removing admin interface of alias '{name}': {e}");
+    }
+    if let Err(e) = server.remove::<Collection, _>(path).await {
+        tracing::debug!("removing alias '{name}': {e}");
+    }
+}
+
+pub async fn register_item(
+    conn: &Connection,
+    state: &Shared,
+    collection_id: &str,
+    item_id: &str,
+) -> zbus::Result<()> {
+    conn.object_server()
+        .at(
+            paths::item(collection_id, item_id),
+            Item::new(
+                state.clone(),
+                collection_id.to_string(),
+                item_id.to_string(),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn register_all(conn: &Connection, state: &Shared) -> zbus::Result<()> {
+    let (ids, aliases) = {
+        let st = state.lock().await;
+        (
+            st.collections
+                .keys()
+                .chain(st.broken.keys())
+                .cloned()
+                .collect::<Vec<_>>(),
+            // Every name the daemon knows of, which while the table is
+            // degraded is the last set it read successfully and, if it has
+            // never parsed, none at all. Registering an object here does not
+            // make it resolve: `Collection::id` asks the table again.
+            st.aliases.known().keys().cloned().collect::<Vec<_>>(),
+        )
+    };
+    for id in ids {
+        register_collection(conn, state, &id).await?;
+    }
+    for name in aliases {
+        register_alias(conn, state, &name).await?;
+    }
+    Ok(())
+}
+
+/// `Service.CollectionChanged` plus `PropertiesChanged` for `Collection.Locked`,
+/// on both the collection's real path and every alias that currently targets
+/// it (an alias is its own D-Bus object with its own cached `Locked`
+/// property, so it needs its own `PropertiesChanged` — see `register_alias`).
+///
+/// Signature kept as `(conn, id)`, matching every existing caller: the
+/// collection's own registered interface is used to reach `ServiceState`
+/// (via `Collection::state`) instead of taking a redundant `&Shared`.
+pub async fn notify_collection_changed(conn: &Connection, id: &str) {
+    if let Ok(emitter) = SignalEmitter::new(conn, paths::SERVICE_PATH)
+        && let Err(e) = emitter.collection_changed(paths::collection(id)).await
+    {
+        tracing::warn!("emitting CollectionChanged for '{id}': {e}");
+    }
+    let Ok(iface) = conn
+        .object_server()
+        .interface::<_, Collection>(paths::collection(id))
+        .await
+    else {
+        return;
+    };
+    // The zbus interface guard is a read lock like any other, and the state
+    // mutex must not be awaited underneath one: the `Shared` is cloned out and
+    // the guard released before the state lock is taken.
+    let state = {
+        let coll = iface.get().await;
+        coll.state().clone()
+    };
+    let aliases: Vec<String> = {
+        let st = state.lock().await;
+        st.aliases
+            .known()
+            .iter()
+            .filter(|(_, target)| target.as_str() == id)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    emit_locked_changed(conn, paths::collection(id)).await;
+    for name in aliases {
+        if let Some(path) = paths::alias(&name) {
+            emit_locked_changed(conn, path).await;
+        }
+    }
+}
+
+async fn emit_locked_changed(conn: &Connection, path: zbus::zvariant::OwnedObjectPath) {
+    if let Ok(iface) = conn.object_server().interface::<_, Collection>(path).await
+        && let Err(e) = iface
+            .get()
+            .await
+            .locked_changed(iface.signal_emitter())
+            .await
+    {
+        tracing::warn!("emitting Locked PropertiesChanged: {e}");
+    }
+}
+
+/// `PropertiesChanged` for `Service.Collections`, after a collection is created or deleted.
+pub async fn notify_collections_changed(conn: &Connection) {
+    if let Ok(iface) = conn
+        .object_server()
+        .interface::<_, Service>(paths::SERVICE_PATH)
+        .await
+    {
+        let _ = iface
+            .get()
+            .await
+            .collections_changed(iface.signal_emitter())
+            .await;
+    }
+}

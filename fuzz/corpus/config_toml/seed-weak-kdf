@@ -1,0 +1,4 @@
+[kdf]
+m_cost_kib = 8
+t_cost = 1
+p_cost = 1

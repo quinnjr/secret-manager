@@ -1,0 +1,655 @@
+mod common;
+
+use common::Fixture;
+use secret_manager::dbus::proxies::{CollectionProxy, PromptProxy, ServiceProxy, SessionProxy};
+use secret_manager::protocol::{Request, Response, call};
+use secret_manager::session::dh::KeyPair;
+use secret_manager::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
+use std::collections::HashMap;
+use zbus::proxy::CacheProperties;
+use zbus::zvariant::{OwnedObjectPath, Value};
+
+async fn control(fx: &Fixture, req: Request) -> Response {
+    let sock = fx.control_socket();
+    tokio::task::spawn_blocking(move || call(&sock, &req))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn plain_and_dh_sessions() {
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    let (output, path) = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+    assert_eq!(String::try_from(output).unwrap(), "");
+    assert!(
+        path.as_str()
+            .starts_with("/org/freedesktop/secrets/session/")
+    );
+
+    let pair = KeyPair::generate();
+    let (output, path2) = service
+        .open_session(ALGORITHM_DH, &Value::from(pair.public_bytes().to_vec()))
+        .await
+        .unwrap();
+    let peer = Vec::<u8>::try_from(output).unwrap();
+    assert!(!peer.is_empty() && peer.len() <= 128);
+    assert!(SessionCipher::from_dh(&pair, &peer).is_ok());
+    assert_ne!(path, path2);
+    assert_eq!(fx.daemon.state.lock().await.sessions.len(), 2);
+
+    let session = SessionProxy::builder(&conn)
+        .path(path.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    session.close().await.unwrap();
+    assert!(
+        common::wait_for(std::time::Duration::from_secs(2), || async {
+            fx.daemon.state.lock().await.sessions.len() == 1
+        })
+        .await
+    );
+}
+
+/// A session belongs to the client that opened it: another client calling
+/// `Close` on it must be refused, and the session must remain open
+/// (finding 6).
+#[tokio::test]
+async fn session_close_is_refused_to_a_non_owner() {
+    let fx = Fixture::start().await;
+    let owner_conn = fx.client().await;
+    let intruder_conn = fx.client().await;
+    let service = ServiceProxy::new(&owner_conn).await.unwrap();
+    let (_, path) = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+
+    let intruder = SessionProxy::builder(&intruder_conn)
+        .path(path.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let err = intruder.close().await.unwrap_err();
+    assert!(
+        matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.Secret.Error.NoSession")
+    );
+    assert_eq!(fx.daemon.state.lock().await.sessions.len(), 1);
+
+    let owner = SessionProxy::builder(&owner_conn)
+        .path(path)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    owner.close().await.unwrap();
+    assert!(
+        common::wait_for(std::time::Duration::from_secs(2), || async {
+            fx.daemon.state.lock().await.sessions.is_empty()
+        })
+        .await
+    );
+}
+
+/// Sessions are only reclaimed on `Close` or disconnect, and each costs an
+/// exported object (plus a 1024-bit modexp for `dh`), so one client may hold
+/// only so many at once (MEDIUM 4). The cap is per sender: another client is
+/// unaffected.
+///
+/// The cap must also actually *bound the work it was added to bound* (HIGH 4).
+/// `KeyPair::generate()` and `SessionCipher::from_dh` — two 1024-bit modexps —
+/// used to run before `require_sender` and the quota check, so a client at its
+/// limit still spent the daemon's CPU on every refused call. That ordering is
+/// asserted here without relying on wall-clock timing: a `dh` request whose
+/// peer key `from_dh` rejects would answer `InvalidArgs` if the key exchange
+/// ran first, and answers the quota error only if the quota check ran first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_session_is_capped_per_client() {
+    use secret_manager::dbus::state::MAX_SESSIONS_PER_SENDER;
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    for i in 0..MAX_SESSIONS_PER_SENDER {
+        service
+            .open_session(ALGORITHM_PLAIN, &Value::from(""))
+            .await
+            .unwrap_or_else(|e| panic!("session {i} must be allowed: {e}"));
+    }
+    let err = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap_err();
+    match &err {
+        zbus::Error::MethodError(name, desc, _) => {
+            assert_eq!(name.as_str(), "org.freedesktop.DBus.Error.Failed");
+            assert!(
+                desc.as_deref()
+                    .unwrap_or_default()
+                    .contains("too many open sessions"),
+                "{desc:?}"
+            );
+        }
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.sessions.len(),
+        MAX_SESSIONS_PER_SENDER
+    );
+
+    // Ordering proof (HIGH 4): `vec![1u8]` is a peer key `from_dh` rejects —
+    // `unsupported_algorithm_and_bad_input` shows it yields `InvalidArgs` when
+    // the quota is free. With the quota exhausted it must be refused *before*
+    // the key exchange is attempted, so the quota error is what comes back.
+    let err = service
+        .open_session(ALGORITHM_DH, &Value::from(vec![1u8]))
+        .await
+        .unwrap_err();
+    match &err {
+        zbus::Error::MethodError(name, desc, _) => {
+            assert_eq!(
+                name.as_str(),
+                "org.freedesktop.DBus.Error.Failed",
+                "the modexps ran before the quota check: {desc:?}"
+            );
+            assert!(
+                desc.as_deref()
+                    .unwrap_or_default()
+                    .contains("too many open sessions"),
+                "{desc:?}"
+            );
+        }
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.sessions.len(),
+        MAX_SESSIONS_PER_SENDER,
+        "a refused call must not have created a session"
+    );
+
+    // A different client is unaffected by the first one's exhausted quota.
+    let other_conn = fx.client().await;
+    ServiceProxy::new(&other_conn)
+        .await
+        .unwrap()
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.daemon.state.lock().await.sessions.len(),
+        MAX_SESSIONS_PER_SENDER + 1
+    );
+}
+
+#[tokio::test]
+async fn unsupported_algorithm_and_bad_input() {
+    let fx = Fixture::start().await;
+    let service = ServiceProxy::new(&fx.client().await).await.unwrap();
+    let err = service
+        .open_session("rot13", &Value::from(""))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.NotSupported")
+    );
+    let err = service
+        .open_session(ALGORITHM_DH, &Value::from("not bytes"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs")
+    );
+    let err = service
+        .open_session(ALGORITHM_DH, &Value::from(vec![1u8]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs")
+    );
+}
+
+/// A vault file that fails to open (corrupt or unreadable) must still show
+/// up as a collection — permanently locked, never silently dropped
+/// (finding 7). `Reload` (triggered here over the control socket, since that
+/// is how a running daemon is told to rescan the vault directory) picks it
+/// up the same way startup does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broken_vault_appears_as_a_locked_collection() {
+    let fx = Fixture::start().await;
+    std::fs::write(
+        fx.data_dir.path().join("secret-manager").join("bad.vault"),
+        b"not a real vault file",
+    )
+    .unwrap();
+
+    assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let bad_path = secret_manager::dbus::paths::collection("bad");
+    assert!(service.collections().await.unwrap().contains(&bad_path));
+
+    let bad = CollectionProxy::builder(&conn)
+        .path(bad_path.clone())
+        .unwrap()
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    assert!(bad.locked().await.unwrap());
+    assert_eq!(bad.label().await.unwrap(), "bad");
+    assert!(bad.items().await.unwrap().is_empty());
+
+    // Unlock still returns a prompt (a broken collection isn't rejected
+    // outright), but it completes dismissed without ever touching pinentry.
+    let (unlocked, prompt) = service
+        .unlock(std::slice::from_ref(&bad_path))
+        .await
+        .unwrap();
+    assert!(unlocked.is_empty());
+    assert_ne!(prompt.as_str(), "/");
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    use futures_util::StreamExt;
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy.prompt("").await.unwrap();
+    let sig = tokio::time::timeout(std::time::Duration::from_secs(5), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sig.args().unwrap().dismissed);
+    assert!(
+        !fx.pinentry_log().contains("GETPIN"),
+        "a broken vault must never reach pinentry"
+    );
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(sig.args().unwrap().result.try_to_owned().unwrap())
+            .unwrap(),
+        Vec::<OwnedObjectPath>::new()
+    );
+}
+
+#[tokio::test]
+async fn collections_alias_and_empty_search() {
+    let fx = Fixture::start().await;
+    let service = ServiceProxy::new(&fx.client().await).await.unwrap();
+    assert_eq!(
+        service.collections().await.unwrap(),
+        vec![fx.default_collection()]
+    );
+    assert_eq!(
+        service.read_alias("default").await.unwrap(),
+        fx.default_collection()
+    );
+    assert_eq!(service.read_alias("nope").await.unwrap().as_str(), "/");
+    let (unlocked, locked) = service
+        .search_items(HashMap::from([("a", "b")]))
+        .await
+        .unwrap();
+    assert!(unlocked.is_empty() && locked.is_empty());
+}
+
+fn error_name(e: &zbus::Error) -> String {
+    match e {
+        zbus::Error::MethodError(name, _, _) => name.to_string(),
+        other => panic!("expected MethodError, got {other:?}"),
+    }
+}
+
+/// `Lock` and `Unlock` take arrays of caller-supplied object paths. A path
+/// that names nothing is skipped, not an error and not a prompt: libsecret
+/// routinely passes paths it cached before a collection went away, and a
+/// prompt raised for one would put a password dialog on screen for a keyring
+/// that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_and_unlock_skip_paths_that_name_nothing() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let nowhere: Vec<OwnedObjectPath> = [
+        // A collection id that was never loaded.
+        "/org/freedesktop/secrets/collection/nope",
+        // An item under one.
+        "/org/freedesktop/secrets/collection/nope/abc",
+        // An alias that resolves to nothing.
+        "/org/freedesktop/secrets/aliases/nope",
+        // Paths outside the collection tree altogether.
+        "/org/freedesktop/secrets",
+        "/",
+    ]
+    .iter()
+    .map(|p| OwnedObjectPath::try_from(*p).unwrap())
+    .collect();
+
+    let (unlocked, prompt) = service.unlock(&nowhere).await.unwrap();
+    assert!(unlocked.is_empty());
+    assert_eq!(
+        prompt.as_str(),
+        "/",
+        "paths that name nothing must not raise a prompt"
+    );
+    assert!(
+        fx.daemon.state.lock().await.prompt_owners.is_empty(),
+        "a prompt object was exported for a collection that does not exist"
+    );
+
+    let (locked, prompt) = service.lock(&nowhere).await.unwrap();
+    assert!(locked.is_empty());
+    assert_eq!(prompt.as_str(), "/");
+    assert!(
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
+        "a Lock of unrelated paths locked the real collection"
+    );
+    assert!(
+        !fx.pinentry_log().contains("GETPIN"),
+        "nothing here may reach pinentry:\n{}",
+        fx.pinentry_log()
+    );
+}
+
+/// A vault file that will not open is advertised as a permanently locked
+/// collection with no vault behind it, which is the one case where a path
+/// resolves but `collections` has no entry. `Lock` must leave it out of its
+/// reply (there is nothing to lock), and the private batch-delete interface,
+/// which is exported on it like on any other collection, must refuse rather
+/// than panic on the missing entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_collection_cannot_be_locked_or_batch_deleted() {
+    use secret_manager::dbus::proxies::CollectionAdminProxy;
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    std::fs::write(
+        fx.data_dir.path().join("secret-manager").join("bad.vault"),
+        b"not a real vault file",
+    )
+    .unwrap();
+    assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
+
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let bad_path = secret_manager::dbus::paths::collection("bad");
+    assert!(service.collections().await.unwrap().contains(&bad_path));
+
+    let (locked, prompt) = service.lock(std::slice::from_ref(&bad_path)).await.unwrap();
+    assert!(
+        locked.is_empty(),
+        "a broken collection has no vault to lock, so it cannot be reported locked"
+    );
+    assert_eq!(prompt.as_str(), "/");
+
+    let admin = CollectionAdminProxy::builder(&conn)
+        .path(bad_path.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    // An empty batch changes nothing, but it must still answer for the state
+    // of the collection it was sent to. A broken collection reports
+    // `Locked = true` and has no vault behind it, so `DeleteItems([])` says
+    // `IsLocked` — the same thing `Item.Delete` and a one-item batch say —
+    // rather than reporting success for a collection nobody can write to.
+    assert_eq!(
+        error_name(&admin.delete_items(&[]).await.unwrap_err()),
+        "org.freedesktop.Secret.Error.IsLocked"
+    );
+    let err = admin
+        .delete_items(&[
+            OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/bad/abc").unwrap(),
+        ])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error_name(&err),
+        "org.freedesktop.Secret.Error.NoSuchObject",
+        "a broken collection holds no items, so none of them can be named"
+    );
+    assert!(service.collections().await.unwrap().contains(&bad_path));
+}
+
+/// `GetSecrets` must not refresh the idle timer for a call it then refuses
+/// (HIGH 1). `st.touch()` used to run before `st.cipher(session, sender)?`,
+/// so `GetSecrets([], "/bogus")` — no session, no unlocked collection, no
+/// knowledge of any path — kept `last_activity` fresh and then failed with
+/// `NoSession`. `daemon::idle_lock` compares exactly that field, so a client
+/// calling it every few minutes stopped `auto_lock_after` (15 minutes, on by
+/// default) from ever locking the vault, and the keys stayed in daemon memory
+/// indefinitely.
+///
+/// Asserted on `last_activity` itself rather than on wall-clock behaviour, so
+/// it pins the ordering and not a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_secrets_does_not_refresh_the_idle_timer_before_the_session_check() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    let before = fx.daemon.state.lock().await.last_activity;
+    let bogus =
+        OwnedObjectPath::try_from("/org/freedesktop/secrets/session/s9_00000000deadbeef").unwrap();
+    let err = service.get_secrets(&[], &bogus).await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.NoSession");
+    assert_eq!(
+        fx.daemon.state.lock().await.last_activity,
+        before,
+        "an unauthorised GetSecrets refreshed the idle timer, defeating auto_lock_after"
+    );
+
+    // A session belonging to someone else is refused the same way, and must
+    // not touch either.
+    let (_, other) = ServiceProxy::new(&fx.client().await)
+        .await
+        .unwrap()
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+    let err = service.get_secrets(&[], &other).await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.NoSession");
+    assert_eq!(
+        fx.daemon.state.lock().await.last_activity,
+        before,
+        "another client's session must not refresh the idle timer either"
+    );
+
+    // A legitimate call still touches, exactly as before: the fix moves the
+    // touch past the authorisation check, it does not remove it.
+    let (_, mine) = service
+        .open_session(ALGORITHM_PLAIN, &Value::from(""))
+        .await
+        .unwrap();
+    service.get_secrets(&[], &mine).await.unwrap();
+    assert!(
+        fx.daemon.state.lock().await.last_activity > before,
+        "an authorised GetSecrets must still refresh the idle timer"
+    );
+}
+
+/// `Lock` and `Unlock` take caller-supplied object arrays, and every element
+/// costs a `paths::parse` plus a `resolve_item` scan of the collection's item
+/// index, all under the global state mutex (HIGH 2). Uncapped, one legal
+/// D-Bus message carries over a million paths. The cap matches `GetSecrets`'s
+/// and is checked before the lock is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_and_unlock_cap_the_object_array() {
+    use secret_manager::dbus::service::MAX_LOCK_OBJECTS;
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    // The worst case the cap exists to bound: a real collection, so the path
+    // parses and resolves, with an item id that does not exist, so the scan
+    // never short-circuits.
+    let paths: Vec<OwnedObjectPath> = (0..MAX_LOCK_OBJECTS + 1)
+        .map(|n| {
+            OwnedObjectPath::try_from(format!(
+                "/org/freedesktop/secrets/collection/default/nosuchitem{n}"
+            ))
+            .unwrap()
+        })
+        .collect();
+
+    for (what, err) in [
+        ("Unlock", service.unlock(&paths).await.unwrap_err()),
+        ("Lock", service.lock(&paths).await.unwrap_err()),
+    ] {
+        assert_eq!(
+            error_name(&err),
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            "{what} accepted {} objects",
+            paths.len()
+        );
+    }
+
+    // Exactly the cap is still allowed, and still behaves as before: paths
+    // that name nothing are skipped, with no prompt.
+    let at_cap = &paths[..MAX_LOCK_OBJECTS];
+    let (unlocked, prompt) = service.unlock(at_cap).await.unwrap();
+    assert!(unlocked.is_empty());
+    assert_eq!(prompt.as_str(), "/");
+    let (locked, prompt) = service.lock(at_cap).await.unwrap();
+    assert!(locked.is_empty());
+    assert_eq!(prompt.as_str(), "/");
+}
+
+/// `SetAlias` was unbounded in three directions at once (HIGH 3): the name
+/// had no length limit (`paths::is_segment` constrains only the alphabet),
+/// nothing capped how many aliases could exist, and every name a client ever
+/// used kept two exported D-Bus objects forever, even after
+/// `SetAlias(name, "/")`. All of it was persisted to `aliases.toml` and
+/// re-registered at every daemon start, so it survived a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_alias_is_bounded_in_name_length_and_count() {
+    use secret_manager::dbus::service::{MAX_ALIAS_NAME, MAX_ALIASES};
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let target = fx.default_collection();
+
+    let long = "a".repeat(MAX_ALIAS_NAME + 1);
+    assert_eq!(
+        error_name(&service.set_alias(&long, &target).await.unwrap_err()),
+        "org.freedesktop.DBus.Error.InvalidArgs",
+        "an alias name of any length was accepted and written to disk"
+    );
+    assert_eq!(service.read_alias(&long).await.unwrap().as_str(), "/");
+    // Exactly the cap is fine.
+    let at_cap = "a".repeat(MAX_ALIAS_NAME);
+    service.set_alias(&at_cap, &target).await.unwrap();
+    service
+        .set_alias(&at_cap, &secret_manager::dbus::paths::root())
+        .await
+        .unwrap();
+
+    // The fixture already installs `default`, so fill the rest of the table.
+    let existing = fx.daemon.state.lock().await.aliases.known().len();
+    for n in existing..MAX_ALIASES {
+        service
+            .set_alias(&format!("bulk{n}"), &target)
+            .await
+            .unwrap_or_else(|e| panic!("alias {n} must be allowed: {e}"));
+    }
+    let err = service
+        .set_alias("one_too_many", &target)
+        .await
+        .unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.Failed");
+    assert_eq!(
+        fx.daemon.state.lock().await.aliases.known().len(),
+        MAX_ALIASES,
+        "a refused SetAlias must not have grown the table"
+    );
+    // Repointing an existing alias is never refused, full table or not.
+    service.set_alias("bulk10", &target).await.unwrap();
+}
+
+/// Clearing an alias must reclaim the two objects `register_alias` exported
+/// for it (HIGH 3), and the alias file must be written atomically rather than
+/// truncated in place.
+///
+/// The inode check is the whole point of the second half: `std::fs::write`
+/// truncates and rewrites the same file, so a crash mid-write leaves a
+/// truncated `aliases.toml`, and `load_aliases` turns that into `InvalidData`,
+/// which refuses daemon startup. A temp file plus `rename` replaces the inode
+/// instead, which is exactly what this observes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clearing_an_alias_reclaims_its_objects_and_the_file_write_is_atomic() {
+    use std::os::unix::fs::MetadataExt;
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let vault_dir = fx.data_dir.path().join("secret-manager");
+    let alias_file = vault_dir.join("aliases.toml");
+
+    service
+        .set_alias("scratch", &fx.default_collection())
+        .await
+        .unwrap();
+    let alias_path = secret_manager::dbus::paths::alias("scratch").unwrap();
+    let proxy = CollectionProxy::builder(&conn)
+        .path(alias_path.clone())
+        .unwrap()
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .unwrap();
+    assert_eq!(proxy.label().await.unwrap(), "Default");
+
+    let before = std::fs::metadata(&alias_file).unwrap().ino();
+    service
+        .set_alias("scratch", &secret_manager::dbus::paths::root())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&alias_file).unwrap().ino(),
+        {
+            let after = std::fs::metadata(&alias_file).unwrap().ino();
+            assert_ne!(
+                after, before,
+                "aliases.toml was truncated and rewritten in place, not replaced atomically"
+            );
+            after
+        },
+        "metadata read twice must agree"
+    );
+    assert!(
+        !std::fs::read_to_string(&alias_file)
+            .unwrap()
+            .contains("scratch"),
+        "the cleared alias is still on disk"
+    );
+    assert!(
+        std::fs::read_dir(&vault_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")),
+        "a temp file was left behind"
+    );
+
+    // The objects are gone, not merely resolving to nothing: an alias that was
+    // once set must not cost two exported objects for the life of the daemon.
+    let err = proxy.label().await.unwrap_err();
+    assert!(
+        matches!(&err, zbus::Error::FDO(e) if matches!(**e, zbus::fdo::Error::UnknownObject(_))),
+        "the alias objects were never unexported: {err:?}"
+    );
+
+    // And setting it again re-exports them, so the reclaim is not one-way.
+    service
+        .set_alias("scratch", &fx.default_collection())
+        .await
+        .unwrap();
+    assert_eq!(proxy.label().await.unwrap(), "Default");
+}

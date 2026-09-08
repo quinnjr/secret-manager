@@ -1,0 +1,76 @@
+# libFuzzer dictionary for the vault-format targets.
+#
+# These targets are structure-aware — `Arbitrary` consumes the input as a
+# stream of decisions, not as a file — so the entries below are not magic
+# numbers the mutator splices into a header. They are the *byte patterns that
+# steer those decisions*: the encodings of the boundary values (a ceiling and
+# one past it, a length prefix at MAX_HEADER, the postcard tag for an empty
+# collection), which the fuzzer would otherwise have to find by chance
+# because uniform mutation almost never lands exactly on a limit.
+#
+# Use with `cargo +nightly fuzz run <target> -- -dict=fuzz/dictionaries/vault.dict`.
+
+# --- file framing ---------------------------------------------------------
+magic="SMVAULT\x00"
+# A length prefix at MAX_HEADER (16 MiB) and one byte past it: the boundary
+# `header_prefix_len` refuses.
+hdr_len_max="\x00\x00\x00\x01"
+hdr_len_over="\x01\x00\x00\x01"
+hdr_len_u32max="\xff\xff\xff\xff"
+hdr_len_zero="\x00\x00\x00\x00"
+# A plausible small header length, so a mutated file still frames correctly.
+hdr_len_small="\x40\x00\x00\x00"
+
+# --- header version -------------------------------------------------------
+# The accepted version, and the two failure branches either side of it.
+version_current="\x03"
+version_old="\x02"
+version_new="\x04"
+version_zero="\x00"
+
+# --- KDF ceilings ---------------------------------------------------------
+# postcard varints for the ceiling values and their neighbours: 256 MiB in
+# KiB (262144), 64 passes, 16 lanes, and the minimum 8 KiB per lane.
+m_cost_max="\x80\x80\x10"
+m_cost_over="\x81\x80\x10"
+m_cost_min="\x08"
+m_cost_u32max="\xff\xff\xff\xff\x0f"
+t_cost_max="\x40"
+t_cost_over="\x41"
+p_cost_max="\x10"
+p_cost_over="\x11"
+zero="\x00"
+one="\x01"
+
+# --- postcard shapes ------------------------------------------------------
+# An empty sequence, a one-element sequence, and a length prefix large enough
+# to drive an allocation if one were made before the bytes were checked.
+seq_empty="\x00"
+seq_one="\x01"
+seq_huge="\xff\xff\xff\xff\x0f"
+
+# --- attribute keys the daemon and libsecret actually use -----------------
+# Real keys make the index target's "should match" branch reachable, and are
+# what a precomputed-dictionary attack on the hashed index would start from.
+attr_xdg_schema="xdg:schema"
+attr_service="service"
+attr_username="username"
+attr_application="application"
+attr_unique="unique"
+schema_generic="org.freedesktop.Secret.Generic"
+schema_note="org.gnome.keyring.Note"
+content_text="text/plain"
+content_octet="application/octet-stream"
+label_default="default"
+
+# --- strings the sanitisers care about ------------------------------------
+# Labels and attribute values are client-supplied, so the round-trip targets
+# want the characters that break naive encoders.
+nul="\x00"
+newline="\x0a"
+crlf="\x0d\x0a"
+quote="\x22"
+backslash="\x5c"
+rtl_override="\xe2\x80\xae"
+zero_width="\xe2\x80\x8b"
+bom="\xef\xbb\xbf"
