@@ -6,8 +6,9 @@ use super::prompt::{Prompt, PromptAction};
 use super::registry;
 use super::require_sender;
 use super::session::SecretStruct;
-use super::state::{ServiceState, Shared};
+use super::state::{PathTarget, ServiceState, Shared, VaultRef, block_in_place};
 use super::{paths, prop_attributes, prop_string};
+use crate::session::SessionCipher;
 use std::collections::{BTreeMap, HashMap};
 use zbus::Connection;
 use zbus::interface;
@@ -20,6 +21,117 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 /// past the vault-level size limit — at which point the whole collection
 /// stops saving — with one `CreateItem` call.
 pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
+
+/// Upper bound on the *ciphertext* of one item's secret, checked before the
+/// decrypt rather than after it.
+///
+/// [`MAX_ITEM_SECRET`] is the exact cap and stays exactly where it was, on the
+/// plaintext. This one exists because the decrypt itself was the attack:
+/// `secret.value` arrives bounded only by the D-Bus message size limit
+/// (128 MiB) and is decrypted while the single global state mutex is held, so
+/// a client could stall every other client for the length of a 128 MiB
+/// decrypt and only then be told its secret was over the cap.
+///
+/// It must never refuse something the plaintext check would have accepted, so
+/// it bounds the plaintext from above rather than claiming to equal it. The
+/// AES session cipher is CBC with PKCS#7, which appends 1..=16 bytes, so
+/// `plaintext == ciphertext - pad >= ciphertext - 16`; a `plain` session's
+/// ciphertext is the plaintext itself, so the same bound holds with room to
+/// spare. Anything longer than `MAX_ITEM_SECRET + 16` therefore cannot
+/// possibly decrypt to something within the cap. Everything shorter is still
+/// measured exactly, after the decrypt, against `MAX_ITEM_SECRET`.
+pub const MAX_ITEM_CIPHERTEXT: usize = MAX_ITEM_SECRET + 16;
+
+/// Upper bound on one item's label.
+///
+/// The label is serialised into the same encrypted item blob as the secret,
+/// so it counts against the vault-level size limit in exactly the same way —
+/// capping only the secret left the cap reachable in two `CreateItem` calls
+/// through the label instead of 256 through the secret. 4 KiB is far more
+/// than any real client needs (libsecret labels are a line of UI text) while
+/// still leaving room for a long multi-byte one.
+pub const MAX_ITEM_LABEL: usize = 4 * 1024;
+
+/// Upper bound on the number of attribute pairs on one item. Attributes are
+/// stored in the item blob, and are also hashed into the header's search
+/// index, so each pair costs twice. Real schemas use a handful; libsecret's
+/// own built-in schemas top out well under ten.
+pub const MAX_ITEM_ATTRIBUTES: usize = 64;
+
+/// Upper bound on one attribute name. Attribute names are schema field names.
+pub const MAX_ATTRIBUTE_KEY: usize = 256;
+
+/// Upper bound on one attribute value. Values are identifiers, paths and
+/// usernames; this project's own largest is an ssh key path.
+///
+/// Together the three attribute caps bound one item's attribute set at
+/// 64 * (256 + 512) = 48 KiB, generous for a real client and small enough
+/// that reaching [`crate::vault::format::MAX_VAULT_BYTES`] through attributes takes
+/// as many calls as reaching it through capped secrets.
+pub const MAX_ATTRIBUTE_VALUE: usize = 512;
+
+/// Upper bound on one item's content type.
+///
+/// The last caller-supplied field that lands in the encrypted item blob, so
+/// the same reasoning as the label: uncapped, it is another way to push a
+/// collection past the vault size limit, just wearing a different field name.
+/// A content type is a MIME type — RFC 6838 caps a registered type or subtree
+/// name at 127 bytes each, so 255 covers `type/subtree` at the registry's own
+/// maximum, and 256 leaves room for a parameter such as `; charset=utf-8`.
+/// Real clients send `text/plain` or `application/octet-stream`.
+pub const MAX_ITEM_CONTENT_TYPE: usize = 256;
+
+/// Refuse an over-long content type. See [`check_label`] for the error type.
+pub(crate) fn check_content_type(content_type: &str) -> std::result::Result<(), zbus::fdo::Error> {
+    if content_type.len() > MAX_ITEM_CONTENT_TYPE {
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "content type is too large; at most {MAX_ITEM_CONTENT_TYPE} bytes per item"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an over-long item label.
+///
+/// Returns `zbus::fdo::Error::InvalidArgs` — what [`Error::invalid_args`]
+/// wraps — rather than [`Error`], because the `#[zbus(property)]` setters in
+/// [`super::item`] cannot return a custom `DBusError` (see
+/// [`super::errors::vault_error_to_fdo`]) and must share this check. `?`
+/// converts it to [`Error`] on the method paths.
+pub(crate) fn check_label(label: &str) -> std::result::Result<(), zbus::fdo::Error> {
+    if label.len() > MAX_ITEM_LABEL {
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "label is too large; at most {MAX_ITEM_LABEL} bytes per item"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse an over-large attribute set: too many pairs, or a pair whose name
+/// or value is over its cap. See [`check_label`] for the error type.
+pub(crate) fn check_attributes<'a>(
+    count: usize,
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> std::result::Result<(), zbus::fdo::Error> {
+    if count > MAX_ITEM_ATTRIBUTES {
+        return Err(zbus::fdo::Error::InvalidArgs(format!(
+            "too many attributes; at most {MAX_ITEM_ATTRIBUTES} per item"
+        )));
+    }
+    for (k, v) in pairs {
+        if k.len() > MAX_ATTRIBUTE_KEY {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "attribute name is too large; at most {MAX_ATTRIBUTE_KEY} bytes per attribute"
+            )));
+        }
+        if v.len() > MAX_ATTRIBUTE_VALUE {
+            return Err(zbus::fdo::Error::InvalidArgs(format!(
+                "attribute value is too large; at most {MAX_ATTRIBUTE_VALUE} bytes per attribute"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Upper bound on one `DeleteItems` batch, for the same reason as
 /// [`super::service::MAX_GET_SECRETS_ITEMS`]: every element costs a path
@@ -54,11 +166,28 @@ impl Collection {
         &self.state
     }
 
-    /// The loaded vault behind this object, or `None` when the target is a
-    /// broken collection (see `state::ServiceState::broken`), which behaves
-    /// as a permanently locked, empty one.
-    fn vault<'a>(&self, st: &'a ServiceState) -> Option<&'a crate::vault::Vault> {
-        self.id(st).ok().and_then(|id| st.collections.get(&id))
+    /// `(id, vault)` under one brief state-lock acquisition, for every method
+    /// that needs the vault behind this object. `Ok(_, None)` is a broken
+    /// collection (see `state::ServiceState::broken`), which behaves as a
+    /// permanently locked, empty one.
+    ///
+    /// Returns the vault's `Arc`, not a borrow: it is locked *after* the
+    /// state guard is dropped, never while it is held (see
+    /// `state::VaultRef`).
+    async fn target(&self) -> Result<(String, Option<VaultRef>)> {
+        let st = self.state.lock().await;
+        let id = self.id(&st)?;
+        let vault = st.vault(&id);
+        Ok((id, vault))
+    }
+
+    /// Whether this collection is locked, or `true` when it is broken or
+    /// gone. One state-lock acquisition, then the vault's own lock.
+    async fn is_locked(&self) -> bool {
+        match self.target().await {
+            Ok((_, Some(v))) => v.lock().await.is_locked(),
+            _ => true,
+        }
     }
 
     fn id(&self, st: &ServiceState) -> Result<String> {
@@ -87,12 +216,16 @@ impl Collection {
         #[zbus(header)] header: Header<'_>,
         #[zbus(object_server)] server: &ObjectServer,
     ) -> Result<OwnedObjectPath> {
-        let mut st = self.state.lock().await;
-        let id = self.id(&st)?;
+        let (id, vault) = self.target().await?;
         // A broken collection has no vault to index; treat it as locked.
-        if self.vault(&st).map(|v| v.is_locked()).unwrap_or(true) {
+        let locked = match &vault {
+            Some(v) => v.lock().await.is_locked(),
+            None => true,
+        };
+        if locked {
             return Err(Error::IsLocked);
         }
+        let mut st = self.state.lock().await;
         let owner = require_sender(&header)?;
         st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
@@ -126,19 +259,16 @@ impl Collection {
                 super::service::MAX_SEARCH_ATTRIBUTES
             )));
         }
-        let st = self.state.lock().await;
-        let id = self.id(&st)?;
+        let (id, vault) = self.target().await?;
         let query: BTreeMap<String, String> = attributes.into_iter().collect();
-        Ok(st
-            .collections
-            .get(&id)
-            .map(|v| {
-                super::state::search_collection(v, &query)
-                    .into_iter()
-                    .map(|iid| paths::item(&id, &iid))
-                    .collect()
-            })
-            .unwrap_or_default())
+        let Some(vault) = vault else {
+            return Ok(Vec::new());
+        };
+        let vault = vault.lock().await;
+        Ok(super::state::search_collection(&vault, &query)
+            .into_iter()
+            .map(|iid| paths::item(&id, &iid))
+            .collect())
     }
 
     #[zbus(out_args("item", "prompt"))]
@@ -152,32 +282,63 @@ impl Collection {
     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
         let label =
             prop_string(&properties, "org.freedesktop.Secret.Item.Label")?.unwrap_or_default();
+        // The label, the content type and the attributes all land in the same
+        // encrypted item blob as the secret, so they need the same kind of
+        // cap; `prop_attributes` bounds the attributes as it reads them.
+        check_label(&label)?;
+        check_content_type(&secret.content_type)?;
         let attributes = prop_attributes(&properties, "org.freedesktop.Secret.Item.Attributes")?;
-        let (id, iid, replaced) = {
-            let mut st = self.state.lock().await;
+        // The state lock is held only for the map lookups and the session
+        // lookup; the decrypt, the insert and the save that follows it all
+        // happen under this collection's own lock with the global one free
+        // (see `state::VaultRef`).
+        let (id, vault, cipher) = {
+            let st = self.state.lock().await;
             let id = self.id(&st)?;
-            let plaintext = st
-                .cipher(secret.session.as_str(), &require_sender(&header)?)?
-                .decrypt(&secret.parameters, &secret.value)
-                .map_err(Error::failed)?;
-            if plaintext.len() > MAX_ITEM_SECRET {
+            let cipher = SessionCipher::clone(
+                st.cipher(secret.session.as_str(), &require_sender(&header)?)?,
+            );
+            // Everything cheap first: the decrypt below is caller-sized, so
+            // it must not happen for a secret that is over the cap anyway,
+            // nor for a collection that is locked and would refuse the write
+            // regardless.
+            if secret.value.len() > MAX_ITEM_CIPHERTEXT {
                 return Err(Error::invalid_args(format!(
                     "secret is too large; at most {MAX_ITEM_SECRET} bytes per item"
                 )));
             }
             // `id` was already validated by `self.id(&st)` above; missing
-            // from `collections` here means it's a broken collection.
-            let vault = st.collections.get_mut(&id).ok_or(Error::IsLocked)?;
-            let (iid, replaced) = vault.insert_item(
-                &label,
-                attributes,
-                plaintext.to_vec(),
-                &secret.content_type,
-                replace,
-            )?;
-            st.touch();
-            (id, iid, replaced)
+            // from `collections` here means it's a broken collection, which
+            // is always locked.
+            let vault = st.vault(&id).ok_or(Error::IsLocked)?;
+            (id, vault, cipher)
         };
+        let (iid, replaced) = {
+            let mut vault = vault.lock().await;
+            if vault.is_locked() {
+                return Err(Error::IsLocked);
+            }
+            let plaintext = cipher
+                .decrypt(&secret.parameters, &secret.value)
+                .map_err(Error::failed)?;
+            // The exact check: `MAX_ITEM_CIPHERTEXT` only bounds the plaintext
+            // from above, it does not measure it.
+            if plaintext.len() > MAX_ITEM_SECRET {
+                return Err(Error::invalid_args(format!(
+                    "secret is too large; at most {MAX_ITEM_SECRET} bytes per item"
+                )));
+            }
+            block_in_place(|| {
+                vault.insert_item(
+                    &label,
+                    attributes,
+                    plaintext.to_vec(),
+                    &secret.content_type,
+                    replace,
+                )
+            })?
+        };
+        self.state.lock().await.touch();
         let item_path = paths::item(&id, &iid);
         if !replaced {
             registry::register_item(conn, &self.state, &id, &iid).await?;
@@ -193,67 +354,67 @@ impl Collection {
 
     #[zbus(property)]
     async fn items(&self) -> Vec<OwnedObjectPath> {
-        let st = self.state.lock().await;
-        let Ok(id) = self.id(&st) else {
+        let Ok((id, Some(vault))) = self.target().await else {
             return Vec::new();
         };
-        self.vault(&st)
-            .map(|v| {
-                v.item_ids()
-                    .into_iter()
-                    .map(|iid| paths::item(&id, &iid))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let item_ids = vault.lock().await.item_ids();
+        item_ids
+            .into_iter()
+            .map(|iid| paths::item(&id, &iid))
+            .collect()
     }
 
     #[zbus(property)]
     async fn label(&self) -> String {
-        let st = self.state.lock().await;
         // A broken collection has no vault to ask; its label is the file
         // stem, which is exactly the id it was loaded under.
-        match self.id(&st) {
-            Ok(id) => st
-                .collections
-                .get(&id)
-                .map(|v| v.label().to_string())
-                .unwrap_or(id),
+        match self.target().await {
+            Ok((_, Some(v))) => v.lock().await.label().to_string(),
+            Ok((id, None)) => id,
             Err(_) => String::new(),
         }
     }
 
     #[zbus(property)]
     async fn set_label(&self, label: &str) -> zbus::fdo::Result<()> {
-        let mut st = self.state.lock().await;
-        let id = self
-            .id(&st)
-            .map_err(|_| zbus::fdo::Error::UnknownObject("no such collection".into()))?;
-        st.collections
-            .get_mut(&id)
-            // Not in `collections` despite `id()` having validated it: it's a
-            // broken collection (see `state::ServiceState::broken`), which is
-            // always reported locked.
-            .ok_or_else(|| super::errors::vault_error_to_fdo(crate::vault::VaultError::Locked))?
-            .set_label(label)
-            .map_err(super::errors::vault_error_to_fdo)
+        let vault = {
+            let st = self.state.lock().await;
+            let id = self
+                .id(&st)
+                .map_err(|_| zbus::fdo::Error::UnknownObject("no such collection".into()))?;
+            st.vault(&id)
+                // Not in `collections` despite `id()` having validated it:
+                // it's a broken collection (see `state::ServiceState::broken`),
+                // which is always reported locked.
+                .ok_or_else(|| {
+                    super::errors::vault_error_to_fdo(crate::vault::VaultError::Locked)
+                })?
+        };
+        // The rename rewrites and re-fsyncs the whole vault, so it runs on
+        // this collection's lock only, and off the async worker.
+        let mut vault = vault.lock().await;
+        block_in_place(|| vault.set_label(label)).map_err(super::errors::vault_error_to_fdo)
     }
 
     #[zbus(property)]
     async fn locked(&self) -> bool {
-        let st = self.state.lock().await;
-        self.vault(&st).map(|v| v.is_locked()).unwrap_or(true)
+        Collection::is_locked(self).await
     }
 
     #[zbus(property)]
     async fn created(&self) -> u64 {
-        let st = self.state.lock().await;
-        self.vault(&st).map(|v| v.created()).unwrap_or(0)
+        match self.target().await {
+            Ok((_, Some(v))) => v.lock().await.created(),
+            _ => 0,
+        }
     }
 
     #[zbus(property)]
     async fn modified(&self) -> u64 {
-        let st = self.state.lock().await;
-        self.vault(&st).map(|v| v.modified()).unwrap_or(0)
+        match self.target().await {
+            Ok((_, Some(v))) => v.lock().await.modified(),
+            _ => 0,
+        }
     }
 
     #[zbus(signal)]
@@ -314,12 +475,12 @@ impl CollectionAdmin {
     /// itself is a single `Vault::delete_items`, which is one `retain` plus one
     /// save with in-memory rollback on write failure.
     ///
-    /// The critical section is one short acquisition of the state mutex with
-    /// no `.await` inside it and no key derivation — the vault is already
-    /// unlocked, so a delete needs none — as `CLAUDE.md` requires. The
-    /// `ItemDeleted` signals and the object unexports happen after the save
-    /// has succeeded, for the whole batch at once; a failed save emits
-    /// nothing.
+    /// The state mutex is held only for the map and alias lookups the batch
+    /// needs; the validation and the single save both run under this
+    /// collection's own lock, which is where a whole-vault re-encrypt and its
+    /// two `fsync`s belong (see `state::VaultRef`). The `ItemDeleted` signals
+    /// and the object unexports happen after the save has succeeded, for the
+    /// whole batch at once; a failed save emits nothing.
     async fn delete_items(
         &self,
         items: Vec<OwnedObjectPath>,
@@ -330,32 +491,62 @@ impl CollectionAdmin {
                 "too many items; at most {MAX_DELETE_ITEMS} per call"
             )));
         }
-        let (id, item_ids) = {
-            let mut st = self.state.lock().await;
-            let id = self.id(&st)?;
-            // Validate the whole batch first, against an immutable borrow.
-            let mut item_ids: Vec<String> = Vec::with_capacity(items.len());
-            for path in &items {
-                let (cid, iid) = st.resolve_item(path.as_str()).ok_or(Error::NoSuchObject)?;
-                if cid != id {
-                    return Err(Error::invalid_args(
-                        "every item must belong to this collection",
-                    ));
+        // Resolve every path, then confirm each names a real item, in the
+        // order the batch gave them. `ServiceState::resolve_path` stops
+        // before the item index — that lives behind the collection's own
+        // lock — so the existence check is done here, one vault lock at a
+        // time and never two at once. A path that names no item is
+        // `NoSuchObject` whichever collection it points at, exactly as the
+        // single `resolve_item` under the state lock used to report it; only
+        // then does a foreign but real item become `InvalidArgs`.
+        let mut item_ids: Vec<String> = Vec::with_capacity(items.len());
+        let id = {
+            let st = self.state.lock().await;
+            self.id(&st)?
+        };
+        for path in &items {
+            let (cid, iid, vault) = {
+                let st = self.state.lock().await;
+                match st.resolve_path(path.as_str()) {
+                    Some(PathTarget::Item { id, vault, item }) => (id, item, vault),
+                    _ => return Err(Error::NoSuchObject),
                 }
-                if !item_ids.contains(&iid) {
-                    item_ids.push(iid);
-                }
+            };
+            if !vault.lock().await.has_item(&iid) {
+                return Err(Error::NoSuchObject);
+            }
+            if cid != id {
+                return Err(Error::invalid_args(
+                    "every item must belong to this collection",
+                ));
+            }
+            if !item_ids.contains(&iid) {
+                item_ids.push(iid);
+            }
+        }
+        {
+            // Not in `collections`: a broken collection, which is always
+            // reported locked.
+            let vault = {
+                let st = self.state.lock().await;
+                st.vault(&id).ok_or(Error::IsLocked)?
+            };
+            let mut vault = vault.lock().await;
+            // The lock is answered before the empty-batch shortcut, so
+            // `DeleteItems([])` cannot report success on a collection where
+            // `Item.Delete` — and a one-item batch — say `IsLocked`.
+            if vault.is_locked() {
+                return Err(Error::IsLocked);
             }
             if item_ids.is_empty() {
                 return Ok(());
             }
-            // Not in `collections` despite `id()` having validated it: a
-            // broken collection, which is always reported locked.
-            let vault = st.collections.get_mut(&id).ok_or(Error::IsLocked)?;
-            vault.delete_items(&item_ids)?;
-            st.touch();
-            (id, item_ids)
-        };
+            // `delete_items` re-checks every id against the items it is
+            // about to remove, so an item that vanished since the loop above
+            // still refuses the whole batch rather than deleting part of it.
+            block_in_place(|| vault.delete_items(&item_ids))?;
+        }
+        self.state.lock().await.touch();
         // Past this point the file on disk no longer has any of them.
         let conn2 = conn.clone();
         let (id2, ids2) = (id.clone(), item_ids.clone());

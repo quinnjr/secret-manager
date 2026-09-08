@@ -104,27 +104,15 @@ async fn most_recent_item_wins() {
     // Force the first item's `modified` timestamp back deterministically
     // instead of sleeping past the second-granularity clock, so this test
     // doesn't depend on a >1s wall-clock sleep.
-    let first_id = fx
-        .daemon
-        .state
-        .lock()
-        .await
-        .collections
-        .get("default")
-        .unwrap()
-        .search_ids(&BTreeMap::from([("k".to_string(), "v".to_string())]))
-        .into_iter()
-        .next()
-        .unwrap();
-    fx.daemon
-        .state
-        .lock()
-        .await
-        .collections
-        .get_mut("default")
-        .unwrap()
-        .set_modified_for_tests(&first_id, 1)
-        .unwrap();
+    secret_manager::dbus::state::with_vault(&fx.daemon.state, "default", |v| {
+        let first_id = v
+            .search_ids(&BTreeMap::from([("k".to_string(), "v".to_string())]))
+            .into_iter()
+            .next()
+            .unwrap();
+        v.set_modified_for_tests(&first_id, 1).unwrap();
+    })
+    .await;
     fx.sm()
         .args(["set", "k=v", "n=2", "--label", "two"])
         .write_stdin("second")
@@ -1094,7 +1082,7 @@ async fn delete_unlocks_every_locked_match_before_deleting() {
 
     fx.sm().args(["delete", "app=git"]).assert().success();
     assert!(
-        !fx.daemon.state.lock().await.collections["default"].is_locked(),
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
         "the delete unlocked the collection through the prompt"
     );
     fx.sm()

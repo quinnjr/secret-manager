@@ -292,26 +292,15 @@ impl Fixture {
     }
 
     pub async fn unlock_default(&self) {
-        self.daemon
-            .state
-            .lock()
-            .await
-            .collections
-            .get_mut("default")
-            .unwrap()
-            .unlock(PASSWORD.as_bytes())
-            .unwrap();
+        secret_manager::dbus::state::with_vault(&self.daemon.state, "default", |v| {
+            v.unlock(PASSWORD.as_bytes())
+        })
+        .await
+        .unwrap();
     }
 
     pub async fn lock_default(&self) {
-        self.daemon
-            .state
-            .lock()
-            .await
-            .collections
-            .get_mut("default")
-            .unwrap()
-            .lock();
+        secret_manager::dbus::state::with_vault(&self.daemon.state, "default", |v| v.lock()).await;
     }
 }
 

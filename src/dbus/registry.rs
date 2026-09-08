@@ -24,13 +24,13 @@ pub async fn register_collection(conn: &Connection, state: &Shared, id: &str) ->
             CollectionAdmin::new(state.clone(), CollectionRef::Id(id.to_string())),
         )
         .await?;
-    let item_ids = state
-        .lock()
-        .await
-        .collections
-        .get(id)
-        .map(|v| v.item_ids())
-        .unwrap_or_default();
+    // The `Arc` is cloned out of the state lock and the vault is locked only
+    // after that guard is dropped; see `state::VaultRef`.
+    let vault = state.lock().await.vault(id);
+    let item_ids = match vault {
+        Some(v) => v.lock().await.item_ids(),
+        None => Vec::new(),
+    };
     for iid in item_ids {
         server
             .at(
@@ -60,8 +60,11 @@ pub async fn unregister_collection(conn: &Connection, id: &str, item_ids: &[Stri
     }
 }
 
-/// Idempotent: an alias object resolves its target at call time, so it is
-/// registered once and never removed.
+/// Idempotent: an alias object resolves its target at call time, so
+/// repointing an alias needs no re-registration. It *is* removed again when
+/// the alias is cleared — see [`unregister_alias`] — because otherwise every
+/// name a client ever passed to `SetAlias` cost two exported objects forever
+/// (HIGH 3).
 pub async fn register_alias(conn: &Connection, state: &Shared, name: &str) -> zbus::Result<()> {
     if let Some(path) = paths::alias(name) {
         let server = conn.object_server();
@@ -79,6 +82,22 @@ pub async fn register_alias(conn: &Connection, state: &Shared, name: &str) -> zb
             .await?;
     }
     Ok(())
+}
+
+/// Drop the two objects [`register_alias`] exported for `name`. Idempotent
+/// and infallible in the same way as [`unregister_collection`]: a name that
+/// was never registered just logs.
+pub async fn unregister_alias(conn: &Connection, name: &str) {
+    let Some(path) = paths::alias(name) else {
+        return;
+    };
+    let server = conn.object_server();
+    if let Err(e) = server.remove::<CollectionAdmin, _>(path.clone()).await {
+        tracing::debug!("removing admin interface of alias '{name}': {e}");
+    }
+    if let Err(e) = server.remove::<Collection, _>(path).await {
+        tracing::debug!("removing alias '{name}': {e}");
+    }
 }
 
 pub async fn register_item(

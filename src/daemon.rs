@@ -7,7 +7,7 @@ use crate::dbus::prompt::Prompt;
 use crate::dbus::registry;
 use crate::dbus::service::{Service, ServiceSignals};
 use crate::dbus::session::Session;
-use crate::dbus::state::{ServiceState, Shared};
+use crate::dbus::state::{ServiceState, Shared, block_in_place};
 use crate::prompt::Pinentry;
 use crate::protocol::{CollectionStatus, Request, Response};
 use crate::vault::crypto::{KdfParams, Key};
@@ -276,16 +276,28 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
         }
         Request::Lock { collection } => {
             let changed = {
-                let mut st = state.lock().await;
-                let targets: Vec<String> = match collection {
-                    Some(c) => vec![c],
-                    None => st.collections.keys().cloned().collect(),
+                // Snapshot the vaults under the state lock, then lock them
+                // one at a time with it released; see `state::VaultRef`.
+                let targets: Vec<(String, Option<crate::dbus::state::VaultRef>)> = {
+                    let st = state.lock().await;
+                    match collection {
+                        Some(c) => {
+                            let v = st.vault(&c);
+                            vec![(c, v)]
+                        }
+                        None => st
+                            .all_vaults()
+                            .into_iter()
+                            .map(|(id, v)| (id, Some(v)))
+                            .collect(),
+                    }
                 };
                 let mut changed = Vec::new();
                 let mut missing = None;
-                for id in targets {
-                    match st.collections.get_mut(&id) {
+                for (id, vault) in targets {
+                    match vault {
                         Some(vault) => {
+                            let mut vault = vault.lock().await;
                             if !vault.is_locked() {
                                 vault.lock();
                                 changed.push(id);
@@ -310,28 +322,41 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
             }
         }
         Request::Status => {
-            let st = state.lock().await;
-            let mut collections: Vec<CollectionStatus> = st
-                .collections
-                .iter()
-                .map(|(id, v)| CollectionStatus {
-                    id: id.clone(),
+            // Snapshot every vault under the state lock, then read them with
+            // it released, so a `Status` cannot queue behind a save and a
+            // save cannot queue behind a `Status`.
+            let (vaults, broken, started) = {
+                let st = state.lock().await;
+                (
+                    st.all_vaults(),
+                    st.broken
+                        .iter()
+                        .map(|(id, (_, err))| (id.clone(), err.clone()))
+                        .collect::<Vec<_>>(),
+                    st.started,
+                )
+            };
+            let mut collections: Vec<CollectionStatus> = Vec::with_capacity(vaults.len());
+            for (id, vault) in vaults {
+                let v = vault.lock().await;
+                collections.push(CollectionStatus {
+                    id,
                     label: v.label().to_string(),
                     locked: v.is_locked(),
                     items: v.item_ids().len(),
                     warning: v.index_warning().map(str::to_string),
-                })
-                .collect();
-            collections.extend(st.broken.iter().map(|(id, (_, err))| CollectionStatus {
-                id: id.clone(),
+                });
+            }
+            collections.extend(broken.into_iter().map(|(id, err)| CollectionStatus {
                 label: id.clone(),
+                id,
                 locked: true,
                 items: 0,
-                warning: Some(err.clone()),
+                warning: Some(err),
             }));
             Response::Status {
                 collections,
-                uptime_secs: st.started.elapsed().as_secs(),
+                uptime_secs: started.elapsed().as_secs(),
             }
         }
         Request::Reload => {
@@ -378,24 +403,33 @@ async fn unlock_with_key(
     collection: &str,
     key: &Key,
 ) -> Response {
-    let result = {
-        let mut st = state.lock().await;
-        match st.collections.get_mut(collection) {
-            // One message for both "no such collection" and "wrong key".
-            // Collection ids are not secret from this socket — `Status`
-            // enumerates them, and the CLI needs that — so this is not an
-            // anti-enumeration measure; it just keeps a failed unlock from
-            // reporting which of the two it was.
-            Some(vault) => vault
-                .unlock_with_key(key)
-                .map_err(|_| "cannot unlock that collection".to_string()),
+    let target = {
+        let st = state.lock().await;
+        match st.vault(collection) {
+            Some(v) => Ok(v),
             // A vault that failed to load is a different, non-secret
             // condition the operator needs to see.
-            None => match st.broken_error(collection) {
-                Some(e) => Err(e.to_string()),
-                None => Err("cannot unlock that collection".to_string()),
-            },
+            None => Err(match st.broken_error(collection) {
+                Some(e) => e.to_string(),
+                None => "cannot unlock that collection".to_string(),
+            }),
         }
+    };
+    let result = match target {
+        // One message for both "no such collection" and "wrong key".
+        // Collection ids are not secret from this socket — `Status`
+        // enumerates them, and the CLI needs that — so this is not an
+        // anti-enumeration measure; it just keeps a failed unlock from
+        // reporting which of the two it was.
+        //
+        // The AEAD open covers the whole plaintext, so it runs on the
+        // collection's own lock and off the async worker.
+        Ok(vault) => {
+            let mut vault = vault.lock().await;
+            block_in_place(|| vault.unlock_with_key(key))
+                .map_err(|_| "cannot unlock that collection".to_string())
+        }
+        Err(e) => Err(e),
     };
     match result {
         Ok(()) => {
@@ -416,11 +450,15 @@ async fn change_key(
     new_kdf: KdfParams,
     new_key: &Key,
 ) -> Response {
-    let mut st = state.lock().await;
-    match st.collections.get_mut(collection) {
+    let vault = state.lock().await.vault(collection);
+    match vault {
         Some(vault) => {
+            // A rotation re-seals the whole collection and fsyncs it twice.
+            // It gets this collection's lock and a blocking-friendly thread;
+            // the state lock is already released.
+            let mut vault = vault.lock().await;
             let was_locked = vault.is_locked();
-            match vault.change_key(old_key, new_salt, new_kdf, new_key) {
+            match block_in_place(|| vault.change_key(old_key, new_salt, new_kdf, new_key)) {
                 Ok(()) => {
                     // `change_key` restores the lock state it found, so no
                     // `CollectionChanged` is owed.
@@ -467,7 +505,7 @@ async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<(
             continue;
         }
         let name = args.name.to_string();
-        let mut relock: Vec<String> = Vec::new();
+        let mut relock: Vec<(String, Option<crate::dbus::state::VaultRef>)> = Vec::new();
         let (sessions, prompts) = {
             let mut st = state.lock().await;
             let sessions: Vec<String> = st
@@ -512,12 +550,14 @@ async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<(
                         // during a later dialog aborts a task that has
                         // already opened earlier collections; without this
                         // they would stay decrypted in memory with no owner.
+                        //
+                        // The vaults themselves are locked below, with the
+                        // state guard released: a per-collection lock is
+                        // never awaited under it (see `state::VaultRef`).
                         if let Some(ids) = st.prompt_unlocked.remove(p) {
                             for id in ids {
-                                if let Some(vault) = st.collections.get_mut(&id) {
-                                    vault.lock();
-                                }
-                                relock.push(id);
+                                let vault = st.vault(&id);
+                                relock.push((id, vault));
                             }
                         }
                     }
@@ -525,9 +565,26 @@ async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<(
             }
             (sessions, prompts)
         };
-        // Signals go out with the lock released.
-        for id in &relock {
-            registry::notify_collection_changed(conn, id).await;
+        // The re-lock and its signal both happen with the state lock
+        // released. A vault that is already locked — because the prompt task
+        // got as far as recording its intent but not as far as opening it,
+        // or because something else locked it first — is left alone and owes
+        // no signal.
+        for (id, vault) in &relock {
+            let relocked = match vault {
+                Some(v) => {
+                    let mut v = v.lock().await;
+                    let was_open = !v.is_locked();
+                    if was_open {
+                        v.lock();
+                    }
+                    was_open
+                }
+                None => false,
+            };
+            if relocked {
+                registry::notify_collection_changed(conn, id).await;
+            }
         }
         for p in sessions {
             let _ = conn.object_server().remove::<Session, _>(p.as_str()).await;
@@ -543,20 +600,23 @@ async fn idle_lock(conn: Connection, state: Shared, after: Duration, check_every
     let mut ticker = tokio::time::interval(check_every);
     loop {
         ticker.tick().await;
-        let ids: Vec<String> = {
-            let mut st = state.lock().await;
+        // Snapshot under the state lock, lock the vaults with it released;
+        // see `state::VaultRef`.
+        let vaults = {
+            let st = state.lock().await;
             if st.last_activity.elapsed() < after {
                 continue;
             }
-            let mut ids = Vec::new();
-            for (id, vault) in st.collections.iter_mut() {
-                if !vault.is_locked() {
-                    vault.lock();
-                    ids.push(id.clone());
-                }
-            }
-            ids
+            st.all_vaults()
         };
+        let mut ids = Vec::new();
+        for (id, vault) in vaults {
+            let mut vault = vault.lock().await;
+            if !vault.is_locked() {
+                vault.lock();
+                ids.push(id);
+            }
+        }
         for id in ids {
             tracing::info!("auto-locked '{id}' after inactivity");
             registry::notify_collection_changed(&conn, &id).await;

@@ -7,7 +7,7 @@ use super::prop_string;
 use super::registry;
 use super::require_sender;
 use super::session::{SecretStruct, Session};
-use super::state::{SessionEntry, Shared};
+use super::state::{PathTarget, SessionEntry, Shared};
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
 use std::collections::{BTreeMap, HashMap};
@@ -37,6 +37,58 @@ pub const MAX_GET_SECRETS_ITEMS: usize = 1024;
 
 /// Upper bound on the attribute count of one search, for the same reason.
 pub const MAX_SEARCH_ATTRIBUTES: usize = 1024;
+
+/// Upper bound on the `objects` array of one `Lock` or `Unlock` call, for the
+/// same reason as [`MAX_GET_SECRETS_ITEMS`] and with the same number (HIGH 2).
+/// Every element costs a `paths::parse` (two `String` allocations) and a
+/// `resolve_item`, which scans the collection's whole item index; a single
+/// legal D-Bus message can carry over a million minimal item paths, and an
+/// attacker maximises the scan by naming a real collection and an item id that
+/// does not exist, so nothing short-circuits. All of it runs under the global
+/// state mutex, so the cap is checked before the lock is taken and before any
+/// per-element work. libsecret never sends more than a few.
+pub const MAX_LOCK_OBJECTS: usize = 1024;
+
+/// Upper bound on an alias name (HIGH 3). `paths::is_segment` constrains the
+/// alphabet but not the length, and every alias is written to `aliases.toml`
+/// on every `SetAlias` and re-read at every daemon start, so an unbounded
+/// name is unbounded disk and unbounded startup work that survives a restart.
+/// Comfortably longer than any real alias (`default`, `login`, `session`).
+pub const MAX_ALIAS_NAME: usize = 128;
+
+/// Upper bound on how many aliases may exist at once (HIGH 3). Each one costs
+/// a map entry, a line in `aliases.toml` — rewritten in full on every
+/// `SetAlias`, so N aliases make the sequence quadratic — and two exported
+/// D-Bus objects registered at startup. The spec defines a handful of aliases;
+/// this leaves room for orders of magnitude more.
+pub const MAX_ALIASES: usize = 256;
+
+/// Refuse an oversized `Lock`/`Unlock` array. Deliberately a free function
+/// called before the state lock is taken, so a refused call does no
+/// per-element work and never contends for the mutex.
+fn check_object_count(n: usize) -> Result<()> {
+    if n > MAX_LOCK_OBJECTS {
+        return Err(Error::invalid_args(format!(
+            "too many objects; at most {MAX_LOCK_OBJECTS} per call"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a client-supplied alias name: the path alphabet, plus the length
+/// cap [`MAX_ALIAS_NAME`]. Shared by `SetAlias` and `CreateCollection`, which
+/// both take one.
+fn check_alias_name(name: &str) -> Result<()> {
+    if !paths::is_segment(name) {
+        return Err(Error::invalid_args("alias names must match [A-Za-z0-9_]+"));
+    }
+    if name.len() > MAX_ALIAS_NAME {
+        return Err(Error::invalid_args(format!(
+            "alias name too long; at most {MAX_ALIAS_NAME} characters"
+        )));
+    }
+    Ok(())
+}
 
 /// A `SessionCipher` is not `Clone`; this copies one so the per-item
 /// encryption in `get_secrets` can run after the state lock is released.
@@ -116,7 +168,7 @@ impl Service {
             )));
         }
         let query: BTreeMap<String, String> = attributes.into_iter().collect();
-        Ok(self.state.lock().await.search_all(&query))
+        Ok(super::state::search_all(&self.state, &query).await)
     }
 
     async fn read_alias(&self, name: &str) -> Result<OwnedObjectPath> {
@@ -133,6 +185,13 @@ impl Service {
     /// message size limit, so it is capped at [`MAX_GET_SECRETS_ITEMS`]; the
     /// per-item encryption also runs after the state lock is released, so
     /// only the (cheap) lookups happen under it.
+    ///
+    /// `touch()` runs only *after* the session check has passed (HIGH 1).
+    /// Touching first meant any bus client could keep `last_activity` fresh
+    /// with `GetSecrets([], "/bogus")` — a call that needs no session, no
+    /// unlocked collection and no knowledge of any path, and that then fails
+    /// with `NoSession`. `daemon::idle_lock` never fired, so `auto_lock_after`
+    /// never locked anything and the keys stayed in daemon memory forever.
     async fn get_secrets(
         &self,
         items: Vec<OwnedObjectPath>,
@@ -146,26 +205,44 @@ impl Service {
         }
         let sender = require_sender(&header)?;
         type Plan = Vec<(OwnedObjectPath, Zeroizing<Vec<u8>>, String)>;
-        let (cipher, plan): (SessionCipher, Plan) = {
+        // Resolve the paths under the state lock, then read the items with it
+        // released — one vault lock at a time, and the requests for the same
+        // collection grouped so a batch costs one acquisition per collection
+        // rather than one per item (see `state::VaultRef`).
+        type Wanted = Vec<(
+            String,
+            Vec<(OwnedObjectPath, String)>,
+            super::state::VaultRef,
+        )>;
+        let (cipher, wanted): (SessionCipher, Wanted) = {
             let mut st = self.state.lock().await;
-            st.touch();
             let cipher = SessionCipher::clone(st.cipher(session.as_str(), &sender)?);
-            let mut plan = Vec::with_capacity(items.len());
+            st.touch();
+            let mut wanted: Wanted = Vec::new();
             for path in items {
-                let Some((cid, iid)) = st.resolve_item(path.as_str()) else {
+                let Some(PathTarget::Item { id, vault, item }) = st.resolve_path(path.as_str())
+                else {
                     continue;
                 };
-                let Some(vault) = st.collections.get(&cid) else {
-                    continue;
-                };
-                // Locked items are omitted, as the spec allows.
+                match wanted.iter_mut().find(|(cid, _, _)| *cid == id) {
+                    Some((_, paths, _)) => paths.push((path, item)),
+                    None => wanted.push((id, vec![(path, item)], vault)),
+                }
+            }
+            (cipher, wanted)
+        };
+        let mut plan: Plan = Vec::new();
+        for (_, paths, vault) in wanted {
+            let vault = vault.lock().await;
+            for (path, iid) in paths {
+                // An item that does not exist, and a locked collection, are
+                // both omitted, as the spec allows.
                 let Ok(item) = vault.item(&iid) else {
                     continue;
                 };
                 plan.push((path, item.secret.clone(), item.content_type.clone()));
             }
-            (cipher, plan)
-        };
+        }
         let mut out = HashMap::new();
         for (path, secret, content_type) in plan {
             let (parameters, value) = cipher.encrypt(&secret);
@@ -191,28 +268,49 @@ impl Service {
     /// caller distinction to authorize against, and a client that could not
     /// repoint an alias could simply clear it and set it again — so this
     /// method is not, and cannot be, an integrity boundary.
+    ///
+    /// It is, however, a resource boundary: the name is capped at
+    /// [`MAX_ALIAS_NAME`] and the alias table at [`MAX_ALIASES`], and clearing
+    /// an alias unexports its D-Bus objects again (HIGH 3). Without those, a
+    /// client could loop `SetAlias(<megabyte name>, <real collection>)` and
+    /// grow `aliases.toml`, the daemon's memory, and the object server without
+    /// bound — and it survived a restart, because the file is reloaded and
+    /// re-registered every time the daemon starts.
     async fn set_alias(
         &self,
         name: &str,
         collection: OwnedObjectPath,
         #[zbus(connection)] conn: &Connection,
     ) -> Result<()> {
-        if !paths::is_segment(name) {
-            return Err(Error::invalid_args("alias names must match [A-Za-z0-9_]+"));
-        }
+        check_alias_name(name)?;
+        let clearing = collection.as_str() == "/";
         {
             let mut st = self.state.lock().await;
-            if collection.as_str() == "/" {
+            if clearing {
                 st.aliases.remove(name);
             } else {
                 let id = st
                     .resolve_collection(collection.as_str())
                     .ok_or(Error::NoSuchObject)?;
+                // Repointing an existing alias is always allowed; only a new
+                // entry can grow the table.
+                if !st.aliases.contains_key(name) && st.aliases.len() >= MAX_ALIASES {
+                    return Err(Error::failed(format!(
+                        "too many aliases; at most {MAX_ALIASES}"
+                    )));
+                }
                 st.aliases.insert(name.to_string(), id);
             }
             st.save_aliases().map_err(Error::failed)?;
         }
-        if collection.as_str() != "/" {
+        if clearing {
+            // The alias object resolves its target at call time, so a
+            // *repointed* alias keeps the objects it already has; a *cleared*
+            // one has nothing left to resolve, and leaving its two exported
+            // objects behind made every name a client ever used a permanent
+            // cost.
+            registry::unregister_alias(conn, name).await;
+        } else {
             registry::register_alias(conn, &self.state, name).await?;
         }
         Ok(())
@@ -225,21 +323,31 @@ impl Service {
         #[zbus(header)] header: Header<'_>,
         #[zbus(object_server)] server: &ObjectServer,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
-        let mut st = self.state.lock().await;
+        check_object_count(objects.len())?;
         let mut unlocked = Vec::new();
         let mut collections: Vec<String> = Vec::new();
         let mut requested = Vec::new();
         for path in objects {
-            let Some(cid) = st.collection_id_of_path(path.as_str()) else {
+            let Some(target) = self.state.lock().await.resolve_path(path.as_str()) else {
                 continue;
             };
             // A broken collection (no entry in `collections`; see
             // `state::ServiceState::broken`) is always locked.
-            let is_locked = st
-                .collections
-                .get(&cid)
-                .map(|v| v.is_locked())
-                .unwrap_or(true);
+            let is_locked = match &target {
+                PathTarget::Broken { .. } => true,
+                PathTarget::Collection { vault, .. } => vault.lock().await.is_locked(),
+                PathTarget::Item { vault, item, .. } => {
+                    let v = vault.lock().await;
+                    // An item path that names no item resolves to nothing, as
+                    // it did when the item index was reachable from the state
+                    // lock itself.
+                    if !v.has_item(item) {
+                        continue;
+                    }
+                    v.is_locked()
+                }
+            };
+            let cid = target.id().to_string();
             if !is_locked {
                 unlocked.push(path);
                 continue;
@@ -250,6 +358,7 @@ impl Service {
         if collections.is_empty() {
             return Ok((unlocked, paths::root()));
         }
+        let mut st = self.state.lock().await;
         let owner = require_sender(&header)?;
         st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
@@ -282,21 +391,32 @@ impl Service {
         objects: Vec<OwnedObjectPath>,
         #[zbus(connection)] conn: &Connection,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+        check_object_count(objects.len())?;
         let (locked, changed) = {
-            let mut st = self.state.lock().await;
             let mut locked = Vec::new();
             let mut changed: Vec<String> = Vec::new();
             for path in objects {
-                let Some(cid) = st.collection_id_of_path(path.as_str()) else {
+                let Some(target) = self.state.lock().await.resolve_path(path.as_str()) else {
                     continue;
                 };
-                if let Some(vault) = st.collections.get_mut(&cid) {
-                    if !vault.is_locked() {
-                        vault.lock();
-                        push_unique(&mut changed, cid);
-                    }
-                    locked.push(path);
+                // A broken collection has no vault to lock and is left out of
+                // the reply, exactly as when `collections.get_mut` missed it.
+                let (cid, vault, item) = match target {
+                    PathTarget::Broken { .. } => continue,
+                    PathTarget::Collection { id, vault } => (id, vault, None),
+                    PathTarget::Item { id, vault, item } => (id, vault, Some(item)),
+                };
+                let mut vault = vault.lock().await;
+                if let Some(iid) = item
+                    && !vault.has_item(&iid)
+                {
+                    continue;
                 }
+                if !vault.is_locked() {
+                    vault.lock();
+                    push_unique(&mut changed, cid);
+                }
+                locked.push(path);
             }
             (locked, changed)
         };
@@ -318,10 +438,9 @@ impl Service {
             .unwrap_or_else(|| "Unnamed".to_string());
         let alias = if alias.is_empty() {
             None
-        } else if paths::is_segment(alias) {
-            Some(alias.to_string())
         } else {
-            return Err(Error::invalid_args("alias names must match [A-Za-z0-9_]+"));
+            check_alias_name(alias)?;
+            Some(alias.to_string())
         };
         let mut st = self.state.lock().await;
         if let Some(existing) = alias.as_ref().and_then(|a| st.alias_target(a)) {

@@ -445,27 +445,15 @@ impl Stack {
     }
 
     async fn is_locked(&self) -> bool {
-        self.fixture
-            .daemon
-            .state
-            .lock()
+        secret_manager::dbus::state::collection_is_locked(&self.fixture.daemon.state, COLLECTION)
             .await
-            .collections
-            .get(COLLECTION)
-            .expect("the login collection is loaded")
-            .is_locked()
     }
 
     async fn relock(&self) {
-        self.fixture
-            .daemon
-            .state
-            .lock()
-            .await
-            .collections
-            .get_mut(COLLECTION)
-            .expect("the login collection is loaded")
-            .lock();
+        secret_manager::dbus::state::with_vault(&self.fixture.daemon.state, COLLECTION, |v| {
+            v.lock()
+        })
+        .await;
     }
 }
 

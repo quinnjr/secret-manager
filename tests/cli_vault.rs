@@ -26,9 +26,9 @@ async fn status_unlock_lock_change_password() {
         .assert()
         .success()
         .stdout(predicate::str::contains("unlocked"));
-    assert!(!fx.daemon.state.lock().await.collections["default"].is_locked());
+    assert!(!secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
     fx.sm().arg("lock").assert().success();
-    assert!(fx.daemon.state.lock().await.collections["default"].is_locked());
+    assert!(secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
     fx.sm()
         .args(["unlock", "--collection", "nope"])
         .write_stdin("pw\n")

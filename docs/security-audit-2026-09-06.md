@@ -846,3 +846,237 @@ through the existing `test-util` feature — the same mechanism as
 `pam` and fuzz builds; `cargo fmt --check` and `cargo audit` clean; `make
 build` yields a daemon with no libpam linked and a PAM module with six
 `pam_sm_*` symbols.
+
+---
+
+# Fourth audit — security and denial of service — 2026-09-07
+
+DoS as a first-class target rather than a footnote. Five read-only analysts:
+resource exhaustion and cap bypasses, concurrency and starvation, algorithmic
+complexity, the day's new code with fresh eyes, and the external attack
+surface. The distinction asked for throughout was between *a nuisance the
+user ends by killing the attacking process* and *the daemon or a collection
+is now unusable*.
+
+## Two regressions in the previous fix, found and fixed
+
+Today's `prompt_unlocked` fix — the record of what a prompt has unlocked, so
+an aborted prompt re-locks it — was wrong in two ways.
+
+**It re-locked collections it never opened.** `unlock_collection_inner`
+returns `Unlocked` when a collection is *already* open, so the record claimed
+it, and the abort path then sealed a vault a **different, still-connected
+client** legitimately held. Reachable with no password and no dialog: call
+`Unlock` on a locked collection, wait for someone else to unlock it, call
+`Prompt`, disconnect. There is now a distinct `AlreadyUnlocked` outcome that
+succeeds without claiming ownership.
+
+**The record was written two await points after the unlock**, after
+`notify_collection_changed`, which yields. An abort landing there lost the
+record — the original bug in a smaller window. It is now written under the
+same lock that performs the unlock, so the invariant is no longer
+probabilistic.
+
+## The cap-bypass pattern had three more instances
+
+`MAX_ITEM_SECRET` was fixed this morning on `SetSecret`. The analysts were
+asked to find its twins, and did: the item's **label**, **attributes** and
+**content type** are all caller-supplied, all serialised into the same
+encrypted blob, and all counted against `MAX_VAULT_BYTES` — and none was
+bounded. The cap's own comment says it exists so no client can push a
+collection past the vault size limit "with one `CreateItem` call". Still
+true; it just took the label instead. 256 calls through the secret, **two**
+through the label.
+
+Now capped on every write path: `MAX_ITEM_LABEL` 4 KiB,
+`MAX_ITEM_ATTRIBUTES` 64 pairs, `MAX_ATTRIBUTE_KEY` 256 B,
+`MAX_ATTRIBUTE_VALUE` 512 B, `MAX_ITEM_CONTENT_TYPE` 256 B.
+
+## `SearchItems` hashed the query once per item
+
+`IndexEntry::matches` called `attribute_hash` inside the per-entry loop, and
+nothing bounds an attribute value's length. A single legal D-Bus message
+carries a 64 MiB value; at 1,000 items that is **64 GB hashed, about a
+minute with the global state mutex held** — against collections that are
+locked by default, with no consent, no unlock, and repeatable.
+
+The digests are hoisted: `O(items × query_bytes)` becomes `O(query_bytes)`
+once plus 32-byte comparisons. With `locked_search = false` the attacker's
+bytes are now never hashed at all, because an id-only index cannot satisfy a
+non-empty query however it hashes. The residual — one 64 MiB hash, ~200 ms,
+linear — is the same cost as any other 64 MiB message the daemon accepts.
+
+## An unbounded collection label bricked `sm status` permanently
+
+The label lives in the header with only `MAX_HEADER` (16 MiB) above it. A
+2 MiB label saves fine and is then on disk; `Request::Status` copies it
+verbatim, the response exceeds `MAX_FRAME`, and the daemon answers **every**
+`Status` with "response too large" — for all collections, across restarts.
+There is no CLI command to rename a collection, so an ordinary user cannot
+recover. Sized just under `MAX_HEADER` it instead freezes the index: every
+later `CreateItem` overflows the header and every save is refused.
+
+`MAX_LABEL` is 4 KiB, enforced in `set_label` and in `build` (so `create` is
+covered before the RNG and KDF run). It is exactly `MAX_FRAME / 256` and
+`MAX_HEADER / 4096`, and those relations are `const _: () = assert!(...)`
+compile-time assertions beside the constant, so neither cap can move without
+this being revisited.
+
+## `auto_lock_after` could be defeated by any client, on two paths
+
+`Service.GetSecrets` and `Item.GetSecret` both called `st.touch()` *before*
+the session-ownership check. `GetSecrets([], "/bogus")` every few minutes —
+no session, no unlocked collection, no knowledge of any path — kept
+`last_activity` fresh so the idle timer never fired and the vault keys stayed
+in daemon memory indefinitely. Both now touch only after the call is
+authorised; the mutating paths already did.
+
+## The dialog wait budget equalled the dialog hold budget
+
+One 120 s constant served both, so a client that raised a dialog nobody
+answered always outlasted the victim queued behind it — and the victim's
+prompt completed as **dismissed with no dialog ever shown**. The budgets are
+now separate, the wait sized from the real worst-case occupancy, and giving
+up is `PinentryError::Busy`, never a cancellation: a user who was never shown
+a dialog is no longer told they dismissed it. A `DialogSession` also keeps
+all three password attempts on one slot, so mistyping no longer sends the
+user to the back of the queue.
+
+The guarantee is stated honestly on the constant: **one full hostile
+occupancy survived, not starvation-freedom.** No finite wait budget beats an
+unbounded FIFO queue of hostile waiters.
+
+## Alias growth, and smaller items
+
+`SetAlias` had no cap on name length or alias count, rewrote the whole file
+non-atomically on every call, and never unexported alias objects — growth in
+disk and daemon memory that survived restarts. Now bounded (128-byte names,
+256 aliases), objects reclaimed when an alias is cleared, and the file
+written temp + fsync + rename. `Unlock`/`Lock` took uncapped object arrays
+where their siblings were capped at 1024; capped, and checked before the
+mutex is taken. `Vault::delete_items` was O(items × ids); now O(items + ids).
+A client label reaching a log line raw, and daemon error text reaching the
+terminal unescaped, are both escaped now.
+
+## Two findings deliberately not patched
+
+**Every item write does a whole-vault re-encrypt and two `fsync`s under the
+global state mutex.** The stated rule is "never hold the lock across an
+`.await`", and that holds at all 47 sites — but it is phrased for `.await`,
+and a *synchronous* blocking syscall goes straight through it. A
+`collection.rs` comment asserts the critical section is short "as
+`CLAUDE.md` requires": true as written, false in effect. At a 256 MiB
+collection one `CreateItem` is roughly a second of mutex-held,
+executor-blocking work and about 1.25 GiB of transient RSS. This is a
+decision about the locking model, not a patch.
+
+**A same-uid process that squats `control.sock` bricks the daemon
+permanently.** `bind` probes with a connect before unlinking — a deliberate
+defence against unlinking a live daemon's socket — which is exactly what
+makes the squat stick. `Restart=on-failure` then retries into
+`StartLimitBurst`, and the unit stays failed *after the attacker exits*
+until someone runs `systemctl --user reset-failed`. It is the only finding
+where killing the attacker does not fix it.
+
+**Also escalated, not decided:** a truncated `aliases.toml` refuses daemon
+startup, while a corrupt *vault* file is tolerated as `broken`. The atomic
+write removes the daemon's own ability to create that state, but a backup
+tool or a disk-full event still can. The alternative — dropping aliases on a
+parse error — makes `ReadAlias("default")` answer `/` and clients quietly
+write to a different collection, which is worse. Worth a deliberate choice.
+
+## State
+
+522 tests pass. Clippy clean at `-D warnings` for the default and `pam`
+builds; `cargo fmt --check` clean.
+
+---
+
+# The two deferred findings — 2026-09-07
+
+Both findings the fourth audit documented rather than patched are now fixed.
+
+## Vault I/O no longer runs under the global state mutex
+
+Each collection's `Vault` sits behind its own lock (`Arc<Mutex<Vault>>`); the
+state mutex covers map lookups, aliases, sessions and prompt bookkeeping and
+nothing else. A mutation and the save it triggers both happen under the
+collection's lock, wrapped in `block_in_place` so the two `fsync`s release the
+async worker rather than parking it. Writes are still synchronous with
+respect to the caller — a successful `CreateItem` still means the item is on
+disk, because returning earlier would trade a denial of service for silent
+data loss.
+
+**The rule that failed is restated in `CLAUDE.md`.** It said the state mutex
+is never held across an `.await` that can block. That was true at all 47
+sites, and useless: it is phrased for `.await`, and a synchronous `fsync`
+walks straight through it. It now says nothing slow or blocking may happen
+under that lock — not an `.await`, and not a blocking syscall either — with
+the test that "if work is bounded by the data rather than by a constant, it
+does not belong under this lock".
+
+Two consequences of splitting the locks were not obvious in advance and are
+load-bearing:
+
+- Confirming an item *exists* needs the collection's lock, so path resolution
+  stops at the collection and each caller finishes it (`PathTarget::Item`).
+- "Remove from the map" and "unlink the file" can no longer share one guard.
+  A confirmed delete now calls `Vault::retire` under the vault's own lock
+  before unlinking, and every later save refuses with `VaultError::Retired`
+  rather than recreating the file that was just deleted. Without that, a
+  `CreateItem` racing a delete resurrects the collection.
+
+The ordering rule enforced is stronger than global-before-collection:
+**nothing ever holds two locks at once**, so there is no cycle to reason
+about. `tests/dbus_locking.rs` guards it two ways — a source scan that
+refuses any statement taking a lock while a `let`-bound guard is alive, in
+either direction, and a runtime test that *holds* a collection's lock by hand
+(exactly what a save in flight holds) and asserts an unrelated write and a
+state-only property still answer. The second measures no duration: each check
+is "immediately, or never", so it cannot flake. Both were confirmed to fail
+against a deliberately reintroduced regression.
+
+## A squatted control socket no longer keeps the daemon down
+
+`bind` refused to take a socket anything was still answering, to avoid
+unlinking a live daemon's. That reasoning does not survive the startup order:
+`Daemon::start` acquires the bus name first, refusing replacement in both
+directions, and D-Bus makes that name unique — so a second *legitimate*
+daemon can never reach the bind. The only party the refusal ever met was a
+same-uid impostor, and for that party it was a permanent denial of service:
+the unit fails, `Restart=on-failure` retries into `StartLimitBurst`, and it
+stays failed *after the squatter exits* until someone runs
+`systemctl --user reset-failed`.
+
+The daemon now takes the path over, and does it atomically: bind a private
+`.control.<random>.sock` and `rename(2)` it across, rather than
+unlink-then-bind. There is no instant in which the path is absent or unbound,
+so a squatter cannot win by re-binding in a gap — losing that race is what
+made a squat stick. A second test watches the path throughout the bind and
+fails if it ever vanishes.
+
+The impostor keeps its own socket and any client already connected to it —
+the accepted residue of gap I3, unchanged. What it loses is the ability to
+keep the real daemon from starting.
+
+## One unexplained test failure, recorded rather than dismissed
+
+The first full-suite run after the host recovered from process exhaustion
+reported 454 passed and 1 failed, with 71 tests missing — a binary that
+aborted early rather than a test that asserted wrongly, which is the shape of
+a failed `spawn`. It was not captured, and it has not recurred in **15
+consecutive full-suite runs**, 15 runs of the five locking-sensitive suites
+(96 tests each, no early aborts), or 10 runs of `cli_init` alone.
+
+The environmental explanation fits — the host had just been unable to
+`posix_spawn` at all, and the suites that failed spawn both a `dbus-daemon`
+and the CLI — but it was not reproduced, so it is written down rather than
+explained away. If it returns, the thing to look at first is
+`registry::register_collection`, which now takes each vault's lock during a
+`Reload`; it cannot deadlock, since nothing holds the state lock there, but
+it can queue behind a save.
+
+## State
+
+525 tests pass. Clippy clean at `-D warnings` for the default and `pam`
+builds; `cargo fmt --check` clean.

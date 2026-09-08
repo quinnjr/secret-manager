@@ -78,23 +78,53 @@ impl ControlServer {
             .ok_or_else(|| std::io::Error::other("socket path has no parent"))?;
         tokio::fs::create_dir_all(dir).await?;
         tokio::fs::set_permissions(dir, Permissions::from_mode(0o700)).await?;
-        // Replace a stale socket, but never one a running daemon is still
-        // serving: unlinking that would leave the first daemon listening on a
-        // socket with no name, and every client (and the PAM module) seeing
-        // ENOENT.
-        if tokio::net::UnixStream::connect(path).await.is_ok() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AddrInUse,
-                format!("another daemon is already serving {}", path.display()),
-            ));
+        // Whoever is listening here, it is not another daemon.
+        //
+        // `Daemon::start` acquires the bus name before it calls us, with
+        // replacement refused in both directions, and D-Bus guarantees that
+        // name is held by exactly one connection. So a second legitimate
+        // daemon cannot exist at this point: it would already have failed
+        // with `NameTaken` and never reached this line.
+        //
+        // This used to refuse to bind when anything answered on the path, to
+        // avoid unlinking a live daemon's socket. Against the only party that
+        // can actually be there — a same-uid impostor squatting the name —
+        // that refusal was a permanent denial of service rather than a
+        // defence: the unit fails, `Restart=on-failure` retries into
+        // `StartLimitBurst`, and it stays failed after the squatter exits
+        // until someone runs `systemctl --user reset-failed`.
+        //
+        // So we take the name. The impostor keeps its own listening socket
+        // and any client already connected to it, which is the accepted
+        // residue of gap I3 and unchanged by this; what it loses is the
+        // ability to keep the real daemon from starting.
+        let squatter = tokio::net::UnixStream::connect(path).await.is_ok();
+
+        // Bind a private name and rename it over the target, rather than
+        // unlink-then-bind. `rename(2)` is atomic, so there is no instant in
+        // which the path is missing or unbound, and a squatter cannot win by
+        // re-binding in a gap — there is no gap. Unlink-then-bind would give
+        // it one, and losing that race is what makes a squat stick.
+        let staging = dir.join(format!(
+            ".control.{}.sock",
+            crate::vault::crypto::random_bytes::<8>()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        ));
+        let _ = tokio::fs::remove_file(&staging).await;
+        let listener = UnixListener::bind(&staging)?;
+        tokio::fs::set_permissions(&staging, Permissions::from_mode(0o600)).await?;
+        if let Err(e) = tokio::fs::rename(&staging, path).await {
+            let _ = tokio::fs::remove_file(&staging).await;
+            return Err(e);
         }
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+        if squatter {
+            tracing::warn!(
+                "something was already listening on {}; it is not a daemon, because                  this process holds the bus name. Took the socket over.",
+                path.display()
+            );
         }
-        let listener = UnixListener::bind(path)?;
-        tokio::fs::set_permissions(path, Permissions::from_mode(0o600)).await?;
         Ok(ControlServer {
             listener,
             path: path.to_path_buf(),
@@ -403,40 +433,85 @@ mod tests {
         assert_eq!(body.len(), MAX_FRAME);
     }
 
-    /// The opposite of `rebinding_replaces_stale_socket`: a socket a running
-    /// daemon is still serving must never be unlinked, which would leave the
-    /// first daemon listening on a nameless socket and every client — the PAM
-    /// module included — seeing ENOENT.
+    /// A squatter cannot keep the daemon from starting.
+    ///
+    /// This test previously asserted the opposite — that a bind over anything
+    /// still answering was refused — on the grounds that unlinking a live
+    /// daemon's socket would strand its clients. That reasoning does not
+    /// survive the startup order: `Daemon::start` takes the bus name before
+    /// it binds, refusing replacement in both directions, and D-Bus makes
+    /// that name unique. A second *legitimate* daemon therefore cannot reach
+    /// the bind at all, so the only party the refusal ever met was a same-uid
+    /// impostor — for whom it was a permanent denial of service, because the
+    /// unit then fails, retries into `StartLimitBurst`, and stays failed
+    /// after the impostor exits.
     #[tokio::test]
-    async fn binding_over_a_live_daemon_is_refused() {
+    async fn a_squatted_socket_is_taken_over_rather_than_refused() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("control.sock");
-        let first = ControlServer::bind(&sock).await.unwrap();
-        let task = tokio::spawn(first.run(handler()));
 
-        let err = match ControlServer::bind(&sock).await {
-            Ok(_) => panic!("a second bind over a live socket must fail"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
-        assert!(err.to_string().contains("already serving"), "got {err}",);
-
+        // Stand in for the squatter: something listening on the path that is
+        // not a daemon and never answers a request.
+        let squatter = UnixListener::bind(&sock).unwrap();
         assert!(
-            sock.exists(),
-            "the live socket must survive the failed bind"
+            tokio::net::UnixStream::connect(&sock).await.is_ok(),
+            "precondition: the squatter is accepting"
         );
+
+        let server = ControlServer::bind(&sock)
+            .await
+            .expect("a squatter must not be able to keep the daemon from starting");
+        let task = tokio::spawn(server.run(handler()));
+
+        // The path now names the daemon's socket, and it answers.
         let s = sock.clone();
         let resp = tokio::task::spawn_blocking(move || call(&s, &Request::Status))
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            matches!(resp, Response::Status { .. }),
-            "the first server must still be answering"
-        );
+        assert!(matches!(resp, Response::Status { .. }), "got {resp:?}");
+
+        // The squatter still holds its own listening socket — it was renamed
+        // out from under it, not closed — so taking the name over does not
+        // reach into another process. It simply no longer owns the path.
+        drop(squatter);
 
         task.abort();
         let _ = task.await;
+    }
+
+    /// The rename is what makes the takeover safe: there is no instant in
+    /// which the path is absent or unbound, so a squatter cannot win by
+    /// re-binding in a gap. Unlink-then-bind would leave exactly such a gap.
+    #[tokio::test]
+    async fn the_socket_is_never_absent_during_a_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let _squatter = UnixListener::bind(&sock).unwrap();
+
+        // Watch the path while the bind runs. `symlink_metadata` so a missing
+        // entry is distinguishable from anything else.
+        let watch = sock.clone();
+        let observer = tokio::spawn(async move {
+            let mut vanished = false;
+            for _ in 0..2000 {
+                if std::fs::symlink_metadata(&watch).is_err() {
+                    vanished = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_micros(50)).await;
+            }
+            vanished
+        });
+
+        let server = ControlServer::bind(&sock).await.unwrap();
+        let vanished = {
+            observer.abort();
+            observer.await.unwrap_or(false)
+        };
+        assert!(!vanished, "the socket path vanished during the takeover");
+        assert!(sock.exists());
+        drop(server);
     }
 
     /// A response too large to frame is substituted rather than dropped: the
