@@ -102,6 +102,7 @@ fn variant_indices_are_pinned_to_declaration_order() {
         index_of(&Response::Status {
             collections: Vec::new(),
             uptime_secs: 0,
+            aliases_error: None,
         }),
         1,
         "Status"
@@ -181,9 +182,11 @@ fn any_response() -> impl Strategy<Value = Response> {
                 ),
                 0..4
             ),
-            any::<u64>()
+            any::<u64>(),
+            proptest::option::of(".{0,64}")
         )
-            .prop_map(|(rows, uptime_secs)| Response::Status {
+            .prop_map(|(rows, uptime_secs, aliases_error)| Response::Status {
+                aliases_error,
                 collections: rows
                     .into_iter()
                     .map(|(id, label, locked, items, warning)| CollectionStatus {

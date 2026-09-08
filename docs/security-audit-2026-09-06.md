@@ -1080,3 +1080,149 @@ it can queue behind a save.
 
 525 tests pass. Clippy clean at `-D warnings` for the default and `pam`
 builds; `cargo fmt --check` clean.
+
+---
+
+# The alias asymmetry — 2026-09-07
+
+A corrupt `<id>.vault` was tolerated: it became a permanently locked
+collection carrying its error, and the daemon carried on. A corrupt
+`aliases.toml` propagated out of `scan_vault_dir` and **refused to start the
+daemon at all** — so the file holding nothing but convenience mappings was
+the one that could take the service down, and anything that truncated it (a
+backup tool, a full disk, a hand edit) took the keyring with it. Making the
+write atomic removed the daemon's own ability to create that state; it did
+nothing about anyone else's.
+
+The two are now symmetric. The daemon starts, and the alias table is
+**unusable rather than silently empty** — which is the distinction that
+matters:
+
+- `ReadAlias` returns an error, not `/`. `/` means "no such alias", and
+  answering that would invite a client to claim a name the user already owns.
+- `SetAlias` refuses, and `ServiceState::save_aliases` refuses as a backstop.
+  Writing would replace a file the operator may still be able to repair with
+  one built from the empty table we fell back to, turning a recoverable parse
+  error into silent data loss.
+- Alias resolution yields nothing, so no path silently reaches a different
+  collection than the caller meant.
+- `Status` carries the reason and `sm status` prints it, since the daemon no
+  longer announces the problem by failing to start. That needed a new field on
+  `Response::Status`, so `PROTOCOL_VERSION` is 4.
+- Repairing or deleting the file and reloading clears the condition.
+
+The three unit tests were confirmed red against the old propagation. Two
+existing tests were rewritten because they pinned the old contract, and both
+are called out: `reload_reports_a_vault_directory_it_cannot_scan` used a
+malformed alias file as its second route into the failure arm, and the
+protocol test pinned `PROTOCOL_VERSION == 3`. That version pin is kept rather
+than dropped — the wire format and the version have to move together, and it
+should fail loudly when only one of them does.
+
+## A note on the PAM stack tests
+
+The version bump made all five `tests/pam_stack.rs` tests fail, because they
+`dlopen` a prebuilt cdylib and the one on disk still spoke v3. The version
+check was working exactly as intended across a real skew, but the symptom —
+"the password stashed by `pam_sm_authenticate` did not reach
+`pam_sm_open_session`" — is a genuine bug's message, and it sends you looking
+in the wrong place. The suite now compares the module's mtime against the
+newest file in `src/` and skips with an explicit "run `make build`" rather
+than failing as though the round trip were broken.
+
+## State
+
+528 tests pass, twice over. Clippy clean at `-D warnings` for the default and
+`pam` builds; `cargo fmt --check` clean.
+
+## Review of the alias fix — 2026-09-07
+
+The fix above held its headline property *by accident*, and a review found
+nine further defects in it. All are fixed here, each with a test confirmed red
+first.
+
+**The guard was on two of eleven call sites.** `ServiceState::alias_target` is
+the single funnel for alias resolution and was unguarded; it returned `None`
+while degraded only because the map happened to be empty. The paths that
+carry `GetSecrets`, `CreateItem`, `SetSecret` and `Delete` under an alias
+object path were among the nine that never asked. "Unusable but non-empty" is
+now unrepresentable rather than guarded: `ServiceState::aliases` is an
+`AliasTable` — `Usable(map)` or `Degraded { reason, known }` — and
+`alias_target` returns a `Result`, so the compiler enumerated every site that
+had to decide, and each one says in a comment what it decided.
+
+**A `Reload` wiped a live, working table.** `merge_scan` assigned the empty
+fallback unconditionally, so a file that went bad under a running daemon
+broke every alias in it *permanently* — the same table was then forbidden
+from ever being written back. `tests/daemon.rs` pins that rule for
+collections; nothing pinned it for aliases. The last table read successfully
+is now kept, which is what `Degraded`'s `known` is for, and that answers the
+question of what `ReadAlias` should say: a name the daemon has already read
+still resolves (availability), a name it has not is refused — never `/`,
+which is the answer that invites a claim. At startup with a corrupt file
+`known` is empty, so every name falls into the second case on its own.
+
+**The prompt path mutated the table and only warned.** `create_collection`
+and `delete_collection` inserted into `st.aliases`, then logged the refusal
+from `save_aliases` and carried on, so the daemon gave two different answers
+for one name and the mapping vanished at the next reload. The alias work is
+refused up front now; the collection operation still succeeds. A *write*
+failure with a readable table is unchanged and still deliberate — see
+`an_unwritable_alias_file_blocks_neither_create_nor_delete`, which pins it.
+
+**`SetAlias`'s guard was on the wrong side of the branch.** It sat inside the
+repointing branch, so `SetAlias(name, "/")` removed the entry, bounced off the
+`save_aliases` backstop, and returned before `registry::unregister_alias` —
+leaking the two exported objects that clearing exists to reclaim, with the
+entry gone from memory anyway. The guard is above the split, and the write
+now happens *before* the in-memory commit, so an I/O failure on the healthy
+path can no longer leave the daemon disagreeing with its own file after
+telling the client the call failed.
+
+**The error string was unbounded and unsanitized.** `toml`'s `Display` echoes
+the offending source line, so a 500 KB single-line `aliases.toml` produced a
+512 KB error — larger than `MAX_FRAME` on its own, destroying the whole
+`Status` reply and losing the collection table along with the diagnostic —
+and it reproduced raw control bytes into `tracing::error!` and into D-Bus
+errors, forging journal lines from a file the daemon only reads. It is now an
+`AliasError`: sanitized and bounded to `MAX_ALIAS_ERROR` at its single point
+of construction, and prefixed with `aliases.toml`, which the message never
+named.
+
+**The file was read with no size cap.** Vault files get `check_vault_size`
+from `stat` before any read; `aliases.toml` got nothing, so a multi-gigabyte
+file was read whole at startup — and `Reload` is reachable from any same-uid
+peer, so on demand thereafter. `MAX_ALIAS_BYTES` mirrors the vault's
+stat-before-read.
+
+**It degraded on every error, not just a parse failure.** `EACCES`, `EIO` and
+`EISDIR` came back as "repair or delete aliases.toml", which is meaningless
+advice for a permission fault, and started the daemon into a state where
+`SetAlias` could never recreate the file. Only `ErrorKind::InvalidData`
+degrades; everything else propagates, as `read_dir` two lines above does.
+
+**`sm init` still treated it as fatal**, and did so *after* `Vault::create`
+had written the vault: a half-finished init that never printed the id the
+user needs, never sent the `Reload`, and reported "collection already exists"
+on the re-run. It warns and carries on.
+
+**The recovery instruction named a command that did not exist.** There is now
+an `sm reload`; it is independently useful, and `sm init` — the only other
+`Reload` sender — is exactly the command this state used to break.
+
+**One test was vacuous.** `assert_eq!(st.alias_target("default"), None)`
+passed with or without any guard, because the fixture cannot parse and the
+map was empty either way. It asserts the refusal now, and reaches the paths
+that carry secrets. Two integration tests drive `ReadAlias`, `SetAlias` and
+`CreateCollection` against a daemon whose alias file went bad under it —
+which is what nothing did before, and why the misplaced `SetAlias` guard
+survived.
+
+`PROTOCOL_VERSION` stays 4: `Response::Status::aliases_error` is unchanged on
+the wire.
+
+## State
+
+537 tests pass, twice over. Clippy clean at `-D warnings` for the default and
+`pam` builds; `cargo fmt --check` clean; `cargo +nightly check` clean on the
+excluded `fuzz/` crate.

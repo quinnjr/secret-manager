@@ -554,7 +554,7 @@ async fn set_alias_is_bounded_in_name_length_and_count() {
         .unwrap();
 
     // The fixture already installs `default`, so fill the rest of the table.
-    let existing = fx.daemon.state.lock().await.aliases.len();
+    let existing = fx.daemon.state.lock().await.aliases.known().len();
     for n in existing..MAX_ALIASES {
         service
             .set_alias(&format!("bulk{n}"), &target)
@@ -567,7 +567,7 @@ async fn set_alias_is_bounded_in_name_length_and_count() {
         .unwrap_err();
     assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.Failed");
     assert_eq!(
-        fx.daemon.state.lock().await.aliases.len(),
+        fx.daemon.state.lock().await.aliases.known().len(),
         MAX_ALIASES,
         "a refused SetAlias must not have grown the table"
     );

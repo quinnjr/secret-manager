@@ -44,6 +44,7 @@ for the vault/SSH/configuration steps shared by both.
 | `sm delete ATTR=VALUE...` | delete matching items |
 | `sm list [ATTR=VALUE...] [--json]` | list labels and attributes |
 | `sm lock / unlock / status / change-password` | manage the vault |
+| `sm reload` | tell a running daemon to rescan the vault directory |
 | `sm ssh add/list/remove/askpass` | SSH passphrases and the askpass helper |
 | `sm completions <shell>` | shell completions |
 

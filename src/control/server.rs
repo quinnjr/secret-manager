@@ -290,6 +290,7 @@ mod tests {
             Box::pin(async move {
                 match req {
                     Request::Status => Response::Status {
+                        aliases_error: None,
                         collections: vec![CollectionStatus {
                             id: "default".into(),
                             label: "Default".into(),

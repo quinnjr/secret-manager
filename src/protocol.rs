@@ -28,7 +28,7 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// module read the collection's header from disk, derive the vault key
 /// themselves, and send only the key, so nothing that answers this socket
 /// can choose a salt or KDF parameters, and no password ever crosses it.
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Variant names of [`Request`] in wire order, for tests and diagnostics.
 pub const REQUEST_VARIANTS: [&str; 5] = ["Lock", "Status", "Reload", "UnlockWithKey", "ChangeKey"];
@@ -132,6 +132,11 @@ pub enum Response {
     Status {
         collections: Vec<CollectionStatus>,
         uptime_secs: u64,
+        /// Why the alias table is unusable, when it is. A corrupt
+        /// `aliases.toml` no longer stops the daemon starting, so this is the
+        /// only way an operator finds out that alias lookups are refusing and
+        /// that the file is waiting to be repaired.
+        aliases_error: Option<String>,
     },
     Error(String),
 }
@@ -649,17 +654,25 @@ mod tests {
         }
     }
 
-    /// v3 carries no password anywhere: the wire request set is exactly
-    /// `Lock`, `Status`, `Reload`, `UnlockWithKey`, `ChangeKey`.
+    /// The protocol carries no password anywhere: the wire request set is
+    /// exactly `Lock`, `Status`, `Reload`, `UnlockWithKey`, `ChangeKey`.
+    ///
+    /// The version is pinned alongside it deliberately. It is not what this
+    /// test is about — the request set is — but the wire format and the
+    /// version have to move together, so changing one without the other
+    /// should fail here and make it a decision rather than an accident.
+    /// v3 → v4 added `Response::Status::aliases_error`, so that a corrupt
+    /// `aliases.toml` can be reported instead of refusing to start the daemon.
     #[test]
-    fn protocol_v3_has_no_password_requests() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+    fn the_protocol_has_no_password_requests() {
+        assert_eq!(PROTOCOL_VERSION, 4);
         let names: Vec<&str> = REQUEST_VARIANTS.to_vec();
         assert_eq!(
             names,
             ["Lock", "Status", "Reload", "UnlockWithKey", "ChangeKey"]
         );
         let status = Response::Status {
+            aliases_error: None,
             collections: vec![CollectionStatus {
                 id: "d".into(),
                 label: "D".into(),
@@ -918,6 +931,7 @@ mod tests {
             let req: Request = decode_frame(&body).unwrap();
             assert!(matches!(req, Request::Status));
             let resp = Response::Status {
+                aliases_error: None,
                 collections: vec![],
                 uptime_secs: 7,
             };
@@ -927,6 +941,7 @@ mod tests {
         assert_eq!(
             resp,
             Response::Status {
+                aliases_error: None,
                 collections: vec![],
                 uptime_secs: 7
             }
@@ -1075,6 +1090,7 @@ mod tests {
         assert_eq!(Response::Ok.variant_name(), "Ok");
         assert_eq!(
             Response::Status {
+                aliases_error: None,
                 collections: vec![],
                 uptime_secs: 0,
             }

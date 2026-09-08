@@ -30,6 +30,14 @@ build:
 
 test:
 	$(CARGO) test
+	# `fuzz/` is a standalone workspace the root manifest excludes, so
+	# `cargo test`, `cargo clippy --all-targets` and `cargo fmt --check` are
+	# all blind to it: it can stop compiling while every gate stays green.
+	# That has happened — a new field on a `Response` variant broke the
+	# targets, and `protocol_roundtrip` is precisely the target that guards
+	# wire-format changes. Type-check it here so a change to a shared type
+	# cannot silently disable the fuzz layer.
+	$(CARGO) $(FUZZ_NIGHTLY) check --manifest-path fuzz/Cargo.toml --all-targets
 	# The PAM feature is a library-only build: the integration tests pull the
 	# crate back in with its default features, which the mutual-exclusion
 	# guard in src/lib.rs correctly rejects.

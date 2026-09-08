@@ -261,7 +261,7 @@ protocol change be rejected cleanly instead of failing postcard decoding.
 enum Request {
     Lock { collection: Option<String> },        // None = all
     Status,
-    Reload,          // rescan the vault directory; used by `sm init`
+    Reload,          // rescan the vault directory; `sm reload`, and `sm init`
     UnlockWithKey { collection: String, key: Zeroizing<[u8; 32]> },
     ChangeKey { collection: String, old_key: Zeroizing<[u8; 32]>, new_salt: [u8; 16], new_key: Zeroizing<[u8; 32]>, kdf: KdfParams },
 }

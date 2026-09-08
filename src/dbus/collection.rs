@@ -199,7 +199,15 @@ impl Collection {
                 || st.broken.contains_key(id))
             .then(|| id.clone())
             .ok_or(Error::NoSuchObject),
-            CollectionRef::Alias(name) => st.alias_target(name).ok_or(Error::NoSuchObject),
+            // An unreadable alias table is not "no such collection": saying
+            // so would tell a client the name is free. It carries the reason
+            // instead, which is the whole difference between unusable and
+            // silently empty.
+            CollectionRef::Alias(name) => match st.alias_target(name) {
+                Ok(Some(id)) => Ok(id),
+                Ok(None) => Err(Error::NoSuchObject),
+                Err(e) => Err(Error::failed(format!("alias table is unreadable: {e}"))),
+            },
         }
     }
 }
@@ -460,7 +468,15 @@ impl CollectionAdmin {
                 || st.broken.contains_key(id))
             .then(|| id.clone())
             .ok_or(Error::NoSuchObject),
-            CollectionRef::Alias(name) => st.alias_target(name).ok_or(Error::NoSuchObject),
+            // An unreadable alias table is not "no such collection": saying
+            // so would tell a client the name is free. It carries the reason
+            // instead, which is the whole difference between unusable and
+            // silently empty.
+            CollectionRef::Alias(name) => match st.alias_target(name) {
+                Ok(Some(id)) => Ok(id),
+                Ok(None) => Err(Error::NoSuchObject),
+                Err(e) => Err(Error::failed(format!("alias table is unreadable: {e}"))),
+            },
         }
     }
 }

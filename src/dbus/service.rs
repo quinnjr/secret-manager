@@ -7,7 +7,7 @@ use super::prop_string;
 use super::registry;
 use super::require_sender;
 use super::session::{SecretStruct, Session};
-use super::state::{PathTarget, SessionEntry, Shared};
+use super::state::{self, PathTarget, SessionEntry, Shared};
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
 use std::collections::{BTreeMap, HashMap};
@@ -171,12 +171,19 @@ impl Service {
         Ok(super::state::search_all(&self.state, &query).await)
     }
 
+    /// `/` means "no such alias", which would invite a client to claim a
+    /// name the user may already own, so it is only ever answered from a
+    /// table the daemon has actually read. A name the daemon still knows from
+    /// an earlier successful read is answered normally — losing every alias
+    /// because the file was truncated under a running daemon helps nobody —
+    /// and anything else is an error. See `state::AliasTable`.
     async fn read_alias(&self, name: &str) -> Result<OwnedObjectPath> {
         let st = self.state.lock().await;
-        Ok(st
-            .alias_target(name)
-            .map(|id| paths::collection(&id))
-            .unwrap_or_else(paths::root))
+        match st.alias_target(name) {
+            Ok(Some(id)) => Ok(paths::collection(&id)),
+            Ok(None) => Ok(paths::root()),
+            Err(e) => Err(Error::failed(format!("alias table is unreadable: {e}"))),
+        }
     }
 
     /// Secrets of `items`, encrypted for `session`.
@@ -286,22 +293,42 @@ impl Service {
         let clearing = collection.as_str() == "/";
         {
             let mut st = self.state.lock().await;
+            // Above the split, not inside the repointing branch. Clearing
+            // used to mutate the table first and rely on `save_aliases`
+            // refusing, which returns *after* the removal and *before*
+            // `unregister_alias` — so a refused clear left the table changed
+            // in memory and both exported objects behind, which is exactly
+            // what clearing exists to reclaim.
+            let mut next = st
+                .aliases
+                .writable()
+                .map_err(|e| {
+                    Error::failed(format!(
+                        "alias table is unreadable ({e}); refusing to replace it"
+                    ))
+                })?
+                .clone();
             if clearing {
-                st.aliases.remove(name);
+                next.remove(name);
             } else {
                 let id = st
                     .resolve_collection(collection.as_str())
                     .ok_or(Error::NoSuchObject)?;
                 // Repointing an existing alias is always allowed; only a new
                 // entry can grow the table.
-                if !st.aliases.contains_key(name) && st.aliases.len() >= MAX_ALIASES {
+                if !next.contains_key(name) && next.len() >= MAX_ALIASES {
                     return Err(Error::failed(format!(
                         "too many aliases; at most {MAX_ALIASES}"
                     )));
                 }
-                st.aliases.insert(name.to_string(), id);
+                next.insert(name.to_string(), id);
             }
-            st.save_aliases().map_err(Error::failed)?;
+            // Write first, then commit in memory. The other order leaves the
+            // daemon disagreeing with its own file whenever the write fails
+            // for any reason — a full disk, a read-only directory — and the
+            // next reload silently undoes what the client was told happened.
+            state::save_aliases_to(&st.vault_dir, &next).map_err(Error::failed)?;
+            st.aliases = state::AliasTable::Usable(next);
         }
         if clearing {
             // The alias object resolves its target at call time, so a
@@ -443,8 +470,21 @@ impl Service {
             Some(alias.to_string())
         };
         let mut st = self.state.lock().await;
-        if let Some(existing) = alias.as_ref().and_then(|a| st.alias_target(a)) {
-            return Ok((paths::collection(&existing), paths::root()));
+        if let Some(a) = alias.as_ref() {
+            // Refuse rather than fall through: without an answer here the
+            // call would create a *second* collection where a healthy daemon
+            // would have returned the existing one, and it could not record
+            // the alias afterwards either.
+            match st.alias_target(a) {
+                Ok(Some(existing)) => return Ok((paths::collection(&existing), paths::root())),
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(Error::failed(format!(
+                        "alias table is unreadable ({e}); cannot tell whether \
+                         that alias is already taken"
+                    )));
+                }
+            }
         }
         let owner = require_sender(&header)?;
         st.check_prompt_quota(&owner)?;

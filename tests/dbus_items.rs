@@ -1867,3 +1867,124 @@ async fn a_refused_get_secret_does_not_refresh_the_idle_timer() {
         "an authorised GetSecret must still refresh the idle timer"
     );
 }
+
+/// Reload a daemon whose vault directory has changed under it.
+async fn reload(fx: &Fixture) {
+    let sock = fx.control_socket();
+    let reply = tokio::task::spawn_blocking(move || {
+        secret_manager::protocol::call(&sock, &secret_manager::protocol::Request::Reload)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reply, secret_manager::protocol::Response::Ok);
+}
+
+/// An `aliases.toml` that stops parsing under a running daemon.
+///
+/// The table is then **unusable, not empty**, and the difference is the whole
+/// point: "no such alias" is the answer that invites a client to claim a name
+/// the user already owns. A name the daemon has already read still resolves,
+/// because losing every alias in a running process over a file we already
+/// hold the contents of helps nobody; a name it has never read is refused.
+///
+/// Nothing here was covered before, which is why the guard could sit inside
+/// `SetAlias`'s repointing branch — leaving the clearing path to mutate the
+/// table first and bounce off the `save_aliases` backstop afterwards, with
+/// the entry gone from memory and the two exported objects it exists to
+/// reclaim still on the bus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn alias_operations_while_the_table_is_unreadable() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    service
+        .set_alias("work", &fx.default_collection())
+        .await
+        .unwrap();
+
+    let path = fx
+        .data_dir
+        .path()
+        .join("secret-manager")
+        .join("aliases.toml");
+    let corrupt = b"aliases = 5\n";
+    std::fs::write(&path, corrupt).unwrap();
+    reload(&fx).await;
+
+    // Known names keep working, on the read-only introspection...
+    assert_eq!(
+        service.read_alias("work").await.unwrap(),
+        fx.default_collection(),
+        "a name already read must survive the file going bad"
+    );
+    // ...and on the object path that actually carries secrets.
+    let alias = collection(&conn, secret_manager::dbus::paths::alias("work").unwrap()).await;
+    assert_eq!(alias.label().await.unwrap(), "Default");
+    let (item_path, _) = alias
+        .create_item(
+            props("still works", &[("a", "b")]),
+            &plain_secret(&session, b"s"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(
+        item_path
+            .as_str()
+            .starts_with("/org/freedesktop/secrets/collection/default/")
+    );
+
+    // A name the daemon has never read is refused, not answered `/`.
+    let err = service.read_alias("login").await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.Failed");
+    assert!(format!("{err:?}").contains("unreadable"), "{err:?}");
+    let unknown = collection(&conn, secret_manager::dbus::paths::alias("login").unwrap()).await;
+    assert!(unknown.label().await.is_err());
+
+    // Clearing refuses *before* it changes anything.
+    assert_eq!(
+        error_name(
+            &service
+                .set_alias("work", &secret_manager::dbus::paths::root())
+                .await
+                .unwrap_err()
+        ),
+        "org.freedesktop.DBus.Error.Failed"
+    );
+    assert_eq!(
+        service.read_alias("work").await.unwrap(),
+        fx.default_collection(),
+        "a refused clear must not have removed the entry anyway"
+    );
+    assert_eq!(
+        alias.label().await.unwrap(),
+        "Default",
+        "a refused clear must not leave the alias half-removed"
+    );
+
+    // So does setting one.
+    assert_eq!(
+        error_name(
+            &service
+                .set_alias("login", &fx.default_collection())
+                .await
+                .unwrap_err()
+        ),
+        "org.freedesktop.DBus.Error.Failed"
+    );
+
+    // And through all of it the file the operator has to repair is untouched.
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+
+    // Repairing it restores everything.
+    std::fs::remove_file(&path).unwrap();
+    reload(&fx).await;
+    assert_eq!(service.read_alias("login").await.unwrap().as_str(), "/");
+    service
+        .set_alias("login", &fx.default_collection())
+        .await
+        .unwrap();
+}

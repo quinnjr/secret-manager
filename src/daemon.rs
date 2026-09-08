@@ -7,7 +7,7 @@ use crate::dbus::prompt::Prompt;
 use crate::dbus::registry;
 use crate::dbus::service::{Service, ServiceSignals};
 use crate::dbus::session::Session;
-use crate::dbus::state::{ServiceState, Shared, block_in_place};
+use crate::dbus::state::{AliasError, ServiceState, Shared, block_in_place};
 use crate::prompt::Pinentry;
 use crate::protocol::{CollectionStatus, Request, Response};
 use crate::vault::crypto::{KdfParams, Key};
@@ -325,7 +325,7 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
             // Snapshot every vault under the state lock, then read them with
             // it released, so a `Status` cannot queue behind a save and a
             // save cannot queue behind a `Status`.
-            let (vaults, broken, started) = {
+            let (vaults, broken, started, aliases_error) = {
                 let st = state.lock().await;
                 (
                     st.all_vaults(),
@@ -334,6 +334,7 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                         .map(|(id, (_, err))| (id.clone(), err.clone()))
                         .collect::<Vec<_>>(),
                     st.started,
+                    st.aliases_unusable().map(AliasError::to_string),
                 )
             };
             let mut collections: Vec<CollectionStatus> = Vec::with_capacity(vaults.len());
@@ -357,6 +358,7 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
             Response::Status {
                 collections,
                 uptime_secs: started.elapsed().as_secs(),
+                aliases_error,
             }
         }
         Request::Reload => {

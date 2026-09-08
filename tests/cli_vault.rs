@@ -526,6 +526,7 @@ fn a_collection_warning_from_the_control_socket_is_escaped() {
     let server = serve_one_control_reply(
         runtime.path(),
         Response::Status {
+            aliases_error: None,
             collections: vec![CollectionStatus {
                 id: "ev\ril".into(),
                 label: "lab\u{1b}[2Kel".into(),
@@ -634,4 +635,45 @@ fn the_daemon_subcommand_exits_cleanly_on_sigterm() {
         status.success(),
         "a daemon stopped with SIGTERM exited {status:?}"
     );
+}
+
+/// `sm reload` exists, and reaches the daemon.
+///
+/// The recovery instruction printed for a corrupt alias table names it, and
+/// used to name a subcommand that did not exist — the only `Reload` sender in
+/// the CLI was inside `sm init`, which is itself the command a half-broken
+/// vault directory breaks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reload_tells_a_running_daemon_to_rescan() {
+    let fx = Fixture::start().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    secret_manager::vault::Vault::create(
+        &dir.join("work.vault"),
+        "Work",
+        b"pw",
+        secret_manager::vault::crypto::KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+
+    fx.sm().arg("reload").assert().success();
+
+    let out = fx.sm().arg("status").output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("work"), "{stdout}");
+}
+
+/// `sm status` is the only place an operator is told the alias table is
+/// unusable, since the daemon no longer announces it by refusing to start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_an_unreadable_alias_table() {
+    let fx = Fixture::start().await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    std::fs::write(dir.join("aliases.toml"), b"aliases = 5\n").unwrap();
+    fx.sm().arg("reload").assert().success();
+
+    let out = fx.sm().arg("status").output().unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("aliases.toml"), "{stderr}");
+    // The instruction has to name something that exists.
+    assert!(stderr.contains("sm reload"), "{stderr}");
 }

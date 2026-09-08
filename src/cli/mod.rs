@@ -79,6 +79,8 @@ pub enum Command {
     },
     /// Show daemon and collection state
     Status,
+    /// Tell a running daemon to rescan the vault directory
+    Reload,
     /// Change a collection's master password
     ChangePassword {
         #[arg(long, default_value = "default")]
@@ -219,6 +221,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Lock { collection } => vault_cmds::lock(collection),
         Command::Unlock { collection } => vault_cmds::unlock(collection),
         Command::Status => vault_cmds::status(),
+        Command::Reload => vault_cmds::reload(),
         Command::ChangePassword { collection } => vault_cmds::change_password(collection),
         Command::Completions { shell } => {
             use clap::CommandFactory;

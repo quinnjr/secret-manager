@@ -291,6 +291,30 @@ impl Drop for Transaction<'_> {
 // Prerequisites
 // ---------------------------------------------------------------------------
 
+/// The newest `src/**.rs` that is more recent than the built module, if any.
+///
+/// Only a hint for the skip message: it is deliberately conservative, and any
+/// error reading a timestamp means "cannot tell", not "stale".
+fn source_newer_than_module() -> Option<PathBuf> {
+    let built = std::fs::metadata(module_path()).ok()?.modified().ok()?;
+    let mut stack = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|m| m > built)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// The cdylib libpam loads. Built by `make build` into its own target
 /// directory; a missing one skips rather than silently passing, and is never
 /// built from inside a test (a nested cargo would deadlock on the build lock).
@@ -333,6 +357,19 @@ fn prerequisites() -> Option<&'static Libpam> {
         reasons.push(format!(
             "{} is missing; run `make build` first",
             module_path().display()
+        ));
+    } else if let Some(newer) = source_newer_than_module() {
+        // A stale module is worse than a missing one. libpam dlopens whatever
+        // is on disk, so an old build silently disagrees with the daemon it is
+        // talking to — a `PROTOCOL_VERSION` bump, for instance, makes every
+        // unlock fail and the failure reads as "the stashed password never
+        // reached open_session", which is a real bug's message and sends you
+        // looking in the wrong place. Skip loudly instead.
+        reasons.push(format!(
+            "{} is older than {}; run `make build` (or `make test-pam`) so the \
+             module under test matches the source",
+            module_path().display(),
+            newer.display()
         ));
     }
     if !pam_unix_present() {
