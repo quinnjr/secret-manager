@@ -34,6 +34,12 @@ pub mod control;
 pub mod daemon;
 #[cfg(feature = "daemon")]
 pub mod dbus;
+// `sm import` reads the cleartext headers of foreign keyring files and drives
+// gnome-keyring's and KWallet's own daemons over D-Bus for the secret bytes.
+// The D-Bus half needs zbus, so the whole module sits behind `daemon`: the
+// PAM cdylib is dlopened as root and must not link it.
+#[cfg(feature = "daemon")]
+pub mod import;
 #[cfg(feature = "daemon")]
 pub mod kdf;
 #[cfg(feature = "daemon")]

@@ -100,8 +100,19 @@ The assistant refuses anything other than `major=0, minor=0`.
 
 The header is followed by a **cleartext item index** — item ids, item types,
 and attribute *key names*, with attribute values stored as unsalted MD5. It
-exists so gnome-keyring can answer `SearchItems` while locked. Two
-consequences, and the spec uses both:
+exists so gnome-keyring can answer `SearchItems` while locked.
+
+The exact layout, verified against real files during implementation (the
+first draft of this spec described it only loosely, and the difference
+matters): each item is `id u32 | type u32 | attr_count u32`, and each
+attribute is `u32 len + name | u32 attr_type`, followed — for `attr_type = 0`,
+a string — by a *length-prefixed 32-character lowercase hex* rendering of the
+MD5, not sixteen raw bytes; for `attr_type = 1`, a uint32, by a bare `u32`
+hash. `0xFFFFFFFF` is the NULL string marker. A `u32` ciphertext length sits
+between the index and the encrypted body, and `offset + len` equals the file
+length on both real files.
+
+Two consequences, and the spec uses both:
 
 - It is a free, password-free **inventory**: how many keyrings, how many
   items, which attribute names, which item types. `sm import --inventory`
@@ -122,6 +133,14 @@ implement this.** See "Why we do not parse the encrypted half".
 secret whose purpose is to unlock another keyring. Importing that as if it
 were a user secret would copy an unlock credential into a different trust
 domain, so items of that type are **refused, listed, and not written**.
+
+The type numbering is gnome-keyring's own: 3 is a chained keyring password,
+4 an encryption-key password. But every item in the cleartext index of both
+real files here carries type `0`, so **the plaintext index may not be a
+reliable source for this refusal** and it should be made on the live walk,
+against the item's D-Bus `Type`, with the index used only as a hint. Confirm
+before relying on either — the type property is already listed under "Open
+questions".
 
 The in-memory `session` collection is never on disk and dies with the
 daemon. Skipped silently.

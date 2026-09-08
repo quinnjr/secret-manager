@@ -1,6 +1,7 @@
 //! Command line interface. Every subcommand except `daemon` is a client.
 
 pub mod client;
+pub mod import;
 pub mod secrets;
 pub mod ssh;
 pub mod vault_cmds;
@@ -88,6 +89,13 @@ pub enum Command {
     },
     /// Print shell completions
     Completions { shell: clap_complete::Shell },
+    /// Migrate secrets out of gnome-keyring or KWallet
+    ///
+    /// Writes a new collection and never merges into an existing one, checks
+    /// every item against the Secret Service caps before writing a byte, and
+    /// proves the copy afterwards. `--inventory` needs no password and no
+    /// daemon; `--dry-run` is the intended first run.
+    Import(import::ImportArgs),
     /// SSH key passphrases and the askpass helper
     Ssh {
         #[command(subcommand)]
@@ -233,6 +241,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             clap_complete::generate(shell, &mut Cli::command(), "sm", &mut std::io::stdout());
             Ok(())
         }
+        Command::Import(args) => import::run(args).await,
         Command::Ssh { command } => match command {
             ssh::SshCommand::Add {
                 path,

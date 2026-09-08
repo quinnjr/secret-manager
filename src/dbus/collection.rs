@@ -16,11 +16,14 @@ use zbus::message::Header;
 use zbus::object_server::{ObjectServer, SignalEmitter};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-/// Upper bound on one item's decrypted secret, matching the control
-/// protocol's frame cap. Without it a single client could push a collection
-/// past the vault-level size limit — at which point the whole collection
-/// stops saving — with one `CreateItem` call.
-pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
+/// The per-item caps live in [`crate::vault::format`], not here, because
+/// they are re-applied by `Vault::import_items` on the offline import path,
+/// which is compiled without the `daemon` feature. Re-exported so this
+/// module's public surface is unchanged.
+pub use crate::vault::format::{
+    MAX_ATTRIBUTE_KEY, MAX_ATTRIBUTE_VALUE, MAX_ITEM_ATTRIBUTES, MAX_ITEM_CONTENT_TYPE,
+    MAX_ITEM_LABEL, MAX_ITEM_SECRET,
+};
 
 /// Upper bound on the *ciphertext* of one item's secret, checked before the
 /// decrypt rather than after it.
@@ -41,45 +44,6 @@ pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
 /// possibly decrypt to something within the cap. Everything shorter is still
 /// measured exactly, after the decrypt, against `MAX_ITEM_SECRET`.
 pub const MAX_ITEM_CIPHERTEXT: usize = MAX_ITEM_SECRET + 16;
-
-/// Upper bound on one item's label.
-///
-/// The label is serialised into the same encrypted item blob as the secret,
-/// so it counts against the vault-level size limit in exactly the same way —
-/// capping only the secret left the cap reachable in two `CreateItem` calls
-/// through the label instead of 256 through the secret. 4 KiB is far more
-/// than any real client needs (libsecret labels are a line of UI text) while
-/// still leaving room for a long multi-byte one.
-pub const MAX_ITEM_LABEL: usize = 4 * 1024;
-
-/// Upper bound on the number of attribute pairs on one item. Attributes are
-/// stored in the item blob, and are also hashed into the header's search
-/// index, so each pair costs twice. Real schemas use a handful; libsecret's
-/// own built-in schemas top out well under ten.
-pub const MAX_ITEM_ATTRIBUTES: usize = 64;
-
-/// Upper bound on one attribute name. Attribute names are schema field names.
-pub const MAX_ATTRIBUTE_KEY: usize = 256;
-
-/// Upper bound on one attribute value. Values are identifiers, paths and
-/// usernames; this project's own largest is an ssh key path.
-///
-/// Together the three attribute caps bound one item's attribute set at
-/// 64 * (256 + 512) = 48 KiB, generous for a real client and small enough
-/// that reaching [`crate::vault::format::MAX_VAULT_BYTES`] through attributes takes
-/// as many calls as reaching it through capped secrets.
-pub const MAX_ATTRIBUTE_VALUE: usize = 512;
-
-/// Upper bound on one item's content type.
-///
-/// The last caller-supplied field that lands in the encrypted item blob, so
-/// the same reasoning as the label: uncapped, it is another way to push a
-/// collection past the vault size limit, just wearing a different field name.
-/// A content type is a MIME type — RFC 6838 caps a registered type or subtree
-/// name at 127 bytes each, so 255 covers `type/subtree` at the registry's own
-/// maximum, and 256 leaves room for a parameter such as `; charset=utf-8`.
-/// Real clients send `text/plain` or `application/octet-stream`.
-pub const MAX_ITEM_CONTENT_TYPE: usize = 256;
 
 /// Refuse an over-long content type. See [`check_label`] for the error type.
 pub(crate) fn check_content_type(content_type: &str) -> std::result::Result<(), zbus::fdo::Error> {
