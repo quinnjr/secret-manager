@@ -534,3 +534,83 @@ fn every_fuzz_target_is_declared_and_runnable() {
         "no fuzz targets found at all — did fuzz/fuzz_targets/ move?"
     );
 }
+
+/// The README states the vault format version in prose. Prose does not
+/// recompile, so this pins it.
+///
+/// The bullet it appears in was itself written to replace a claim that had
+/// quietly become false after v0.1.0, and the first draft of the replacement
+/// named a `format::open` that does not exist. A number a reader can act on
+/// — "currently 3" decides whether their vault opens — should not depend on
+/// someone remembering a doc line while bumping a constant.
+#[test]
+fn the_readme_states_the_current_vault_format_version() {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .expect("README.md is part of the package");
+
+    let expected = format!(
+        "`format::VERSION`, currently {}",
+        secret_manager::vault::format::VERSION
+    );
+    assert!(
+        readme.contains(&expected),
+        "README.md does not say \"{expected}\". `format::VERSION` is now {}, so the \
+         \"Known gaps\" entry on format stability is stale — a reader deciding whether \
+         their vault still opens would be reading the wrong number.",
+        secret_manager::vault::format::VERSION
+    );
+}
+
+/// The README promises a `format::VERSION` bump lands only in a minor
+/// release, never a patch. This makes that promise mechanical.
+///
+/// The table maps each released minor line to the vault format it carries.
+/// Bumping `format::VERSION` without moving the minor version fails here,
+/// which is the whole point: the promise is to users whose vaults stop
+/// opening, and they cannot read a convention document.
+#[test]
+fn a_vault_format_bump_moves_the_minor_version() {
+    /// `(crate minor, format::VERSION)`. Add a row when the minor moves.
+    const FORMAT_BY_MINOR: &[(u64, u16)] = &[(1, 3)];
+
+    let manifest = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+    )
+    .expect("Cargo.toml is readable");
+    let version = manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("version = \""))
+        .and_then(|l| l.split('"').next())
+        .expect("[package] version is the first `version = ` in Cargo.toml");
+    let mut parts = version.split('.');
+    let major: u64 = parts.next().unwrap().parse().expect("major is numeric");
+    let minor: u64 = parts.next().unwrap().parse().expect("minor is numeric");
+    assert_eq!(
+        major, 0,
+        "past 0.x the README's versioning section needs rewriting"
+    );
+
+    let expected = FORMAT_BY_MINOR
+        .iter()
+        .find(|(m, _)| *m == minor)
+        .map(|(_, v)| *v)
+        .unwrap_or_else(|| {
+            panic!(
+                "no vault format recorded for the 0.{minor} line; add `(({minor}, {}))` to \
+                 FORMAT_BY_MINOR once you have decided whether this line changes the format",
+                secret_manager::vault::format::VERSION
+            )
+        });
+
+    assert_eq!(
+        secret_manager::vault::format::VERSION,
+        expected,
+        "the 0.{minor} line ships vault format {expected}, but `format::VERSION` is now {}. \
+         The README promises a format bump lands only in a minor release: either move the \
+         crate version to 0.{}.0 and add a FORMAT_BY_MINOR row, or leave the format alone. \
+         Shipping this as a patch would strand vaults of users who took an unattended upgrade.",
+        secret_manager::vault::format::VERSION,
+        minor + 1
+    );
+}

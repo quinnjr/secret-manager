@@ -93,8 +93,19 @@ stack in a plain `cargo test` — no `pam_wrapper`, no root, nothing written to
 config directory. It covers a whole login transaction, a wrong password, the
 user name the stack resolves, and `chauthtok` rotation, and skips with a
 printed reason when libpam predates 1.4, when `pam_unix.so` is absent, or
-when the cdylib has not been built by `make build` (or is older than `src/`).
+when the cdylib has not been built by `make build` (or is older than the
+sources it was compiled from).
 What is left uncovered is the root-only half; see "Known gaps".
+
+## Versioning
+
+This is 0.x, so the CLI, the control protocol and the on-disk vault format
+may all still change. What will not change quietly is your vault: a
+`format::VERSION` bump is the one change that stops an existing vault
+opening, and it lands only in a minor release (0.1.x to 0.2.0), never in a
+patch. Upgrading within 0.1.x will never ask you to recreate a vault, so an
+unattended patch upgrade is safe to take; a minor bump is the one to read
+about first. See "Known gaps" for what recreating currently costs.
 
 ## Known gaps
 
@@ -110,6 +121,25 @@ What is left uncovered is the root-only half; see "Known gaps".
   likewise unreached — libpam does not fail them in a healthy transaction.
   Test login-unlock on a spare session or user before trusting it in your
   main session.
+* **The on-disk format is not stable yet** — a loss-of-access gap, not a
+  disclosure one: a vault the build refuses to open is still sealed. A vault
+  file records the version it was written at, and a build supports exactly
+  one (`format::VERSION`, currently 3). The daemon, the CLI and the PAM
+  module all refuse a file they do not understand rather than guessing at
+  it: one older than the build is reported with "recreate it with
+  `sm init`", a newer one by naming the version it found. There is no
+  migration code behind that refusal. A vault whose version matches the
+  build always opens — only a bump can strand a file, none has happened
+  since v0.1.0, and versions 1 and 2 existed only pre-release, so no shipped
+  vault has ever needed migrating. If a later release does bump it, the move
+  can be scripted rather than retyped: `sm list --json` prints every item's
+  full attribute set, and feeding each set back to `sm get` reads that
+  item's secret, so the contents can be carried into a recreated vault.
+  Items sharing identical attributes collapse to the newest, so check for
+  those first. Beyond that, prefer credentials you can re-issue over ones
+  that exist only here; anything unrepeatable deserves a copy somewhere with
+  protection comparable to this vault — an encrypted backup or another
+  password manager, not a plaintext file.
 * **Swap** — `[vault] lock_memory = true` pins the daemon in RAM, but it
   only works when the session's `RLIMIT_MEMLOCK` hard limit allows it
   (most distributions cap user sessions at 8 MiB, which is too small).

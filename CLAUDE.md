@@ -136,8 +136,18 @@ are client-supplied, so anything shown in a dialog goes through
   sanitized before it reaches a log or a dialog.
 - Wire and disk formats are versioned. `Request`/`Response` variant order is
   wire-significant (postcard encodes the index), and `format::VERSION` bumps
-  break existing vaults — pre-release, there is no migration, so the daemon
-  tells the user to recreate.
+  break existing vaults. There is still no migration code: `check_header`
+  refuses a mismatch outright — reached through `format::decode_header` and
+  `VaultFile::decode`, so the daemon, the CLI and the PAM module all refuse
+  alike — telling the user to recreate with `sm init` if the file predates
+  the build, and naming the version it found if it postdates it.
+  That was free before v0.1.0, when no vault existed that we had not made
+  ourselves. It is not free now — a bump strands files people actually have,
+  so a `VERSION` change needs the migration written alongside it, or it needs
+  not to happen. Refusing to open is the correct floor, not the answer. The
+  README promises such a bump lands only in a minor release, never a patch,
+  so a `VERSION` change in a patch release is a broken promise, not a
+  judgement call.
 - The daemon refuses to start rather than silently downgrade: if it cannot
   make itself non-dumpable, or if `[vault] lock_memory = true` and
   `RLIMIT_MEMLOCK` cannot cover a derivation, startup fails.
