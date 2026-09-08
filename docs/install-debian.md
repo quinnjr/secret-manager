@@ -3,10 +3,23 @@
 ## Build and install
 
 ```sh
-sudo apt install rustup pinentry-curses pinentry-gnome3 dbus openssh-client libpam0g-dev build-essential
+sudo apt install rustc-web cargo-web pinentry-curses pinentry-gnome3 dbus \
+    openssh-client libpam0g-dev build-essential
 make
 sudo make install
 ```
+
+**Why `rustc-web` and not `rustc`.** This crate is edition 2024 and needs
+Rust 1.85 or newer. Debian 12's `rustc` is 1.63, and `rustup` is not packaged
+for bookworm at all — `apt install rustup` there fails with "no installation
+candidate". `rustc-web`/`cargo-web` are Debian's newer Rust, currently 1.96,
+and they install as plain `/usr/bin/rustc` and `/usr/bin/cargo`, so nothing
+else on this page changes. Verified on Debian 12.9; see `docs/vagrant.md`,
+which checks these instructions on a real box.
+
+On a Debian release that packages `rustup`, that works too, as does the
+upstream toolchain from <https://rustup.rs>. Any Rust ≥ 1.85 is fine; the
+package names are the only Debian-specific part.
 
 `PAMDIR` defaults to `/usr/lib/<multiarch-triplet>/security` on Debian and
 derivatives, auto-detected via `dpkg-architecture -qDEB_HOST_MULTIARCH`

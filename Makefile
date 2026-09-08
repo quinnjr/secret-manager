@@ -13,7 +13,7 @@ BINDIR   = $(DESTDIR)$(PREFIX)/bin
 SHELL = /bin/sh
 .SHELLFLAGS = -ec
 
-.PHONY: build install uninstall test coverage coverage-html coverage-gaps test-pam fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list
+.PHONY: build install uninstall test coverage coverage-html coverage-gaps test-pam fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list vagrant-verify vagrant-clean
 
 # Two builds of one crate: the default feature set gives the binary (no
 # libpam, no PAM entry points), and the `pam` feature alone gives the cdylib
@@ -169,3 +169,12 @@ coverage-html:
 # Uncovered lines, per file. Reuses the last run's profile data.
 coverage-gaps:
 	$(CARGO) llvm-cov report --show-missing-lines
+
+# Verify docs/install-debian.md on a real Debian box. Needs vagrant and a
+# provider; see docs/vagrant.md. Exits non-zero if any documented step fails.
+vagrant-verify:
+	vagrant up
+	vagrant provision --provision-with verify
+
+vagrant-clean:
+	vagrant destroy -f
