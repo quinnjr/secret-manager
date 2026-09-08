@@ -500,8 +500,10 @@ pub async fn update_aliases<E>(
 ///
 /// A free function so the caller can clone `loaded` and `dir` out of the
 /// state guard and run this — which does a blocking `symlink_metadata` per
-/// candidate, in an unbounded loop — with the guard dropped.
-/// [`ServiceState::unique_collection_id`] is this, against its own fields.
+/// candidate, in an unbounded loop — with the guard dropped. There is
+/// deliberately no `&self` method on [`ServiceState`] wrapping this: such a
+/// method could only run with the guard held, which is the shape the lock
+/// rules forbid.
 pub fn unique_collection_id_in(
     dir: &Path,
     loaded: &std::collections::BTreeSet<String>,
@@ -988,16 +990,6 @@ impl ServiceState {
             .map(|(id, v)| (id.clone(), v.clone()))
             .collect()
     }
-
-    /// Path-safe id derived from a label, made unique against loaded
-    /// collections and files.
-    ///
-    /// Blocking: one `symlink_metadata` per candidate. It must not be called
-    /// with the state guard held — [`unique_collection_id_in`] is the same
-    /// thing against cloned-out fields, which is what the create path uses.
-    pub fn unique_collection_id(&self, label: &str) -> String {
-        unique_collection_id_in(&self.vault_dir, &self.loaded_ids(), label)
-    }
 }
 
 #[cfg(test)]
@@ -1105,9 +1097,15 @@ mod tests {
     fn unique_ids_and_counters() {
         let dir = tempfile::tempdir().unwrap();
         let mut st = state(dir.path());
-        assert_eq!(st.unique_collection_id("Work"), "work");
+        assert_eq!(
+            unique_collection_id_in(&st.vault_dir, &st.loaded_ids(), "Work"),
+            "work"
+        );
         std::fs::write(dir.path().join("work.vault"), b"").unwrap();
-        assert_eq!(st.unique_collection_id("Work"), "work_2");
+        assert_eq!(
+            unique_collection_id_in(&st.vault_dir, &st.loaded_ids(), "Work"),
+            "work_2"
+        );
         let first = st.new_session_path().to_string();
         let second = st.new_session_path().to_string();
         assert!(

@@ -497,6 +497,57 @@ async fn watch_clients(conn: Connection, state: Shared) {
     }
 }
 
+/// Reclaim one prompt whose owner left the bus: drop its bookkeeping, abort
+/// its task unless it has already committed, and collect the vaults it opened
+/// for the caller to re-lock.
+///
+/// Called with the state guard held (that is what `&mut ServiceState` means
+/// here), so it only mutates the maps: it takes no second lock and does no
+/// blocking work.
+fn reclaim_prompt(
+    st: &mut ServiceState,
+    p: &str,
+    relock: &mut Vec<(String, Option<crate::dbus::state::VaultRef>)>,
+) {
+    st.prompt_owners.remove(p);
+    let commit = st.prompt_commits.remove(p);
+    if let Some(task) = st.prompt_tasks.remove(p) {
+        // A prompt that has passed its commit gate is doing irreversible work
+        // (unlinking a vault file, re-sealing a collection). Aborting it there
+        // would drop a change the user already confirmed and leave the daemon
+        // disagreeing with the disk, so let it finish; its own `finish` call
+        // completes the prompt exactly once.
+        // An atomic, so this cannot fail and cannot be confused with
+        // contention; a missing gate means the prompt never reached its commit
+        // point, so aborting is safe.
+        let committed = commit
+            .as_ref()
+            .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(false);
+        if committed {
+            tracing::debug!("not aborting prompt {p}: it has already committed");
+        } else {
+            task.abort();
+            // The task's own re-lock branch runs at the end of its loop, which
+            // an abort never reaches. The commit gate is reset per collection,
+            // so a disconnect during a later dialog aborts a task that has
+            // already opened earlier collections; without this they would stay
+            // decrypted in memory with no owner.
+            //
+            // Only the `VaultRef`s are collected here. The caller locks the
+            // vaults themselves after it has dropped the state guard: a
+            // per-collection lock is never awaited under it (see
+            // `state::VaultRef`).
+            if let Some(ids) = st.prompt_unlocked.remove(p) {
+                for id in ids {
+                    let vault = st.vault(&id);
+                    relock.push((id, vault));
+                }
+            }
+        }
+    }
+}
+
 /// One run of the watch, returning when the signal stream ends.
 async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<()> {
     let dbus = zbus::fdo::DBusProxy::new(conn).await?;
@@ -526,44 +577,7 @@ async fn watch_clients_once(conn: &Connection, state: &Shared) -> zbus::Result<(
                 .map(|(p, _)| p.clone())
                 .collect();
             for p in &prompts {
-                st.prompt_owners.remove(p);
-                let commit = st.prompt_commits.remove(p);
-                if let Some(task) = st.prompt_tasks.remove(p) {
-                    // A prompt that has passed its commit gate is doing
-                    // irreversible work (unlinking a vault file, re-sealing a
-                    // collection). Aborting it there would drop a change the
-                    // user already confirmed and leave the daemon disagreeing
-                    // with the disk, so let it finish; its own `finish` call
-                    // completes the prompt exactly once.
-                    // An atomic, so this cannot fail and cannot be confused
-                    // with contention; a missing gate means the prompt never
-                    // reached its commit point, so aborting is safe.
-                    let committed = commit
-                        .as_ref()
-                        .map(|c| c.load(std::sync::atomic::Ordering::Acquire))
-                        .unwrap_or(false);
-                    if committed {
-                        tracing::debug!("not aborting prompt {p}: it has already committed");
-                    } else {
-                        task.abort();
-                        // The task's own re-lock branch runs at the end of
-                        // its loop, which an abort never reaches. The commit
-                        // gate is reset per collection, so a disconnect
-                        // during a later dialog aborts a task that has
-                        // already opened earlier collections; without this
-                        // they would stay decrypted in memory with no owner.
-                        //
-                        // The vaults themselves are locked below, with the
-                        // state guard released: a per-collection lock is
-                        // never awaited under it (see `state::VaultRef`).
-                        if let Some(ids) = st.prompt_unlocked.remove(p) {
-                            for id in ids {
-                                let vault = st.vault(&id);
-                                relock.push((id, vault));
-                            }
-                        }
-                    }
-                }
+                reclaim_prompt(&mut st, p, &mut relock);
             }
             (sessions, prompts)
         };

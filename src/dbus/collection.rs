@@ -142,13 +142,6 @@ pub(crate) fn check_attributes<'a>(
 /// work one message can ask for, not the time the mutex is held.
 pub const MAX_DELETE_ITEMS: usize = 1024;
 
-/// Wire name of the private batch interface. Deliberately *not* under
-/// `org.freedesktop.Secret.*`: the freedesktop spec has no batch delete, and a
-/// libsecret client must keep seeing exactly the spec's methods on
-/// `org.freedesktop.Secret.Collection`. This is a separate interface on the
-/// same object, for this project's own CLI.
-pub const ADMIN_INTERFACE: &str = "org.secret_manager.Collection1";
-
 pub enum CollectionRef {
     Id(String),
     Alias(String),
@@ -485,6 +478,11 @@ impl CollectionAdmin {
     }
 }
 
+/// The private batch interface. Its wire name is deliberately *not* under
+/// `org.freedesktop.Secret.*`: the freedesktop spec has no batch delete, and a
+/// libsecret client must keep seeing exactly the spec's methods on
+/// `org.freedesktop.Secret.Collection`. This is a separate interface on the
+/// same object, for this project's own CLI.
 #[interface(name = "org.secret_manager.Collection1")]
 impl CollectionAdmin {
     /// Delete every item in `items`, or none of them.

@@ -334,7 +334,7 @@ fn normalize_timeout(e: ProtocolError) -> ProtocolError {
 /// Blocking request/response over the control socket, verifying that the
 /// listening peer runs as the current effective uid.
 pub fn call(path: &Path, req: &Request) -> Result<Response, ProtocolError> {
-    call_expecting_uid(path, req, effective_uid())
+    call_inner(path, req, effective_uid(), CALL_TIMEOUT)
 }
 
 /// [`call`] with an explicit overall deadline, for tests.

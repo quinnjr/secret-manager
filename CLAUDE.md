@@ -165,6 +165,8 @@ while a guard is still alive — a `let`-bound one, a `match`/`while let`/`if
 let` scrutinee that locks, or, since the scan does not follow calls, the whole
 body of a helper whose signature takes `&ServiceState`, `&mut ServiceState` or
 the guard itself, which can only have been called with the state held. A
+`&self` method in an `impl ServiceState` is the same thing one position
+further in, and is covered too: `&self` there *is* `&ServiceState`. A
 `&Shared` parameter is not that: it is the lock, not a guard, so locking
 inside it is the intended pattern. That is what a green run cannot establish
 and the next edit could break. Run `cargo fmt` before trusting a failure from

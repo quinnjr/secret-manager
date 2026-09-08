@@ -236,6 +236,16 @@ async fn a_write_stuck_on_one_collection_blocks_nothing_else() {
 ///   silently. Such a function is now a guard region for its whole body,
 ///   exactly as if a guard were bound on its first line. `MutexGuard<'_,
 ///   ServiceState>` taken by value counts too; it is the same object.
+/// * **A `&self` method on `ServiceState`.** The same rule one position
+///   further in, and the position the one above structurally cannot reach: a
+///   receiver has no `name: ty` form to split on. `&self` here *is*
+///   `&ServiceState`, so such a method is only reachable through the guard.
+///   This was a live blind spot, not a theoretical one —
+///   `ServiceState::unique_collection_id` did an unbounded loop of blocking
+///   `symlink_metadata` behind `&self`, wrapping a free function whose own
+///   doc comment said it must run with the guard dropped. It has been
+///   deleted; this rule is what stops the next one. `self` by value is not
+///   included: it consumes the state and so cannot be behind a guard.
 ///
 /// A `&Shared` parameter is deliberately *not* treated this way. [`Shared`]
 /// is `Arc<Mutex<ServiceState>>` — the lock, not a guard — so a function
@@ -263,12 +273,14 @@ fn no_source_file_acquires_a_lock_while_holding_one() {
     let mut offences: Vec<String> = Vec::new();
     let mut guards_seen = 0usize;
     let mut state_params_seen = 0usize;
+    let mut self_methods_seen = 0usize;
     for file in &files {
         let text = std::fs::read_to_string(file).unwrap();
         let name = file.strip_prefix(root).unwrap().display().to_string();
         let found = scan(&name, &text);
         guards_seen += found.guards;
         state_params_seen += found.state_params;
+        self_methods_seen += found.self_methods;
         offences.extend(found.offences);
     }
     assert!(
@@ -277,13 +289,22 @@ fn no_source_file_acquires_a_lock_while_holding_one() {
          looking at what it thinks it is"
     );
     // `CollectionAdmin::id` and `Collection::id` in `src/dbus/collection.rs`
-    // are the live examples, and the shape the declined `reclaim_prompt`
-    // extraction would have added a third of. If this ever reads zero the
-    // helper rule has stopped matching and is proving nothing.
+    // are the live examples, joined by `daemon::reclaim_prompt` — an
+    // extraction that was refused until this rule existed to watch it. If this
+    // ever reads zero the helper rule has stopped matching and is proving
+    // nothing.
     assert!(
-        state_params_seen >= 2,
+        state_params_seen >= 3,
         "the scan recognised only {state_params_seen} functions taking the \
          state by reference, so that rule is no longer matching the tree"
+    );
+    // `ServiceState`'s own accessors — `vault`, `all_vaults`, `resolve_path`
+    // and the rest. There are many; a low reading means the `impl` detection
+    // has stopped matching, not that the methods went away.
+    assert!(
+        self_methods_seen >= 10,
+        "the scan recognised only {self_methods_seen} `&self` methods on \
+         `ServiceState`, so that rule is no longer matching the tree"
     );
     assert!(
         offences.is_empty(),
@@ -399,6 +420,26 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
             "fn reclaim(st: &mut ServiceState) {\n    if st.dirty {\n        \
              file.sync_all()?;\n    }\n}\n",
         ),
+        // The shape `ServiceState::unique_collection_id` actually had before
+        // it was deleted: an unbounded loop of blocking `symlink_metadata`,
+        // reachable only through the guard, in the one position the
+        // `&ServiceState`-parameter rule structurally cannot see.
+        (
+            "blocking I/O in a `&self` method on `ServiceState`",
+            "impl ServiceState {\n    fn unique(&self, label: &str) -> String {\n        \
+             for n in 1.. {\n            if self.dir.join(n).symlink_metadata().is_err() {\n \
+             break;\n            }\n        }\n    }\n}\n",
+        ),
+        (
+            "a lock taken in a `&mut self` method on `ServiceState`",
+            "impl ServiceState {\n    async fn f(&mut self) {\n        \
+             let v = vault.lock().await;\n    }\n}\n",
+        ),
+        (
+            "a `&self` method on `ServiceState` reached through a trait impl",
+            "impl fmt::Debug for ServiceState {\n    fn fmt(&self, f: &mut Formatter) {\n        \
+             file.sync_all()?;\n    }\n}\n",
+        ),
     ];
     for (what, src) in offending {
         let found = scan("synthetic.rs", src);
@@ -458,6 +499,30 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              let v = vault.try_lock();\n}\n",
         ),
         (
+            "a `&self` method on some other type, which is not the state",
+            "impl Vault {\n    fn save(&self) {\n        file.sync_all()?;\n    }\n}\n",
+        ),
+        (
+            "an associated function on `ServiceState` with no receiver",
+            "impl ServiceState {\n    fn load(dir: &Path) -> Self {\n        \
+             file.sync_all()?;\n    }\n}\n",
+        ),
+        (
+            "a `self`-by-value method, which cannot be behind a guard",
+            "impl ServiceState {\n    fn into_parts(self) -> Parts {\n        \
+             file.sync_all()?;\n    }\n}\n",
+        ),
+        (
+            "a free function after the `impl ServiceState` block has closed",
+            "impl ServiceState {\n    fn id(&self) -> u32 {\n        0\n    }\n}\n\
+             fn helper(p: &Path) {\n    file.sync_all()?;\n}\n",
+        ),
+        (
+            "`block_in_place` inside a `&self` method on `ServiceState`",
+            "impl ServiceState {\n    fn save(&self) {\n        \
+             block_in_place(|| file.sync_all())?;\n    }\n}\n",
+        ),
+        (
             // Exactly the shape of the declined `reclaim_prompt` extraction
             // from `src/daemon.rs`: map surgery on state already held. This
             // must stay clean or the rule above forbids the extraction rather
@@ -514,6 +579,9 @@ struct Scan {
     /// itself. Counted separately so the real-tree test can assert the rule is
     /// live and not matching nothing.
     state_params: usize,
+    /// `&self` methods in an `impl ServiceState`, treated as a guard region
+    /// for the same reason and counted for the same reason.
+    self_methods: usize,
 }
 
 /// Anything that yields a guard whose lifetime is the binding's. `.lock()` is
@@ -539,6 +607,9 @@ const BLOCKING: &[&str] = &[
     "create_dir_all",
     "std::fs::",
     "fs::rename",
+    // A `stat`. One is cheap; `unique_collection_id_in` does an unbounded
+    // number of them in a loop, which is the shape the rule above exists for.
+    "symlink_metadata",
 ];
 
 /// The sanctioned escape hatch. `CLAUDE.md` requires a vault mutation and the
@@ -570,6 +641,9 @@ fn scan(name: &str, text: &str) -> Scan {
     let mut offences: Vec<String> = Vec::new();
     let mut guards = 0usize;
     let mut state_params = 0usize;
+    let mut self_methods = 0usize;
+    // Brace depths at which an `impl ServiceState` block is currently open.
+    let mut state_impl: Vec<usize> = Vec::new();
     // Held guards, as (binding name, brace depth of the block they live in).
     // Depth is what ends a region; `drop(name)` ends one early.
     let mut held: Vec<(String, usize)> = Vec::new();
@@ -611,6 +685,7 @@ fn scan(name: &str, text: &str) -> Scan {
         // that opens a block exempts everything inside it, for as long as it
         // is open.
         let opens_exemption = code.contains(EXEMPT);
+        let opens_state_impl = opens_state_impl(&code);
         let entry_depth = depth;
         for ch in code.chars() {
             match ch {
@@ -619,11 +694,15 @@ fn scan(name: &str, text: &str) -> Scan {
                     if opens_exemption && depth == entry_depth + 1 {
                         blocking_ok.push(entry_depth);
                     }
+                    if opens_state_impl && depth == entry_depth + 1 {
+                        state_impl.push(entry_depth);
+                    }
                 }
                 '}' => {
                     depth = depth.saturating_sub(1);
                     held.retain(|(_, d)| *d <= depth);
                     blocking_ok.retain(|d| *d < depth);
+                    state_impl.retain(|d| *d < depth);
                 }
                 _ => {}
             }
@@ -642,12 +721,70 @@ fn scan(name: &str, text: &str) -> Scan {
             state_params += 1;
             held.push((p, depth));
         }
+        // The same rule one position further in. A `&self` method on
+        // `ServiceState` can only be reached through the guard, because
+        // `&ServiceState` cannot be produced any other way — but a receiver
+        // has no `name: ty` form, so `state_param` structurally cannot see it.
+        if !state_impl.is_empty() && has_self_receiver(&code) {
+            self_methods += 1;
+            held.push(("self".to_string(), depth));
+        }
     }
     Scan {
         offences,
         guards,
         state_params,
+        self_methods,
     }
+}
+
+/// Whether a line opens an inherent `impl ServiceState` block. A trait impl
+/// (`impl Debug for ServiceState`) is deliberately included: its methods reach
+/// the state through the same `&self`, so they are under the guard too.
+fn opens_state_impl(code: &str) -> bool {
+    let Some(rest) = code.trim_start().strip_prefix("impl") else {
+        return false;
+    };
+    if !rest.starts_with(|c: char| c.is_whitespace() || c == '<') {
+        return false;
+    }
+    // The implementing type is what follows `for` in a trait impl, and the
+    // whole tail otherwise.
+    let target = rest.rsplit_once(" for ").map(|(_, t)| t).unwrap_or(rest);
+    let target = target.split('{').next().unwrap_or(target).trim();
+    let target = target.rsplit("::").next().unwrap_or(target);
+    let head = target.trim_end_matches(|c: char| c.is_whitespace());
+    let head = head.split(['<', ' ']).next().unwrap_or(head);
+    head == "ServiceState"
+}
+
+/// Whether a signature's first parameter is a `self` receiver taken by
+/// reference. `self` by value consumes the state and cannot happen behind a
+/// guard, so it is not one.
+fn has_self_receiver(code: &str) -> bool {
+    let Some(open) = code
+        .find("fn ")
+        .and_then(|i| code[i..].find('(').map(|j| i + j))
+    else {
+        return false;
+    };
+    let rest = code[open + 1..].trim_start();
+    let rest = match rest.strip_prefix('&') {
+        Some(r) => r.trim_start(),
+        None => return false,
+    };
+    // `&'a self` / `&'a mut self`.
+    let rest = match rest.strip_prefix('\'') {
+        Some(r) => r
+            .trim_start_matches(|c: char| c.is_alphanumeric() || c == '_')
+            .trim_start(),
+        None => rest,
+    };
+    let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+    let Some(tail) = rest.strip_prefix("self") else {
+        return false;
+    };
+    !tail.starts_with(|c: char| c.is_alphanumeric() || c == '_')
 }
 
 /// Physical lines joined into logical ones: a line whose first non-space
