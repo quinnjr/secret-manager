@@ -1080,3 +1080,57 @@ it can queue behind a save.
 
 525 tests pass. Clippy clean at `-D warnings` for the default and `pam`
 builds; `cargo fmt --check` clean.
+
+---
+
+# The alias asymmetry — 2026-09-07
+
+A corrupt `<id>.vault` was tolerated: it became a permanently locked
+collection carrying its error, and the daemon carried on. A corrupt
+`aliases.toml` propagated out of `scan_vault_dir` and **refused to start the
+daemon at all** — so the file holding nothing but convenience mappings was
+the one that could take the service down, and anything that truncated it (a
+backup tool, a full disk, a hand edit) took the keyring with it. Making the
+write atomic removed the daemon's own ability to create that state; it did
+nothing about anyone else's.
+
+The two are now symmetric. The daemon starts, and the alias table is
+**unusable rather than silently empty** — which is the distinction that
+matters:
+
+- `ReadAlias` returns an error, not `/`. `/` means "no such alias", and
+  answering that would invite a client to claim a name the user already owns.
+- `SetAlias` refuses, and `ServiceState::save_aliases` refuses as a backstop.
+  Writing would replace a file the operator may still be able to repair with
+  one built from the empty table we fell back to, turning a recoverable parse
+  error into silent data loss.
+- Alias resolution yields nothing, so no path silently reaches a different
+  collection than the caller meant.
+- `Status` carries the reason and `sm status` prints it, since the daemon no
+  longer announces the problem by failing to start. That needed a new field on
+  `Response::Status`, so `PROTOCOL_VERSION` is 4.
+- Repairing or deleting the file and reloading clears the condition.
+
+The three unit tests were confirmed red against the old propagation. Two
+existing tests were rewritten because they pinned the old contract, and both
+are called out: `reload_reports_a_vault_directory_it_cannot_scan` used a
+malformed alias file as its second route into the failure arm, and the
+protocol test pinned `PROTOCOL_VERSION == 3`. That version pin is kept rather
+than dropped — the wire format and the version have to move together, and it
+should fail loudly when only one of them does.
+
+## A note on the PAM stack tests
+
+The version bump made all five `tests/pam_stack.rs` tests fail, because they
+`dlopen` a prebuilt cdylib and the one on disk still spoke v3. The version
+check was working exactly as intended across a real skew, but the symptom —
+"the password stashed by `pam_sm_authenticate` did not reach
+`pam_sm_open_session`" — is a genuine bug's message, and it sends you looking
+in the wrong place. The suite now compares the module's mtime against the
+newest file in `src/` and skips with an explicit "run `make build`" rather
+than failing as though the round trip were broken.
+
+## State
+
+528 tests pass, twice over. Clippy clean at `-D warnings` for the default and
+`pam` builds; `cargo fmt --check` clean.

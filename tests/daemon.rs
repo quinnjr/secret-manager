@@ -647,20 +647,42 @@ async fn reload_reports_a_vault_directory_it_cannot_scan() {
         "a failed scan must not discard the collections already loaded"
     );
 
-    // Same arm by a different route: the alias file is read as part of the
-    // scan, and one that does not parse fails the whole scan.
+    // An unparseable alias file, by contrast, must *not* fail the scan.
+    //
+    // This half of the test used to assert the opposite, and that was the
+    // asymmetry: a corrupt vault became a permanently locked collection and
+    // the daemon carried on, while a corrupt `aliases.toml` — a file holding
+    // nothing but convenience mappings — refused the reload and, at startup,
+    // refused to run at all. Anything that truncated it took the service
+    // down. It is now reported instead, and the table is unusable rather than
+    // silently empty.
     std::fs::remove_file(&dir).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("default.vault"), &saved).unwrap();
     std::fs::write(dir.join("aliases.toml"), b"aliases = 5\n").unwrap();
-    assert!(matches!(
-        control(&fx, Request::Reload).await,
-        Response::Error(_)
-    ));
-    assert!(still_loaded(control(&fx, Request::Status).await));
+    assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
+    match control(&fx, Request::Status).await {
+        Response::Status {
+            collections,
+            aliases_error,
+            ..
+        } => {
+            assert!(collections.iter().any(|c| c.id == "default"));
+            assert!(
+                aliases_error.is_some(),
+                "a corrupt alias table must be reported, not passed off as empty"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 
+    // Repairing it clears the condition.
     std::fs::remove_file(dir.join("aliases.toml")).unwrap();
     assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
+    match control(&fx, Request::Status).await {
+        Response::Status { aliases_error, .. } => assert!(aliases_error.is_none()),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// SIGTERM must end `run_until_shutdown` and take the daemon's resources with

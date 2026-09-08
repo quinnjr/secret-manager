@@ -173,6 +173,11 @@ impl Service {
 
     async fn read_alias(&self, name: &str) -> Result<OwnedObjectPath> {
         let st = self.state.lock().await;
+        // `/` means "no such alias", which would invite a client to claim the
+        // name. An unreadable table is a different thing and has to say so.
+        if let Some(e) = st.aliases_unusable() {
+            return Err(Error::failed(format!("alias table is unreadable: {e}")));
+        }
         Ok(st
             .alias_target(name)
             .map(|id| paths::collection(&id))
@@ -294,6 +299,11 @@ impl Service {
                     .ok_or(Error::NoSuchObject)?;
                 // Repointing an existing alias is always allowed; only a new
                 // entry can grow the table.
+                if let Some(e) = st.aliases_unusable() {
+                    return Err(Error::failed(format!(
+                        "alias table is unreadable ({e}); refusing to replace it"
+                    )));
+                }
                 if !st.aliases.contains_key(name) && st.aliases.len() >= MAX_ALIASES {
                     return Err(Error::failed(format!(
                         "too many aliases; at most {MAX_ALIASES}"

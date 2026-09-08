@@ -526,6 +526,7 @@ fn a_collection_warning_from_the_control_socket_is_escaped() {
     let server = serve_one_control_reply(
         runtime.path(),
         Response::Status {
+            aliases_error: None,
             collections: vec![CollectionStatus {
                 id: "ev\ril".into(),
                 label: "lab\u{1b}[2Kel".into(),

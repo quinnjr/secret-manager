@@ -2678,6 +2678,7 @@ mod tests {
         let server = fake_daemon_answering(
             &sock,
             Response::Status {
+                aliases_error: None,
                 collections: vec![crate::protocol::CollectionStatus {
                     id: "default".into(),
                     label: "\u{202e}forged label".into(),
@@ -2699,6 +2700,7 @@ mod tests {
         server.join().unwrap();
         assert_eq!(
             Response::Status {
+                aliases_error: None,
                 collections: Vec::new(),
                 uptime_secs: 0,
             }

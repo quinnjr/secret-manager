@@ -92,6 +92,17 @@ pub struct ServiceState {
     /// `broken_error`.
     pub broken: BTreeMap<String, (PathBuf, String)>,
     pub aliases: BTreeMap<String, String>,
+    /// Set when `aliases.toml` exists but could not be parsed.
+    ///
+    /// A corrupt vault file has always been tolerated — it becomes a
+    /// permanently locked collection carrying its error — while a corrupt
+    /// alias file refused to start the daemon at all, so the least valuable
+    /// file in the directory was the one that could brick it. This makes the
+    /// two symmetric: the daemon starts, the aliases are *unusable* rather
+    /// than silently empty, and every alias operation refuses while it is
+    /// set. Nothing rewrites the file in that state, because the operator may
+    /// still want to recover it.
+    pub alias_error: Option<String>,
     /// session object path -> entry
     pub sessions: BTreeMap<String, SessionEntry>,
     /// prompt object path -> owner unique bus name
@@ -198,6 +209,8 @@ pub struct VaultScan {
     pub opened: Vec<(String, Vault)>,
     pub broken: Vec<(String, PathBuf, String)>,
     pub aliases: BTreeMap<String, String>,
+    /// See [`ServiceState::alias_error`].
+    pub alias_error: Option<String>,
     pub seen: std::collections::BTreeSet<String>,
 }
 
@@ -217,6 +230,7 @@ pub fn scan_vault_dir(
         opened: Vec::new(),
         broken: Vec::new(),
         aliases: BTreeMap::new(),
+        alias_error: None,
         seen: std::collections::BTreeSet::new(),
     };
     for entry in std::fs::read_dir(dir)? {
@@ -246,7 +260,21 @@ pub fn scan_vault_dir(
             }
         }
     }
-    scan.aliases = load_aliases(dir)?;
+    // Tolerated exactly as a corrupt vault file is, and for the same reason:
+    // refusing to start leaves the user with no daemon at all over a file that
+    // holds nothing but convenience mappings, and anything that truncates it —
+    // a backup tool, a full disk, a hand edit — would take the service down.
+    match load_aliases(dir) {
+        Ok(aliases) => scan.aliases = aliases,
+        Err(e) => {
+            tracing::error!(
+                "{} could not be read ({e}); alias lookups will refuse until it is \
+                 repaired or removed, and nothing will overwrite it meanwhile",
+                dir.join(ALIAS_FILE).display()
+            );
+            scan.alias_error = Some(e.to_string());
+        }
+    }
     Ok(scan)
 }
 
@@ -374,6 +402,7 @@ impl ServiceState {
             collections: BTreeMap::new(),
             broken: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            alias_error: None,
             sessions: BTreeMap::new(),
             prompt_owners: BTreeMap::new(),
             prompt_tasks: BTreeMap::new(),
@@ -433,6 +462,7 @@ impl ServiceState {
         // being advertised as a locked collection.
         self.broken.retain(|id, _| scan.seen.contains(id));
         self.aliases = scan.aliases;
+        self.alias_error = scan.alias_error;
         new_ids
     }
 
@@ -443,7 +473,22 @@ impl ServiceState {
         self.broken.get(id).map(|(_, e)| e.as_str())
     }
 
+    /// Why the alias table cannot be used, when it cannot.
+    pub fn aliases_unusable(&self) -> Option<&str> {
+        self.alias_error.as_deref()
+    }
+
     pub fn save_aliases(&self) -> std::io::Result<()> {
+        // Writing here would replace a file the operator may still be able to
+        // repair with one built from the empty table we fell back to, turning
+        // a recoverable parse error into silent data loss. The callers refuse
+        // first; this is the backstop.
+        if let Some(e) = self.aliases_unusable() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("refusing to overwrite an unreadable alias table: {e}"),
+            ));
+        }
         save_aliases_to(&self.vault_dir, &self.aliases)
     }
 
@@ -793,6 +838,92 @@ mod tests {
         std::fs::create_dir(dir.path().join(ALIAS_FILE)).unwrap();
         let err = load_aliases(dir.path()).unwrap_err();
         assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    }
+
+    /// A corrupt alias file must not stop the daemon, and must not be
+    /// silently treated as "no aliases" either.
+    ///
+    /// It used to propagate out of `scan_vault_dir` and refuse startup, while
+    /// a corrupt *vault* was tolerated as a permanently locked collection —
+    /// so the file holding nothing but convenience mappings was the one that
+    /// could brick the service, and anything that truncated it (a backup
+    /// tool, a full disk, a hand edit) took the daemon down with it.
+    #[test]
+    fn a_corrupt_alias_file_degrades_instead_of_refusing_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        Vault::create(
+            &dir.path().join("default.vault"),
+            "Default",
+            b"pw",
+            KdfParams::FAST_FOR_TESTS,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(ALIAS_FILE), b"this is = = not toml").unwrap();
+
+        let scan = scan_vault_dir(dir.path(), true, &Default::default())
+            .expect("a corrupt alias file must not fail the scan");
+        assert_eq!(scan.opened.len(), 1, "the vault still loads");
+        assert!(scan.aliases.is_empty());
+        let reason = scan.alias_error.as_deref().expect("the reason is recorded");
+        assert!(!reason.is_empty());
+
+        let mut st = state(dir.path());
+        st.load_vaults().expect("the daemon still starts");
+        assert!(st.collections.contains_key("default"));
+        assert_eq!(st.aliases_unusable(), Some(reason));
+
+        // Unusable, not empty: nothing resolves, so no client is told a name
+        // is free and invited to claim it.
+        assert_eq!(st.alias_target("default"), None);
+    }
+
+    /// The file the operator still needs must not be replaced by one built
+    /// from the empty table we fell back to.
+    #[test]
+    fn a_degraded_alias_table_is_never_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(ALIAS_FILE);
+        let corrupt = b"aliases = \"not a table\"";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let mut st = state(dir.path());
+        st.load_vaults().unwrap();
+        assert!(st.aliases_unusable().is_some());
+
+        let err = st.save_aliases().expect_err("must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            corrupt,
+            "the unreadable file was overwritten"
+        );
+    }
+
+    /// Repairing the file and reloading clears the condition.
+    #[test]
+    fn repairing_the_alias_file_restores_it_on_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ALIAS_FILE), b"not toml at all =").unwrap();
+        let mut st = state(dir.path());
+        st.load_vaults().unwrap();
+        assert!(st.aliases_unusable().is_some());
+
+        Vault::create(
+            &dir.path().join("work.vault"),
+            "Work",
+            b"pw",
+            KdfParams::FAST_FOR_TESTS,
+        )
+        .unwrap();
+        save_aliases_to(
+            dir.path(),
+            &BTreeMap::from([("default".to_string(), "work".to_string())]),
+        )
+        .unwrap();
+
+        st.load_vaults().unwrap();
+        assert_eq!(st.aliases_unusable(), None, "the condition must clear");
+        assert_eq!(st.alias_target("default"), Some("work".to_string()));
     }
 
     /// A vault directory that cannot be scanned must fail `load_vaults`

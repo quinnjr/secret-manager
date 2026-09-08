@@ -154,6 +154,7 @@ pub fn status() -> Result<(), CliError> {
         Response::Status {
             collections,
             uptime_secs,
+            aliases_error,
         } => {
             println!("daemon up {}s", uptime_secs);
             println!("{:<16} {:<24} {:<9} ITEMS", "ID", "LABEL", "STATE");
@@ -172,6 +173,18 @@ pub fn status() -> Result<(), CliError> {
                 if let Some(w) = &c.warning {
                     println_warning(&c.id, w);
                 }
+            }
+            // The daemon starts without a usable alias table rather than
+            // refusing to run, so this is the only place the operator is told
+            // that alias lookups are refusing and the file is waiting to be
+            // repaired.
+            if let Some(e) = &aliases_error {
+                eprintln!(
+                    "secret-manager: the alias table is unreadable ({}); \
+                     alias lookups are refused and nothing will overwrite it. \
+                     Repair or delete aliases.toml, then run `sm reload`.",
+                    escape_control(e)
+                );
             }
             Ok(())
         }
