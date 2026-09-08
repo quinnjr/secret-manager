@@ -2500,3 +2500,106 @@ async fn a_collection_is_created_even_when_its_alias_cannot_be_recorded() {
     );
     assert!(service.read_alias("work").await.is_err());
 }
+
+/// An over-long label is refused before a prompt is ever raised.
+///
+/// `Vault::build` caps the label too, but that check is reached only after the
+/// user has been shown a pinentry dialog and typed a password — and the client
+/// is then told the prompt was *dismissed*, which is not what happened. The cap
+/// belongs in front of the consent, not behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_label_is_refused_before_any_prompt() {
+    let fx = Fixture::start_with_pin(Some("newpw")).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let too_long = "x".repeat(secret_manager::vault::format::MAX_LABEL + 1);
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from(too_long),
+    )]);
+
+    let err = service.create_collection(props, "").await.unwrap_err();
+    assert_eq!(error_name(&err), "org.freedesktop.DBus.Error.InvalidArgs");
+
+    // No dialog, and no prompt object left outstanding: the refusal happened
+    // before either existed.
+    assert_eq!(
+        fx.pinentry_log().matches("GETPIN").count(),
+        0,
+        "a refused label must not raise a dialog:\n{}",
+        fx.pinentry_log()
+    );
+    assert!(fx.daemon.state.lock().await.prompt_owners.is_empty());
+
+    // Exactly at the limit is still accepted, so the bound is a ceiling rather
+    // than a tightening.
+    let at_limit = "y".repeat(secret_manager::vault::format::MAX_LABEL);
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from(at_limit),
+    )]);
+    let (_, prompt) = service.create_collection(props, "").await.unwrap();
+    assert_ne!(prompt.as_str(), "/", "the at-limit label was refused too");
+}
+
+/// The alias-count cap holds on the `CreateCollection` path too, not just on
+/// `SetAlias` — and a full table costs the user their collection's alias, not
+/// the collection.
+///
+/// The cap was enforced in `Service::set_alias` only, while the prompt path
+/// inserted unconditionally. `MAX_ALIAS_BYTES` derives its own sizing from
+/// `MAX_ALIASES` holding, so a bypass there undermines the file-size bound as
+/// well as the count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_alias_cap_holds_on_the_create_collection_path() {
+    let fx = Fixture::start_with_pin(Some("newpw")).await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    // Fill the table *to* the cap. The fixture already ships a `default`
+    // alias, so top up from whatever is there rather than assuming empty.
+    let target = fx.default_collection();
+    let already = fx.daemon.state.lock().await.aliases.known().len();
+    for n in already..secret_manager::dbus::service::MAX_ALIASES {
+        service
+            .set_alias(&format!("filler_{n}"), &target)
+            .await
+            .unwrap_or_else(|e| panic!("filler {n} refused: {e}"));
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.aliases.known().len(),
+        secret_manager::dbus::service::MAX_ALIASES
+    );
+
+    // Creating a collection with a *new* alias now succeeds as a collection
+    // and declines the alias, rather than growing the table past its cap.
+    let props = HashMap::from([(
+        "org.freedesktop.Secret.Collection.Label",
+        Value::from("Overflow"),
+    )]);
+    let (_, prompt) = service
+        .create_collection(props, "one_too_many")
+        .await
+        .unwrap();
+    let (dismissed, result) = perform(&conn, &prompt).await;
+    assert!(!dismissed, "the collection itself must still be created");
+    let created = OwnedObjectPath::try_from(result).unwrap();
+    assert_ne!(created.as_str(), "/");
+
+    let st = fx.daemon.state.lock().await;
+    assert_eq!(
+        st.aliases.known().len(),
+        secret_manager::dbus::service::MAX_ALIASES,
+        "the table grew past its cap"
+    );
+    assert!(!st.aliases.known().contains_key("one_too_many"));
+    drop(st);
+
+    // Repointing a name that already exists is still allowed at a full table
+    // — the cap counts new names, not writes. (`already` is where the fill
+    // started, so that is the first name this test created.)
+    service
+        .set_alias(&format!("filler_{already}"), &created)
+        .await
+        .unwrap();
+}

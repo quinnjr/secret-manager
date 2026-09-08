@@ -331,26 +331,37 @@ async fn get_warns_when_more_than_one_item_matches() {
 }
 
 /// MEDIUM 2: stdin is capped, so `sm set < /dev/zero` cannot exhaust memory.
+///
+/// Every size and the expected message are derived from `MAX_SECRET`, which is
+/// itself derived from the control protocol's `MAX_FRAME`. They used to be the
+/// literals `1 << 20` and `"exceeds 1 MiB"`, which pinned a number the code no
+/// longer had to agree with: moving `MAX_FRAME` would have made the message
+/// wrong and left this test asserting the stale string. The assertions are the
+/// same ones -- one byte over is refused with exit 2 and a message naming the
+/// cap, exactly the cap is accepted -- just no longer spelled out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn set_rejects_an_oversized_secret() {
+    use secret_manager::cli::MAX_SECRET;
+    let too_big = predicate::str::contains(format!("exceeds {MAX_SECRET} bytes"));
+
     let fx = Fixture::start().await;
     fx.unlock_default().await;
     fx.sm()
         .args(["set", "big=1", "--label", "big"])
-        .write_stdin(vec![b'x'; (1 << 20) + 1])
+        .write_stdin(vec![b'x'; MAX_SECRET + 1])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("exceeds 1 MiB"));
+        .stderr(too_big.clone());
     // Exactly at the limit still works.
     fx.sm()
         .args(["set", "big=1", "--label", "big"])
-        .write_stdin(vec![b'x'; 1 << 20])
+        .write_stdin(vec![b'x'; MAX_SECRET])
         .assert()
         .success();
     // LOW: the trailing newline is a delimiter, not part of the secret, so it
     // must be dropped *before* the size check. `printf '%s\n'` of a 1 MiB
     // secret is a 1 MiB secret.
-    let mut with_newline = vec![b'x'; 1 << 20];
+    let mut with_newline = vec![b'x'; MAX_SECRET];
     with_newline.push(b'\n');
     fx.sm()
         .args(["set", "big=2", "--label", "big2"])
@@ -362,17 +373,17 @@ async fn set_rejects_an_oversized_secret() {
         .assert()
         .success()
         .stdout(predicate::function(|o: &[u8]| {
-            o.len() == (1 << 20) && o.iter().all(|b| *b == b'x')
+            o.len() == MAX_SECRET && o.iter().all(|b| *b == b'x')
         }));
     // One byte past the limit *plus* a newline is still too big.
-    let mut oversized = vec![b'x'; (1 << 20) + 1];
+    let mut oversized = vec![b'x'; MAX_SECRET + 1];
     oversized.push(b'\n');
     fx.sm()
         .args(["set", "big=3", "--label", "big3"])
         .write_stdin(oversized)
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("exceeds 1 MiB"));
+        .stderr(too_big);
 }
 
 /// LOW 1: control characters in a label or an attribute value must not reach
@@ -429,12 +440,21 @@ async fn list_escapes_control_characters() {
 /// wall clock, so the deadline is shortened through the `test-util` feature
 /// (`SM_CONNECT_TIMEOUT_MS`), the same mechanism `KdfParams::FAST_FOR_TESTS`
 /// uses. Nothing we ship enables that feature, so the shipped deadline stays
-/// 10 s — which is what the message the user sees still says.
+/// 10 s.
+///
+/// The message names the deadline it actually waited, so the expectation is
+/// derived from the same override rather than spelled out: it used to assert
+/// the literal "within 10 s" against a run that waited 500 ms, which is the
+/// mismatch that made the message worth interpolating in the first place.
 #[test]
 fn a_session_bus_that_accepts_and_never_answers_is_unreachable() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    /// The deadline this run actually waits, and so the one the message must
+    /// name.
+    const SHORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("silent-bus");
@@ -470,15 +490,18 @@ fn a_session_bus_that_accepts_and_never_answers_is_unreachable() {
             "DBUS_SESSION_BUS_ADDRESS",
             format!("unix:path={}", sock.display()),
         )
-        .env("SM_CONNECT_TIMEOUT_MS", "500")
+        .env(
+            "SM_CONNECT_TIMEOUT_MS",
+            SHORT_CONNECT_TIMEOUT.as_millis().to_string(),
+        )
         .args(["get", "a=b"])
         .assert()
         // Exit 3, not 1: a script must be able to tell "the bus is not
         // answering" from "no such secret".
         .code(3)
-        .stderr(predicate::str::contains(
-            "session bus did not answer within 10 s",
-        ));
+        .stderr(predicate::str::contains(format!(
+            "session bus did not answer within {SHORT_CONNECT_TIMEOUT:?}"
+        )));
     let elapsed = started.elapsed();
 
     stop.store(true, Ordering::Relaxed);

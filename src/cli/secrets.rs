@@ -11,7 +11,8 @@ use super::{CliError, read_secret_from_stdin};
 // already refused to hide. Found by `fuzz_targets/escape_control_sanitize.rs`
 // on U+F0000; keeping one table is what stops the two drifting again.
 use crate::dbus::prompt::is_invisible_format;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::io::Write;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -73,7 +74,11 @@ pub(crate) const INCOMPLETE_UNLOCK: &str = "could not unlock every match; nothin
 /// opened, listing only the paths that actually unlocked, so an `Ok` result is
 /// not by itself proof that the whole set is reachable.
 fn covers_all(items: &[OwnedObjectPath], locked: &[OwnedObjectPath]) -> bool {
-    locked.iter().all(|p| items.contains(p))
+    // Both slices are `SearchItems` results, so their length is bounded only
+    // by how many items exist: the membership test is built once rather than
+    // rescanned per locked path.
+    let have: HashSet<&OwnedObjectPath> = items.iter().collect();
+    locked.iter().all(|p| have.contains(p))
 }
 
 async fn find_inner(
@@ -103,10 +108,15 @@ async fn find_inner(
 /// the invisible formatters above, becomes `\xNN` per UTF-8 byte.
 pub(crate) fn escape_control(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    let mut scratch = [0u8; 4];
     for ch in s.chars() {
         if ch.is_control() || is_invisible_format(ch) {
-            for b in ch.to_string().into_bytes() {
-                out.push_str(&format!("\\x{b:02x}"));
+            // `write!` into the buffer we already have: this runs per
+            // attribute key and value per `sm list` row, and on every daemon
+            // error, so the old `ch.to_string()` plus a `format!` per byte was
+            // two allocations for every escaped byte.
+            for b in ch.encode_utf8(&mut scratch).as_bytes() {
+                let _ = write!(out, "\\x{b:02x}");
             }
         } else {
             out.push(ch);

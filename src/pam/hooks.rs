@@ -4,10 +4,10 @@
 //! There is deliberately no logic here. Each hook pulls its inputs out of the
 //! `PamHandle`, hands them to the matching `*_decision` function in the parent
 //! module, and turns the outcome back into a `PamError`. Everything that
-//! decides anything — the order of the checks, the budget guards, when the
-//! stashed password is cleared — lives in the parent module, which compiles
-//! and is tested without `pamsm`, so a plain `cargo test` exercises it. This
-//! file exists only in the `cdylib` PAM actually loads.
+//! decides anything — the order of the checks, the budget guards, whether the
+//! session hook still has a stash to clear — lives in the parent module, which
+//! compiles and is tested without `pamsm`, so a plain `cargo test` exercises
+//! it. This file exists only in the `cdylib` PAM actually loads.
 
 use super::{
     AuthOutcome, Budget, HOOK_BUDGET, Options, PAM_PRELIM_CHECK, Target, authenticate_decision,
@@ -15,6 +15,7 @@ use super::{
 };
 use crate::protocol::Zeroizing;
 use pamsm::{Pam, PamData, PamError, PamFlags, PamLibExt, PamServiceModule, pam_module};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 const DATA_KEY: &str = "secret_manager_password";
 
@@ -40,6 +41,34 @@ fn clear_stashed_password(pamh: &Pam) {
     // SAFETY: DATA_KEY is only ever paired with `Password` in send_data/retrieve_data.
     if let Err(e) = unsafe { pamh.send_data(DATA_KEY, Password(Zeroizing::new(String::new()))) } {
         log(&format!("cannot clear the stashed password: {e}"));
+    }
+}
+
+/// Clears the stash when it leaves scope, so a hook that returns *and* a hook
+/// that panics both reach the clear.
+///
+/// `guard` catches the unwind and turns it into `PAM_SUCCESS`, which used to
+/// mean the panic path returned to libpam with the login password still in PAM
+/// data for the rest of the transaction. A destructor runs during that unwind;
+/// the explicit call sites do not.
+///
+/// `armed` is what `SessionOutcome::clears_stash` answers: `open_session`
+/// disarms it on the one path where there was nothing stashed to clear.
+struct ClearStash<'a> {
+    pamh: &'a Pam,
+    armed: bool,
+}
+
+impl Drop for ClearStash<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // A panic escaping a destructor that is itself running during an
+        // unwind aborts the process — and the process here is `sshd`, `login`
+        // or `passwd`. Swallow it: this is already the "something went wrong"
+        // path, and there is nothing left to clean up after.
+        let _ = catch_unwind(AssertUnwindSafe(|| clear_stashed_password(self.pamh)));
     }
 }
 
@@ -70,6 +99,12 @@ impl PamServiceModule for PamSecretManager {
 
     fn open_session(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
         guard("open_session", PamError::SUCCESS, || {
+            // Armed before anything that can panic, so the stash goes even if
+            // one of the stages below unwinds into `guard`.
+            let mut clear = ClearStash {
+                pamh: &pamh,
+                armed: true,
+            };
             // Every stage below is serial and attacker-influenced; without one
             // deadline over the lot they sum to half a minute of login latency
             // the user being logged in gets to choose.
@@ -90,15 +125,22 @@ impl PamServiceModule for PamSecretManager {
                 },
             );
             drop(stashed);
-            if outcome.clears_stash() {
-                clear_stashed_password(&pamh);
-            }
+            clear.armed = outcome.clears_stash();
             PamError::SUCCESS
         })
     }
 
     fn chauthtok(pamh: Pam, flags: PamFlags, args: Vec<String>) -> PamError {
         guard("chauthtok", PamError::SUCCESS, || {
+            // The password hook never reads the stash, so there is no
+            // `clears_stash` question to answer: it clears on every exit. A
+            // `passwd` transaction runs `auth` and `password` and never
+            // `session`, so without this the login password the auth hook
+            // stashed sits in PAM data until `pam_end`.
+            let _clear = ClearStash {
+                pamh: &pamh,
+                armed: true,
+            };
             // Two Argon2 derivations plus a socket call, all serial: same
             // deadline as the session hook. It is started before the prelim
             // check returns, which costs one `Instant::now()` and nothing else.

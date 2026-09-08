@@ -209,7 +209,14 @@ fuzz_target!(|input: Input| {
         return;
     };
     let path = dir.path().join("fuzz.vault");
-    let Ok(mut vault) = secret_manager::vault::Vault::create(&path, "fuzz", &password, FAST) else {
+    // The fuzzer's own label, not a placeholder: `check_label`, the header
+    // size it feeds, and the label's round trip through the real store are
+    // only fuzzed if the hostile string actually reaches them. An over-long
+    // label is a legitimate refusal, so it returns like every other guard
+    // here.
+    let Ok(mut vault) =
+        secret_manager::vault::Vault::create(&path, &file.header.label, &password, FAST)
+    else {
         return;
     };
     for item in &items {
@@ -233,6 +240,13 @@ fuzz_target!(|input: Input| {
     assert!(
         reopened.is_locked(),
         "a freshly opened vault must be locked"
+    );
+    // The label is client-supplied and lives in the header, so it is both an
+    // aad contributor and a string that has to survive postcard unchanged.
+    assert_eq!(
+        reopened.label(),
+        file.header.label,
+        "the collection label changed on the disk round trip"
     );
     assert_eq!(
         reopened.item_ids().len(),

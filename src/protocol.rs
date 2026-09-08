@@ -28,6 +28,12 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// module read the collection's header from disk, derive the vault key
 /// themselves, and send only the key, so nothing that answers this socket
 /// can choose a salt or KDF parameters, and no password ever crosses it.
+///
+/// v4 added the `aliases_error` field to [`Response::Status`], so a corrupt
+/// `aliases.toml` is reported to `sm status` instead of keeping the daemon
+/// from starting. The request set is unchanged from v3 - v4 is a response
+/// shape change only - but a `Response` field is as wire-significant as a
+/// request variant under postcard, so the version moved with it.
 pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Variant names of [`Request`] in wire order, for tests and diagnostics.

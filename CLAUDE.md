@@ -53,7 +53,8 @@ over a **private control socket** at
 `$XDG_RUNTIME_DIR/secret-manager/control.sock`, defined in `src/protocol.rs`.
 
 **The central invariant: no password crosses the control socket.** Control
-protocol v3 has no password-carrying request. Both the CLI and the PAM module
+protocol v3 onward has no password-carrying request (`PROTOCOL_VERSION` is
+now 4). Both the CLI and the PAM module
 read the collection's vault header from disk, derive the key locally with
 Argon2id, and send only the key. Nothing that answers the socket can choose a
 salt or a KDF cost. Preserve this when touching `src/protocol.rs`,
@@ -159,9 +160,15 @@ collection's lock by hand — a save in flight holds exactly that and nothing
 else — and asserts a write to another collection and a state-only property
 still answer, so the proof needs no duration and cannot flake. Beside it, a
 source scan over `src/dbus/` and `src/daemon.rs` refuses any statement that
-takes a lock while a `let`-bound guard is still alive, in either direction;
-that is what a green run cannot establish and the next edit could break. Run
-`cargo fmt` before trusting a failure from it — it reads formatted source.
+takes a second lock, or does blocking I/O outside a `state::block_in_place`,
+while a guard is still alive — a `let`-bound one, a `match`/`while let`/`if
+let` scrutinee that locks, or, since the scan does not follow calls, the whole
+body of a helper whose signature takes `&ServiceState`, `&mut ServiceState` or
+the guard itself, which can only have been called with the state held. A
+`&Shared` parameter is not that: it is the lock, not a guard, so locking
+inside it is the intended pattern. That is what a green run cannot establish
+and the next edit could break. Run `cargo fmt` before trusting a failure from
+it — it reads formatted source.
 
 Argon2 at the real cost makes tests slow, so tests use
 `KdfParams::FAST_FOR_TESTS`, exposed to integration tests through the

@@ -106,8 +106,12 @@ pub struct Client {
 impl Client {
     /// Connect to the session bus and open a DH session (plain if the service refuses DH).
     pub async fn connect() -> Result<Client, CliError> {
-        let timed_out = || CliError::Unreachable("session bus did not answer within 10 s".into());
         let deadline = connect_timeout();
+        // The deadline, not a literal: `connect_timeout` is shortened under
+        // `test-util`, and a hardcoded "10 s" would then describe a wait that
+        // never happened.
+        let timed_out =
+            || CliError::Unreachable(format!("session bus did not answer within {deadline:?}"));
 
         let conn = tokio::time::timeout(deadline, Connection::session())
             .await
@@ -254,19 +258,66 @@ impl Client {
         self.decrypt(&secret)
     }
 
+    /// Everything `sm list` shows about one item, in a single round trip.
+    ///
+    /// The proxy is built with `CacheProperties::No` — the daemon's properties
+    /// change under it, and a stale `Locked` is the difference between showing
+    /// a secret and refusing to — so nothing is amortised across calls and the
+    /// four generated property getters were four `Properties.Get` messages.
+    /// `sm list` with no filter calls this once per item across every
+    /// collection, so that was 4N round trips for N items. `GetAll` is one.
+    ///
+    /// The per-item calls are *not* issued concurrently instead: they are
+    /// independent, but a `try_join_all` would report whichever of four
+    /// failures raced to the front while the others were cancelled mid-flight,
+    /// and the CLI prints that error verbatim. One call has one error.
+    ///
+    /// A property the daemon does not return, or returns with the wrong type,
+    /// is a protocol error rather than a silent default: `sm list` would
+    /// otherwise print an unlabelled item, or an item as unlocked, on the
+    /// strength of a missing field.
     pub async fn item_info(&self, item: &OwnedObjectPath) -> Result<ItemInfo, CliError> {
-        let proxy = self.item_proxy(item).await?;
+        let mut props = zbus::fdo::PropertiesProxy::builder(&self.conn)
+            .destination("org.freedesktop.secrets")
+            .map_err(map_zbus)?
+            .path(item.clone())
+            .map_err(map_zbus)?
+            .build()
+            .await
+            .map_err(map_zbus)?
+            .get_all(
+                zbus::names::InterfaceName::try_from("org.freedesktop.Secret.Item")
+                    .expect("a literal, valid interface name"),
+            )
+            .await
+            .map_err(|e| map_zbus(e.into()))?;
+
+        fn take<T: TryFrom<OwnedValue>>(
+            props: &mut HashMap<String, OwnedValue>,
+            name: &str,
+        ) -> Result<T, CliError> {
+            props
+                .remove(name)
+                .ok_or_else(|| {
+                    CliError::Failed(format!("the item has no {} property", escape_control(name)))
+                })?
+                .try_into()
+                .map_err(|_| {
+                    CliError::Failed(format!(
+                        "the item's {} property has the wrong type",
+                        escape_control(name)
+                    ))
+                })
+        }
+
         Ok(ItemInfo {
             path: item.clone(),
-            label: proxy.label().await.map_err(map_zbus)?,
-            attributes: proxy
-                .attributes()
-                .await
-                .map_err(map_zbus)?
+            label: take::<String>(&mut props, "Label")?,
+            attributes: take::<HashMap<String, String>>(&mut props, "Attributes")?
                 .into_iter()
                 .collect(),
-            locked: proxy.locked().await.map_err(map_zbus)?,
-            modified: proxy.modified().await.map_err(map_zbus)?,
+            locked: take::<bool>(&mut props, "Locked")?,
+            modified: take::<u64>(&mut props, "Modified")?,
         })
     }
 

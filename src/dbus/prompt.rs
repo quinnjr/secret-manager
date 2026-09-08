@@ -5,8 +5,10 @@ use super::paths;
 use super::registry;
 use super::require_sender;
 use super::service::ServiceSignals;
+use super::service::check_alias_room;
 use super::state::{
-    AliasTable, PromptCommit, Shared, VaultRef, block_in_place, save_aliases_to, vault_ref,
+    self, AliasUpdate, OnWriteError, PromptCommit, Shared, VaultRef, block_in_place,
+    update_aliases, vault_ref,
 };
 use crate::prompt::{PinOutcome, PinRequest};
 use crate::vault::{Vault, VaultError};
@@ -720,12 +722,21 @@ async fn create_collection(
     let mut attempt = 0;
     let (id, mut vault) = loop {
         attempt += 1;
-        let (id, path, kdf) = {
+        // Only the cheap bookkeeping under the state lock, for real this
+        // time: picking the id does a blocking `symlink_metadata` per
+        // candidate in an unbounded loop, so what it needs is cloned out and
+        // the search runs with the guard dropped. Nothing is lost by racing —
+        // `Vault::create` below reserves the name exclusively, and a name
+        // taken in between is the retry this loop already exists for.
+        let (dir, loaded, kdf) = {
             let st = state.lock().await;
-            let id = st.unique_collection_id(label);
-            let path = st.vault_dir.join(format!("{id}.vault"));
-            (id, path, st.kdf)
+            (st.vault_dir.clone(), st.loaded_ids(), st.kdf)
         };
+        let (id, path) = block_in_place(|| {
+            let id = state::unique_collection_id_in(&dir, &loaded, label);
+            let path = dir.join(format!("{id}.vault"));
+            (id, path)
+        });
         let created = {
             let (path, label) = (path.clone(), label.to_string());
             let pin = zeroize::Zeroizing::new(pin.as_bytes().to_vec());
@@ -746,49 +757,60 @@ async fn create_collection(
             }
         }
     };
+    {
+        // One acquisition, and allocation-only: the vault goes into the map
+        // here, and the alias — whose write `fsync`s — is done afterwards,
+        // with this guard released.
+        let mut st = state.lock().await;
+        vault.set_index_attributes(st.index_attributes);
+        st.collections.insert(id.clone(), vault_ref(vault));
+    }
     // Whether the alias was actually recorded. The alias work is refused up
     // front while the table is unusable, rather than done in memory and then
     // regretted when the save is refused: that left the daemon answering the
     // name from a table it may never write, so it gave two different answers
     // for one name and the mapping vanished at the next reload.
-    let alias = {
-        // One acquisition, not three: the loop used to read `index_attributes`
-        // only to discard it, then re-read it here under a second lock, then
-        // take a third for the insert (MEDIUM 4).
-        let mut st = state.lock().await;
-        vault.set_index_attributes(st.index_attributes);
-        st.collections.insert(id.clone(), vault_ref(vault));
-        match alias {
-            None => None,
-            Some(a) => match st.aliases.writable().cloned() {
-                Ok(mut next) => {
-                    next.insert(a.to_string(), id.clone());
-                    if let Err(e) = save_aliases_to(&st.vault_dir, &next) {
-                        tracing::warn!(
-                            "collection '{id}' was created, but its alias could not be \
-                             saved ({e}); it holds for this daemon's lifetime only"
-                        );
-                    }
-                    // Applied either way. A create the user has already
-                    // confirmed must not be left half-done because a
-                    // convenience file beside the vaults could not be
-                    // written, and the table being applied to is the file's
-                    // own contents — which is the difference from the arm
-                    // below. Pinned by
-                    // `an_unwritable_alias_file_blocks_neither_create_nor_delete`.
-                    st.aliases = AliasTable::Usable(next);
+    let alias = match alias {
+        None => None,
+        Some(a) => {
+            // `OnWriteError::Keep`: a create the user has already confirmed
+            // must not be left half-done because a convenience file beside
+            // the vaults could not be written, and the table being applied
+            // to is the file's own contents — which is the difference from
+            // the `Unusable` arm. Pinned by
+            // `an_unwritable_alias_file_blocks_neither_create_nor_delete`.
+            let outcome = update_aliases(state, OnWriteError::Keep, |_, next| {
+                // The cap used to live in `Service::set_alias` alone, so this
+                // path grew the table past it — and `MAX_ALIAS_BYTES` sizes
+                // itself on the cap holding.
+                check_alias_room(next, a)?;
+                next.insert(a.to_string(), id.clone());
+                Ok::<(), Error>(())
+            })
+            .await;
+            match outcome {
+                AliasUpdate::Committed => Some(a),
+                AliasUpdate::NotWritten(e) => {
+                    tracing::warn!(
+                        "collection '{id}' was created, but its alias could not be \
+                         saved ({e}); it holds for this daemon's lifetime only"
+                    );
                     Some(a)
                 }
-                Err(e) => {
-                    // The collection itself still exists; only the
-                    // convenience mapping is refused.
+                // The collection itself still exists; only the convenience
+                // mapping is refused.
+                AliasUpdate::Unusable(e) => {
                     tracing::warn!(
                         "collection '{id}' was created without its alias: {e}, so the \
                          file is left for repair"
                     );
                     None
                 }
-            },
+                AliasUpdate::Rejected(e) => {
+                    tracing::warn!("collection '{id}' was created without its alias: {e}");
+                    None
+                }
+            }
         }
     };
     if let Err(e) = registry::register_collection(conn, state, &id).await {
@@ -901,28 +923,27 @@ async fn delete_collection(
         }
         v.item_ids()
     };
+    state.lock().await.collections.remove(id);
+    // As in `create_collection`: a table that cannot be written is not edited
+    // in memory either. Names still pointing at a deleted collection resolve
+    // to nothing anyway (`ServiceState::alias_target` filters on the loaded
+    // collections), so nothing is served from the entries left behind. The
+    // write itself happens with the state guard dropped; see
+    // `state::update_aliases`.
+    match update_aliases(state, OnWriteError::Keep, |_, next| {
+        next.retain(|_, target| target != id);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .await
     {
-        let mut st = state.lock().await;
-        st.collections.remove(id);
-        // As in `create_collection`: a table that cannot be written is not
-        // edited in memory either. Names still pointing at a deleted
-        // collection resolve to nothing anyway
-        // (`ServiceState::alias_target` filters on the loaded collections),
-        // so nothing is served from the entries left behind.
-        match st.aliases.writable().cloned() {
-            Ok(mut next) => {
-                next.retain(|_, target| target != id);
-                if let Err(e) = save_aliases_to(&st.vault_dir, &next) {
-                    tracing::warn!("cannot save aliases: {e}");
-                }
-                // As in `create_collection`: a write that fails does not put
-                // a deleted collection's aliases back.
-                st.aliases = AliasTable::Usable(next);
-            }
-            Err(e) => tracing::warn!(
-                "aliases pointing at the deleted collection '{id}' were left in place: {e}"
-            ),
-        }
+        AliasUpdate::Committed => {}
+        // As in `create_collection`: a write that fails does not put a
+        // deleted collection's aliases back.
+        AliasUpdate::NotWritten(e) => tracing::warn!("cannot save aliases: {e}"),
+        AliasUpdate::Unusable(e) => tracing::warn!(
+            "aliases pointing at the deleted collection '{id}' were left in place: {e}"
+        ),
+        AliasUpdate::Rejected(never) => match never {},
     }
     let conn2 = conn.clone();
     let id2 = id.to_string();

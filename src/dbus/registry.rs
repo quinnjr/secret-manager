@@ -165,9 +165,15 @@ pub async fn notify_collection_changed(conn: &Connection, id: &str) {
     else {
         return;
     };
-    let aliases: Vec<String> = {
+    // The zbus interface guard is a read lock like any other, and the state
+    // mutex must not be awaited underneath one: the `Shared` is cloned out and
+    // the guard released before the state lock is taken.
+    let state = {
         let coll = iface.get().await;
-        let st = coll.state().lock().await;
+        coll.state().clone()
+    };
+    let aliases: Vec<String> = {
+        let st = state.lock().await;
         st.aliases
             .known()
             .iter()

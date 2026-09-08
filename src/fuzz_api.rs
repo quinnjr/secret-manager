@@ -1,15 +1,18 @@
 //! Thin wrappers over internal helpers, for the fuzz targets in `fuzz/`.
 //!
-//! The functions below are deliberately not part of the shipped API: they are
-//! `pub(crate)` or private because nothing outside this crate should call
-//! them. The fuzzers do need them, because they sit directly on attacker-fed
-//! input — a hostile collection label, a pinentry server's reply, an askpass
-//! prompt string — and are exactly where a panic or a sanitisation gap would
-//! matter.
+//! The items below sit directly on attacker-fed input — a hostile collection
+//! label, a pinentry server's reply, an askpass prompt string — and are
+//! exactly where a panic or a sanitisation gap would matter, which is why the
+//! fuzzers need to reach them.
 //!
-//! These are wrappers rather than `pub use` re-exports because a `pub use`
-//! cannot widen a `pub(crate)` item's visibility. Each one forwards and
-//! nothing more, so a fuzz target exercises the same code the daemon runs.
+//! Most are `pub(crate)` or private, because nothing outside this crate should
+//! call them, and a `pub use` cannot widen a `pub(crate)` item's visibility:
+//! hence wrappers. Three of them are not: `display_label` and
+//! `classify_prompt` are already `pub` in a `pub` module, and `AskpassKind` is
+//! a plain `pub use` of a `pub` type. They are restated here anyway so the
+//! fuzz targets have one import path and do not have to track which side of
+//! that line each helper is on. Every wrapper forwards and does nothing else,
+//! so a fuzz target exercises the same code the daemon runs.
 //!
 //! Gated behind the `fuzzing` feature, so enabling it is a deliberate act and
 //! the default build's public surface is unchanged. `cargo fuzz` turns it on

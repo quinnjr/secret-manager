@@ -204,5 +204,5 @@ distro's install guide.
 
 ## Known gaps
 
-See "Known gaps" in the top-level README for the current state of PAM CI
-coverage and the swap/mlock trade-off above.
+See "Known gaps" in the top-level README for what the PAM module's tests do
+and do not reach, and the swap/mlock trade-off above.

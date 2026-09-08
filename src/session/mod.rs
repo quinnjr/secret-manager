@@ -48,8 +48,19 @@ impl SessionCipher {
     }
 
     /// Returns `(parameters, value)` for the `(oayays)` secret struct.
+    ///
+    /// The returned value is a bare `Vec`, not `Zeroizing`, where `decrypt`
+    /// returns `Zeroizing<Vec<u8>>`. The asymmetry is deliberate, not an
+    /// oversight: this value is handed straight to zbus, which copies it into
+    /// marshalling buffers that nothing wipes and that outlive anything we
+    /// could zeroize here. Wrapping it would clear one copy out of several
+    /// and read as a guarantee the plaintext's path does not actually have.
+    /// `decrypt` is the direction worth wrapping - there the plaintext ends
+    /// in *our* buffers, and it is `Zeroizing` accordingly.
     pub fn encrypt(&self, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
         match self {
+            // `Plain` is the no-session case: the caller asked for the secret
+            // unencrypted, so the "ciphertext" is the plaintext.
             SessionCipher::Plain => (Vec::new(), plaintext.to_vec()),
             SessionCipher::Aes { key } => {
                 let iv = crate::vault::crypto::random_bytes::<16>();

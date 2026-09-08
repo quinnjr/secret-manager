@@ -195,7 +195,12 @@ pub fn read_secret_from_stdin() -> Result<Zeroizing<Vec<u8>>, CliError> {
         buf.pop();
     }
     if buf.len() > MAX_SECRET {
-        return Err(CliError::Usage("secret exceeds 1 MiB".into()));
+        // Interpolated, never spelled out: `MAX_SECRET` is derived from
+        // `MAX_FRAME`, so a literal here would start lying the moment the
+        // frame cap moved.
+        return Err(CliError::Usage(format!(
+            "secret exceeds {MAX_SECRET} bytes"
+        )));
     }
     Ok(buf)
 }

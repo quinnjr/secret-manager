@@ -57,9 +57,12 @@ distributions.
 
 ## Unlock at login (PAM)
 
-This module's logic is unit-tested, but nothing drives it through a real
-libpam stack automatically (see "Known gaps" in the README). Test login
-unlock on a spare session before relying on it for your main login.
+`tests/pam_stack.rs` drives this module through a real libpam stack in a
+plain `cargo test`, so the entry points and the unlock itself are covered.
+That suite runs as an ordinary user, so the root-only paths a real login
+takes — the `/run/user/<uid>` socket, the `systemctl --machine` auto-start —
+are not (see "Known gaps" in the README). Test login unlock on a spare
+session before relying on it for your main login.
 
 Add the three lines from `/usr/share/doc/secret-manager/pam.d-snippet` to
 `common-auth`, `common-session`, and `common-password`. In `common-session`,

@@ -23,6 +23,11 @@ pub const MAX_HEADER: usize = 16 << 20;
 ///   command to rename a collection back.
 /// * A label near `MAX_HEADER` leaves no room for the index, so the next
 ///   `CreateItem` overflows the header and every save is refused.
+/// * The label is also what a collection's *filename* is derived from, and
+///   `NAME_MAX` is 255 bytes. That third ceiling is enforced separately, by
+///   `vault::MAX_ID_LEN` truncating in `vault::collection_id_from_label`,
+///   rather than by lowering this cap: the label itself is free to be long,
+///   only the derived id is not.
 ///
 /// 4 KiB is orders of magnitude more than any real label ("Login", "Default")
 /// and cannot interact with either cap: 4 KiB is 1/256 of `MAX_FRAME`, so a
@@ -240,6 +245,17 @@ fn describe_version(v: u16) -> String {
 /// Total bytes the header occupies (magic, length prefix, body), computed
 /// from the first [`PREFIX_LEN`] bytes of a file. Lets a caller read the
 /// header without holding the ciphertext.
+///
+/// A declared length over [`MAX_HEADER`] is reported as
+/// [`FormatError::Truncated`], not [`FormatError::HeaderTooLarge`], and that
+/// is deliberate. The length prefix sits *outside* the AEAD's reach until a
+/// successful decrypt, so on the read side it is attacker-controlled: an
+/// over-large value says nothing about how big the real header is, only that
+/// the file does not contain the header it claims to - which is what
+/// `Truncated` means to a caller here. `HeaderTooLarge` stays write-side, for
+/// [`VaultFile::header_bytes`], where the length is one we computed and the
+/// number in the message is meaningful. Reporting it here would also hand a
+/// caller an attacker's number to put in a log line. A test pins this.
 pub fn header_prefix_len(prefix: &[u8]) -> Result<usize, FormatError> {
     if prefix.len() < 8 {
         return Err(FormatError::Truncated);

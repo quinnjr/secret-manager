@@ -996,3 +996,53 @@ async fn ssh_list_reports_a_failed_write() {
         "the failure must say something"
     );
 }
+
+/// The askpass fallback puts ssh's own question into the dialog, and that
+/// question is peer text: OpenSSH interpolates an attacker-chosen destination
+/// (a `.gitmodules` URL, an `ssh://` link, a shared config) into the host-key
+/// prompt, and `sm ssh askpass` gets it as raw argv.
+///
+/// Assuan's `escape()` downstream covers `%`, C0 and DEL and nothing else, so
+/// before the fix a `U+202E` in a hostname reached the toolkit intact and
+/// reordered the text of the dialog the user is about to type a key passphrase
+/// into, and a `U+200B` split a word an operator was scanning for. The
+/// assertion is over the whole `SETDESC` payload rather than a list of
+/// codepoints: nothing invisible or reordering may survive into the
+/// description at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_askpass_fallback_dialog_carries_no_invisible_or_bidi_characters() {
+    let fx = Fixture::start().await;
+
+    // The bidi override, an isolate, a zero-width space and a soft hyphen,
+    // inside exactly the string OpenSSH lets a remote name choose.
+    let hostile = "The authenticity of host \
+         'ev\u{200B}il\u{202E}gro.elpmaxe\u{2066}\u{00AD}' can't be established.\n\
+         ED25519 key fingerprint is SHA256:abcdef.\n\
+         Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+
+    let before = fx.pinentry_log().len();
+    fx.sm()
+        .args(["ssh", "askpass", hostile])
+        .env("FAKE_CONFIRM", "no")
+        .assert()
+        .success()
+        .stdout("no\n");
+    let log = fx.pinentry_log();
+    let dialog: String = log[before..]
+        .lines()
+        .filter(|l| l.starts_with("SETDESC"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !dialog.is_empty(),
+        "the fallback never reached a dialog: {:?}",
+        &log[before..]
+    );
+    for c in dialog.chars() {
+        assert!(
+            !secret_manager::fuzz_api::is_invisible_format(c) && !c.is_control(),
+            "U+{:04X} survived into the dialog: {dialog:?}",
+            c as u32
+        );
+    }
+}

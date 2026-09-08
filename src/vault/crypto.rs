@@ -101,8 +101,16 @@ impl Key {
 
     /// A wiping copy of the key material, for callers that must hand it to an
     /// API taking ownership (the control protocol's request types).
-    /// `Zeroizing::new(*key.as_bytes())` would build the array on the stack
-    /// first, leaving an unwiped copy behind; this never does.
+    ///
+    /// Cloning the `Zeroizing` directly is preferred over
+    /// `Zeroizing::new(*key.as_bytes())`: that spells out a dereference of
+    /// the inner array into a temporary that nothing wipes, whereas the
+    /// clone's only named value is already `Zeroizing`. Whether either form
+    /// actually materialises an intermediate is a codegen question the source
+    /// cannot settle - the compiler is free to elide or to spill - so the
+    /// claim here is about what the code *writes down*, not about what the
+    /// machine does. Callers should treat it as the smaller of two
+    /// stack-copy surfaces, not as a guarantee of none.
     pub fn to_zeroizing(&self) -> Zeroizing<[u8; KEY_LEN]> {
         self.0.clone()
     }
@@ -223,6 +231,18 @@ mod tests {
 
     const SALT: [u8; SALT_LEN] = [7u8; SALT_LEN];
     const NONCE: [u8; NONCE_LEN] = [9u8; NONCE_LEN];
+
+    /// `to_zeroizing` had no test at all: nothing pinned that the copy it
+    /// hands out is the key.
+    #[test]
+    fn to_zeroizing_yields_the_key_bytes() {
+        let key = derive_key(b"pw", &SALT, KdfParams::FAST_FOR_TESTS).unwrap();
+        let copy = key.to_zeroizing();
+        assert_eq!(&*copy, key.as_bytes());
+        // And it is a copy, not an alias: the round trip through
+        // `from_zeroizing` reproduces the same key.
+        assert_eq!(Key::from_zeroizing(copy).as_bytes(), key.as_bytes());
+    }
 
     #[test]
     fn derive_is_deterministic_and_password_sensitive() {

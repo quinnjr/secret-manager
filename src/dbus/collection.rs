@@ -134,8 +134,12 @@ pub(crate) fn check_attributes<'a>(
 }
 
 /// Upper bound on one `DeleteItems` batch, for the same reason as
-/// [`super::service::MAX_GET_SECRETS_ITEMS`]: every element costs a path
-/// resolution and a linear item lookup under the global state mutex.
+/// [`super::service::MAX_GET_SECRETS_ITEMS`] and with the same number: every
+/// element costs a path resolution and a linear scan of the collection's item
+/// index to confirm it exists. Neither happens under the global state mutex
+/// any more — the batch is resolved under one acquisition of it and checked
+/// with it released, under this collection's own lock — so the cap bounds the
+/// work one message can ask for, not the time the mutex is held.
 pub const MAX_DELETE_ITEMS: usize = 1024;
 
 /// Wire name of the private batch interface. Deliberately *not* under
@@ -491,12 +495,13 @@ impl CollectionAdmin {
     /// itself is a single `Vault::delete_items`, which is one `retain` plus one
     /// save with in-memory rollback on write failure.
     ///
-    /// The state mutex is held only for the map and alias lookups the batch
-    /// needs; the validation and the single save both run under this
-    /// collection's own lock, which is where a whole-vault re-encrypt and its
-    /// two `fsync`s belong (see `state::VaultRef`). The `ItemDeleted` signals
-    /// and the object unexports happen after the save has succeeded, for the
-    /// whole batch at once; a failed save emits nothing.
+    /// The state mutex is taken **once** for the whole batch — the alias
+    /// lookup and every path resolution together — and released before any
+    /// item is looked up; the validation and the single save then run under
+    /// this collection's own lock, which is where a whole-vault re-encrypt
+    /// and its two `fsync`s belong (see `state::VaultRef`). The `ItemDeleted`
+    /// signals and the object unexports happen after the save has succeeded,
+    /// for the whole batch at once; a failed save emits nothing.
     async fn delete_items(
         &self,
         items: Vec<OwnedObjectPath>,
@@ -507,37 +512,60 @@ impl CollectionAdmin {
                 "too many items; at most {MAX_DELETE_ITEMS} per call"
             )));
         }
-        // Resolve every path, then confirm each names a real item, in the
-        // order the batch gave them. `ServiceState::resolve_path` stops
-        // before the item index — that lives behind the collection's own
-        // lock — so the existence check is done here, one vault lock at a
-        // time and never two at once. A path that names no item is
-        // `NoSuchObject` whichever collection it points at, exactly as the
-        // single `resolve_item` under the state lock used to report it; only
-        // then does a foreign but real item become `InvalidArgs`.
-        let mut item_ids: Vec<String> = Vec::with_capacity(items.len());
-        let id = {
+        // Resolve every path under ONE state acquisition, then confirm each
+        // names a real item with that lock released — the shape
+        // `Service::get_secrets` uses. It used to re-take the state lock
+        // *and* this collection's lock once per element, up to 1024 of each
+        // per call, and de-duplicate with a linear `Vec::contains` inside the
+        // loop (about half a million comparisons at the cap).
+        //
+        // `ServiceState::resolve_path` stops before the item index — that
+        // lives behind the collection's own lock — so the existence check is
+        // done here. Every semantic of the per-element version is kept: a
+        // path that names no item is `NoSuchObject` whichever collection it
+        // points at, exactly as the single `resolve_item` under the state
+        // lock used to report it, and the *first* such path in the batch's
+        // own order is the one reported; only then does a foreign but real
+        // item become `InvalidArgs`; an empty batch is a no-op.
+        let (id, resolved) = {
             let st = self.state.lock().await;
-            self.id(&st)?
-        };
-        for path in &items {
-            let (cid, iid, vault) = {
-                let st = self.state.lock().await;
+            let id = self.id(&st)?;
+            let mut resolved = Vec::with_capacity(items.len());
+            for path in &items {
                 match st.resolve_path(path.as_str()) {
-                    Some(PathTarget::Item { id, vault, item }) => (id, item, vault),
+                    Some(PathTarget::Item { id, vault, item }) => resolved.push((id, item, vault)),
                     _ => return Err(Error::NoSuchObject),
                 }
-            };
-            if !vault.lock().await.has_item(&iid) {
-                return Err(Error::NoSuchObject);
             }
-            if cid != id {
-                return Err(Error::invalid_args(
-                    "every item must belong to this collection",
-                ));
-            }
-            if !item_ids.contains(&iid) {
-                item_ids.push(iid);
+            (id, resolved)
+        };
+        // One vault-lock acquisition per *run* of paths naming the same
+        // collection, not one per path. Checking in the batch's own order is
+        // what keeps the reporting rule above exact, and it costs nothing:
+        // the first path naming another collection refuses the whole call, so
+        // any batch that is not refused on its second element is a single
+        // run — one acquisition, whatever its length.
+        let mut item_ids: Vec<String> = Vec::with_capacity(resolved.len());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < resolved.len() {
+            let cid = resolved[i].0.clone();
+            let vault = resolved[i].2.clone();
+            let vault = vault.lock().await;
+            while i < resolved.len() && resolved[i].0 == cid {
+                let iid = &resolved[i].1;
+                if !vault.has_item(iid) {
+                    return Err(Error::NoSuchObject);
+                }
+                if cid != id {
+                    return Err(Error::invalid_args(
+                        "every item must belong to this collection",
+                    ));
+                }
+                if seen.insert(iid.clone()) {
+                    item_ids.push(iid.clone());
+                }
+                i += 1;
             }
         }
         {

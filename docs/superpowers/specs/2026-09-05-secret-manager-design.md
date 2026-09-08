@@ -254,7 +254,7 @@ own uid or 0 (root), because the PAM module runs as root during
 display-manager and console logins.
 
 Protocol: `u32` big-endian length prefix, then a frame body of
-`[version u8 = 3][postcard encoded message]`. The version byte lets a future
+`[version u8 = 4][postcard encoded message]`. The version byte lets a future
 protocol change be rejected cleanly instead of failing postcard decoding.
 
 ```rust
@@ -263,14 +263,14 @@ enum Request {
     Status,
     Reload,          // rescan the vault directory; `sm reload`, and `sm init`
     UnlockWithKey { collection: String, key: Zeroizing<[u8; 32]> },
-    ChangeKey { collection: String, old_key: Zeroizing<[u8; 32]>, new_salt: [u8; 16], new_key: Zeroizing<[u8; 32]>, kdf: KdfParams },
+    ChangeKey { collection: String, old_key: Zeroizing<[u8; 32]>, new_salt: [u8; 16], new_kdf: KdfParams, new_key: Zeroizing<[u8; 32]> },
 }
 enum Response {
     Ok,
-    Status { collections: Vec<CollectionStatus>, uptime_secs: u64 },
+    Status { collections: Vec<CollectionStatus>, uptime_secs: u64, aliases_error: Option<String> },
     Error(String),
 }
-struct CollectionStatus { id: String, label: String, locked: bool, items: usize }
+struct CollectionStatus { id: String, label: String, locked: bool, items: usize, warning: Option<String> }
 ```
 
 The password never crosses the socket: both the CLI (`sm unlock`, `sm
@@ -312,7 +312,7 @@ everything they call sits in `mod.rs` and is unit-tested without it.
 - `pam_sm_chauthtok` (`PAM_UPDATE_AUTHTOK` phase): read the header, derive
   both the old key (from the header's current salt/params) and a new key
   (fresh salt, current config's params) locally, and send
-  `ChangeKey { collection, old_key, new_salt, new_key, kdf }`. Same failure
+  `ChangeKey { collection, old_key, new_salt, new_kdf, new_key }`. Same failure
   policy.
 - `pam_sm_setcred`, `pam_sm_close_session`: `PAM_SUCCESS`.
 
@@ -514,3 +514,47 @@ paths pointing at `/usr/bin`.
   every `cargo test` pull `bindgen` and `libclang` through `pam-client`. The
   module's logic is unit-tested instead; only libpam's own call into the
   hooks is now untested.
+
+
+## Amendment 2026-09-07: control protocol v4, and PAM tested through libpam
+
+* **`PROTOCOL_VERSION` is 4.** The frame body is
+  `[version u8 = 4][postcard encoded message]`. The request set is unchanged
+  from the v3 amendment above — `Lock`, `Status`, `Reload`, `UnlockWithKey`,
+  `ChangeKey`, in that order, and still no password-carrying request. The
+  bump is for two added response fields, below: postcard encodes struct
+  fields positionally, so adding one is a wire break even though no variant
+  moved. The "Control socket" section's code block is the current shape.
+* **`Response::Status` carries `aliases_error: Option<String>`.** A corrupt
+  `aliases.toml` no longer stops the daemon starting, so this is the only way
+  an operator learns that alias lookups are refusing and the file is waiting
+  to be repaired.
+* **`CollectionStatus` carries `warning: Option<String>`.** A per-collection
+  condition the operator should know about, such as an attribute index that
+  could not be rewritten to match `locked_search`.
+* **`Request::ChangeKey`'s field order.** It is
+  `{ collection, old_key, new_salt, new_kdf, new_key }`, and the KDF field is
+  named `new_kdf`. Earlier revisions of this document listed
+  `{ ..., new_key, kdf }` — the last two transposed — in both this section
+  and the PAM section. Because postcard encodes struct-variant fields
+  positionally, a reader built from the old text would have parsed the new
+  key as the KDF parameters. Both places are corrected; the code was always
+  as written here.
+* **Testing: the PAM module is driven through a real libpam stack.**
+  `tests/pam_stack.rs` runs in a plain `cargo test` — no `pam_wrapper`, no
+  root, and nothing written to `/etc/pam.d`. It uses `pam_start_confdir`
+  (Linux-PAM ≥ 1.4) to point libpam at a temporary config directory whose
+  service file loads the built cdylib by absolute path, and `dlopen`s libpam
+  rather than linking it, so a machine without it skips instead of failing to
+  build. It covers a full login transaction (auth stashes the token, session
+  unlocks the collection, the stash is then cleared), a wrong password, the
+  user name the stack hands the module, and `chauthtok` key rotation. It
+  skips — with a printed reason — when libpam predates 1.4, when
+  `target/pam/release/libsecret_manager.so` is missing or older than `src/`,
+  or when `pam_unix.so` (which caches `PAM_AUTHTOK` for the module to read)
+  is absent. The `pam_wrapper` note in the 2026-09-06 amendment is
+  superseded. What remains untested is the root-only half: the real
+  `/run/user/<uid>` socket, the `systemctl --machine` auto-start, `socket=`
+  being ignored as root (the suite asserts it is *honoured* below root, and
+  refuses to run as root at all), and the error arms of `send_data` /
+  `retrieve_data`.

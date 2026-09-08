@@ -53,8 +53,10 @@ vault, config) · 2 usage error · 3 daemon or bus unreachable, or
 `XDG_RUNTIME_DIR` unset.
 
 `sm delete` is strict: if an unlock prompt is dismissed it fails (exit 1) and
-deletes nothing. `sm get` and `sm list` stay lenient and return the best
-already-unlocked match instead of prompting.
+deletes nothing. `sm get` still prompts when a match is locked, but is lenient
+about the answer: a dismissed prompt is tolerated when something already
+matched, and is a failure (exit 1) when nothing did. `sm list` never unlocks
+at all — it prints locked entries as `[locked]` and prompts for nothing.
 
 `SetAlias` will repoint an alias that already targets another collection:
 any session-bus client can do this, which is inherent to the same-uid
@@ -84,16 +86,28 @@ as you give them. Both encode the same invariants — see `docs/fuzzing.md`.
 The PAM login-unlock path (see "Unlock at login" in `docs/install-arch.md`
 and `docs/install-debian.md`) has unit tests for everything it decides:
 reading the vault header, the login KDF bounds, the exact key it derives and
-sends, the stale-socket rule, and the runtime-directory checks. What no test
-covers is libpam itself calling the hooks; see "Known gaps".
+sends, the stale-socket rule, and the runtime-directory checks. On top of
+that, `tests/pam_stack.rs` drives the built cdylib through a real libpam
+stack in a plain `cargo test` — no `pam_wrapper`, no root, nothing written to
+`/etc/pam.d` — using `pam_start_confdir` to point libpam at a temporary
+config directory. It covers a whole login transaction, a wrong password, the
+user name the stack resolves, and `chauthtok` rotation, and skips with a
+printed reason when libpam predates 1.4, when `pam_unix.so` is absent, or
+when the cdylib has not been built by `make build` (or is older than `src/`).
+What is left uncovered is the root-only half; see "Known gaps".
 
 ## Known gaps
 
-* **PAM end-to-end coverage** — the module's logic is unit-tested, but no
-  automated test drives it through a real libpam stack, so the wiring
-  between the `pam_sm_*` entry points and that logic has never executed
-  here. Closing this needs a CI runner with `pam_wrapper` and `pam_matrix`
-  installed and a harness that loads the built `pam_secret_manager.so`.
+* **PAM coverage stops at the uid boundary** — `tests/pam_stack.rs` drives
+  the built cdylib through a real libpam stack, so the `pam_sm_*` entry
+  points, the stash that carries the token from the auth stack to the session
+  stack, and the unlock itself all execute under test. That suite runs as an
+  ordinary user, and refuses to run as root, so the root-only half of the
+  module is still exercised only by unit tests of its decision functions:
+  connecting to the real `/run/user/<uid>` control socket, the
+  `systemctl --machine=<user>@.host` auto-start, and `socket=` being ignored
+  when the module is root. The error arms of `send_data`/`retrieve_data` are
+  likewise unreached — libpam does not fail them in a healthy transaction.
   Test login-unlock on a spare session or user before trusting it in your
   main session.
 * **Swap** — `[vault] lock_memory = true` pins the daemon in RAM, but it

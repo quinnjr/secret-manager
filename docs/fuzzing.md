@@ -72,7 +72,7 @@ built from), which it cannot discover by mutation alone.
 
 | Target | Attacker-controlled input | Core invariant |
 |---|---|---|
-| `vault_decode` | the vault file, before any authentication | no panic, bounded allocation, `aad` is exactly the parsed prefix |
+| `vault_decode` | the vault file, before any authentication | no panic; peak allocation stays inside a bound derived from the input length, measured by a `GlobalAlloc` counter rather than left to libFuzzer's `-rss_limit_mb`; a declared header length above `MAX_HEADER` is refused before anything is sized by it; `aad` is exactly the parsed prefix, and covers every byte the decoder consumed |
 | `vault_roundtrip` | a header | encode/decode is an identity, so the AEAD-authenticated prefix really describes the parsed header |
 | `vault_open_unlock` | a sealed vault | a wrong key never opens it; any corruption fails rather than yielding plaintext |
 | `vault_items_codec` | the decrypted item blob | round-trips; hostile bytes never panic |

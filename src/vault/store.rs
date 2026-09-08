@@ -64,6 +64,23 @@ enum State {
     Unlocked { key: Key, items: Vec<Item> },
 }
 
+/// What one item-list mutation did, so [`Vault::save_or_restore`] can undo it
+/// without a copy of the whole collection.
+///
+/// The alternative - cloning every `Item`, secrets included, before every
+/// single-item write - is paid on the success path too, and `save` already
+/// walks the list three more times (`build_index`, `encode_items`, `seal`).
+/// The delta restores exactly the same state because `save` neither reorders
+/// nor resizes the list.
+enum ItemDelta {
+    /// A new item was appended; undo by popping it.
+    Pushed,
+    /// The item at `index` was overwritten; undo by putting `prior` back.
+    Replaced { index: usize, prior: Box<Item> },
+    /// The item at `index` was removed; undo by reinserting `prior` there.
+    Removed { index: usize, prior: Box<Item> },
+}
+
 pub struct Vault {
     path: PathBuf,
     header: Header,
@@ -318,6 +335,28 @@ impl Vault {
     /// so callers can run Argon2 outside any lock, or on another host of the
     /// password entirely (the PAM module). Verifies the key even when the vault
     /// is already unlocked.
+    ///
+    /// **This can write the vault file, and callers must treat it as a
+    /// blocking write.** A successful unlock is the first moment the items are
+    /// readable, and therefore the first moment the header's attribute index
+    /// can be compared against the current `index_attributes` policy - a
+    /// header written under the other setting keeps its old shape until it is
+    /// re-sealed. When the two disagree this re-seals the whole collection:
+    /// `build_index`, `seal`, `write_temp`, `fsync`, `rename`, and an `fsync`
+    /// of the directory. That is bounded by the *data*, not by a constant, so
+    /// under `CLAUDE.md`'s "nothing slow or blocking under the state mutex"
+    /// rule it belongs to the collection's own lock, wrapped in
+    /// `state::block_in_place` exactly like an explicit save. The innocuous
+    /// name is the trap: an earlier bug came from calling this where only a
+    /// cheap key check was expected.
+    ///
+    /// **A failure of that rewrite does not fail the unlock.** The vault is
+    /// already open and correct in memory, and refusing the unlock would make
+    /// a read-only or full filesystem lock the user out of secrets that are
+    /// perfectly readable. The reason is recorded in
+    /// [`Vault::index_warning`] instead and surfaced by `sm status`, so a
+    /// failed rescrub is visible rather than silent. It is cleared on any
+    /// unlock that finds the index already correct.
     pub fn unlock_with_key(&mut self, key: &Key) -> Result<(), VaultError> {
         // A retired vault's file is already gone; opening it would decrypt a
         // collection that no longer exists and could never be saved again.
@@ -474,6 +513,36 @@ impl Vault {
         }
     }
 
+    /// Undo one single-item mutation, for [`Vault::save_or_restore`].
+    ///
+    /// The whole-vector snapshot [`Vault::restore_items`] takes is a deep
+    /// clone of every item *including every secret*, paid on the success path
+    /// too, purely as rollback insurance for a write that almost always
+    /// succeeds. For the paths that touch exactly one item the delta is all
+    /// that is needed, and it restores the same state: `save` never reorders
+    /// or resizes the item list, so the index recorded here still names the
+    /// same slot when this runs.
+    fn restore_delta(&mut self, delta: ItemDelta) {
+        let State::Unlocked { items, .. } = &mut self.state else {
+            return;
+        };
+        match delta {
+            ItemDelta::Pushed => {
+                items.pop();
+            }
+            ItemDelta::Replaced { index, prior } => {
+                if let Some(slot) = items.get_mut(index) {
+                    *slot = *prior;
+                }
+            }
+            ItemDelta::Removed { index, prior } => {
+                if index <= items.len() {
+                    items.insert(index, *prior);
+                }
+            }
+        }
+    }
+
     /// Insert an item. With `replace`, an item whose attributes are exactly
     /// equal is overwritten instead. Returns `(id, replaced)`.
     pub fn insert_item(
@@ -485,51 +554,59 @@ impl Vault {
         replace: bool,
     ) -> Result<(String, bool), VaultError> {
         let t = now();
-        let items_before = self.items()?.to_vec();
-        let result = {
-            let items = self.items_mut()?;
-            let pos = if replace {
-                items.iter().position(|i| i.attributes == attributes)
-            } else {
-                None
-            };
-            if let Some(p) = pos {
-                let existing = &mut items[p];
-                existing.label = label.to_string();
-                existing.secret = Zeroizing::new(secret);
-                existing.content_type = content_type.to_string();
-                existing.modified = t;
-                (existing.id.clone(), true)
-            } else {
-                let id = uuid::Uuid::new_v4().simple().to_string();
-                items.push(Item {
-                    id: id.clone(),
-                    label: label.to_string(),
-                    attributes,
-                    secret: Zeroizing::new(secret),
-                    content_type: content_type.to_string(),
-                    created: t,
-                    modified: t,
-                });
-                (id, false)
-            }
+        let items = self.items_mut()?;
+        let pos = if replace {
+            items.iter().position(|i| i.attributes == attributes)
+        } else {
+            None
         };
-        self.save_or_restore(items_before, Self::restore_items)?;
+        // Snapshot only what this call is about to change: the one item it
+        // overwrites, or nothing at all for a push, which rolls back by
+        // popping. See `restore_delta`.
+        let (result, delta) = if let Some(p) = pos {
+            let prior = Box::new(items[p].clone());
+            let existing = &mut items[p];
+            existing.label = label.to_string();
+            existing.secret = Zeroizing::new(secret);
+            existing.content_type = content_type.to_string();
+            existing.modified = t;
+            (
+                (existing.id.clone(), true),
+                ItemDelta::Replaced { index: p, prior },
+            )
+        } else {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            items.push(Item {
+                id: id.clone(),
+                label: label.to_string(),
+                attributes,
+                secret: Zeroizing::new(secret),
+                content_type: content_type.to_string(),
+                created: t,
+                modified: t,
+            });
+            ((id, false), ItemDelta::Pushed)
+        };
+        self.save_or_restore(delta, Self::restore_delta)?;
         Ok(result)
     }
 
     pub fn update_item(&mut self, id: &str, f: impl FnOnce(&mut Item)) -> Result<(), VaultError> {
-        let items_before = self.items()?.to_vec();
-        {
+        let delta = {
             let items = self.items_mut()?;
-            let item = items
-                .iter_mut()
-                .find(|i| i.id == id)
+            let index = items
+                .iter()
+                .position(|i| i.id == id)
                 .ok_or_else(|| VaultError::NoSuchItem(id.to_string()))?;
+            // Only the one item `f` may touch is snapshotted; see
+            // `restore_delta`.
+            let prior = Box::new(items[index].clone());
+            let item = &mut items[index];
             f(item);
             item.modified = now();
-        }
-        self.save_or_restore(items_before, Self::restore_items)
+            ItemDelta::Replaced { index, prior }
+        };
+        self.save_or_restore(delta, Self::restore_delta)
     }
 
     /// Test-only hook: force an item's `modified` timestamp to an exact
@@ -539,29 +616,34 @@ impl Vault {
     /// across the timestamp's clock granularity.
     #[cfg(feature = "test-util")]
     pub fn set_modified_for_tests(&mut self, id: &str, ts: u64) -> Result<(), VaultError> {
-        let items_before = self.items()?.to_vec();
-        {
+        let delta = {
             let items = self.items_mut()?;
-            let item = items
-                .iter_mut()
-                .find(|i| i.id == id)
-                .ok_or_else(|| VaultError::NoSuchItem(id.to_string()))?;
-            item.modified = ts;
-        }
-        self.save_or_restore(items_before, Self::restore_items)
-    }
-
-    pub fn delete_item(&mut self, id: &str) -> Result<(), VaultError> {
-        let items_before = self.items()?.to_vec();
-        {
-            let items = self.items_mut()?;
-            let pos = items
+            let index = items
                 .iter()
                 .position(|i| i.id == id)
                 .ok_or_else(|| VaultError::NoSuchItem(id.to_string()))?;
-            items.remove(pos);
-        }
-        self.save_or_restore(items_before, Self::restore_items)
+            let prior = Box::new(items[index].clone());
+            items[index].modified = ts;
+            ItemDelta::Replaced { index, prior }
+        };
+        self.save_or_restore(delta, Self::restore_delta)
+    }
+
+    pub fn delete_item(&mut self, id: &str) -> Result<(), VaultError> {
+        let delta = {
+            let items = self.items_mut()?;
+            let index = items
+                .iter()
+                .position(|i| i.id == id)
+                .ok_or_else(|| VaultError::NoSuchItem(id.to_string()))?;
+            // The removed item and where it sat: reinserting there restores
+            // the list exactly, order included. See `restore_delta`.
+            ItemDelta::Removed {
+                index,
+                prior: Box::new(items.remove(index)),
+            }
+        };
+        self.save_or_restore(delta, Self::restore_delta)
     }
 
     /// Delete several items in a single save: either every id in `ids` is gone
@@ -1412,6 +1494,187 @@ mod tests {
 
         unblock(block);
         v.unlock(b"old").unwrap();
+    }
+
+    /// A confirmed delete calls `Vault::retire` under the vault's own lock
+    /// and only then unlinks the file, so a save that races the unlink cannot
+    /// recreate the collection that was just deleted. Nothing asserted it.
+    #[test]
+    fn a_retired_vault_refuses_to_be_written() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.insert_item(
+            "x",
+            attrs(&[("a", "1")]),
+            b"s".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+
+        assert!(!v.is_retired());
+        v.retire();
+        assert!(v.is_retired());
+
+        let err = v
+            .insert_item(
+                "y",
+                attrs(&[("a", "2")]),
+                b"s".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, VaultError::Retired), "{err:?}");
+    }
+
+    /// `retire` also closes the door the other way: a retired vault must not
+    /// be re-opened, or the daemon would serve a collection whose file is
+    /// gone and which could never be saved again.
+    #[test]
+    fn a_retired_vault_refuses_to_unlock() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let key = crypto::derive_key(b"pw", &v.header.salt, v.header.kdf).unwrap();
+        v.lock();
+        v.retire();
+
+        let err = v.unlock_with_key(&key).unwrap_err();
+        assert!(matches!(err, VaultError::Retired), "{err:?}");
+    }
+
+    /// `unretire` is the delete path's rollback: an unlink that failed leaves
+    /// the collection in place, so writes must work again afterwards.
+    #[test]
+    fn unretire_restores_writability() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.retire();
+        assert!(
+            v.insert_item(
+                "x",
+                attrs(&[("a", "1")]),
+                b"s".to_vec(),
+                "text/plain",
+                false
+            )
+            .is_err()
+        );
+
+        v.unretire();
+        assert!(!v.is_retired());
+        v.insert_item(
+            "x",
+            attrs(&[("a", "1")]),
+            b"s".to_vec(),
+            "text/plain",
+            false,
+        )
+        .unwrap();
+        assert_eq!(v.items().unwrap().len(), 1);
+
+        // It really was written, not just accepted in memory.
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        assert_eq!(reopened.items().unwrap().len(), 1);
+    }
+
+    /// Every single-item mutation rolls back to *exactly* the prior list on a
+    /// failed save - not just to the right length.
+    ///
+    /// `insert_item`, `update_item` and `delete_item` each snapshot only the
+    /// one item they touch rather than deep-cloning the whole collection, so
+    /// each of the three deltas needs its own proof: a replacing insert must
+    /// put the overwritten item back with its old label, secret, content type
+    /// and `modified`; an update must undo the mutation *and* the `now()`
+    /// stamp; a delete must put the item back at its original index.
+    #[test]
+    fn a_failed_save_restores_each_single_item_delta_exactly() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        for n in 0..3 {
+            v.insert_item(
+                &format!("label-{n}"),
+                attrs(&[("a", &n.to_string())]),
+                format!("secret-{n}").into_bytes(),
+                "text/plain",
+                false,
+            )
+            .unwrap();
+        }
+        let snapshot = |v: &Vault| v.items().unwrap().to_vec();
+        let same = |a: &[Item], b: &[Item]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|(x, y)| {
+                    x.id == y.id
+                        && x.label == y.label
+                        && x.attributes == y.attributes
+                        && x.secret.as_slice() == y.secret.as_slice()
+                        && x.content_type == y.content_type
+                        && x.created == y.created
+                        && x.modified == y.modified
+                })
+        };
+        let before = snapshot(&v);
+        let middle = before[1].id.clone();
+
+        // 1. A fresh insert: the pushed item must be gone.
+        let block = block_writes(&path);
+        assert!(
+            v.insert_item(
+                "new",
+                attrs(&[("a", "new")]),
+                b"new-secret".to_vec(),
+                "text/plain",
+                false,
+            )
+            .is_err()
+        );
+        assert!(same(&snapshot(&v), &before), "fresh insert not rolled back");
+
+        // 2. A replacing insert: the overwritten item must come back whole.
+        assert!(
+            v.insert_item(
+                "clobbered",
+                attrs(&[("a", "1")]),
+                b"clobbering-secret".to_vec(),
+                "application/octet-stream",
+                true,
+            )
+            .is_err()
+        );
+        let after = snapshot(&v);
+        assert!(same(&after, &before), "replacing insert not rolled back");
+        assert_eq!(after[1].id, middle, "replaced item lost its identity");
+
+        // 3. An update: the mutation and the `modified` stamp must both go.
+        assert!(
+            v.update_item(&middle, |i| {
+                i.label = "touched".into();
+                i.secret = Zeroizing::new(b"touched".to_vec());
+            })
+            .is_err()
+        );
+        assert!(same(&snapshot(&v), &before), "update not rolled back");
+
+        // 4. A delete: the item must return at its original index.
+        assert!(v.delete_item(&middle).is_err());
+        assert!(same(&snapshot(&v), &before), "delete not rolled back");
+
+        // 5. And a batch delete, which keeps the whole-vector snapshot.
+        let ids: Vec<String> = before.iter().map(|i| i.id.clone()).collect();
+        assert!(v.delete_items(&ids[..2]).is_err());
+        assert!(same(&snapshot(&v), &before), "batch delete not rolled back");
+
+        // Memory still describes the file: with writes allowed again the
+        // vault round-trips through disk unchanged.
+        unblock(block);
+        v.lock();
+        v.unlock(b"pw").unwrap();
+        assert!(same(&snapshot(&v), &before), "in-memory state was stale");
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        assert!(same(reopened.items().unwrap(), &before));
     }
 
     /// A failed `insert_item` must not leave the in-memory item list

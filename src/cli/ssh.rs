@@ -425,7 +425,16 @@ async fn fallback(prompt: &str, confirm: bool) -> Result<(), CliError> {
     let pinentry = Pinentry::new(&config.prompt.pinentry);
     let req = PinRequest {
         title: "ssh".into(),
-        description: prompt.to_string(),
+        // `prompt` is raw argv from ssh, and OpenSSH embeds an
+        // attacker-chosen destination in the host-key question, so this is
+        // peer text in the strongest sense. Assuan's own `escape()` covers
+        // `%`, C0 and DEL and stops there: a `U+202E` in a hostname would
+        // still reach the toolkit and reorder the text of the very dialog the
+        // user is about to type a key passphrase into. Escaped the same way
+        // `consented` escapes its path, rather than filtered like
+        // `display_label`, because a host-key question carries a fingerprint
+        // the user has to read in full and `display_label` truncates.
+        description: escape_control(prompt),
         prompt: if confirm {
             String::new()
         } else {

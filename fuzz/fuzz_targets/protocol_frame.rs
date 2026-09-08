@@ -21,39 +21,14 @@ use secret_manager::protocol::{
     self, decode_frame, read_frame_sync, ProtocolError, Request, Response, MAX_FRAME,
     PROTOCOL_VERSION,
 };
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Records the largest single allocation Rust code makes, so the target can
-/// assert the *real* bound — that the reader never allocates more than the
-/// length the peer declared — rather than trusting that the length check
-/// happens to come first. libFuzzer itself is C++ and allocates through
-/// `malloc` directly, so it does not pollute this counter.
-struct PeakAlloc;
-
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for PeakAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        PEAK.fetch_max(layout.size(), Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        PEAK.fetch_max(new_size, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        PEAK.fetch_max(layout.size(), Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
-    }
-}
-
+/// The peak-allocation counter lives in `smfuzz` so more than one target can
+/// assert the real bound rather than leaning on `-rss_limit_mb`. libFuzzer
+/// itself is C++ and allocates through `malloc` directly, so it does not
+/// pollute the counter.
 #[global_allocator]
-static ALLOC: PeakAlloc = PeakAlloc;
+static ALLOC: smfuzz::PeakAlloc = smfuzz::PeakAlloc;
 
 /// Slack for the bookkeeping `read_frame_sync` does around the body buffer
 /// (the `Zeroizing` wrapper, the 4-byte prefix). Anything bigger than this
@@ -204,9 +179,9 @@ fuzz_target!(|case: FrameCase| {
     };
 
     let mut cursor = Cursor::new(&bytes[..]);
-    PEAK.store(0, Ordering::Relaxed);
+    smfuzz::reset_peak();
     let got = read_frame_sync(&mut cursor);
-    let peak = PEAK.load(Ordering::Relaxed);
+    let peak = smfuzz::peak();
 
     match (declared, got) {
         (None, Err(ProtocolError::Io(e))) => {

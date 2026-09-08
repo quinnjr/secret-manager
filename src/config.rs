@@ -23,7 +23,13 @@ pub struct VaultConfig {
     pub auto_lock_after: Duration,
     /// `mlockall` the daemon so secrets are never paged to swap. Needs
     /// `RLIMIT_MEMLOCK` large enough for the process (Argon2 alone maps
-    /// `m_cost_kib`); a failure is logged and ignored.
+    /// `m_cost_kib`).
+    ///
+    /// **A failure is fatal, not ignored.** `Daemon::start` propagates it as
+    /// `DaemonError::Hardening` and the daemon refuses to start: the setting
+    /// was asked for, and starting anyway would leave the operator believing
+    /// in a property that is not being provided. Do not "restore" an
+    /// ignore-on-failure path here - the refusal is the invariant.
     pub lock_memory: bool,
     /// Hash item attributes into the vault header so `SearchItems` works
     /// while locked. Off means a file holder learns only the item count, and

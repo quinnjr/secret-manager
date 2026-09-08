@@ -703,6 +703,77 @@ async fn chauthtok_rotates_the_key() {
     );
 }
 
+/// A `passwd`-shaped transaction must not leave the login password in PAM data.
+///
+/// `auth` stashes it, `password` runs, and `session` never does — that is the
+/// whole shape of `/etc/pam.d/passwd`, which `docs/install-arch.md` names as a
+/// target for this module and which the shipped snippet stacks both hooks in.
+/// The password hook therefore has to clear the stash itself; nothing else in
+/// such a transaction ever will before `pam_end`.
+///
+/// PAM data cannot be read from outside a module, so the session hook is the
+/// read-back, the same way
+/// [`a_login_transaction_unlocks_the_collection_and_then_clears_the_stash`]
+/// uses it. The trick is which password is answered where: the *auth* answer
+/// is the **new** vault password, so it is the new password that gets stashed,
+/// and after `chauthtok` has rotated the vault to that same password a
+/// surviving stash would unlock it. A cleared one cannot. `vault_opens_with`
+/// runs first so a collection that stays locked cannot be blamed on a
+/// `chauthtok` that did nothing, and the control transaction at the end proves
+/// the session hook does unlock with exactly this stash when it is still there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_password_change_clears_the_stashed_login_password() {
+    let Some(pam) = prerequisites() else { return };
+    let old = "login-vault-password";
+    let new = "rotated-vault-password";
+    let stack = Stack::build(old, "sm-chauthtok-stash").await;
+    let vault = stack.vault_file();
+
+    let tx = stack.transaction(pam, &current_user(), Answers::new(new, old, new));
+    assert_eq!(
+        tokio::task::block_in_place(|| tx.authenticate()),
+        PAM_SUCCESS,
+        "the auth stack must see PAM_SUCCESS from the module"
+    );
+    assert_eq!(
+        tokio::task::block_in_place(|| tx.chauthtok()),
+        PAM_SUCCESS,
+        "the password stack must see PAM_SUCCESS from the module"
+    );
+    assert!(
+        vault_opens_with(&vault, new),
+        "the vault was not rotated, so the session pass below proves nothing"
+    );
+
+    stack.relock().await;
+    assert!(stack.is_locked().await, "the collection is locked again");
+    assert_eq!(
+        tokio::task::block_in_place(|| tx.open_session()),
+        PAM_SUCCESS
+    );
+    assert!(
+        stack.is_locked().await,
+        "the session hook unlocked the vault after a password change: the \
+         login password chauthtok was handed is still in PAM data"
+    );
+    drop(tx);
+
+    // Control: the same stash, never passed through `chauthtok`, does unlock.
+    let tx = stack.transaction(pam, &current_user(), Answers::new(new, new, new));
+    assert_eq!(
+        tokio::task::block_in_place(|| tx.authenticate()),
+        PAM_SUCCESS
+    );
+    assert_eq!(
+        tokio::task::block_in_place(|| tx.open_session()),
+        PAM_SUCCESS
+    );
+    assert!(
+        !stack.is_locked().await,
+        "the control run did not unlock either, so the run above proves nothing"
+    );
+}
+
 /// The one thing about `PAM_PRELIM_CHECK` libpam cannot be made to
 /// demonstrate: that the module's hard-coded copy is the platform's value.
 ///

@@ -9,6 +9,7 @@ use crypto_bigint::modular::{MontyForm, MontyParams};
 use crypto_bigint::{NonZero, Odd, U1024};
 use hkdf::Hkdf;
 use sha2::Sha256;
+use std::sync::LazyLock;
 use zeroize::{Zeroize, Zeroizing};
 
 const PRIME_HEX: &str = concat!(
@@ -23,8 +24,17 @@ pub const PRIME_BYTES: usize = 128;
 
 pub const PRIME: U1024 = U1024::from_be_hex(PRIME_HEX);
 
+/// Montgomery parameters for [`PRIME`], built once.
+///
+/// `MontyParams::new_vartime` performs a 1024-bit modular inversion. The
+/// modulus is a fixed public constant, so recomputing it on every
+/// `generate()` and every `derive_aes_key()` - both on the per-D-Bus-call
+/// `OpenSession` path - buys nothing.
+static MONTY: LazyLock<MontyParams<{ U1024::LIMBS }>> =
+    LazyLock::new(|| MontyParams::new_vartime(Odd::new(PRIME).expect("group prime is odd")));
+
 fn monty() -> MontyParams<{ U1024::LIMBS }> {
-    MontyParams::new_vartime(Odd::new(PRIME).expect("group prime is odd"))
+    *MONTY
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -145,13 +155,33 @@ mod tests {
         ));
     }
 
-    /// The private exponent must not survive in the struct after a drop.
+    /// `U1024::zeroize` actually clears the exponent - the operation
+    /// `impl Drop for KeyPair` performs.
+    ///
+    /// This is deliberately *not* named for the drop: observing memory after
+    /// a value is dropped needs `unsafe` and is not worth it, so the wipe and
+    /// the fact that a drop performs it are pinned separately - here, and in
+    /// `key_pair_implements_drop` below.
     #[test]
-    fn private_exponent_is_zeroized_on_drop() {
+    fn zeroizing_the_private_exponent_clears_it() {
         let mut pair = KeyPair::generate();
         assert_ne!(pair.private, U1024::ZERO);
         pair.private.zeroize();
         assert_eq!(pair.private, U1024::ZERO);
+    }
+
+    /// The other half: `KeyPair` must have a `Drop` impl at all. Without
+    /// this, deleting `impl Drop for KeyPair` leaves every other test in this
+    /// module green while the exponent is never wiped.
+    #[test]
+    fn key_pair_implements_drop() {
+        // `needs_drop` would be true from the `Vec<u8>` public key alone, so
+        // name the impl itself: this bound resolves only while
+        // `impl Drop for KeyPair` exists, and deleting it breaks the build
+        // here instead of silently leaving the exponent unwiped.
+        #[allow(drop_bounds)]
+        fn assert_impls_drop<T: Drop>() {}
+        assert_impls_drop::<KeyPair>();
     }
 
     #[test]

@@ -77,18 +77,12 @@ impl Fixture {
 
     /// `pin = None` makes every prompt cancel.
     pub async fn start_with_pin(pin: Option<&str>) -> Fixture {
-        Self::start_custom(pin, Duration::ZERO).await
+        Self::start_with_pin_and_env(pin, Vec::new(), Duration::ZERO).await
     }
 
     /// Daemon with a fast idle-lock timer instead of the default disabled one.
     pub async fn start_with_idle(idle: Duration) -> Fixture {
-        Self::start_custom(Some(PASSWORD), idle).await
-    }
-
-    /// General constructor: `pin = None` makes every prompt cancel; `idle` sets
-    /// `auto_lock_after`.
-    pub async fn start_custom(pin: Option<&str>, idle: Duration) -> Fixture {
-        Self::start_with_pin_and_env(pin, Vec::new(), idle).await
+        Self::start_with_pin_and_env(Some(PASSWORD), Vec::new(), idle).await
     }
 
     /// Like [`start_with_pin`](Self::start_with_pin), with extra environment
@@ -99,21 +93,12 @@ impl Fixture {
         extra_pinentry_env: Vec<(String, String)>,
         idle: Duration,
     ) -> Fixture {
-        Self::start_full(pin, extra_pinentry_env, idle, |_| {}).await
+        Self::start_inner(pin, extra_pinentry_env, idle, |_| {}, true).await
     }
 
     /// Daemon with the default fixture plus `mutate` applied to its config.
     pub async fn start_with_config(mutate: impl FnOnce(&mut Config)) -> Fixture {
-        Self::start_full(Some(PASSWORD), Vec::new(), Duration::ZERO, mutate).await
-    }
-
-    pub async fn start_full(
-        pin: Option<&str>,
-        extra_pinentry_env: Vec<(String, String)>,
-        idle: Duration,
-        mutate: impl FnOnce(&mut Config),
-    ) -> Fixture {
-        Self::start_inner(pin, extra_pinentry_env, idle, mutate, true).await
+        Self::start_inner(Some(PASSWORD), Vec::new(), Duration::ZERO, mutate, true).await
     }
 
     /// The default fixture, except that the alias file is never written, so

@@ -385,6 +385,147 @@ pub fn save_aliases_to(dir: &Path, aliases: &BTreeMap<String, String>) -> std::i
     }
 }
 
+/// What [`update_aliases`] does with an in-memory table whose write failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnWriteError {
+    /// Leave the table as it was: the caller reports the failure to a client
+    /// that can retry, and the daemon must not disagree with its own file.
+    /// This is `SetAlias`.
+    Refuse,
+    /// Apply the edit anyway, for this daemon's lifetime. The create and
+    /// delete prompts have already done the irreversible half — a vault
+    /// exists, or is gone — and must not be left half-done because a
+    /// convenience file beside the vaults could not be written.
+    Keep,
+}
+
+/// How an [`update_aliases`] call ended.
+#[derive(Debug)]
+pub enum AliasUpdate<E> {
+    /// Written to `aliases.toml` and applied in memory.
+    Committed,
+    /// The write failed. Whether the edit was applied in memory anyway is
+    /// the [`OnWriteError`] the caller passed.
+    NotWritten(std::io::Error),
+    /// The table is not the file's own contents, so nothing may be written
+    /// back at all. See [`AliasTable::writable`].
+    Unusable(AliasError),
+    /// The `edit` closure refused.
+    Rejected(E),
+}
+
+/// How many times [`update_aliases`] redoes its edit against a table another
+/// writer committed underneath it. Contention here is two same-uid clients
+/// racing `SetAlias`, so a handful is generous; the last attempt commits
+/// regardless, which is no worse than the lost update a non-retrying version
+/// would have taken every time.
+const ALIAS_UPDATE_ATTEMPTS: usize = 8;
+
+/// Edit the alias table and make the result durable, **with the state guard
+/// dropped across the write**.
+///
+/// `save_aliases_to` does `create_dir_all`, `create_new`, `write_all`,
+/// `sync_all`, `rename` and a second `sync_all` on the directory. All three
+/// writers used to do that with the `ServiceState` guard alive, which is the
+/// defect `CLAUDE.md` names in as many words — "not a synchronous blocking
+/// call either: a `write`, an `fsync`" — and which a `SetAlias` from any
+/// same-uid client, with no consent gate and no rate limit, could repeat at
+/// will. It is the same shape a vault save already has, minus the vault: the
+/// work the write needs is cloned out, the guard is dropped, the blocking
+/// half runs in [`block_in_place`], and only the (allocation-only) commit
+/// happens back under the lock.
+///
+/// **The write happens before the in-memory commit, deliberately.** The other
+/// order leaves the daemon disagreeing with its own file whenever the write
+/// fails, and the next reload silently undoes what the client was told
+/// happened.
+///
+/// Dropping the guard means two writers can now interleave, which one global
+/// guard made impossible, so the commit is a compare-and-swap: the table the
+/// edit was based on is remembered, and if another writer committed in the
+/// meantime the edit is redone against the new table and written again.
+///
+/// There is deliberately **no separate alias lock**. Holding one across the
+/// state lock is exactly the "two locks at once" shape `VaultRef` forbids and
+/// `tests/dbus_locking.rs` scans for, and unlike a vault the alias table has
+/// no expensive per-object work to protect — the whole file is rewritten
+/// every time, so serialising writers buys only what the retry already gives.
+pub async fn update_aliases<E>(
+    state: &Shared,
+    on_write_error: OnWriteError,
+    mut edit: impl FnMut(&ServiceState, &mut BTreeMap<String, String>) -> std::result::Result<(), E>,
+) -> AliasUpdate<E> {
+    for attempt in 1..=ALIAS_UPDATE_ATTEMPTS {
+        let (dir, base, next) = {
+            let st = state.lock().await;
+            let base = match st.aliases.writable() {
+                Ok(table) => table.clone(),
+                Err(e) => return AliasUpdate::Unusable(e.clone()),
+            };
+            let mut next = base.clone();
+            if let Err(e) = edit(&st, &mut next) {
+                return AliasUpdate::Rejected(e);
+            }
+            (st.vault_dir.clone(), base, next)
+        };
+        let written = block_in_place(|| save_aliases_to(&dir, &next));
+        let mut st = state.lock().await;
+        // Re-checked after re-acquiring: both the writability of the table
+        // and its contents can change while the guard is dropped.
+        let stale = match st.aliases.writable() {
+            Ok(current) => *current != base,
+            Err(e) => return AliasUpdate::Unusable(e.clone()),
+        };
+        if stale && attempt < ALIAS_UPDATE_ATTEMPTS {
+            continue;
+        }
+        return match written {
+            Ok(()) => {
+                st.aliases = AliasTable::Usable(next);
+                AliasUpdate::Committed
+            }
+            Err(e) => {
+                if on_write_error == OnWriteError::Keep {
+                    st.aliases = AliasTable::Usable(next);
+                }
+                AliasUpdate::NotWritten(e)
+            }
+        };
+    }
+    unreachable!("the last attempt always returns")
+}
+
+/// A free `<id>` for a collection labelled `label`, given the ids already
+/// loaded and the directory to check for files.
+///
+/// A free function so the caller can clone `loaded` and `dir` out of the
+/// state guard and run this — which does a blocking `symlink_metadata` per
+/// candidate, in an unbounded loop — with the guard dropped.
+/// [`ServiceState::unique_collection_id`] is this, against its own fields.
+pub fn unique_collection_id_in(
+    dir: &Path,
+    loaded: &std::collections::BTreeSet<String>,
+    label: &str,
+) -> String {
+    let base = collection_id_from_label(label);
+    let taken = |id: &str| {
+        // `symlink_metadata`, not `exists`: `exists` follows the link, so a
+        // dangling symlink at `<id>.vault` looks free here and then makes
+        // `Vault::create`'s RENAME_NOREPLACE publish fail EEXIST, retrying
+        // the same free-looking name until the attempts run out. Same-uid
+        // is only semi-trusted, so treat any entry at the name — link,
+        // directory, or file — as taken.
+        loaded.contains(id) || std::fs::symlink_metadata(dir.join(format!("{id}.vault"))).is_ok()
+    };
+    if !taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}_{n}"))
+        .find(|id| !taken(id))
+        .expect("unbounded")
+}
+
 /// What a directory scan found, before any of it is applied to the daemon's
 /// state. Produced by [`scan_vault_dir`] and consumed by
 /// [`ServiceState::merge_scan`].
@@ -556,7 +697,12 @@ pub async fn search_all(
 /// itself obeys (see [`VaultRef`]).
 #[cfg(any(test, feature = "test-util"))]
 pub async fn collection_is_locked(state: &Shared, id: &str) -> bool {
-    match state.lock().await.vault(id) {
+    // A `let`, not a `match` scrutinee: a scrutinee temporary lives for the
+    // whole `match`, so the state guard survived into the arms and the state
+    // lock was held for as long as the vault's was contended. Same shape as
+    // `with_vault` below.
+    let vault = state.lock().await.vault(id);
+    match vault {
         Some(v) => v.lock().await.is_locked(),
         None => true,
     }
@@ -679,8 +825,17 @@ impl ServiceState {
     }
 
     /// Write the table back. Refuses unless it is the file's own contents;
-    /// see [`AliasTable::writable`]. The callers refuse first, with a better
-    /// message; this is the backstop.
+    /// see [`AliasTable::writable`].
+    ///
+    /// **No production caller.** It used to be described as the backstop the
+    /// writers relied on, and it never was: `SetAlias` and both collection
+    /// prompts go through [`update_aliases`], which has to clone the table
+    /// out and drop the state guard before writing — something a `&self`
+    /// method on the state cannot do, since holding `&self` *is* holding the
+    /// guard. Routing them back through here would put the `fsync` under the
+    /// state mutex again, so the doc is what changed, not the callers. Kept
+    /// for tests and for a future writer that already has the guard and can
+    /// afford the write.
     pub fn save_aliases(&self) -> std::io::Result<()> {
         let table = self.aliases.writable().map_err(|e| {
             std::io::Error::new(
@@ -834,26 +989,14 @@ impl ServiceState {
             .collect()
     }
 
-    /// Path-safe id derived from a label, made unique against loaded collections and files.
+    /// Path-safe id derived from a label, made unique against loaded
+    /// collections and files.
+    ///
+    /// Blocking: one `symlink_metadata` per candidate. It must not be called
+    /// with the state guard held — [`unique_collection_id_in`] is the same
+    /// thing against cloned-out fields, which is what the create path uses.
     pub fn unique_collection_id(&self, label: &str) -> String {
-        let base = collection_id_from_label(label);
-        let taken = |id: &str| {
-            // `symlink_metadata`, not `exists`: `exists` follows the link, so a
-            // dangling symlink at `<id>.vault` looks free here and then makes
-            // `Vault::create`'s RENAME_NOREPLACE publish fail EEXIST, retrying
-            // the same free-looking name until the attempts run out. Same-uid
-            // is only semi-trusted, so treat any entry at the name — link,
-            // directory, or file — as taken.
-            self.collections.contains_key(id)
-                || std::fs::symlink_metadata(self.vault_dir.join(format!("{id}.vault"))).is_ok()
-        };
-        if !taken(&base) {
-            return base;
-        }
-        (2..)
-            .map(|n| format!("{base}_{n}"))
-            .find(|id| !taken(id))
-            .expect("unbounded")
+        unique_collection_id_in(&self.vault_dir, &self.loaded_ids(), label)
     }
 }
 
@@ -1327,5 +1470,208 @@ mod tests {
             panic!("a file that cannot be read is not a parse failure");
         };
         assert_ne!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    }
+
+    /// No blocking file I/O may happen while the **global state** guard is
+    /// held — `CLAUDE.md`, "Nothing slow or blocking may happen under the
+    /// state mutex": "not a synchronous blocking call either: a `write`, an
+    /// `fsync`".
+    ///
+    /// `tests/dbus_locking.rs` scans the same files for a *lock* taken while
+    /// a guard is held; it cannot see a blocking syscall, which is how three
+    /// `save_aliases_to` calls — `create_dir_all`, `write_all`, two
+    /// `sync_all`s and a `rename` — sat under the state guard on the
+    /// `SetAlias`, `CreateCollection` and `DeleteCollection` paths, and how
+    /// `unique_collection_id` came to `symlink_metadata` in an unbounded loop
+    /// under it. This is the half a green run cannot establish, so it is
+    /// checked against the source.
+    ///
+    /// Only guards bound from the *state* lock are tracked. `block_in_place`
+    /// under a **vault**'s own lock is exactly where a save belongs, so a
+    /// scan that did not distinguish the two would forbid the shape the rest
+    /// of the daemon is built on. Reads formatted source; run `cargo fmt`
+    /// before trusting a failure.
+    #[test]
+    fn no_blocking_io_under_a_state_guard() {
+        /// Calls that block on the filesystem, or that hide one.
+        const BLOCKING: &[&str] = &[
+            "std::fs::",
+            "save_aliases_to(",
+            "save_aliases(",
+            "load_aliases(",
+            "unique_collection_id",
+            "block_in_place(",
+            "sync_all(",
+            "scan_vault_dir(",
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<PathBuf> = std::fs::read_dir(root.join("src/dbus"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        files.sort();
+        assert!(files.len() > 5, "the scan found almost nothing: {files:?}");
+
+        let mut offences = Vec::new();
+        let mut guards_seen = 0usize;
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let name = file.strip_prefix(root).unwrap().display().to_string();
+            // (binding name, brace depth of the block it lives in)
+            let mut held: Vec<(String, usize)> = Vec::new();
+            let mut depth = 0usize;
+            for (n, raw) in text.lines().enumerate() {
+                let code = strip_strings_and_comments(raw);
+                if let Some((holder, _)) = held.last()
+                    && let Some(call) = BLOCKING.iter().find(|c| code.contains(**c))
+                {
+                    offences.push(format!(
+                        "{name}:{}: `{call}` runs while the state guard `{holder}` is held\n    {}",
+                        n + 1,
+                        raw.trim()
+                    ));
+                }
+                held.retain(|(b, _)| !code.contains(&format!("drop({b})")));
+                for ch in code.chars() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth = depth.saturating_sub(1);
+                            held.retain(|(_, d)| *d <= depth);
+                        }
+                        _ => {}
+                    }
+                }
+                let t = code.trim();
+                if t.starts_with("let ")
+                    && t.ends_with(".lock().await;")
+                    && t.contains("state.lock().await")
+                    && let Some(b) = t
+                        .trim_start_matches("let ")
+                        .trim_start_matches("mut ")
+                        .split(['=', ':', ' '])
+                        .next()
+                        .map(str::trim)
+                    && !b.is_empty()
+                    && b.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    guards_seen += 1;
+                    held.push((b.to_string(), depth));
+                }
+            }
+        }
+        assert!(
+            guards_seen >= 5,
+            "the scan recognised only {guards_seen} state guards, so it is not \
+             looking at what it thinks it is"
+        );
+        assert!(
+            offences.is_empty(),
+            "blocking I/O under the global state mutex; see `CLAUDE.md`, \
+             \"Nothing slow or blocking may happen under the state mutex\":\n{}",
+            offences.join("\n")
+        );
+    }
+
+    /// Drop `//` comments and string-literal contents, so a call named in a
+    /// doc comment or inside a `format!` is not read as code.
+    fn strip_strings_and_comments(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut chars = line.char_indices().peekable();
+        while let Some((_, ch)) = chars.next() {
+            match (in_str, ch) {
+                (true, _) if escaped => escaped = false,
+                (true, '\\') => escaped = true,
+                (true, '"') => {
+                    in_str = false;
+                    out.push('"');
+                }
+                (true, _) => {}
+                (false, '"') => {
+                    in_str = true;
+                    out.push('"');
+                }
+                (false, '/') if chars.peek().map(|(_, c)| *c) == Some('/') => break,
+                (false, _) => out.push(ch),
+            }
+        }
+        out
+    }
+
+    /// The state guard must be released before a collection's lock is
+    /// awaited (`VaultRef`: "nothing ever holds both"). Written as a
+    /// `match` scrutinee, `state.lock().await.vault(id)` survives into the
+    /// arms, so the state lock stayed held for as long as the vault's was
+    /// contended — every other bus call, control request and housekeeping
+    /// task behind one busy collection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn collection_is_locked_leaves_the_state_lock_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::create(
+            &dir.path().join("default.vault"),
+            "Default",
+            b"pw",
+            KdfParams::FAST_FOR_TESTS,
+        )
+        .unwrap();
+        let mut st = state(dir.path());
+        st.collections.insert("default".into(), vault_ref(vault));
+        let shared: Shared = Arc::new(tokio::sync::Mutex::new(st));
+
+        let vault = shared.lock().await.vault("default").unwrap();
+        let mut held = vault.lock().await;
+        held.lock();
+        let probe = tokio::spawn({
+            let shared = shared.clone();
+            async move { collection_is_locked(&shared, "default").await }
+        });
+        // Let the probe reach the vault lock it cannot have.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !probe.is_finished(),
+            "timing assumption: the probe must still be waiting on the vault"
+        );
+        assert!(
+            shared.try_lock().is_ok(),
+            "the state lock must be free while `collection_is_locked` waits on a vault"
+        );
+        drop(held);
+        assert!(probe.await.unwrap(), "the collection is locked");
+    }
+
+    /// `update_aliases` writes with the state guard dropped, so two writers
+    /// can interleave; each rechecks the table it based its write on and
+    /// redoes the edit if another commit landed first, so neither is lost —
+    /// which the single-guard version got for free and a naive
+    /// clone-drop-write-recommit would have given up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_alias_updates_do_not_lose_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared: Shared = Arc::new(tokio::sync::Mutex::new(state(dir.path())));
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    update_aliases(&shared, OnWriteError::Refuse, move |_, next| {
+                        next.insert(format!("a{n}"), "default".to_string());
+                        Ok::<(), String>(())
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for w in writers {
+            assert!(matches!(w.await.unwrap(), AliasUpdate::Committed));
+        }
+        let on_disk = load_aliases(dir.path()).unwrap();
+        assert_eq!(on_disk.len(), 8, "{on_disk:?}");
+        assert_eq!(
+            shared.lock().await.aliases,
+            AliasTable::Usable(on_disk),
+            "memory and disk agree once every writer has been answered"
+        );
     }
 }

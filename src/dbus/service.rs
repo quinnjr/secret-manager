@@ -31,8 +31,15 @@ impl Service {
 /// Upper bound on the `items` array of one `GetSecrets` call. Every element
 /// costs a linear path resolution, a linear item lookup, and an AES
 /// encryption; without a cap a single ~128 MiB D-Bus message could occupy the
-/// global state mutex for a very long time. libsecret never sends more than a
-/// few hundred.
+/// daemon for a very long time. libsecret never sends more than a few
+/// hundred.
+///
+/// The per-element cost is no longer paid *under the global state mutex*:
+/// only the path resolutions are, and the lookups and the encryption happen
+/// with it released, one collection lock per collection named. The cap is
+/// still the right one — a resolution each, plus a lock acquisition each, is
+/// unbounded work driven by one message either way — but it bounds the
+/// daemon's time, not the mutex's.
 pub const MAX_GET_SECRETS_ITEMS: usize = 1024;
 
 /// Upper bound on the attribute count of one search, for the same reason.
@@ -40,13 +47,16 @@ pub const MAX_SEARCH_ATTRIBUTES: usize = 1024;
 
 /// Upper bound on the `objects` array of one `Lock` or `Unlock` call, for the
 /// same reason as [`MAX_GET_SECRETS_ITEMS`] and with the same number (HIGH 2).
-/// Every element costs a `paths::parse` (two `String` allocations) and a
-/// `resolve_item`, which scans the collection's whole item index; a single
-/// legal D-Bus message can carry over a million minimal item paths, and an
-/// attacker maximises the scan by naming a real collection and an item id that
-/// does not exist, so nothing short-circuits. All of it runs under the global
-/// state mutex, so the cap is checked before the lock is taken and before any
-/// per-element work. libsecret never sends more than a few.
+/// Every element costs a `paths::parse` (two `String` allocations), one state
+/// lock acquisition to resolve it, and one acquisition of the named
+/// collection's lock plus a scan of its whole item index to confirm the item
+/// exists — the existence half of what `resolve_item` used to answer in one
+/// step under the state lock, which is now the caller's to do with that lock
+/// released. A single legal D-Bus message can carry over a million minimal
+/// item paths, and an attacker maximises the scan by naming a real collection
+/// and an item id that does not exist, so nothing short-circuits. The cap is
+/// checked before any of it, and before any lock is taken. libsecret never
+/// sends more than a few.
 pub const MAX_LOCK_OBJECTS: usize = 1024;
 
 /// Upper bound on an alias name (HIGH 3). `paths::is_segment` constrains the
@@ -90,8 +100,22 @@ fn check_alias_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A `SessionCipher` is not `Clone`; this copies one so the per-item
-/// encryption in `get_secrets` can run after the state lock is released.
+/// Refuse a *new* alias once the table is at [`MAX_ALIASES`]. Repointing an
+/// existing one is always allowed; only a new entry can grow the table.
+///
+/// Shared by `SetAlias` and the `CreateCollection` prompt: the cap used to be
+/// enforced in `SetAlias` alone, so a client could pass it by creating
+/// collections with an alias instead — and [`state::MAX_ALIAS_BYTES`] sizes
+/// itself on this cap holding.
+pub(crate) fn check_alias_room(table: &BTreeMap<String, String>, name: &str) -> Result<()> {
+    if !table.contains_key(name) && table.len() >= MAX_ALIASES {
+        return Err(Error::failed(format!(
+            "too many aliases; at most {MAX_ALIASES}"
+        )));
+    }
+    Ok(())
+}
+
 /// Append `id` unless it's already present.
 fn push_unique(ids: &mut Vec<String>, id: String) {
     if !ids.contains(&id) {
@@ -291,44 +315,45 @@ impl Service {
     ) -> Result<()> {
         check_alias_name(name)?;
         let clearing = collection.as_str() == "/";
-        {
-            let mut st = self.state.lock().await;
-            // Above the split, not inside the repointing branch. Clearing
-            // used to mutate the table first and rely on `save_aliases`
-            // refusing, which returns *after* the removal and *before*
-            // `unregister_alias` — so a refused clear left the table changed
-            // in memory and both exported objects behind, which is exactly
-            // what clearing exists to reclaim.
-            let mut next = st
-                .aliases
-                .writable()
-                .map_err(|e| {
-                    Error::failed(format!(
-                        "alias table is unreadable ({e}); refusing to replace it"
-                    ))
-                })?
-                .clone();
-            if clearing {
-                next.remove(name);
-            } else {
+        // The edit runs under the state guard; the write that follows it does
+        // not. `state::update_aliases` keeps the deliberate write-first,
+        // commit-second order, re-checks `writable()` after re-acquiring the
+        // lock — the table can degrade while the guard is dropped — and
+        // redoes the edit if another writer committed underneath it.
+        //
+        // Clearing is handled above the split, not inside the repointing
+        // branch. It used to mutate the table first and rely on the save
+        // refusing, which returns *after* the removal and *before*
+        // `unregister_alias` — so a refused clear left the table changed in
+        // memory and both exported objects behind, which is exactly what
+        // clearing exists to reclaim.
+        let outcome =
+            state::update_aliases(&self.state, state::OnWriteError::Refuse, |st, next| {
+                if clearing {
+                    next.remove(name);
+                    return Ok(());
+                }
                 let id = st
                     .resolve_collection(collection.as_str())
                     .ok_or(Error::NoSuchObject)?;
-                // Repointing an existing alias is always allowed; only a new
-                // entry can grow the table.
-                if !next.contains_key(name) && next.len() >= MAX_ALIASES {
-                    return Err(Error::failed(format!(
-                        "too many aliases; at most {MAX_ALIASES}"
-                    )));
-                }
+                check_alias_room(next, name)?;
                 next.insert(name.to_string(), id);
+                Ok(())
+            })
+            .await;
+        match outcome {
+            state::AliasUpdate::Committed => {}
+            state::AliasUpdate::Rejected(e) => return Err(e),
+            state::AliasUpdate::Unusable(e) => {
+                return Err(Error::failed(format!(
+                    "alias table is unreadable ({e}); refusing to replace it"
+                )));
             }
-            // Write first, then commit in memory. The other order leaves the
-            // daemon disagreeing with its own file whenever the write fails
-            // for any reason — a full disk, a read-only directory — and the
-            // next reload silently undoes what the client was told happened.
-            state::save_aliases_to(&st.vault_dir, &next).map_err(Error::failed)?;
-            st.aliases = state::AliasTable::Usable(next);
+            // Nothing is committed in memory: the daemon must not disagree
+            // with its own file when the write failed for any reason — a
+            // full disk, a read-only directory — because the next reload
+            // would silently undo what the client was told happened.
+            state::AliasUpdate::NotWritten(e) => return Err(Error::failed(e)),
         }
         if clearing {
             // The alias object resolves its target at call time, so a
@@ -463,6 +488,17 @@ impl Service {
     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
         let label = prop_string(&properties, "org.freedesktop.Secret.Collection.Label")?
             .unwrap_or_else(|| "Unnamed".to_string());
+        // Beside `check_alias_name`, and before the prompt object exists.
+        // `Vault::build` refuses an oversized label too, but only after a
+        // pinentry dialog has been raised and answered — and the client is
+        // then told its prompt was *dismissed*, which is neither true nor
+        // actionable.
+        if label.len() > crate::vault::format::MAX_LABEL {
+            return Err(Error::invalid_args(format!(
+                "label is too large; at most {} bytes",
+                crate::vault::format::MAX_LABEL
+            )));
+        }
         let alias = if alias.is_empty() {
             None
         } else {
@@ -535,4 +571,35 @@ impl Service {
         emitter: &SignalEmitter<'_>,
         collection: OwnedObjectPath,
     ) -> zbus::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The alias cap is a property of the *table*, not of `SetAlias`: the
+    /// `CreateCollection` prompt takes an alias too and used to insert
+    /// unconditionally, so a client could grow the table past `MAX_ALIASES`
+    /// by creating collections instead of setting aliases — and
+    /// `state::MAX_ALIAS_BYTES` derives its own sizing from this cap holding.
+    /// Repointing an existing name never grows the table and is always
+    /// allowed, at the cap included.
+    #[test]
+    fn the_alias_cap_counts_only_new_names() {
+        let mut table: BTreeMap<String, String> = (0..MAX_ALIASES - 1)
+            .map(|n| (format!("a{n}"), "default".to_string()))
+            .collect();
+        assert!(
+            check_alias_room(&table, "fresh").is_ok(),
+            "room for one more"
+        );
+        table.insert("fresh".into(), "default".into());
+        assert_eq!(table.len(), MAX_ALIASES);
+        assert!(
+            check_alias_room(&table, "fresh").is_ok(),
+            "repointing an existing alias at the cap is always allowed"
+        );
+        let err = check_alias_room(&table, "one_too_many").unwrap_err();
+        assert!(err.to_string().contains(&MAX_ALIASES.to_string()), "{err}");
+    }
 }

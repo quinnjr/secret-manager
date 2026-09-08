@@ -72,6 +72,16 @@ impl From<VaultError> for Error {
 /// `Item::set_attributes`) is therefore stuck reporting a locked vault as
 /// `org.freedesktop.DBus.Error.Failed` on the wire; this keeps the intended
 /// name legible in the description text instead of losing it entirely.
+///
+/// **This is a deliberate, wire-visible deviation from the Secret Service
+/// spec, and it is accepted.** A libsecret client that matches on the error
+/// *name* never sees `org.freedesktop.Secret.Error.IsLocked` from a property
+/// setter — only `Failed`, with the intended name pasted into the human-
+/// readable description, where nothing matches on it. Every non-property
+/// method still returns the real name through `Error`'s own `DBusError` impl,
+/// so this affects the three setters above and nothing else. Recorded here
+/// because it is the kind of trade that is invisible from the outside until a
+/// client's `IsLocked` branch quietly stops firing.
 pub fn vault_error_to_fdo(e: VaultError) -> zbus::fdo::Error {
     match e {
         VaultError::Locked => zbus::fdo::Error::Failed(
