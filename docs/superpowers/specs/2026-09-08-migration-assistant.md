@@ -443,36 +443,25 @@ themselves.
 
 ## Decommissioning
 
-`docs/install-arch.md` and `docs/install-debian.md` already cover replacing
-gnome-keyring: disable and mask the unit, copy the D-Bus activation file into
-`~/.local/share/dbus-1/services/`. The assistant references those documents
-rather than restating them. Research for this spec found four gaps in them,
-which should be fixed in the install docs themselves, not here:
+`docs/install-arch.md` and `docs/install-debian.md` cover replacing both
+providers, and the assistant references them rather than restating them.
+Research for this spec found four gaps in those documents; they have since
+been fixed there, which is where they belonged:
 
-- **XDG autostart is not mentioned.** `/etc/xdg/autostart/gnome-keyring-secrets.desktop`
-  runs `gnome-keyring-daemon --components=secrets` from a plain desktop
-  session even with the systemd unit masked. The fix is a `Hidden=true`
-  override in `~/.config/autostart/`.
-- **`--components` deserves a warning.** The packaged unit runs
-  `pkcs11,secrets` as one process, so masking it removes the user's PKCS#11
-  provider too, which can break certificate auth in Evolution, Chrome and
-  other NSS consumers. Debian's `apt purge gnome-keyring` has the same
-  effect. A user who needs PKCS#11 must re-enable that component alone.
-- **The KWallet guidance is one sentence and is insufficient.** It says
-  KWallet does not claim the name unless `ksecretd` is enabled, and points at
-  a GUI. On the author's machine `ksecretd` holds the name *despite* the
-  system activation file naming gnome-keyring — so following the doc
-  literally leaves KWallet serving `org.freedesktop.secrets`. The file-level
-  equivalent is `~/.config/kwalletrc` with `[Wallet] Enabled=false`.
-- **`pam_kwallet5` and the extra bus names are unmentioned.**
-  `pam_kwallet5.so` appears in several login stacks and keeps unlocking and
-  starting KWallet at every login. `ksecretd` additionally owns
-  `org.kde.secretservicecompat` and
-  `org.freedesktop.impl.portal.desktop.kwallet`, the latter meaning the
-  xdg-desktop-portal Secret backend still routes to KWallet after the main
-  name is taken.
+- XDG autostart, which starts gnome-keyring from a desktop session even with
+  the systemd unit masked.
+- A warning that masking the unit removes the user's PKCS#11 provider too,
+  since the packaged unit runs `pkcs11,secrets` as one process.
+- Real KWallet instructions. The previous single sentence pointed at a GUI
+  and was wrong in the case that matters: `ksecretd` claims the bus name at
+  runtime and holds it even when the system activation file names
+  gnome-keyring, so the documented `cp` does not displace it.
+- `pam_kwallet5` in the login stacks, and the two further bus names
+  `ksecretd` owns — including the xdg-desktop-portal Secret backend, which
+  keeps routing sandboxed applications to KWallet after the main name is
+  taken.
 
-One thing the assistant does say itself, because it is a consequence of
+The assistant adds one thing itself, because it is a consequence of
 migrating rather than of installing: `ksecretd` holds the bus name for the
 life of the session, so a log-out and back in is required. Anything short of
 that leaves the old provider in place and the user concluding the migration

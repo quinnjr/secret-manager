@@ -183,7 +183,14 @@ Append options to the `pam_secret_manager.so` lines (space separated):
 **`secret-manager.service` is `failed` or `start-limit-hit`**
 
 Another process already owns `org.freedesktop.secrets` on the session bus
-(KWallet's `ksecretd`, or `gnome-keyring-daemon`).
+(KWallet's `ksecretd`, or `gnome-keyring-daemon`). Find out which, rather
+than guessing — the two need different steps, and `ksecretd` can hold the
+name on a machine where gnome-keyring is the one named in the activation
+file:
+
+```sh
+busctl --user status org.freedesktop.secrets | grep -E 'Pid|Comm'
+```
 
 ```sh
 systemctl --user status secret-manager.service
@@ -192,7 +199,9 @@ systemctl --user reset-failed secret-manager.service
 
 Confirm the competing service is disabled or masked (see "Replace
 gnome-keyring or kwallet" in your distro's install guide) before starting
-secret-manager again.
+secret-manager again. Note that `ksecretd` keeps the name for the life of
+the session, so after disabling KWallet you must log out and back in — no
+amount of restarting `secret-manager.service` will take it.
 
 **The D-Bus activation override reverts after an upgrade**
 

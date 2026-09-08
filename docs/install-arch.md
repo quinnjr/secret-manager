@@ -25,6 +25,12 @@ systemctl --user disable --now gnome-keyring-daemon.service gnome-keyring-daemon
 systemctl --user mask gnome-keyring-daemon.service
 ```
 
+**Masking the unit also removes your PKCS#11 provider.** The packaged unit
+runs `--components="pkcs11,secrets"` as one process, so stopping it stops
+both. If you use certificates or a smartcard through NSS — Evolution,
+Chrome, Firefox — re-enable that half alone, through the autostart entry
+below, and disable only `secrets`.
+
 If `gnome-keyring` is installed, its own activation file also claims the bus
 name. Override it for your user so the bus starts secret-manager instead:
 
@@ -33,8 +39,82 @@ mkdir -p ~/.local/share/dbus-1/services
 cp /usr/share/dbus-1/services/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/
 ```
 
-KWallet does not claim `org.freedesktop.secrets` unless `kwallet-secrets`
-(`ksecretd`) is enabled; disable that in System Settings › KDE Wallet.
+**The systemd unit is not the only thing that starts it.**
+`/etc/xdg/autostart/gnome-keyring-secrets.desktop` launches
+`gnome-keyring-daemon --components=secrets` from a plain desktop session even
+with the unit masked, and it will take the bus name before secret-manager
+does. Shadow it with a per-user override — same filename, `Hidden=true`:
+
+```sh
+mkdir -p ~/.config/autostart
+cat > ~/.config/autostart/gnome-keyring-secrets.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=GNOME Keyring: Secret Service (disabled)
+Exec=/usr/bin/gnome-keyring-daemon --start --foreground --components=secrets
+Hidden=true
+X-GNOME-Autostart-enabled=false
+EOF
+```
+
+To keep PKCS#11 while disabling secrets, leave
+`/etc/xdg/autostart/gnome-keyring-pkcs11.desktop` alone and do not write an
+override for it.
+
+### KWallet
+
+KWallet claims `org.freedesktop.secrets` through `ksecretd`, and it does so
+at runtime — it will hold the name even when the system activation file
+names gnome-keyring, so the `cp` above does not displace it. Turning it off
+takes four steps, and none of them is the D-Bus override.
+
+Disable the wallet subsystem:
+
+```sh
+kwriteconfig6 --file kwalletrc --group Wallet --key Enabled false
+```
+
+(System Settings › KDE Wallet is the same setting. `kwriteconfig5` on a
+Plasma 5 system. Without the key, the default is enabled.)
+
+Stop it being activated on demand, under both of its other names:
+
+```sh
+mkdir -p ~/.local/share/dbus-1/services
+for n in org.kde.secretservicecompat org.freedesktop.impl.portal.desktop.kwallet; do
+  printf '[D-BUS Service]\nName=%s\nExec=/bin/false\n' "$n" \
+    > ~/.local/share/dbus-1/services/$n.service
+done
+```
+
+The second name is the xdg-desktop-portal Secret backend: without it,
+sandboxed and Flatpak applications keep reaching KWallet after you have taken
+the main bus name.
+
+If `pam_kwallet5` is in your login stack it will keep unlocking and starting
+KWallet at every login, in parallel with secret-manager's own PAM module. On
+Arch it appears in `/etc/pam.d/sddm`, `/etc/pam.d/sddm-autologin` and
+`/etc/pam.d/wdm`:
+
+```sh
+grep -rn pam_kwallet /etc/pam.d/
+```
+
+Comment out the `auth` and `session` lines it matches. **Keep a root shell
+open on another TTY while you test a new login** — a broken PAM stack can
+lock you out of the display manager. These lines are prefixed `-`, so PAM
+already tolerates the module being absent, which makes commenting them out
+the low-risk edit. They are package-owned and may return on upgrade.
+
+Finally, log out and back in. `ksecretd` holds the bus name for the life of
+the session, so nothing short of a fresh session releases it. Then check:
+
+```sh
+busctl --user status org.freedesktop.secrets | grep -E 'Pid|Comm'
+```
+
+`Comm` should read `secret-manager`. If it still says `ksecretd`, one of the
+four steps has not taken effect.
 
 See `docs/install-common.md` (installed alongside this file at
 `/usr/share/doc/secret-manager/install-common.md`) for creating your vault,
