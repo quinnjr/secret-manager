@@ -53,15 +53,7 @@ pub struct ControlServer {
 impl ControlServer {
     /// Create the parent directory (0700), replace any stale socket, bind, chmod 0600.
     pub async fn bind(path: &Path) -> std::io::Result<ControlServer> {
-        Self::bind_with_timeout(path, CONNECTION_TIMEOUT).await
-    }
-
-    /// [`bind`](Self::bind) with a custom per-connection deadline (tests).
-    pub async fn bind_with_timeout(
-        path: &Path,
-        timeout: Duration,
-    ) -> std::io::Result<ControlServer> {
-        Self::bind_with_timeouts(path, timeout, HANDLER_TIMEOUT).await
+        Self::bind_with_timeouts(path, CONNECTION_TIMEOUT, HANDLER_TIMEOUT).await
     }
 
     /// [`bind`](Self::bind) with both deadlines given explicitly. They are
@@ -351,9 +343,10 @@ mod tests {
     async fn idle_connections_are_closed_after_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("control.sock");
-        let server = ControlServer::bind_with_timeout(&sock, Duration::from_millis(200))
-            .await
-            .unwrap();
+        let server =
+            ControlServer::bind_with_timeouts(&sock, Duration::from_millis(200), HANDLER_TIMEOUT)
+                .await
+                .unwrap();
         let task = tokio::spawn(server.run(handler()));
         let mut idle = Vec::new();
         for _ in 0..(MAX_CONNECTIONS + 4) {

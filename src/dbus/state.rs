@@ -500,8 +500,10 @@ pub async fn update_aliases<E>(
 ///
 /// A free function so the caller can clone `loaded` and `dir` out of the
 /// state guard and run this — which does a blocking `symlink_metadata` per
-/// candidate, in an unbounded loop — with the guard dropped.
-/// [`ServiceState::unique_collection_id`] is this, against its own fields.
+/// candidate, in an unbounded loop — with the guard dropped. There is
+/// deliberately no `&self` method on [`ServiceState`] wrapping this: such a
+/// method could only run with the guard held, which is the shape the lock
+/// rules forbid.
 pub fn unique_collection_id_in(
     dir: &Path,
     loaded: &std::collections::BTreeSet<String>,
@@ -754,22 +756,6 @@ impl ServiceState {
         }
     }
 
-    /// Open every `<id>.vault` in the vault directory that is not loaded yet, and
-    /// reload aliases. A file that fails to open is recorded in `broken`
-    /// instead of being skipped, so it still shows up as a (permanently
-    /// locked) collection; a previously-broken file that now opens cleanly
-    /// moves into `collections`. Returns the ids seen for the first time
-    /// this call (freshly opened, or freshly found broken) — the set a
-    /// caller should register D-Bus objects for and announce.
-    pub fn load_vaults(&mut self) -> std::io::Result<Vec<String>> {
-        let scan = scan_vault_dir(
-            &self.vault_dir,
-            self.index_attributes,
-            &self.collections.keys().cloned().collect(),
-        )?;
-        Ok(self.merge_scan(scan))
-    }
-
     /// The ids already loaded, so a scan can skip re-reading them.
     pub fn loaded_ids(&self) -> std::collections::BTreeSet<String> {
         self.collections.keys().cloned().collect()
@@ -777,6 +763,13 @@ impl ServiceState {
 
     /// Apply a [`VaultScan`] taken outside the lock. Fast and allocation-only:
     /// no file is opened here.
+    ///
+    /// A file that failed to open is recorded in `broken` instead of being
+    /// skipped, so it still shows up as a (permanently locked) collection; a
+    /// previously-broken file that now opens cleanly moves into
+    /// `collections`. Returns the ids seen for the first time in this merge
+    /// (freshly opened, or freshly found broken) — the set a caller should
+    /// register D-Bus objects for and announce.
     pub fn merge_scan(&mut self, scan: VaultScan) -> Vec<String> {
         let mut new_ids = Vec::new();
         for (id, vault) in scan.opened {
@@ -822,28 +815,6 @@ impl ServiceState {
     /// Why the alias table cannot be used, when it cannot.
     pub fn aliases_unusable(&self) -> Option<&AliasError> {
         self.aliases.unusable()
-    }
-
-    /// Write the table back. Refuses unless it is the file's own contents;
-    /// see [`AliasTable::writable`].
-    ///
-    /// **No production caller.** It used to be described as the backstop the
-    /// writers relied on, and it never was: `SetAlias` and both collection
-    /// prompts go through [`update_aliases`], which has to clone the table
-    /// out and drop the state guard before writing — something a `&self`
-    /// method on the state cannot do, since holding `&self` *is* holding the
-    /// guard. Routing them back through here would put the `fsync` under the
-    /// state mutex again, so the doc is what changed, not the callers. Kept
-    /// for tests and for a future writer that already has the guard and can
-    /// afford the write.
-    pub fn save_aliases(&self) -> std::io::Result<()> {
-        let table = self.aliases.writable().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("refusing to overwrite an unreadable alias table: {e}"),
-            )
-        })?;
-        save_aliases_to(&self.vault_dir, table)
     }
 
     /// Collection id an alias currently resolves to.
@@ -988,16 +959,6 @@ impl ServiceState {
             .map(|(id, v)| (id.clone(), v.clone()))
             .collect()
     }
-
-    /// Path-safe id derived from a label, made unique against loaded
-    /// collections and files.
-    ///
-    /// Blocking: one `symlink_metadata` per candidate. It must not be called
-    /// with the state guard held — [`unique_collection_id_in`] is the same
-    /// thing against cloned-out fields, which is what the create path uses.
-    pub fn unique_collection_id(&self, label: &str) -> String {
-        unique_collection_id_in(&self.vault_dir, &self.loaded_ids(), label)
-    }
 }
 
 #[cfg(test)]
@@ -1038,11 +999,12 @@ mod tests {
         std::fs::write(dir.path().join("junk.txt"), b"").unwrap();
 
         let mut st = state(dir.path());
-        assert_eq!(st.load_vaults().unwrap(), vec!["default"]);
-        assert!(
-            st.load_vaults().unwrap().is_empty(),
-            "second load adds nothing"
-        );
+        // The startup pair, as `src/daemon.rs` runs it: scan with no state in
+        // hand, then merge. There is no `&self` wrapper fusing the two.
+        let scan = scan_vault_dir(dir.path(), st.index_attributes, &st.loaded_ids()).unwrap();
+        assert_eq!(st.merge_scan(scan), vec!["default"]);
+        let scan = scan_vault_dir(dir.path(), st.index_attributes, &st.loaded_ids()).unwrap();
+        assert!(st.merge_scan(scan).is_empty(), "second load adds nothing");
         assert_eq!(
             st.resolve_collection("/org/freedesktop/secrets/collection/default"),
             Some("default".into())
@@ -1105,9 +1067,15 @@ mod tests {
     fn unique_ids_and_counters() {
         let dir = tempfile::tempdir().unwrap();
         let mut st = state(dir.path());
-        assert_eq!(st.unique_collection_id("Work"), "work");
+        assert_eq!(
+            unique_collection_id_in(&st.vault_dir, &st.loaded_ids(), "Work"),
+            "work"
+        );
         std::fs::write(dir.path().join("work.vault"), b"").unwrap();
-        assert_eq!(st.unique_collection_id("Work"), "work_2");
+        assert_eq!(
+            unique_collection_id_in(&st.vault_dir, &st.loaded_ids(), "Work"),
+            "work_2"
+        );
         let first = st.new_session_path().to_string();
         let second = st.new_session_path().to_string();
         assert!(
@@ -1234,7 +1202,9 @@ mod tests {
         assert!(!reason.to_string().is_empty());
 
         let mut st = state(dir.path());
-        st.load_vaults().expect("the daemon still starts");
+        // The scan above is the one startup would have taken, and it did not
+        // fail; merging it is what a started daemon does with it.
+        st.merge_scan(scan);
         assert!(st.collections.contains_key("default"));
         assert_eq!(st.aliases_unusable(), Some(&reason));
 
@@ -1272,15 +1242,39 @@ mod tests {
         std::fs::write(&path, corrupt).unwrap();
 
         let mut st = state(dir.path());
-        st.load_vaults().unwrap();
+        let scan = scan_vault_dir(dir.path(), st.index_attributes, &st.loaded_ids()).unwrap();
+        st.merge_scan(scan);
         assert!(st.aliases_unusable().is_some());
 
-        let err = st.save_aliases().expect_err("must refuse");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // The refusal is in front of `save_aliases_to`, not inside it: a
+        // degraded table is not the file's own contents, so no writer may
+        // take a snapshot to hand it. `update_aliases` turns this same `Err`
+        // into `AliasUpdate::Unusable` and writes nothing.
+        let reason = st
+            .aliases
+            .writable()
+            .expect_err("a degraded table must refuse to be written back")
+            .to_string();
+        assert!(
+            !reason.is_empty(),
+            "the refusal must carry why the file could not be read"
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             corrupt,
             "the unreadable file was overwritten"
+        );
+        // And that assertion is not vacuous: the writer the refusal stands in
+        // front of does replace the file, given a table to write.
+        save_aliases_to(
+            dir.path(),
+            &BTreeMap::from([("default".to_string(), "work".to_string())]),
+        )
+        .unwrap();
+        assert_ne!(
+            std::fs::read(&path).unwrap(),
+            corrupt,
+            "`save_aliases_to` did not write, so nothing above was being prevented"
         );
     }
 
@@ -1290,7 +1284,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(ALIAS_FILE), b"not toml at all =").unwrap();
         let mut st = state(dir.path());
-        st.load_vaults().unwrap();
+        let scan = scan_vault_dir(dir.path(), st.index_attributes, &st.loaded_ids()).unwrap();
+        st.merge_scan(scan);
         assert!(st.aliases_unusable().is_some());
 
         Vault::create(
@@ -1306,20 +1301,28 @@ mod tests {
         )
         .unwrap();
 
-        st.load_vaults().unwrap();
+        let scan = scan_vault_dir(dir.path(), st.index_attributes, &st.loaded_ids()).unwrap();
+        st.merge_scan(scan);
         assert_eq!(st.aliases_unusable(), None, "the condition must clear");
         assert_eq!(st.alias_target("default"), Ok(Some("work".to_string())));
     }
 
-    /// A vault directory that cannot be scanned must fail `load_vaults`
+    /// A vault directory that cannot be scanned must fail the startup scan
     /// rather than reporting an empty daemon.
+    ///
+    /// `src/daemon.rs` propagates that failure with `?` before it has a scan
+    /// to merge, so nothing is applied and startup refuses; the same shape is
+    /// asserted here.
     #[test]
-    fn load_vaults_propagates_a_scan_failure() {
+    fn a_failed_scan_propagates_instead_of_reporting_an_empty_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let not_a_dir = dir.path().join("file");
         std::fs::write(&not_a_dir, b"").unwrap();
-        let mut st = state(&not_a_dir);
-        assert!(st.load_vaults().is_err());
+        let st = state(&not_a_dir);
+        assert!(scan_vault_dir(&not_a_dir, st.index_attributes, &st.loaded_ids()).is_err());
+        // The error stands in front of the merge — there is no scan to apply
+        // — so nothing reached the state and no caller can mistake the
+        // failure for a daemon that is merely empty.
         assert!(st.collections.is_empty());
     }
 
@@ -1384,14 +1387,16 @@ mod tests {
         )
         .unwrap();
         let mut st = state(dir.path());
-        st.load_vaults().unwrap();
+        let scan = scan_vault_dir(dir.path(), st.index_attributes, &st.loaded_ids()).unwrap();
+        st.merge_scan(scan);
         assert_eq!(
             st.resolve_collection("/org/freedesktop/secrets/aliases/default"),
             Some("work".to_string())
         );
 
         std::fs::write(dir.path().join(ALIAS_FILE), b"aliases = 5\n").unwrap();
-        st.load_vaults().unwrap();
+        let scan = scan_vault_dir(dir.path(), st.index_attributes, &st.loaded_ids()).unwrap();
+        st.merge_scan(scan);
         assert_eq!(
             st.resolve_collection("/org/freedesktop/secrets/aliases/default"),
             Some("work".to_string()),
@@ -1401,8 +1406,9 @@ mod tests {
         // A name we have never read is still refused: what is in the file now
         // is the thing we do not know, so "no such alias" is not ours to say.
         assert!(st.alias_target("login").is_err());
-        // And the table stays unwritable while it is in that state.
-        assert!(st.save_aliases().is_err());
+        // And the table stays unwritable while it is in that state, so no
+        // writer can reach `save_aliases_to` with it.
+        assert!(st.aliases.writable().is_err());
         assert_eq!(
             std::fs::read(dir.path().join(ALIAS_FILE)).unwrap(),
             b"aliases = 5\n",
@@ -1497,9 +1503,12 @@ mod tests {
         const BLOCKING: &[&str] = &[
             "std::fs::",
             "save_aliases_to(",
-            "save_aliases(",
             "load_aliases(",
-            "unique_collection_id",
+            // The free function. The `&self` wrapper this used to name was
+            // deleted; the entry survived only because `contains` matched
+            // inside this longer name, which is not a check, it is a
+            // coincidence that the next rename would silently undo.
+            "unique_collection_id_in(",
             "block_in_place(",
             "sync_all(",
             "scan_vault_dir(",

@@ -491,7 +491,7 @@ fn a_session_bus_that_accepts_and_never_answers_is_unreachable() {
             format!("unix:path={}", sock.display()),
         )
         .env(
-            "SM_CONNECT_TIMEOUT_MS",
+            secret_manager::cli::client::CONNECT_TIMEOUT_ENV,
             SHORT_CONNECT_TIMEOUT.as_millis().to_string(),
         )
         .args(["get", "a=b"])

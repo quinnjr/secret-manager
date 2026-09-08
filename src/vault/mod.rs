@@ -17,7 +17,7 @@ pub fn now() -> u64 {
 /// The id is used as the `<id>.vault` filename, so it is bounded by `NAME_MAX`
 /// (255 bytes on every filesystem Linux ships), not by `format::MAX_LABEL` -
 /// which allows 4 KiB. 200 bytes leaves room for the `.vault` suffix and for
-/// the `_<n>` uniquifier `ServiceState::unique_collection_id` appends.
+/// the `_<n>` uniquifier `dbus::state::unique_collection_id_in` appends.
 pub const MAX_ID_LEN: usize = 200;
 
 /// Derive an object-path-safe collection id from a label: lowercase `[a-z0-9_]+`,

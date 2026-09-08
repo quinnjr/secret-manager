@@ -291,28 +291,63 @@ impl Drop for Transaction<'_> {
 // Prerequisites
 // ---------------------------------------------------------------------------
 
-/// The newest `src/**.rs` that is more recent than the built module, if any.
+/// A source file the module was actually built from that is newer than the
+/// module, if any.
 ///
-/// Only a hint for the skip message: it is deliberately conservative, and any
-/// error reading a timestamp means "cannot tell", not "stale".
+/// The list comes from cargo's own dep-info beside the artifact, not from a
+/// walk of `src/`. The cdylib is built `--no-default-features --features pam`,
+/// so `daemon.rs`, `dbus/` and `cli/` are not compiled into it and cargo
+/// rightly does not relink when they change. A whole-tree walk called the
+/// module stale on any daemon-only edit and **silently skipped five of these
+/// six tests** until someone happened to touch the `.so` — the failure mode a
+/// skip-with-a-reason exists to avoid, wearing the costume of the thing that
+/// avoids it.
+///
+/// Only a hint for the skip message: any error reading the dep-info or a
+/// timestamp means "cannot tell", not "stale". If the dep-info is missing
+/// (a hand-copied artifact) it falls back to the tree walk, which errs
+/// towards skipping rather than towards trusting a stale module.
 fn source_newer_than_module() -> Option<PathBuf> {
     let built = std::fs::metadata(module_path()).ok()?.modified().ok()?;
-    let mut stack = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).ok()? {
-            let path = entry.ok()?.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
-                && std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|m| m > built)
-            {
-                return Some(path);
+    match compiled_sources() {
+        Some(sources) => sources.into_iter().find(|path| newer_than(path, built)),
+        None => {
+            let mut stack = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).ok()? {
+                    let path = entry.ok()?.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                        && newer_than(&path, built)
+                    {
+                        return Some(path);
+                    }
+                }
             }
+            None
         }
     }
-    None
+}
+
+fn newer_than(path: &Path, built: std::time::SystemTime) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .is_ok_and(|m| m > built)
+}
+
+/// The `.rs` files cargo recorded as inputs to the cdylib. The dep-info is
+/// `<artifact>: <space-separated prerequisites>` on its first line, with
+/// spaces in paths backslash-escaped.
+fn compiled_sources() -> Option<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(module_path().with_extension("d")).ok()?;
+    let (_, prereqs) = text.lines().next()?.split_once(':')?;
+    let files: Vec<PathBuf> = prereqs
+        .split(' ')
+        .filter(|s| s.ends_with(".rs"))
+        .map(|s| PathBuf::from(s.replace("\\ ", " ")))
+        .collect();
+    (!files.is_empty()).then_some(files)
 }
 
 /// The cdylib libpam loads. Built by `make build` into its own target

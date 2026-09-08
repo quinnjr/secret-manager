@@ -1714,7 +1714,7 @@ async fn a_dangling_symlink_cannot_reserve_a_collection_name() {
 /// The alias table is a convenience that lives beside the vaults; a create or
 /// a delete the user has already confirmed must not be undone because it could
 /// not be written out. Here `aliases.toml` is a *directory*, so every
-/// `save_aliases` fails, and both operations have to carry on regardless —
+/// `save_aliases_to` fails, and both operations have to carry on regardless —
 /// with the in-memory alias table still correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unwritable_alias_file_blocks_neither_create_nor_delete() {
