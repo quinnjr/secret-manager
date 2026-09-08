@@ -15,6 +15,8 @@ login. It replaces gnome-keyring or kwallet as the owner of
 spec and the source of truth for the format and the protocol; its amendment
 section records deliberate changes. `docs/security-audit-2026-09-06.md`
 records two security audits and what each finding's fix was.
+`docs/superpowers/specs/2026-09-08-migration-assistant.md` specs `sm import`,
+which moves a user off gnome-keyring or kwallet; it is proposed, not built.
 
 ## Build and test
 
