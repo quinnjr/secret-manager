@@ -232,17 +232,21 @@ async fn a_write_stuck_on_one_collection_blocks_nothing_else() {
 /// in it blocked; everything it called did.
 ///
 /// A `&self`/`&mut self` receiver in an `impl ServiceState` is `&ServiceState`
-/// one position further in, and so is a region too — but a *reached* one, not
-/// a seeded one. Unlike a parameter, such a method can also be called before
-/// the mutex exists: `src/daemon.rs` builds a `ServiceState`, calls
-/// `load_vaults()` on the owned value and wraps it in the `Mutex` on the next
-/// line, where the blocking directory scan is not merely allowed but required.
-/// Seeding the receiver asserted a premise that is false there, so the region
-/// is entered where the call graph actually carries a guard into it — which
-/// still covers every method a guard-holder calls, delegation included. See
-/// [`entry_points`], and [`dead_and_dangerous`] for the hole that opens: a
-/// method nothing calls is never reached, and both methods this scan was
-/// written from were exactly that.
+/// one position further in, and is a seed on the same terms: holding `&self`
+/// on the state *is* holding the guard, so the whole body is a region and it
+/// is entered whether or not this scan can see a caller. There was for a
+/// while one method in the tree that made the premise false —
+/// `ServiceState::load_vaults`, which fused the blocking directory scan to
+/// the pure merge and which `src/daemon.rs` called on the owned value one
+/// line before the `Mutex` existed — and the seed was softened to a
+/// reachability question to accommodate it. That method is gone: startup
+/// calls the free `scan_vault_dir` and then `merge_scan`, exactly as
+/// `Request::Reload` does. So the seed is unconditional again, which is the
+/// stronger rule: a blocking receiver method is reported the moment it is
+/// written, rather than when someone first gives it a guarded caller. See
+/// [`entry_points`], and [`dead_and_dangerous`] for the rule that still
+/// covers a method with no caller at all — the shape both methods this scan
+/// was written from were in.
 ///
 /// A `match`/`while let`/`if let`/`for` scrutinee that locks is refused
 /// outright rather than modelled: a scrutinee is not a terminating scope, so
@@ -318,7 +322,7 @@ fn no_source_file_acquires_a_lock_while_holding_one() {
     assert!(
         found.receiver_seeds >= 12,
         "the scan recognised only {} `&self`/`&mut self` methods on \
-         `ServiceState`, so neither the reachability seeding nor the \
+         `ServiceState`, so neither the receiver seeding nor the \
          dead-and-dangerous rule is looking at this tree",
         found.receiver_seeds
     );
@@ -591,9 +595,11 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              update_aliases(state, |st| {\n        \
              std::fs::remove_file(st.path())?;\n        Ok(())\n    })\n    .await;\n}\n",
         ),
-        // ---- The seeding correction, and the rule that pays for it. -------
-        // A receiver region is now entered where a caller reaches it, not by
-        // assumption. These two are the coverage that must survive that.
+        // ---- Receiver regions reached through the call graph. -------------
+        // The seed catches these on its own now, but the call graph must keep
+        // carrying the guard into them too: these are the paths by which a
+        // *non*-receiver region reaches a receiver one, and they are what a
+        // method-resolution regression would break first.
         (
             "a `&self` method on `ServiceState` reached from a `let`-bound state guard",
             "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
@@ -607,10 +613,10 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              impl ServiceState {\n    fn persist(&self) {\n        \
              std::fs::create_dir_all(&self.dir).ok();\n    }\n}\n",
         ),
-        // Dead and dangerous: the shape of both deletions. Nothing calls it,
-        // so reachability alone would call it clean — and "nothing calls it"
-        // is not a defence for a method whose only possible caller holds the
-        // guard.
+        // Dead and dangerous: the shape of both deletions. The seed reports
+        // the body either way; what this rule adds is the diagnosis, because
+        // "nothing calls it" reads as a defence and is not one for a method
+        // whose only possible caller holds the guard.
         (
             "a blocking `&self` method on `ServiceState` that nothing calls",
             "impl ServiceState {\n    fn save_aliases(&self) -> Result<()> {\n        \
@@ -626,24 +632,89 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              assert!(st.save_aliases().is_err());\n    }\n}\n",
         ),
         (
+            // What pins the local type inference. `syn` infers nothing, so a
+            // call on a local receiver resolves only where the initialiser
+            // names the type. Without it `v.persist()` is a call on an
+            // unknown receiver, is not followed, and the blocking body one
+            // `fn` deeper goes unreported — the delegation hole again, in the
+            // one place a type annotation is the only thing that closes it.
+            "a method on a local typed by its initialiser, called under a guard",
+            "async fn f(state: &Shared, path: &Path) -> Result<()> {\n    \
+             let st = state.lock().await;\n    let v = Vault::open(path)?;\n    \
+             v.persist();\n    Ok(())\n}\n\
+             impl Vault {\n    fn persist(&self) {\n        \
+             std::fs::create_dir_all(&self.dir).ok();\n    }\n}\n",
+        ),
+        (
+            // What pins the closure-parameter typing on its own, now that a
+            // receiver on `ServiceState` is a seeded region again and would
+            // catch the case above by itself. Nothing here is on the state:
+            // `Vault::persist` is reached only because the callee's signature
+            // says the closure's parameter is a `&Vault`, and it is guarded
+            // only because the callee invokes `edit` with the state held.
+            // Drop either half and this goes unreported.
+            "a method on a typed closure parameter, invoked by the callee under the guard",
+            "async fn with_vault<E>(\n    state: &Shared,\n    \
+             mut edit: impl FnMut(&Vault) -> Result<(), E>,\n) {\n    \
+             let st = state.lock().await;\n    edit(&st.vault).ok();\n}\n\
+             async fn caller(state: &Shared) {\n    \
+             with_vault(state, |v| {\n        v.persist();\n        \
+             Ok(())\n    })\n    .await;\n}\n\
+             impl Vault {\n    fn persist(&self) {\n        \
+             std::fs::create_dir_all(&self.dir).ok();\n    }\n}\n",
+        ),
+        (
             // The closure-region rule and the receiver rule have to meet:
             // `Service::set_alias` calls `st.resolve_collection(…)` inside the
             // closure it hands `update_aliases`, and `st` there is a closure
-            // parameter, typed nowhere but in the callee's own signature. The
-            // startup call below gives the method a caller, so
-            // `dead_and_dangerous` steps aside and the guarded closure is the
-            // only thing left to catch it.
+            // parameter, typed nowhere but in the callee's own signature.
+            // Without that typing the call resolves to nothing and the edge
+            // into `dir` — and through it into the blocking helper — is never
+            // drawn. The blocking work is deliberately *not* in the method: a
+            // receiver on `ServiceState` is a seeded region on its own now, so
+            // putting it there would prove the seed and not the closure.
             "a `&self` method on `ServiceState` called inside a closure the callee runs guarded",
             "async fn update_aliases<E>(\n    state: &Shared,\n    \
              mut edit: impl FnMut(&ServiceState) -> Result<(), E>,\n) {\n    \
              let st = state.lock().await;\n    edit(&st).ok();\n}\n\
              async fn caller(state: &Shared) {\n    \
-             update_aliases(state, |st| {\n        st.persist();\n        \
+             update_aliases(state, |st| {\n        persist(st.dir());\n        \
              Ok(())\n    })\n    .await;\n}\n\
-             fn startup(dir: &Path) {\n    let mut state = ServiceState::new(dir);\n    \
-             state.persist();\n}\n\
-             impl ServiceState {\n    fn persist(&self) {\n        \
-             std::fs::create_dir_all(&self.dir).ok();\n    }\n}\n",
+             impl ServiceState {\n    fn dir(&self) -> &Path {\n        \
+             &self.vault_dir\n    }\n}\n\
+             fn persist(dir: &Path) {\n    std::fs::create_dir_all(dir).ok();\n}\n",
+        ),
+        // ---- The exception that used to be carved out here. -------------
+        // `ServiceState::load_vaults` was a `&mut self` method fusing the
+        // blocking directory scan to the pure merge, and `src/daemon.rs`
+        // called it on the owned value one line before the `Mutex` existed.
+        // That one call site was the whole reason the receiver seed had been
+        // softened from "a receiver on `ServiceState` is a guard region" to
+        // "…only where a caller carries a guard into it" — a weaker rule that
+        // waits for a guarded caller before it says anything. The method is
+        // gone: startup now calls the free `scan_vault_dir` and then
+        // `merge_scan`, so nothing in the tree needs the exception and the
+        // shape it protected is an offence again, reported the moment it is
+        // written rather than when someone first calls it under the guard.
+        (
+            "a blocking `&mut self` method on `ServiceState` called only before the mutex exists",
+            "impl ServiceState {\n    fn load_vaults(&mut self) -> Result<()> {\n        \
+             std::fs::create_dir_all(&self.vault_dir)\n    }\n}\n\
+             async fn run(dir: &Path) -> Result<()> {\n    \
+             let mut state = ServiceState::new(dir);\n    state.load_vaults()?;\n    \
+             let state: Shared = Arc::new(Mutex::new(state));\n    Ok(())\n}\n",
+        ),
+        (
+            // Its delegating twin: the blocking half one `fn` deeper, which is
+            // how `unique_collection_id` hid. The seed puts the body under the
+            // guard and the call graph carries it into `scan_vault_dir`.
+            "a `&mut self` method delegating to a blocking helper, called only before the mutex",
+            "impl ServiceState {\n    fn load_vaults(&mut self) -> Result<()> {\n        \
+             let scan = scan_vault_dir(&self.vault_dir)?;\n    Ok(self.merge_scan(scan))\n    }\n}\n\
+             fn scan_vault_dir(dir: &Path) -> Result<Scan> {\n    \
+             std::fs::create_dir_all(dir)?;\n    Ok(Scan::default())\n}\n\
+             async fn run(dir: &Path) -> Result<()> {\n    \
+             let mut state = ServiceState::new(dir);\n    state.load_vaults()?;\n    Ok(())\n}\n",
         ),
         (
             "regression: a lock taken inside a macro invocation under a guard",
@@ -812,31 +883,6 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              Ok(())\n    })\n    .await;\n}\n",
         ),
         (
-            // Finding 2, in miniature, and the reason the receiver seed had to
-            // become a reachability question. `src/daemon.rs` builds the state,
-            // scans the vault directory on the owned value and only then wraps
-            // it in the mutex; the blocking scan there is required, and there
-            // is no lock in existence for it to be under.
-            "a blocking `&mut self` method on `ServiceState` called only before the mutex exists",
-            "impl ServiceState {\n    fn load_vaults(&mut self) -> Result<()> {\n        \
-             std::fs::create_dir_all(&self.vault_dir)\n    }\n}\n\
-             async fn run(dir: &Path) -> Result<()> {\n    \
-             let mut state = ServiceState::new(dir);\n    state.load_vaults()?;\n    \
-             let state: Shared = Arc::new(Mutex::new(state));\n    Ok(())\n}\n",
-        ),
-        (
-            // The same method, reached by delegation from the pre-lock call.
-            // Reachability has to carry "no guard" through the call graph the
-            // same way it carries a guard, or the fix above is one `fn` deep.
-            "a `&mut self` method delegating to a blocking helper, called only before the mutex",
-            "impl ServiceState {\n    fn load_vaults(&mut self) -> Result<()> {\n        \
-             let scan = scan_vault_dir(&self.vault_dir)?;\n    Ok(self.merge_scan(scan))\n    }\n}\n\
-             fn scan_vault_dir(dir: &Path) -> Result<Scan> {\n    \
-             std::fs::create_dir_all(dir)?;\n    Ok(Scan::default())\n}\n\
-             async fn run(dir: &Path) -> Result<()> {\n    \
-             let mut state = ServiceState::new(dir);\n    state.load_vaults()?;\n    Ok(())\n}\n",
-        ),
-        (
             // The other half of the dead-and-dangerous rule: uncalled is only
             // an offence when the body would cost something under the guard.
             // Most of `ServiceState` is uncalled map accessors.
@@ -845,17 +891,21 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              self.broken.get(id).map(|(_, e)| e.as_str())\n    }\n}\n",
         ),
         (
+            // The near-miss for the guarded-closure offender above, written to
+            // the same shape so the two differ in exactly one thing: whether
+            // the callee invokes `edit` with the guard held. Here it drops the
+            // guard first, so the blocking helper the closure reaches through
+            // the typed `&ServiceState` parameter runs with nothing held.
             "a `&self` method on `ServiceState` called in a closure the callee runs unguarded",
             "async fn apply(state: &Shared, mut edit: impl FnMut(&ServiceState) -> Result<()>) {\n    \
              {\n        let st = state.lock().await;\n        st.touch();\n    }\n    \
              edit(&owned).ok();\n}\n\
              async fn caller(state: &Shared) {\n    \
-             apply(state, |st| {\n        st.persist();\n        Ok(())\n    })\n    \
+             apply(state, |st| {\n        persist(st.dir());\n        Ok(())\n    })\n    \
              .await;\n}\n\
-             fn startup(dir: &Path) {\n    let mut state = ServiceState::new(dir);\n    \
-             state.persist();\n}\n\
-             impl ServiceState {\n    fn persist(&self) {\n        \
-             std::fs::create_dir_all(&self.dir).ok();\n    }\n}\n",
+             impl ServiceState {\n    fn dir(&self) -> &Path {\n        \
+             &self.vault_dir\n    }\n}\n\
+             fn persist(dir: &Path) {\n    std::fs::create_dir_all(dir).ok();\n}\n",
         ),
         (
             "work handed to a blocking pool under a guard, which takes nothing with it",
@@ -1022,8 +1072,8 @@ struct FnDef {
     /// Why this function's whole body is a guard region, if it is.
     seed: Option<(Guard, String)>,
     /// Whether that region comes from a `&self`/`&mut self` receiver rather
-    /// than from a parameter. The two are seeded differently: see
-    /// [`entry_points`].
+    /// than from a parameter. Both are seeded, and identically; the
+    /// distinction is what [`dead_and_dangerous`] ranges over.
     receiver_seed: bool,
     /// Declared inside a `#[cfg(test)]` module, so a call written here is not
     /// a production caller.
@@ -1465,8 +1515,8 @@ struct Walk<'a> {
     /// initialiser — `let mut state = ServiceState::new(…)`. `syn` does no
     /// inference, so this is the only way a call on a local receiver resolves,
     /// and it is the shape `src/daemon.rs` builds its state with: without it
-    /// the daemon's own call to `ServiceState::load_vaults` is invisible and
-    /// the method reads as uncalled.
+    /// the daemon's own `state.loaded_ids()` and `state.merge_scan(scan)` are
+    /// invisible and both methods read as uncalled.
     locals: Vec<(String, String, usize)>,
     depth: usize,
     exempt: usize,
@@ -1888,8 +1938,8 @@ struct Scan {
     /// signature — a `&ServiceState`/`&mut ServiceState`/`MutexGuard`
     /// parameter, or a `&self` receiver in an `impl ServiceState`.
     seeds: usize,
-    /// Of those, the ones seeded from a receiver, which are entered as a
-    /// guard region only where a caller actually reaches them.
+    /// Of those, the ones seeded from a receiver — the population
+    /// [`dead_and_dangerous`] ranges over.
     receiver_seeds: usize,
     /// Functions reached, through the call graph, while a guard is held.
     /// Zero would mean the graph is not being walked.
@@ -1990,34 +2040,37 @@ fn run_pass(
 /// Where a walk starts.
 ///
 /// Every function is walked once holding nothing. On top of that, a function
-/// whose **parameter** is a `&ServiceState`, `&mut ServiceState` or a
-/// `MutexGuard<'_, ServiceState>` is walked again with the state guard held:
-/// such a value cannot be produced any other way, so whoever called it was
-/// holding the state, whether or not this scan can see the call.
+/// whose signature puts its whole body under the state guard is walked again
+/// with the guard held — a **parameter** of type `&ServiceState`,
+/// `&mut ServiceState` or `MutexGuard<'_, ServiceState>`, which cannot be
+/// produced any other way, and equally a `&self`/`&mut self` **receiver** in
+/// an `impl ServiceState`, which is the same borrow one position further in.
 ///
-/// A **receiver** seed is deliberately not in that list, and the difference is
-/// the point. `&self` on `ServiceState` *is* `&ServiceState`, but unlike a
-/// parameter it can also be reached before the mutex exists:
-/// `src/daemon.rs` builds a `ServiceState`, calls `load_vaults()` on the owned
-/// value, and only on the next line wraps it in the `Mutex`. That call
-/// provably holds no lock — the lock does not exist yet — and the blocking
-/// directory scan it does there is not merely permitted but required. Seeding
-/// it as a guard region asserted something false, and no narrowing of the
-/// blocking rules could have made it true.
+/// The receiver seed is unconditional, and that is stronger than seeding it
+/// only where the call graph carries a guard in. Reachability waits: a
+/// blocking method added today says nothing until someone gives it a guarded
+/// caller, and by then the call is written. Seeding says it at the moment the
+/// method appears.
 ///
-/// So a receiver region is entered where it is *reached*: the call graph
-/// already carries the state guard into `st.foo()` from every site that holds
-/// one, and through `self.bar()` from there. Nothing under the guard loses
-/// coverage, delegation included. What it does open is a hole for a method
-/// with no caller at all — which is exactly what `unique_collection_id` and
-/// `save_aliases` were — and [`dead_and_dangerous`] closes that.
+/// It was not always unconditional. `ServiceState::load_vaults` fused the
+/// blocking vault-directory scan to the pure merge, and `src/daemon.rs`
+/// called it on the owned value one line before wrapping it in the `Mutex` —
+/// a call that provably held no lock, because the lock did not yet exist. One
+/// method made the premise false for all of them, and the seed was weakened
+/// to a reachability question to accommodate it. The method is gone: startup
+/// takes the two steps explicitly, the free `scan_vault_dir` and then
+/// `merge_scan`, which is what `Request::Reload` had always done. Nothing in
+/// the tree is now called on a `ServiceState` that no mutex owns.
+///
+/// The hole the seed does not reach is a method with **no caller at all**:
+/// it is walked, but so is every other function, and nothing distinguishes
+/// it. That is exactly what `unique_collection_id` and `save_aliases` were,
+/// and [`dead_and_dangerous`] is what names it.
 fn entry_points(reg: &Registry) -> Vec<(usize, Entry, String)> {
     let mut work = Vec::new();
     for (i, d) in reg.defs.iter().enumerate() {
         work.push((i, Entry::NONE, d.display.clone()));
-        if let Some((g, why)) = &d.seed
-            && !d.receiver_seed
-        {
+        if let Some((g, why)) = &d.seed {
             work.push((
                 i,
                 Entry::held(*g, false),
@@ -2035,23 +2088,23 @@ fn entry_points(reg: &Registry) -> Vec<(usize, Entry, String)> {
 }
 
 /// The companion to the seeding rule above: a `&self`/`&mut self` method on
-/// `ServiceState` that would offend if it were called under the guard, and
-/// that **nothing in production calls at all**.
+/// `ServiceState` that offends when walked under the guard, and that
+/// **nothing in production calls at all**.
 ///
-/// Reachability makes a method with no caller unreachable, and so trivially
-/// clean — but "nothing calls it" is not a defence for a method on the state.
-/// Holding `&self` on `ServiceState` *is* holding the guard, so the only
+/// The seed above already walks such a method with the guard held, so a body
+/// that blocks is reported either way. What this adds is the *diagnosis*, and
+/// it is a different one: "nothing calls it" reads as a defence, and it is
+/// not. Holding `&self` on `ServiceState` *is* holding the guard, so the only
 /// caller such a method can ever acquire is one that already has it; a
 /// blocking body sitting there is a deadlock-shaped hole with a doc comment
-/// inviting someone to fill it. Both methods this rule was written from —
+/// inviting someone to fill it, and the fix is deletion rather than a
+/// carefully placed call. Both methods this rule was written from —
 /// `unique_collection_id` and `save_aliases` — were precisely that: no
 /// production caller, kept alive by their own unit tests, each a delegation
 /// away from a `fsync` under the global mutex.
 ///
-/// The check is the seeding that was just removed, applied where it is still
-/// sound: walk the method as if a caller had the state, and report what that
-/// would cost. Tests are not production callers — a `#[cfg(test)]` module
-/// keeping a method alive is the symptom, not the excuse.
+/// Tests are not production callers — a `#[cfg(test)]` module keeping a
+/// method alive is the symptom, not the excuse.
 fn dead_and_dangerous(
     reg: &Registry,
     facts: &BTreeMap<(usize, usize), Guard>,

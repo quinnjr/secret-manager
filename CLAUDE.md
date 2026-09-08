@@ -192,19 +192,28 @@ of these: it is the lock, not a guard, so locking inside it is the intended
 pattern.
 
 A `&self`/`&mut self` receiver in an `impl ServiceState` *is* `&ServiceState`
-one position further in, and is a region too — but a **reached** one. Unlike a
-parameter it can also be called before the mutex exists: `src/daemon.rs` builds
-a `ServiceState`, calls `load_vaults()` on the owned value and wraps it in the
-`Mutex` on the next line, where the blocking scan of the vault directory is not
-merely allowed but required. So the region is entered where the call graph
-carries a guard into it, which still covers everything a guard-holder calls.
-The hole that opens is a method nothing calls at all, and it is closed by
-naming it: a `&self` method on `ServiceState` that blocks, or takes a lock, and
-that no production caller reaches is reported as **dead and dangerous**.
+one position further in, so **holding `&self` on the state is holding the
+guard**, and the whole body is a region — seeded, with no exception in the
+tree. Nothing is ever handed a `ServiceState` that no mutex owns: the one
+place that used to be, `ServiceState::load_vaults`, fused the blocking
+vault-directory scan to the pure merge and was called on the owned value one
+line before `Arc::new(Mutex::new(state))`. It is gone. Startup takes the two
+steps `Reload` had always taken — the free `scan_vault_dir`, which takes no
+state precisely so it can never run behind a receiver, and then `merge_scan`,
+which is allocation-only. **Nothing blocking may sit behind a receiver on
+`ServiceState`**; if a blocking half needs the state's fields, clone them out
+and pass them to a free function. Seeding is the stronger rule and it is why
+it is worth restoring: a blocking receiver method is reported the moment it is
+written, not when it first acquires a guarded caller.
+
+The hole a seed cannot see is a method nothing calls at all, and it is closed
+by naming it: a `&self` method on `ServiceState` that blocks, or takes a lock,
+and that no production caller reaches is reported as **dead and dangerous**.
 "Nothing calls it" is not a defence there — the only caller such a method can
-ever gain is one that already holds the guard — and it is what both
-`unique_collection_id` and `save_aliases` were before they were deleted, each
-kept alive by its own unit tests.
+ever gain is one that already holds the guard, so the fix is deletion, not a
+carefully placed call — and it is what both `unique_collection_id` and
+`save_aliases` were before they were deleted, each kept alive by its own unit
+tests.
 
 Run `cargo fmt` before trusting a failure from any of this — it reads
 formatted source.

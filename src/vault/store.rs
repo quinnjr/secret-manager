@@ -136,7 +136,7 @@ impl Vault {
     /// held that reservation across the 100-500 ms Argon2 derivation and the
     /// save. That window is not survivable: a SIGINT, SIGTERM, OOM kill or
     /// power loss inside it runs no cleanup code and strands a zero-length
-    /// `<id>.vault`, which `open` reports as `Truncated`, `load_vaults` files
+    /// `<id>.vault`, which `open` reports as `Truncated`, `merge_scan` files
     /// under `broken`, and this function then refuses as `AlreadyExists` -
     /// permanently, since no command removes it. Nothing reserves anything
     /// now, and a zero-length file left by an older build is treated as
@@ -201,7 +201,7 @@ impl Vault {
         // Bound the read before making it: `MAX_HEADER` caps the header but
         // not the ciphertext, so an oversized file in the vault directory
         // would otherwise be slurped whole and take the daemon down during
-        // `load_vaults`.
+        // `scan_vault_dir`.
         let meta = std::fs::metadata(path).map_err(|e| io_err(path, e))?;
         format::check_vault_size(meta.len())?;
         let bytes = std::fs::read(path).map_err(|e| io_err(path, e))?;
@@ -870,7 +870,7 @@ impl Vault {
         // Bound the whole file, not just the header. `open` refuses anything
         // over `MAX_VAULT_BYTES`, so without this a collection can be grown
         // past the limit one item at a time: every save succeeds, the daemon
-        // keeps serving from memory, and at the next restart `load_vaults`
+        // keeps serving from memory, and at the next restart `merge_scan`
         // files the collection under `broken` with every secret in it
         // unreachable - and the rename has already replaced the last good
         // copy by then. Refusing here routes through the same header rollback
@@ -2028,7 +2028,7 @@ mod tests {
     }
 
     /// An interrupted `create` used to leave a zero-length reservation, which
-    /// `open` reports as `Truncated`, `load_vaults` files under `broken`, and
+    /// `open` reports as `Truncated`, `merge_scan` files under `broken`, and
     /// `create` refuses as `AlreadyExists` - permanently, with no command that
     /// removes it. A zero-length file is never a valid vault, so `create`
     /// claims the name instead of being blocked by it.
@@ -2582,7 +2582,7 @@ mod tests {
     }
 
     /// A missing collection must be an `Io` error carrying `NotFound`, not a
-    /// format error: `load_vaults` and the CLI use exactly that distinction to
+    /// format error: `scan_vault_dir` and the CLI use exactly that distinction to
     /// tell a collection that was never created from one that is damaged.
     #[test]
     fn open_reports_a_missing_file_as_not_found() {

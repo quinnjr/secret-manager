@@ -171,7 +171,18 @@ impl Daemon {
         if swept > 0 {
             tracing::info!("removed {swept} stale vault temp file(s) left by an interrupted save");
         }
-        state.load_vaults()?;
+        // The same two steps `Request::Reload` takes below, and for the same
+        // reason: the scan opens and parses every vault file in the directory,
+        // so it is a free function taking no state and can never run behind a
+        // receiver on `ServiceState`. Here there is not yet a mutex to be
+        // under — `state` is still owned — and only `merge_scan`, which is
+        // allocation-only, touches the state at all.
+        let scan = crate::dbus::state::scan_vault_dir(
+            &state.vault_dir,
+            state.index_attributes,
+            &state.loaded_ids(),
+        )?;
+        state.merge_scan(scan);
         let state: Shared = Arc::new(tokio::sync::Mutex::new(state));
 
         let builder = match &opts.bus {
