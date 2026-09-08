@@ -282,7 +282,7 @@ impl Service {
                 SecretStruct {
                     session: session.clone(),
                     parameters,
-                    value,
+                    value: Zeroizing::new(value),
                     content_type,
                 },
             );

@@ -58,7 +58,7 @@ fn plain_secret(session: &OwnedObjectPath, bytes: &[u8]) -> SecretStruct {
     SecretStruct {
         session: session.clone(),
         parameters: vec![],
-        value: bytes.to_vec(),
+        value: bytes.to_vec().into(),
         content_type: "text/plain".into(),
     }
 }
@@ -422,6 +422,27 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
             "an unlink under a guard",
             "async fn f() {\n    let g = self.state.lock().await;\n    \
              remove_file(&path)?;\n}\n",
+        ),
+        (
+            // `src/vault/store.rs` is outside the parsed set, so the
+            // `write_all`/`sync_all`/`rename` at the end of this call is
+            // reachable by no edge the scan can draw. It is caught by name or
+            // not at all — remove `import_items` from `BLOCKING_METHODS` and
+            // this case goes green while a whole-vault re-encrypt and two
+            // `fsync`s run under the global mutex.
+            "a vault batch import under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             vault.import_items(batch)?;\n}\n",
+        ),
+        (
+            "a vault save under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             vault.save()?;\n}\n",
+        ),
+        (
+            "a vault mutator under a collection lock, outside a block_in_place",
+            "async fn f() {\n    let mut v = vault.lock().await;\n    \
+             v.insert_item(label, attrs, secret, ct, false)?;\n}\n",
         ),
         (
             "blocking work under a guard bound in an outer block",
@@ -908,6 +929,25 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              fn persist(dir: &Path) {\n    std::fs::create_dir_all(dir).ok();\n}\n",
         ),
         (
+            // The near-miss for the three offenders above: the same mutators,
+            // under a *collection's* lock and inside the sanctioned wrapper,
+            // which is exactly how `CreateItem`, `SetLabel` and `DeleteItems`
+            // are written today. Naming the mutators must not forbid the one
+            // shape `CLAUDE.md` sanctions.
+            "vault mutators inside a block_in_place under a collection's lock",
+            "async fn f() {\n    let mut v = vault.lock().await;\n    \
+             block_in_place(|| v.import_items(batch))?;\n    \
+             block_in_place(|| v.set_label(label))?;\n    \
+             block_in_place(|| v.delete_items(&ids))?;\n}\n",
+        ),
+        (
+            // The mutator names are not reserved words: a call with nothing
+            // held is not an offence, wherever it is written.
+            "a vault mutator with no lock held at all",
+            "async fn f(path: &Path) {\n    let mut v = Vault::open(path)?;\n    \
+             v.import_items(batch)?;\n}\n",
+        ),
+        (
             "work handed to a blocking pool under a guard, which takes nothing with it",
             "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
              let dir = st.vault_dir.clone();\n    \
@@ -1016,6 +1056,28 @@ const BLOCKING_METHODS: &[&str] = &[
     // number of them in a loop, which is the shape the delegation rule below
     // exists for.
     "symlink_metadata",
+    // ---- The vault mutators. -----------------------------------------
+    // Every one of these ends in `Vault::save`: build the hashed index over
+    // the whole collection, postcard-encode every item, seal the entire blob,
+    // write a temp file, `fsync` it, rename, `fsync` the directory. That is
+    // the exact work `CLAUDE.md` says may not happen under the state mutex,
+    // and it is bounded by the data rather than by a constant.
+    //
+    // They have to be named, because the scan parses `src/dbus/` and
+    // `src/daemon.rs` and nothing else: `src/vault/store.rs` is never read,
+    // so no call edge ever reaches the `write_all`/`sync_all`/`rename` inside
+    // them and blocking work outside the parsed set is recognised by *name*
+    // alone. Without these entries `let st = state.lock().await; …
+    // vault.import_items(batch)` passes silently and does a whole-vault
+    // re-encrypt and two `fsync`s under the global mutex — precisely the bug
+    // this scan exists to prevent, and the one `import_items` newly makes
+    // easy to write. All five are listed rather than only the new one: the
+    // gap was never specific to it.
+    "import_items",
+    "insert_item",
+    "delete_items",
+    "set_label",
+    "save",
 ];
 
 /// The same, as the last segment of a called path: `remove_file(p)`,

@@ -63,6 +63,10 @@ override for it.
 
 ### KWallet
 
+This section — `ksecretd`'s behaviour, the file paths, the PAM stack
+contents — was reasoned from Arch's packaging, not checked on a live KDE
+session.
+
 KWallet claims `org.freedesktop.secrets` through `ksecretd`, and it does so
 at runtime — it will hold the name even when the system activation file
 names gnome-keyring, so the `cp` above does not displace it. Turning it off
@@ -77,7 +81,8 @@ kwriteconfig6 --file kwalletrc --group Wallet --key Enabled false
 (System Settings › KDE Wallet is the same setting. `kwriteconfig5` on a
 Plasma 5 system. Without the key, the default is enabled.)
 
-Stop it being activated on demand, under both of its other names:
+Stop it being activated on demand, under both of its other names. This
+truncates any override already at these paths — check first if you have one:
 
 ```sh
 mkdir -p ~/.local/share/dbus-1/services

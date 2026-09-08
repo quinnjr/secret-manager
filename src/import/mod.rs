@@ -30,10 +30,7 @@ pub mod gnome;
 pub mod kwallet;
 pub mod verify;
 
-use crate::vault::format::{
-    MAX_ATTRIBUTE_KEY, MAX_ATTRIBUTE_VALUE, MAX_ITEM_ATTRIBUTES, MAX_ITEM_CONTENT_TYPE,
-    MAX_ITEM_LABEL, MAX_ITEM_SECRET,
-};
+use crate::vault::format::CapViolation;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -42,6 +39,30 @@ use zeroize::Zeroizing;
 /// The attribute every libsecret client writes and searches on. Its presence
 /// is what separates a fully portable item from a merely preserved one.
 pub const XDG_SCHEMA: &str = "xdg:schema";
+
+/// Attribute names this importer *synthesises*, which therefore say nothing
+/// about whether any client can find the item.
+///
+/// `kwallet::map_entry` adds exactly these three to exactly the entries that
+/// arrived with no attributes at all — a native KWallet entry, whose identity
+/// is `(folder, key)`. They are provenance we wrote, not a searchable
+/// attribute set the source wrote, and no libsecret client has ever searched
+/// on `kwallet:folder`. Counting them as "attributes preserved" would report
+/// the one case a migration tool is tempted to lie about as "might work" when
+/// the truth is [`Outcome::PreservedOnly`], so [`Outcome::classify`] ignores
+/// them.
+///
+/// The names live here, beside the classifier that must know them, and
+/// `kwallet` is their single definition — a second copy of the strings is the
+/// only way the two could drift apart.
+pub const SYNTHESISED_ATTRIBUTES: [&str; 3] =
+    [kwallet::ATTR_FOLDER, kwallet::ATTR_KEY, kwallet::ATTR_TYPE];
+
+/// True for an attribute name this importer invented. See
+/// [`SYNTHESISED_ATTRIBUTES`].
+pub fn is_synthesised_attribute(key: &str) -> bool {
+    SYNTHESISED_ATTRIBUTES.contains(&key)
+}
 
 /// Where an item came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -118,11 +139,15 @@ impl Provenance {
 
 /// One item as read from a source, before any mapping.
 ///
-/// Attributes are already `String`s here: a source attribute holding
-/// non-UTF-8 bytes cannot be represented, and lossy conversion is not an
-/// option because a changed attribute is a silently broken lookup. The
-/// extractor refuses such an item with [`Refusal::NonUtf8Attribute`] rather
-/// than constructing a `SourceItem` for it.
+/// Attributes are already `String`s here, and every route that produces one
+/// hands us text that has already been UTF-8 validated: D-Bus `s` and `a{ss}`
+/// are validated by the marshaller, and the KWallet sidecar is JSON, whose
+/// parser rejects invalid UTF-8 outright. So there is no live path on which a
+/// non-UTF-8 attribute could reach this type, and none of the lossy
+/// conversions that would silently break a lookup. Should a future route ever
+/// read raw attribute bytes, it must refuse the item rather than convert it —
+/// and it must add the refusal variant at the same time, in the same commit
+/// as the code that constructs it.
 #[derive(Clone)]
 pub struct SourceItem {
     pub label: String,
@@ -201,10 +226,24 @@ impl Outcome {
     /// `xdg:schema=org.freedesktop.Secret.Generic` does not match an empty
     /// one, so calling it portable would be the same lie as synthesising a
     /// schema outright.
+    ///
+    /// Attributes *we* synthesised do not count towards
+    /// [`Outcome::AttributesPreserved`] either, and for the same reason. The
+    /// map reaching this function has already been through
+    /// `kwallet::map_entry`, which stamps [`SYNTHESISED_ATTRIBUTES`] onto
+    /// precisely the schema-less items — so classifying on "the map is
+    /// non-empty" would report every native KWallet entry as "might work"
+    /// when what is true of it is that no libsecret client that did not write
+    /// it ever will find it.
     pub fn classify(attributes: &BTreeMap<String, String>) -> Outcome {
         match attributes.get(XDG_SCHEMA) {
             Some(schema) if !schema.is_empty() => Outcome::FullyPortable,
-            _ if !attributes.is_empty() => Outcome::AttributesPreserved,
+            _ if attributes
+                .keys()
+                .any(|k| !is_synthesised_attribute(k.as_str())) =>
+            {
+                Outcome::AttributesPreserved
+            }
             _ => Outcome::PreservedOnly,
         }
     }
@@ -224,80 +263,68 @@ impl fmt::Display for Outcome {
     }
 }
 
-/// One of the six per-item limits that live in the D-Bus layer and nowhere
-/// else. `Vault::insert_item` enforces none of them, so an importer writing
-/// vault files directly could produce a collection the daemon serves happily
-/// but which no D-Bus client could ever have created — and whose items may be
-/// unreadable through the very API they exist to be reached by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Cap {
-    Secret,
-    Label,
-    AttributeCount,
-    AttributeKey,
-    AttributeValue,
-    ContentType,
-}
+/// The six per-item caps, as `vault::format` defines them.
+///
+/// This module used to carry its own copy of the enum, the limits, the
+/// `as_str`/`Display` and the ordering. `vault::format` now owns the single
+/// predicate every layer shares — the D-Bus entry points, `Vault::import_items`
+/// and this pre-flight — so a re-export is all that is left. Two copies of "in
+/// what order, measured how, `>` or `>=`" is the drift that shows up as a
+/// pre-check passing an item the write then refuses halfway through a
+/// migration.
+pub use crate::vault::format::Cap;
 
-impl Cap {
-    /// The single definition of each limit lives in `vault::format`; this is
-    /// a view of it, never a second copy that can drift.
-    pub const fn limit(self) -> usize {
-        match self {
-            Cap::Secret => MAX_ITEM_SECRET,
-            Cap::Label => MAX_ITEM_LABEL,
-            Cap::AttributeCount => MAX_ITEM_ATTRIBUTES,
-            Cap::AttributeKey => MAX_ATTRIBUTE_KEY,
-            Cap::AttributeValue => MAX_ATTRIBUTE_VALUE,
-            Cap::ContentType => MAX_ITEM_CONTENT_TYPE,
+impl From<CapViolation> for Refusal {
+    fn from(violation: CapViolation) -> Self {
+        Refusal::CapViolation {
+            cap: violation.cap,
+            actual: violation.actual,
+            limit: violation.limit,
         }
-    }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Cap::Secret => "secret",
-            Cap::Label => "label",
-            Cap::AttributeCount => "attribute count",
-            Cap::AttributeKey => "attribute name",
-            Cap::AttributeValue => "attribute value",
-            Cap::ContentType => "content type",
-        }
-    }
-}
-
-impl fmt::Display for Cap {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
 /// The first cap `label`/`attributes`/`secret_len`/`content_type` violate.
 ///
+/// The measurement is [`crate::vault::format::check_caps`]; this only maps its
+/// [`CapViolation`] into the report's own vocabulary. An item the D-Bus API
+/// could never have created is one `Vault::insert_item` would happily store,
+/// and which no D-Bus client could then read back.
+///
 /// Sizes only ever reach the report as *numbers*: a `Refusal` names the cap,
 /// the measured size and the limit, never the oversized value itself.
+///
+/// # The policy, stated once
+///
+/// **A cap violation refuses one item; it never aborts the migration.** The
+/// violating item is listed in the report with its `Refusal` and not written,
+/// and every other item is imported as normal.
+///
+/// This function is a *classifier*, not a gate: it is deliberately callable
+/// during extraction, before a destination vault exists, so that a `--dry-run`
+/// and a real run agree about which items are refusable. The rule it does not
+/// state — because it belongs to the caller — is that no item may be written
+/// before every item has been classified: an import that discovers the
+/// twenty-eighth item is oversized after writing twenty-seven leaves the user
+/// with a half-populated vault and no way to tell which half. Check first,
+/// write second; refuse items, not runs.
+///
+/// Three callers exist and two policies are written down. `gnome::extract`
+/// (around the `cap_violation` call) and `kwallet::extract` both do what this
+/// doc says: the item goes to `refused` and the walk continues. `cli::import`
+/// then runs a second pre-check over `extraction.items` that treats any
+/// violation as fatal and writes nothing — and because both extractors have
+/// already removed every violating item from `items`, that list is always
+/// empty and the abort is unreachable. The abort is the policy to delete, not
+/// the one to spread: it contradicts this doc, and as written it is dead code
+/// carrying a comment that describes behaviour the product does not have.
 pub fn check_caps(
     label: &str,
     attributes: &BTreeMap<String, String>,
     secret_len: usize,
     content_type: &str,
 ) -> Option<Refusal> {
-    let over = |cap: Cap, actual: usize| {
-        (actual > cap.limit()).then(|| Refusal::CapViolation {
-            cap,
-            actual,
-            limit: cap.limit(),
-        })
-    };
-    over(Cap::Secret, secret_len)
-        .or_else(|| over(Cap::Label, label.len()))
-        .or_else(|| over(Cap::ContentType, content_type.len()))
-        .or_else(|| over(Cap::AttributeCount, attributes.len()))
-        .or_else(|| {
-            attributes.iter().find_map(|(k, v)| {
-                over(Cap::AttributeKey, k.len()).or_else(|| over(Cap::AttributeValue, v.len()))
-            })
-        })
+    crate::vault::format::check_caps(label, attributes, secret_len, content_type).map(Refusal::from)
 }
 
 /// Why an item was not written. Every variant is one the spec names, and no
@@ -309,14 +336,25 @@ pub enum Refusal {
     /// Importing it would copy an unlock credential into a different trust
     /// domain, so it is refused, listed, and not written.
     ChainedKeyringItem { item_type: u32 },
-    /// A source attribute holding bytes that are not UTF-8. Lossy conversion
-    /// changes the attribute and a changed attribute is a broken lookup, so
-    /// the item is refused instead. `key` is `None` when it is the key itself
-    /// that failed to decode and so cannot be named.
-    NonUtf8Attribute {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        key: Option<String>,
-    },
+    /// The item's `Type` property exists but the read of it failed or timed
+    /// out, so nothing was established about what the item is.
+    ///
+    /// Distinct from [`Refusal::ChainedKeyringItem`] on purpose, and the
+    /// distinction is the whole point: recording an unknown type as "type 3
+    /// unlocks another keyring" puts a statement in a security report that is
+    /// not true of the item it names. What is true is that the source daemon
+    /// would not answer, and the direction that guesses "it is harmless" is
+    /// the direction that imports an unlock credential.
+    UnreadableItemType,
+    /// The item's attribute map could not be read.
+    ///
+    /// Attributes are the item's identity — every libsecret client looks a
+    /// secret up by attribute set — so an item whose map is unknown cannot be
+    /// written: a copy with an empty or guessed map is a secret the
+    /// application that wrote it will never find again. One such item refuses
+    /// itself and the walk continues; the rest of the keyring is still worth
+    /// importing.
+    UnreadableAttributes,
     /// An item the D-Bus API could never have created. See [`Cap`].
     CapViolation {
         cap: Cap,
@@ -333,15 +371,18 @@ impl fmt::Display for Refusal {
                 "item type {item_type} unlocks another keyring; importing it would move an \
                  unlock credential into a different trust domain"
             ),
-            Refusal::NonUtf8Attribute { key: Some(k) } => {
-                write!(f, "attribute {k} is not valid UTF-8 and cannot be copied")
-            }
-            Refusal::NonUtf8Attribute { key: None } => {
-                write!(
-                    f,
-                    "an attribute name is not valid UTF-8 and cannot be copied"
-                )
-            }
+            Refusal::UnreadableItemType => f.write_str(
+                "the source daemon would not say what type this item is, and an item type \
+                 that cannot be read may be an unlock credential for another keyring; \
+                 unlock the source keyring and re-run the import, or copy this one item \
+                 across by hand once you have checked what it is",
+            ),
+            Refusal::UnreadableAttributes => f.write_str(
+                "the source daemon would not return this item's attributes, which are how \
+                 every application finds its secret again; importing it without them would \
+                 produce a copy nothing can look up. Re-run the import, and if it fails the \
+                 same way copy this one item across by hand",
+            ),
             Refusal::CapViolation { cap, actual, limit } => write!(
                 f,
                 "{cap} is {actual} bytes, over the {limit} the Secret Service API allows"
@@ -368,7 +409,17 @@ impl AttributeKeys {
     /// From names that are already just names — the gnome-keyring cleartext
     /// index, which stores key names and hashed values, hands us exactly
     /// this.
-    pub fn from_names<I, S>(names: I) -> Self
+    ///
+    /// `pub(crate)` on purpose. This is the one hole in the guarantee the
+    /// type doc makes: it takes any strings at all, so
+    /// `AttributeKeys::from_names(attributes.values().cloned())` compiles and
+    /// fills a report with `server=`/`user=` *values*. Keeping it inside the
+    /// crate reduces "no code path can do this by accident" to a claim about
+    /// code in this repository, which is a claim review can actually settle.
+    /// The structural fix is a distinct `AttributeName` type that only a
+    /// parser can mint; until that exists, this stays crate-private and
+    /// [`AttributeKeys::of`] is the only public constructor.
+    pub(crate) fn from_names<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -390,14 +441,6 @@ impl AttributeKeys {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-}
-
-impl<'a> IntoIterator for &'a AttributeKeys {
-    type Item = &'a str;
-    type IntoIter = Box<dyn Iterator<Item = &'a str> + 'a>;
-    fn into_iter(self) -> Self::IntoIter {
-        Box::new(self.iter())
     }
 }
 
@@ -470,12 +513,18 @@ impl ItemReport {
 }
 
 /// The three-way tally, plus what was refused.
+///
+/// The counters are only ever moved by [`Tally::record_outcome`] and
+/// [`Tally::record_refused`], which is what keeps a tally and the items it
+/// summarises in step. (They are still `pub` fields: `src/cli/import.rs`
+/// reads them by name when it prints the summary, so sealing them is a change
+/// to a file this lane does not own.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tally {
-    pub fully_portable: usize,
-    pub attributes_preserved: usize,
-    pub preserved_only: usize,
-    pub refused: usize,
+    fully_portable: usize,
+    attributes_preserved: usize,
+    preserved_only: usize,
+    refused: usize,
 }
 
 impl Tally {
@@ -485,29 +534,65 @@ impl Tally {
     }
 
     /// Every item the walk produced, written or not.
+    pub fn fully_portable(&self) -> usize {
+        self.fully_portable
+    }
+
+    pub fn attributes_preserved(&self) -> usize {
+        self.attributes_preserved
+    }
+
+    pub fn preserved_only(&self) -> usize {
+        self.preserved_only
+    }
+
+    pub fn refused(&self) -> usize {
+        self.refused
+    }
+
     pub fn seen(&self) -> usize {
         self.imported() + self.refused
     }
 
+    /// Count one item that was written, under `outcome`.
+    ///
+    /// The counters are incremented here and nowhere else. `tally.refused +=
+    /// 1` written at a call site is how a tally comes to disagree with the
+    /// items it summarises, and the disagreement is invisible until someone
+    /// reads the report and believes it.
+    pub fn record_outcome(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::FullyPortable => self.fully_portable += 1,
+            Outcome::AttributesPreserved => self.attributes_preserved += 1,
+            Outcome::PreservedOnly => self.preserved_only += 1,
+        }
+    }
+
+    /// Count one item that was not written.
+    pub fn record_refused(&mut self) {
+        self.refused += 1;
+    }
+
     fn record(&mut self, report: &ItemReport) {
         if report.is_refused() {
-            self.refused += 1;
+            self.record_refused();
             return;
         }
         match report.outcome {
-            Some(Outcome::FullyPortable) => self.fully_portable += 1,
-            Some(Outcome::AttributesPreserved) => self.attributes_preserved += 1,
-            Some(Outcome::PreservedOnly) => self.preserved_only += 1,
+            Some(outcome) => self.record_outcome(outcome),
             // An item with neither an outcome nor a refusal is a bug in the
             // caller, not a category; count it as refused so the totals still
             // add up and the discrepancy is visible rather than swallowed.
-            None => self.refused += 1,
+            None => self.record_refused(),
         }
     }
 }
 
 /// What `--report PATH` writes, and what `--dry-run` prints.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Deserialize` is hand-written below: a report whose `tally` disagrees with
+/// its `items` is refused rather than read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImportReport {
     pub source: Source,
     /// Destination collection label.
@@ -543,25 +628,78 @@ impl ImportReport {
         self.items.push(report);
     }
 
-    /// `Some(header_count)` when the cleartext header's item count and the
-    /// number of items the walk produced disagree. The caller must report
-    /// this rather than success: something was skipped.
-    pub fn count_mismatch(&self) -> Option<usize> {
-        let expected = self.header_item_count?;
-        (expected != self.tally.seen()).then_some(expected)
+    /// The tally these items add up to, recomputed from scratch.
+    ///
+    /// Used by [`ImportReport`]'s `Deserialize`, so a report read back from
+    /// JSON cannot carry a tally its own items contradict.
+    fn recomputed_tally(items: &[ItemReport]) -> Tally {
+        let mut tally = Tally::default();
+        for item in items {
+            tally.record(item);
+        }
+        tally
     }
+}
 
-    /// The report as JSON. Carries keys, counts and outcomes; no secret and
-    /// no attribute value can reach it, because no type it holds has a field
-    /// that could carry one.
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
+/// The wire shape of an [`ImportReport`], with no invariant attached.
+///
+/// Only [`ImportReport`]'s hand-written `Deserialize` builds one, and it
+/// refuses to hand back a report whose tally disagrees with its items.
+#[derive(Deserialize)]
+#[serde(rename = "ImportReport")]
+struct ImportReportRepr {
+    source: Source,
+    collection: String,
+    tally: Tally,
+    items: Vec<ItemReport>,
+    #[serde(default)]
+    empty_folders: usize,
+    #[serde(default)]
+    header_item_count: Option<usize>,
+}
+
+/// Hand-written so the tally is *checked*, not merely read.
+///
+/// [`ImportReport::push`] is the only thing that builds a report in this
+/// process and it keeps the two in step by construction. Deserialization is
+/// the other door into the type, and it is the one that matters most: the
+/// JSON report is the artefact a user keeps, pastes into a bug report and
+/// trusts when deciding whether their credentials survived. A file whose
+/// `tally` says "0 refused" while its `items` list four refusals must be an
+/// error at the point it is read, not a summary someone acts on.
+impl<'de> Deserialize<'de> for ImportReport {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let repr = ImportReportRepr::deserialize(deserializer)?;
+        let recomputed = ImportReport::recomputed_tally(&repr.items);
+        if recomputed != repr.tally {
+            return Err(serde::de::Error::custom(format!(
+                "the report's tally {:?} disagrees with the {} items it summarises, \
+                 which add up to {recomputed:?}",
+                repr.tally,
+                repr.items.len(),
+            )));
+        }
+        Ok(ImportReport {
+            source: repr.source,
+            collection: repr.collection,
+            tally: repr.tally,
+            items: repr.items,
+            empty_folders: repr.empty_folders,
+            header_item_count: repr.header_item_count,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vault::format::{
+        MAX_ATTRIBUTE_KEY, MAX_ATTRIBUTE_VALUE, MAX_ITEM_ATTRIBUTES, MAX_ITEM_CONTENT_TYPE,
+        MAX_ITEM_LABEL, MAX_ITEM_SECRET,
+    };
 
     fn attrs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -593,6 +731,63 @@ mod tests {
             Outcome::AttributesPreserved
         );
         assert_eq!(item(&[]).outcome(), Outcome::PreservedOnly);
+    }
+
+    /// The case the classifier used to get wrong, and the one the spec calls
+    /// the one a migration tool is tempted to lie about.
+    ///
+    /// `kwallet::map_entry` stamps `kwallet:folder`, `kwallet:key` and
+    /// `kwallet:type` onto exactly the entries that arrived with *no*
+    /// attributes, so by the time `classify` sees the map it is never empty.
+    /// Classifying on "non-empty" reported every native KWallet entry as
+    /// `AttributesPreserved` — "might work" — when the truth is that no
+    /// libsecret client which did not write it ever will find it.
+    #[test]
+    fn a_synthesised_attribute_map_is_preserved_only_not_preserved_attributes() {
+        // Exactly what `kwallet::map_entry` leaves on a native entry with no
+        // sidecar row: three synthesised keys and nothing else.
+        let mapped = item(&[
+            (kwallet::ATTR_FOLDER, "Passwords"),
+            (kwallet::ATTR_KEY, "my router"),
+            (kwallet::ATTR_TYPE, "password"),
+        ]);
+        assert!(
+            !mapped.attributes.is_empty(),
+            "the map is empty, so this test would pass for the wrong reason"
+        );
+        assert!(
+            mapped
+                .attributes
+                .keys()
+                .all(|k| is_synthesised_attribute(k)),
+            "a key nobody synthesised crept into the fixture: {:?}",
+            AttributeKeys::of(&mapped.attributes)
+        );
+        assert_eq!(mapped.outcome(), Outcome::PreservedOnly);
+
+        // One real attribute alongside them is enough to make the item's
+        // attribute set something a client could have searched on.
+        let mut with_real = mapped.clone();
+        with_real
+            .attributes
+            .insert("server".into(), "example.com".into());
+        assert_eq!(with_real.outcome(), Outcome::AttributesPreserved);
+    }
+
+    /// The names the classifier ignores are `kwallet`'s own constants, not a
+    /// second copy of the same strings that could drift away from them.
+    #[test]
+    fn the_synthesised_names_are_kwallets_own_constants() {
+        assert_eq!(
+            SYNTHESISED_ATTRIBUTES,
+            [kwallet::ATTR_FOLDER, kwallet::ATTR_KEY, kwallet::ATTR_TYPE]
+        );
+        for key in SYNTHESISED_ATTRIBUTES {
+            assert!(is_synthesised_attribute(key));
+        }
+        assert!(!is_synthesised_attribute(XDG_SCHEMA));
+        assert!(!is_synthesised_attribute("server"));
+        assert!(!is_synthesised_attribute("kwallet:folder2"));
     }
 
     /// An empty schema value matches nothing, so calling it portable would be
@@ -707,24 +902,33 @@ mod tests {
         assert_eq!(report.tally.seen(), report.items.len());
     }
 
-    /// The independent count is the check the fingerprints cannot make: if
-    /// the header says 28 and the walk yielded 27, the import failed.
+    /// A report read back from JSON cannot carry a tally its own items
+    /// contradict. The JSON report is the artefact a user trusts when
+    /// deciding whether their credentials survived, so "0 refused" beside a
+    /// list of four refusals is an error at the point of reading, not a
+    /// summary anyone acts on.
     #[test]
-    fn a_count_mismatch_is_reported() {
-        let mut report = ImportReport::new(Source::GnomeKeyring, "Default keyring");
-        report.header_item_count = Some(2);
-        report.push(ItemReport::imported(&item(&[])));
-        assert_eq!(report.count_mismatch(), Some(2));
-        report.push(ItemReport::imported(&item(&[])));
-        assert_eq!(report.count_mismatch(), None);
-        // A refused item still counts as seen: it was in the file.
-        report.header_item_count = Some(3);
+    fn a_tally_that_disagrees_with_its_items_will_not_deserialize() {
+        let mut report = ImportReport::new(Source::KWallet, "kdewallet (imported)");
         report.push(ItemReport::refused(
-            Provenance::gnome("Default keyring", 9),
+            Provenance::gnome("Login", 1),
             "chained",
             Refusal::ChainedKeyringItem { item_type: 3 },
         ));
-        assert_eq!(report.count_mismatch(), None);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(serde_json::from_str::<ImportReport>(&json).is_ok());
+
+        // The same items, with the tally quietly zeroed.
+        let doctored = json.replace(r#""refused":1"#, r#""refused":0"#);
+        assert_ne!(
+            doctored, json,
+            "the tally field was not where it was patched"
+        );
+        let err = serde_json::from_str::<ImportReport>(&doctored).unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees with the 1 items"),
+            "{err}"
+        );
     }
 
     /// The whole reason `AttributeKeys` exists. A value that appears in the
@@ -739,7 +943,7 @@ mod tests {
         it.secret = Zeroizing::new(b"correct horse battery staple".to_vec());
         let mut report = ImportReport::new(Source::KWallet, "kdewallet (imported)");
         report.push(ItemReport::imported(&it));
-        let json = report.to_json().unwrap();
+        let json = serde_json::to_string_pretty(&report).unwrap();
         for leaked in [
             "correct horse battery staple",
             "secret-host.example.com",
@@ -784,8 +988,79 @@ mod tests {
         ir.lost_item_type = Some(2);
         ir.acl_downgrade = true;
         report.push(ir);
-        let back: ImportReport = serde_json::from_str(&report.to_json().unwrap()).unwrap();
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        let back: ImportReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back, report);
+    }
+
+    /// The report is an artefact a user keeps, so `Refusal`'s wire form is
+    /// fixed. Re-pointing [`Cap`] at `vault::format` must not have moved a
+    /// byte of it: same variant names, same kebab-case renaming, same field
+    /// names. Every variant is listed, so adding one without deciding its
+    /// wire form fails here.
+    #[test]
+    fn every_refusal_has_a_fixed_wire_form() {
+        let cases = [
+            (
+                Refusal::ChainedKeyringItem { item_type: 3 },
+                r#"{"reason":"chained-keyring-item","item_type":3}"#,
+            ),
+            (
+                Refusal::UnreadableItemType,
+                r#"{"reason":"unreadable-item-type"}"#,
+            ),
+            (
+                Refusal::UnreadableAttributes,
+                r#"{"reason":"unreadable-attributes"}"#,
+            ),
+            (
+                Refusal::CapViolation {
+                    cap: Cap::AttributeValue,
+                    actual: 513,
+                    limit: 512,
+                },
+                r#"{"reason":"cap-violation","cap":"attribute-value","actual":513,"limit":512}"#,
+            ),
+        ];
+        for (refusal, json) in cases {
+            assert_eq!(serde_json::to_string(&refusal).unwrap(), json);
+            assert_eq!(serde_json::from_str::<Refusal>(json).unwrap(), refusal);
+        }
+        // Every cap name too: `Cap` is serialized inside a `CapViolation`, so
+        // its renaming is part of the report's wire form as much as the
+        // refusal's own is.
+        for (cap, name) in [
+            (Cap::Secret, "secret"),
+            (Cap::Label, "label"),
+            (Cap::AttributeCount, "attribute-count"),
+            (Cap::AttributeKey, "attribute-key"),
+            (Cap::AttributeValue, "attribute-value"),
+            (Cap::ContentType, "content-type"),
+        ] {
+            assert_eq!(serde_json::to_string(&cap).unwrap(), format!("\"{name}\""));
+        }
+    }
+
+    /// The two refusals that exist because a read failed must say what the
+    /// user can do about it, and must not describe the item as something
+    /// nobody established it is.
+    #[test]
+    fn an_unreadable_property_reads_as_itself_and_not_as_a_chained_keyring() {
+        let unreadable_type = Refusal::UnreadableItemType.to_string();
+        assert!(
+            unreadable_type.contains("re-run the import"),
+            "{unreadable_type}"
+        );
+        assert!(
+            !unreadable_type.contains("item type 3"),
+            "an unknown type must not be reported as a known one: {unreadable_type}"
+        );
+        let unreadable_attrs = Refusal::UnreadableAttributes.to_string();
+        assert!(
+            unreadable_attrs.contains("attributes"),
+            "{unreadable_attrs}"
+        );
+        assert!(unreadable_attrs.contains("by hand"), "{unreadable_attrs}");
     }
 
     #[test]
@@ -801,11 +1076,6 @@ mod tests {
             }
             .to_string()
             .contains("secret is 2 bytes")
-        );
-        assert!(
-            Refusal::NonUtf8Attribute { key: None }
-                .to_string()
-                .contains("not valid UTF-8")
         );
         assert!(
             Refusal::ChainedKeyringItem { item_type: 3 }

@@ -37,7 +37,7 @@ fn plain_secret(session: &OwnedObjectPath, bytes: &[u8]) -> SecretStruct {
     SecretStruct {
         session: session.clone(),
         parameters: vec![],
-        value: bytes.to_vec(),
+        value: bytes.to_vec().into(),
         content_type: "text/plain".into(),
     }
 }
@@ -142,13 +142,13 @@ async fn create_search_get_set_delete_with_signals() {
     assert!(!it.locked().await.unwrap());
     assert!(it.created().await.unwrap() > 0);
     let s = it.get_secret(&session).await.unwrap();
-    assert_eq!(s.value, b"tok");
+    assert_eq!(s.value.as_slice(), b"tok");
     assert_eq!(s.content_type, "text/plain");
     let all = service
         .get_secrets(std::slice::from_ref(&item_path), &session)
         .await
         .unwrap();
-    assert_eq!(all[&item_path].value, b"tok");
+    assert_eq!(all[&item_path].value.as_slice(), b"tok");
 
     let mut changed = coll.receive_item_changed().await.unwrap();
     it.set_secret(&plain_secret(&session, b"tok2"))
@@ -158,7 +158,10 @@ async fn create_search_get_set_delete_with_signals() {
         changed.next().await.unwrap().args().unwrap().item,
         item_path
     );
-    assert_eq!(it.get_secret(&session).await.unwrap().value, b"tok2");
+    assert_eq!(
+        it.get_secret(&session).await.unwrap().value.as_slice(),
+        b"tok2"
+    );
     it.set_label("renamed").await.unwrap();
     assert_eq!(it.label().await.unwrap(), "renamed");
     it.set_attributes(HashMap::from([("app", "git"), ("user", "jane")]))
@@ -215,7 +218,7 @@ async fn dh_session_end_to_end() {
     let secret = SecretStruct {
         session: session.clone(),
         parameters,
-        value,
+        value: value.into(),
         content_type: "text/plain".into(),
     };
     let coll = collection(&conn, fx.default_collection()).await;
@@ -228,7 +231,7 @@ async fn dh_session_end_to_end() {
         .await
         .unwrap();
     let s = &got[&item_path];
-    assert_ne!(s.value, b"encrypted on the wire");
+    assert_ne!(s.value.as_slice(), b"encrypted on the wire");
     assert_eq!(
         cipher.decrypt(&s.parameters, &s.value).unwrap().as_slice(),
         b"encrypted on the wire"
@@ -350,7 +353,7 @@ async fn get_secrets_and_search_are_capped() {
     // At the cap: still answered (the real item repeated to fill the array).
     let at_cap = vec![item_path.clone(); MAX_GET_SECRETS_ITEMS];
     let got = service.get_secrets(&at_cap, &session).await.unwrap();
-    assert_eq!(got[&item_path].value, b"s");
+    assert_eq!(got[&item_path].value.as_slice(), b"s");
 
     let over = vec![item_path.clone(); MAX_GET_SECRETS_ITEMS + 1];
     let err = service.get_secrets(&over, &session).await.unwrap_err();
@@ -588,7 +591,7 @@ async fn secret_calls_reject_a_foreign_session() {
     assert_eq!(error_name(&err), "org.freedesktop.Secret.Error.NoSession");
     // The owner is unaffected.
     let got = item(&owner, path).await.get_secret(&session).await.unwrap();
-    assert_eq!(got.value, b"s");
+    assert_eq!(got.value.as_slice(), b"s");
 }
 
 /// A `Close` naming a session the daemon does not know must answer exactly
@@ -1058,7 +1061,7 @@ async fn batch_delete_on_a_locked_collection_changes_nothing() {
         .get_secrets(std::slice::from_ref(&item_path), &session)
         .await
         .unwrap();
-    assert_eq!(got[&item_path].value, b"s");
+    assert_eq!(got[&item_path].value.as_slice(), b"s");
 }
 
 /// `CreateItem` is the one mutation path where caller-supplied bytes reach a
@@ -1081,7 +1084,7 @@ async fn create_item_rejects_an_undecryptable_secret() {
             &SecretStruct {
                 session: session.clone(),
                 parameters: vec![0u8; 8],
-                value: good.clone(),
+                value: good.clone().into(),
                 content_type: "text/plain".into(),
             },
             false,
@@ -1100,7 +1103,7 @@ async fn create_item_rejects_an_undecryptable_secret() {
             &SecretStruct {
                 session: session.clone(),
                 parameters: iv,
-                value: ragged,
+                value: ragged.into(),
                 content_type: "text/plain".into(),
             },
             false,
@@ -1132,7 +1135,7 @@ async fn set_secret_leaves_the_old_secret_when_the_decrypt_fails() {
             &SecretStruct {
                 session: session.clone(),
                 parameters,
-                value,
+                value: value.into(),
                 content_type: "text/plain".into(),
             },
             false,
@@ -1146,7 +1149,7 @@ async fn set_secret_leaves_the_old_secret_when_the_decrypt_fails() {
         .set_secret(&SecretStruct {
             session: session.clone(),
             parameters: vec![0u8; 8],
-            value: replacement,
+            value: replacement.into(),
             content_type: "text/plain".into(),
         })
         .await
@@ -1200,7 +1203,7 @@ async fn set_secret_rejects_an_oversized_secret() {
         error_message(&err)
     );
     assert_eq!(
-        it.get_secret(&session).await.unwrap().value,
+        it.get_secret(&session).await.unwrap().value.as_slice(),
         b"s",
         "a refused SetSecret must not touch the stored secret"
     );
@@ -1254,7 +1257,7 @@ async fn get_secrets_omits_paths_that_name_no_readable_item() {
         vec![item_path],
         "only the one readable item may appear in the reply"
     );
-    assert_eq!(out.values().next().unwrap().value, b"s".to_vec());
+    assert_eq!(out.values().next().unwrap().value.as_slice(), b"s");
 }
 
 /// The `Attributes` property is optional in the spec, and `secret-tool`-style
@@ -1597,7 +1600,7 @@ async fn oversized_and_locked_are_refused_before_the_decrypt() {
     let undecryptable = |len: usize| SecretStruct {
         session: session.clone(),
         parameters: vec![7u8; 16],
-        value: vec![0xab; len],
+        value: vec![0xab; len].into(),
         content_type: "text/plain".into(),
     };
 
@@ -1625,7 +1628,7 @@ async fn oversized_and_locked_are_refused_before_the_decrypt() {
             &SecretStruct {
                 session: session.clone(),
                 parameters: params,
-                value,
+                value: value.into(),
                 content_type: "text/plain".into(),
             },
             false,
@@ -1652,7 +1655,7 @@ async fn oversized_and_locked_are_refused_before_the_decrypt() {
     it.set_secret(&SecretStruct {
         session: session.clone(),
         parameters: params,
-        value,
+        value: value.into(),
         content_type: "text/plain".into(),
     })
     .await
@@ -1749,7 +1752,7 @@ async fn content_type_is_capped_on_every_write_path() {
     let typed = |content_type: &str| SecretStruct {
         session: session.clone(),
         parameters: vec![],
-        value: b"s".to_vec(),
+        value: b"s".to_vec().into(),
         content_type: content_type.to_string(),
     };
 
@@ -1861,7 +1864,10 @@ async fn a_refused_get_secret_does_not_refresh_the_idle_timer() {
     );
 
     // The authorised call still counts, in the same lock acquisition.
-    assert_eq!(it.get_secret(&session).await.unwrap().value, b"s");
+    assert_eq!(
+        it.get_secret(&session).await.unwrap().value.as_slice(),
+        b"s"
+    );
     assert!(
         last_activity().await > before,
         "an authorised GetSecret must still refresh the idle timer"

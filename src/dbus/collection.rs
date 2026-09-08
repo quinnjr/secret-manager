@@ -25,6 +25,40 @@ pub use crate::vault::format::{
     MAX_ITEM_LABEL, MAX_ITEM_SECRET,
 };
 
+/// The *predicate* moved with the constants, for the same reason and one step
+/// later: three layers each measured the same six caps in their own order
+/// with their own error type - here, in `Vault::import_items`, and in
+/// `import`'s pre-flight check - and when three hand-maintained copies of an
+/// ordering drift, the symptom is a pre-check that passes an item the vault
+/// then refuses halfway through a migration. [`Cap`] decides what is too
+/// large; everything below only decides what to say about it.
+use crate::vault::format::{Cap, CapViolation};
+
+/// Render one cap violation as the `InvalidArgs` this layer has always
+/// returned. The wording is per-cap and unchanged, so no client-visible
+/// message moves.
+fn cap_message(v: CapViolation) -> String {
+    let limit = v.limit;
+    match v.cap {
+        Cap::Secret => format!("secret is too large; at most {limit} bytes per item"),
+        Cap::Label => format!("label is too large; at most {limit} bytes per item"),
+        Cap::ContentType => format!("content type is too large; at most {limit} bytes per item"),
+        Cap::AttributeCount => format!("too many attributes; at most {limit} per item"),
+        Cap::AttributeKey => {
+            format!("attribute name is too large; at most {limit} bytes per attribute")
+        }
+        Cap::AttributeValue => {
+            format!("attribute value is too large; at most {limit} bytes per attribute")
+        }
+    }
+}
+
+/// [`cap_message`] as the `InvalidArgs` the property setters must return; see
+/// [`check_label`] for why they cannot return [`Error`].
+fn invalid_args(v: CapViolation) -> zbus::fdo::Error {
+    zbus::fdo::Error::InvalidArgs(cap_message(v))
+}
+
 /// Upper bound on the *ciphertext* of one item's secret, checked before the
 /// decrypt rather than after it.
 ///
@@ -47,12 +81,10 @@ pub const MAX_ITEM_CIPHERTEXT: usize = MAX_ITEM_SECRET + 16;
 
 /// Refuse an over-long content type. See [`check_label`] for the error type.
 pub(crate) fn check_content_type(content_type: &str) -> std::result::Result<(), zbus::fdo::Error> {
-    if content_type.len() > MAX_ITEM_CONTENT_TYPE {
-        return Err(zbus::fdo::Error::InvalidArgs(format!(
-            "content type is too large; at most {MAX_ITEM_CONTENT_TYPE} bytes per item"
-        )));
+    match Cap::ContentType.check(content_type.len()) {
+        Some(v) => Err(invalid_args(v)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuse an over-long item label.
@@ -63,12 +95,10 @@ pub(crate) fn check_content_type(content_type: &str) -> std::result::Result<(), 
 /// [`super::errors::vault_error_to_fdo`]) and must share this check. `?`
 /// converts it to [`Error`] on the method paths.
 pub(crate) fn check_label(label: &str) -> std::result::Result<(), zbus::fdo::Error> {
-    if label.len() > MAX_ITEM_LABEL {
-        return Err(zbus::fdo::Error::InvalidArgs(format!(
-            "label is too large; at most {MAX_ITEM_LABEL} bytes per item"
-        )));
+    match Cap::Label.check(label.len()) {
+        Some(v) => Err(invalid_args(v)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuse an over-large attribute set: too many pairs, or a pair whose name
@@ -77,21 +107,15 @@ pub(crate) fn check_attributes<'a>(
     count: usize,
     pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> std::result::Result<(), zbus::fdo::Error> {
-    if count > MAX_ITEM_ATTRIBUTES {
-        return Err(zbus::fdo::Error::InvalidArgs(format!(
-            "too many attributes; at most {MAX_ITEM_ATTRIBUTES} per item"
-        )));
+    if let Some(over) = Cap::AttributeCount.check(count) {
+        return Err(invalid_args(over));
     }
     for (k, v) in pairs {
-        if k.len() > MAX_ATTRIBUTE_KEY {
-            return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "attribute name is too large; at most {MAX_ATTRIBUTE_KEY} bytes per attribute"
-            )));
-        }
-        if v.len() > MAX_ATTRIBUTE_VALUE {
-            return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "attribute value is too large; at most {MAX_ATTRIBUTE_VALUE} bytes per attribute"
-            )));
+        if let Some(over) = Cap::AttributeKey
+            .check(k.len())
+            .or_else(|| Cap::AttributeValue.check(v.len()))
+        {
+            return Err(invalid_args(over));
         }
     }
     Ok(())
@@ -292,10 +316,8 @@ impl Collection {
                 .map_err(Error::failed)?;
             // The exact check: `MAX_ITEM_CIPHERTEXT` only bounds the plaintext
             // from above, it does not measure it.
-            if plaintext.len() > MAX_ITEM_SECRET {
-                return Err(Error::invalid_args(format!(
-                    "secret is too large; at most {MAX_ITEM_SECRET} bytes per item"
-                )));
+            if let Some(over) = Cap::Secret.check(plaintext.len()) {
+                return Err(Error::invalid_args(cap_message(over)));
             }
             block_in_place(|| {
                 vault.insert_item(

@@ -132,6 +132,14 @@ pub enum HeaderError {
     ImpossibleLength { field: &'static str, declared: u64 },
     #[error("{field} is not valid UTF-8")]
     NonUtf8 { field: &'static str },
+    /// A length-prefixed string encoded as the format's NULL (`0xffffffff`)
+    /// in a position that requires a name. Reported separately from
+    /// [`HeaderError::NonUtf8`] because nothing failed to decode: there were
+    /// no bytes to decode, and saying "not valid UTF-8" of a field that was
+    /// never present sends a reader looking for an encoding bug that is not
+    /// there.
+    #[error("{field} is NULL, and this format requires a name here")]
+    NullName { field: &'static str },
     #[error("item {item_id} has an attribute of unknown type {attribute_type}")]
     UnknownAttributeType { item_id: u32, attribute_type: u32 },
     #[error("the `default` file does not name a keyring")]
@@ -188,10 +196,6 @@ impl<'a> Cursor<'a> {
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn i32(&mut self, field: &'static str) -> Result<i32, HeaderError> {
-        Ok(self.u32(field)? as i32)
-    }
-
     fn u64(&mut self, field: &'static str) -> Result<u64, HeaderError> {
         let b = self.take(8, field)?;
         Ok(u64::from_be_bytes([
@@ -208,10 +212,13 @@ impl<'a> Cursor<'a> {
     /// A declared count, refused unless the file could actually hold that
     /// many elements of `min_each` bytes.
     ///
-    /// This is the check that keeps allocation proportional to the input
-    /// rather than to a number an attacker wrote: a `num_items` of
-    /// `0xffffffff` in a 900-byte file is rejected here, before any
-    /// `Vec::with_capacity`.
+    /// This is the check that keeps work proportional to the input rather
+    /// than to a number an attacker wrote: a `num_items` of `0xffffffff` in a
+    /// 900-byte file is rejected here, before any loop is entered. It bounds
+    /// the *count*, not the allocation — `min_each` is the smallest encoded
+    /// size and the parsed element is wider — so callers grow their `Vec`
+    /// from the elements they actually read rather than reserving on the
+    /// declared count.
     fn count(
         &self,
         declared: u32,
@@ -279,8 +286,12 @@ pub struct KeyringInventory {
     pub modified: u64,
     pub flags: u32,
     /// Seconds of idle time before the keyring re-locks; `0` for never.
-    /// Signed in the format, and negative values do occur in the wild.
-    pub lock_timeout: i32,
+    /// gnome-keyring declares it `guint32` and writes it as one, so it is
+    /// read as one: an earlier version read it signed on the strength of an
+    /// unverified claim that negative values occur in the wild, which turned
+    /// a large timeout into a negative number in an inventory nobody could
+    /// then explain. Recorded, never acted on.
+    pub lock_timeout: u32,
     /// Iterations of the file's iterated-MD5 key derivation, calibrated per
     /// file at creation (3457 and 1166 in the two measured here). Recorded
     /// because it is the honest measure of how weak the source is, not
@@ -357,7 +368,7 @@ pub fn parse_keyring_header(bytes: &[u8]) -> Result<KeyringInventory, HeaderErro
     let created = c.u64("created time")?;
     let modified = c.u64("modified time")?;
     let flags = c.u32("flags")?;
-    let lock_timeout = c.i32("lock timeout")?;
+    let lock_timeout = c.u32("lock timeout")?;
     let hash_iterations = c.u32("hash iterations")?;
     let mut salt = [0u8; 8];
     salt.copy_from_slice(c.take(8, "salt")?);
@@ -367,7 +378,13 @@ pub fn parse_keyring_header(bytes: &[u8]) -> Result<KeyringInventory, HeaderErro
 
     let declared = c.u32("item count")?;
     let num_items = c.count(declared, MIN_ITEM_BYTES, "item count")?;
-    let mut items = Vec::with_capacity(num_items);
+    // `Vec::new`, not `with_capacity(num_items)`. `count` bounds the declared
+    // number by the *encoded* minimum against a wider in-memory type, so
+    // reserving up front still admits roughly 2x amplification over the file
+    // length — bounded by `MAX_SOURCE_BYTES`, so not a denial of service, but
+    // it contradicts this module's `O(file length)` claim for no gain: the
+    // push loop is bounded by the same reads that produce the elements.
+    let mut items = Vec::new();
     for _ in 0..num_items {
         items.push(parse_keyring_item(&mut c)?);
     }
@@ -398,11 +415,11 @@ fn parse_keyring_item(c: &mut Cursor<'_>) -> Result<KeyringItemIndex, HeaderErro
     let item_type = c.u32("item type")?;
     let declared = c.u32("attribute count")?;
     let count = c.count(declared, MIN_ATTRIBUTE_BYTES, "attribute count")?;
-    let mut names = Vec::with_capacity(count);
+    let mut names = Vec::new();
     for _ in 0..count {
         let name = c
             .opt_string("attribute name")?
-            .ok_or(HeaderError::NonUtf8 {
+            .ok_or(HeaderError::NullName {
                 field: "attribute name",
             })?;
         let attribute_type = c.u32("attribute type")?;
@@ -440,7 +457,13 @@ fn parse_keyring_item(c: &mut Cursor<'_>) -> Result<KeyringItemIndex, HeaderErro
 /// containing `../../etc/passwd` is refused rather than resolved.
 pub fn parse_default_file(contents: &str) -> Result<String, HeaderError> {
     let name = contents.lines().next().unwrap_or("").trim();
-    let name = name.strip_suffix(".keyring").unwrap_or(name);
+    // Trimmed again after the suffix is stripped, not only before it. A
+    // `default` reading `Login  .keyring` otherwise yielded `Login  ` — an
+    // accepted name that is not what feeding it back through this function
+    // produces, so `<name>.keyring` and the name in a report disagreed about
+    // the same keyring. The `import_keyring_header` fuzz target found this by
+    // asserting the idempotence the caller relies on.
+    let name = name.strip_suffix(".keyring").unwrap_or(name).trim_end();
     let rejected = name.is_empty()
         || name == "."
         || name == ".."
@@ -550,12 +573,14 @@ pub fn parse_wallet_header(bytes: &[u8]) -> Result<WalletInventory, HeaderError>
 
     let declared = c.u32("folder count")?;
     let folder_count = c.count(declared, MIN_FOLDER_BYTES, "folder count")?;
-    let mut folders = Vec::with_capacity(folder_count);
+    // See `parse_keyring_header`: reserving on a declared count is allocation
+    // proportional to a number the attacker wrote, not to the file.
+    let mut folders = Vec::new();
     for _ in 0..folder_count {
         let folder_hash = c.array16("folder name hash")?;
         let declared = c.u32("entry count")?;
         let entry_count = c.count(declared, 16, "entry count")?;
-        let mut entry_hashes = Vec::with_capacity(entry_count);
+        let mut entry_hashes = Vec::new();
         for _ in 0..entry_count {
             entry_hashes.push(c.array16("entry name hash")?);
         }
@@ -578,11 +603,19 @@ mod tests {
     use super::*;
 
     // ----------------------------------------------------------------
-    // Byte-level builders. These write the layout that was read out of
-    // the real files on this machine, so a fixture and a hand-built case
-    // are the same bytes; `tests/fixtures/import/` holds the golden files
-    // that keep this honest, since a parser tested only against its own
-    // encoder proves nothing.
+    // Byte-level builders, writing the layout this parser was written to.
+    //
+    // What these prove is limited, and the limit is worth stating: the
+    // builders and the parser encode the *same* understanding of the
+    // format, by the same author, so a wrong understanding makes both
+    // wrong together and every test below still passes. They pin the
+    // parser against change — a regression suite — and they do not
+    // validate the format. Only bytes from a file this project did not
+    // write could do that, and there are none here: a real keyring is
+    // personal data and does not belong in a repository. Anyone with a
+    // real `.keyring` or `.kwl` to hand should check an annotated
+    // hexdump of its cleartext prefix against `keyring_prologue` and
+    // `wallet_index` before trusting the layout.
     // ----------------------------------------------------------------
 
     #[derive(Default)]
@@ -690,9 +723,9 @@ mod tests {
     // Golden files
     // ----------------------------------------------------------------
 
-    /// Committed fixtures, built to the layout verified against real files.
-    /// They are synthetic: a real keyring is personal data and does not
-    /// belong in a repository.
+    /// Committed fixtures. They are synthetic, built from the same layout
+    /// knowledge as the parser, so they pin regressions and do not confirm
+    /// the format; see the note on the builders above.
     #[test]
     fn the_golden_keyring_parses_to_exact_values() {
         let inv =
@@ -810,14 +843,16 @@ mod tests {
         assert_eq!(parse_keyring_header(&bytes).unwrap().display_name, "");
     }
 
+    /// The top-bit-set case, which is where reading this field signed used
+    /// to turn a large timeout into `-1`.
     #[test]
-    fn a_negative_lock_timeout_round_trips() {
+    fn a_top_bit_set_lock_timeout_round_trips_unsigned() {
         let mut bytes = keyring_prologue("x", 1, 0).done();
         // `lock_timeout` sits 12 bytes before `hash_iterations`.
         let at = KEYRING_MAGIC.len() + 4 + 4 + 1 + 8 + 8 + 4;
-        bytes[at..at + 4].copy_from_slice(&(-1i32).to_be_bytes());
+        bytes[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
         bytes.extend_from_slice(&0u32.to_be_bytes());
-        assert_eq!(parse_keyring_header(&bytes).unwrap().lock_timeout, -1);
+        assert_eq!(parse_keyring_header(&bytes).unwrap().lock_timeout, u32::MAX);
     }
 
     #[test]
@@ -1018,8 +1053,11 @@ mod tests {
         );
     }
 
+    /// A NULL name is not a decoding failure: the bytes decoded fine, there
+    /// were none. Reporting it as `NonUtf8` sends the reader hunting an
+    /// encoding bug that does not exist.
     #[test]
-    fn a_null_attribute_name_is_refused() {
+    fn a_null_attribute_name_is_refused_as_null_and_not_as_bad_utf8() {
         let bytes = keyring_prologue("x", 1, 1)
             .u32(7)
             .u32(0)
@@ -1031,7 +1069,7 @@ mod tests {
             .done();
         assert_eq!(
             parse_keyring_header(&bytes),
-            Err(HeaderError::NonUtf8 {
+            Err(HeaderError::NullName {
                 field: "attribute name"
             })
         );
@@ -1066,6 +1104,26 @@ mod tests {
             parse_default_file("  spaced  \nignored\n").unwrap(),
             "spaced"
         );
+    }
+
+    /// Stripping `.keyring` can uncover whitespace the first trim could not
+    /// see. Returning `login  ` there would be a name that does not survive
+    /// being read back — the same keyring under two spellings.
+    #[test]
+    fn whitespace_uncovered_by_the_suffix_is_trimmed_too() {
+        assert_eq!(parse_default_file("login  .keyring").unwrap(), "login");
+        assert_eq!(
+            parse_default_file("  login  .keyring  \n").unwrap(),
+            "login"
+        );
+        assert_eq!(
+            parse_default_file(" .keyring"),
+            Err(HeaderError::InvalidDefaultName)
+        );
+        for text in ["login  .keyring", "  login \t.keyring", "login"] {
+            let once = parse_default_file(text).unwrap();
+            assert_eq!(parse_default_file(&once).unwrap(), once, "{text:?}");
+        }
     }
 
     /// The name becomes a filename, so a traversal is refused rather than

@@ -276,7 +276,7 @@ async fn unlock_by_item_path_and_lock() {
     let secret = SecretStruct {
         session: session.clone(),
         parameters: vec![],
-        value: b"s".to_vec(),
+        value: b"s".to_vec().into(),
         content_type: "text/plain".into(),
     };
     let (item_path, _) = coll.create_item(props, &secret, false).await.unwrap();
@@ -309,7 +309,7 @@ async fn unlock_by_item_path_and_lock() {
         .get_secrets(std::slice::from_ref(&item_path), &session)
         .await
         .unwrap();
-    assert_eq!(got[&item_path].value, b"s");
+    assert_eq!(got[&item_path].value.as_slice(), b"s");
 }
 
 /// A prompt belongs to the client that obtained it (`Service.Unlock` etc.):
@@ -2126,7 +2126,7 @@ async fn deleting_a_collection_unexports_its_item_objects() {
     let secret = SecretStruct {
         session,
         parameters: vec![],
-        value: b"s".to_vec(),
+        value: b"s".to_vec().into(),
         content_type: "text/plain".into(),
     };
     let (item_path, _) = work.create_item(item_props, &secret, false).await.unwrap();

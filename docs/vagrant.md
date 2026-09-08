@@ -41,9 +41,11 @@ every installed file landed.
 - the `sm` and `sm-askpass` argv0 aliases really are symlinks to the one
   binary;
 - the PAM module is at the multiarch path the document promises, exports
-  `pam_sm_open_session`, and **does not link tokio or zbus** — the invariant
-  `CLAUDE.md` states, checked here against an installed artifact rather than
-  a build flag;
+  `pam_sm_open_session`, and **does not export any tokio or zbus symbol in
+  its dynamic symbol table** — a sanity check on the installed artifact, not
+  a proof: `nm -D` only reads the dynamic symbol table, and a statically
+  linked dependency need not appear there. The `compile_error!` in
+  `src/lib.rs` is what actually enforces the invariant `CLAUDE.md` states;
 - a daemon on a private session bus, a vault, a secret stored and read back,
   `secret-tool` interop in *both* directions, and `sm lock`;
 - `sm import --inventory` runs with no source and no daemon;

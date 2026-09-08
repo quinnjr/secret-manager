@@ -15,6 +15,7 @@
 //! structured one.
 
 use arbitrary::{Arbitrary, Unstructured};
+use secret_manager::import::formats as import_formats;
 use secret_manager::vault::crypto::{KdfParams, KEY_LEN, NONCE_LEN, SALT_LEN};
 use secret_manager::vault::format::{self, Header, IndexEntry, Item};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -500,5 +501,483 @@ mod tests {
             format::MAX_HEADER
         );
         assert!(p < format::MAX_HEADER, "allocated {p} from the prefix alone");
+    }
+}
+
+// --------------------------------------------------------------------------
+// `sm import`: the cleartext headers of foreign keyring files
+// --------------------------------------------------------------------------
+//
+// These are the only files this project parses that it did not write, read by
+// `sm import --inventory` with **no authentication of any kind** — the source
+// formats keep their integrity check inside the encrypted half, which the
+// parsers never touch. A `.keyring` or a `.kwl` in `~/.local/share/` may have
+// been written by anything.
+//
+// Random bytes bounce off a 16- or 12-byte magic and a version gate before a
+// single length is read, so the generators below emit a real magic and,
+// usually, the accepted version — and put the hostility where it belongs: in
+// the counts, the length prefixes, the attribute types and the NULL marker.
+// They mirror `tests/prop_import.rs`, which is the same invariants at
+// `cargo test` speed.
+
+/// Big-endian, which is what both formats use throughout.
+fn be32(v: u32) -> [u8; 4] {
+    v.to_be_bytes()
+}
+
+/// A declared count or length: mostly honest and small, sometimes one of the
+/// boundary values that decide the parser's `count` check, sometimes anything.
+fn declared_count(u: &mut Unstructured) -> arbitrary::Result<u32> {
+    Ok(match u.int_in_range(0..=9)? {
+        0..=5 => u.int_in_range(0..=4)?,
+        6 | 7 => *u.choose(&[0, 1, u32::MAX, u32::MAX - 1, 1 << 30, 0x0F00_0000])?,
+        _ => u.arbitrary()?,
+    })
+}
+
+/// `None` encodes the honest length; `Some(n)` overrides it.
+fn maybe_declared(u: &mut Unstructured) -> arbitrary::Result<Option<u32>> {
+    if u.ratio(7, 10)? {
+        Ok(None)
+    } else {
+        Ok(Some(declared_count(u)?))
+    }
+}
+
+/// A short byte string, biased towards the attribute names a real keyring
+/// carries — `xdg:schema` above all, since the whole import classification
+/// turns on it — but reaching arbitrary, possibly non-UTF-8, bytes too.
+fn attribute_name_bytes(u: &mut Unstructured) -> arbitrary::Result<Vec<u8>> {
+    if u.ratio(4, 5)? {
+        Ok(u.choose(&["xdg:schema", "server", "user", "account", "port", "keyring", ""])?
+            .as_bytes()
+            .to_vec())
+    } else {
+        let n = u.int_in_range(0..=6)?;
+        let mut out = vec![0u8; n];
+        u.fill_buffer(&mut out)?;
+        Ok(out)
+    }
+}
+
+/// One attribute in a gnome-keyring cleartext index.
+#[derive(Debug)]
+pub struct KeyringAttr {
+    pub name: Vec<u8>,
+    /// Encode the name as the format's NULL (`0xffffffff`) instead.
+    pub null_name: bool,
+    pub declared_name_len: Option<u32>,
+    pub attr_type: u32,
+    pub value: Vec<u8>,
+    pub declared_value_len: Option<u32>,
+}
+
+impl<'a> Arbitrary<'a> for KeyringAttr {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let name = attribute_name_bytes(u)?;
+        let null_name = u.ratio(1, 10)?;
+        let declared_name_len = maybe_declared(u)?;
+        // Weighted onto the two types the format defines, so the value
+        // encodings are reached; the third arm is the unknown-type refusal.
+        let attr_type = match u.int_in_range(0..=9)? {
+            0..=4 => 0,
+            5..=8 => 1,
+            _ => u.arbitrary()?,
+        };
+        let vlen = u.int_in_range(0..=34)?;
+        let mut value = vec![0u8; vlen];
+        u.fill_buffer(&mut value)?;
+        let declared_value_len = maybe_declared(u)?;
+        Ok(Self {
+            name,
+            null_name,
+            declared_name_len,
+            attr_type,
+            value,
+            declared_value_len,
+        })
+    }
+}
+
+impl KeyringAttr {
+    fn encode(&self, out: &mut Vec<u8>) {
+        if self.null_name {
+            out.extend_from_slice(&be32(u32::MAX));
+        } else {
+            out.extend_from_slice(&be32(
+                self.declared_name_len.unwrap_or(self.name.len() as u32)
+            ));
+            out.extend_from_slice(&self.name);
+        }
+        out.extend_from_slice(&be32(self.attr_type));
+        match self.attr_type {
+            0 => {
+                out.extend_from_slice(&be32(
+                    self.declared_value_len.unwrap_or(self.value.len() as u32)
+                ));
+                out.extend_from_slice(&self.value);
+            }
+            1 => out.extend_from_slice(&be32(0xDEAD_BEEF)),
+            // Refused before a value is read, so none is written.
+            _ => {}
+        }
+    }
+
+    /// The name this attribute contributes to the parsed key set.
+    pub fn honest_name(&self) -> Option<&str> {
+        if self.null_name || self.declared_name_len.is_some() {
+            return None;
+        }
+        std::str::from_utf8(&self.name).ok()
+    }
+
+    fn is_honest(&self) -> bool {
+        self.honest_name().is_some()
+            && matches!(self.attr_type, 0 | 1)
+            && (self.attr_type != 0 || self.declared_value_len.is_none())
+    }
+}
+
+/// One item in a gnome-keyring cleartext index.
+#[derive(Debug)]
+pub struct KeyringItemSpec {
+    pub id: u32,
+    pub item_type: u32,
+    pub attrs: Vec<KeyringAttr>,
+    pub declared_attr_count: Option<u32>,
+}
+
+impl<'a> Arbitrary<'a> for KeyringItemSpec {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let id = u.arbitrary()?;
+        // Mostly a type the format defines, including the two unlock
+        // credentials the importer refuses.
+        let item_type = if u.ratio(4, 5)? {
+            u.int_in_range(0..=5)?
+        } else {
+            u.arbitrary()?
+        };
+        let n = u.int_in_range(0..=3)?;
+        let mut attrs = Vec::new();
+        for _ in 0..n {
+            if u.is_empty() {
+                break;
+            }
+            attrs.push(KeyringAttr::arbitrary(u)?);
+        }
+        let declared_attr_count = maybe_declared(u)?;
+        Ok(Self {
+            id,
+            item_type,
+            attrs,
+            declared_attr_count,
+        })
+    }
+}
+
+impl KeyringItemSpec {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&be32(self.id));
+        out.extend_from_slice(&be32(self.item_type));
+        out.extend_from_slice(&be32(
+            self.declared_attr_count.unwrap_or(self.attrs.len() as u32)
+        ));
+        for a in &self.attrs {
+            a.encode(out);
+        }
+    }
+
+    fn is_honest(&self) -> bool {
+        self.declared_attr_count.is_none() && self.attrs.iter().all(KeyringAttr::is_honest)
+    }
+
+    /// The attribute names, as the set the index yields.
+    pub fn names(&self) -> std::collections::BTreeSet<String> {
+        self.attrs
+            .iter()
+            .filter_map(|a| a.honest_name().map(str::to_string))
+            .collect()
+    }
+}
+
+/// A `.keyring` file's cleartext half.
+#[derive(Debug)]
+pub struct KeyringBytes {
+    /// Entirely the fuzzer's bytes — "not a keyring at all", kept so the
+    /// target still covers the dumb case.
+    pub raw: Option<Vec<u8>>,
+    pub major: u8,
+    pub minor: u8,
+    pub name: Vec<u8>,
+    pub null_name: bool,
+    pub declared_name_len: Option<u32>,
+    pub hash_iterations: u32,
+    pub items: Vec<KeyringItemSpec>,
+    pub declared_item_count: Option<u32>,
+    pub ciphertext: Vec<u8>,
+    pub declared_ciphertext_len: Option<u32>,
+}
+
+/// The fixed fields the generator writes, so a target can assert on them.
+pub const KEYRING_CREATED: u64 = 1_699_383_593;
+pub const KEYRING_SALT: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+impl<'a> Arbitrary<'a> for KeyringBytes {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        // One case in eight is raw bytes; the rest are structured.
+        let raw = if u.ratio(1, 8)? {
+            Some(u.arbitrary()?)
+        } else {
+            None
+        };
+        // Weighted hard onto 0.0: the version gate runs before any length is
+        // read, so an even spread here filters everything below it.
+        let (major, minor) = if u.ratio(4, 5)? {
+            (0, 0)
+        } else {
+            (u.int_in_range(0..=2)?, u.int_in_range(0..=2)?)
+        };
+        let name = if u.ratio(3, 4)? {
+            u.choose(&["Sample keyring", "login", ""])?.as_bytes().to_vec()
+        } else {
+            let n = u.int_in_range(0..=12)?;
+            let mut b = vec![0u8; n];
+            u.fill_buffer(&mut b)?;
+            b
+        };
+        let null_name = u.ratio(1, 10)?;
+        let declared_name_len = maybe_declared(u)?;
+        let hash_iterations = if u.ratio(4, 5)? { 3457 } else { u.arbitrary()? };
+        let n = u.int_in_range(0..=3)?;
+        let mut items = Vec::new();
+        for _ in 0..n {
+            if u.is_empty() {
+                break;
+            }
+            items.push(KeyringItemSpec::arbitrary(u)?);
+        }
+        let declared_item_count = maybe_declared(u)?;
+        let clen = u.int_in_range(0..=48)?;
+        let mut ciphertext = vec![0u8; clen];
+        u.fill_buffer(&mut ciphertext)?;
+        let declared_ciphertext_len = maybe_declared(u)?;
+        Ok(Self {
+            raw,
+            major,
+            minor,
+            name,
+            null_name,
+            declared_name_len,
+            hash_iterations,
+            items,
+            declared_item_count,
+            ciphertext,
+            declared_ciphertext_len,
+        })
+    }
+}
+
+impl KeyringBytes {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        if let Some(raw) = &self.raw {
+            return raw.clone();
+        }
+        let mut out = import_formats::KEYRING_MAGIC.to_vec();
+        // The crypto and hash ids describe the encrypted half and are read
+        // past, never validated.
+        out.extend_from_slice(&[self.major, self.minor, 0, 0]);
+        if self.null_name {
+            out.extend_from_slice(&be32(u32::MAX));
+        } else {
+            out.extend_from_slice(&be32(
+                self.declared_name_len.unwrap_or(self.name.len() as u32)
+            ));
+            out.extend_from_slice(&self.name);
+        }
+        out.extend_from_slice(&KEYRING_CREATED.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&be32(0)); // flags
+        out.extend_from_slice(&be32(0)); // lock timeout
+        out.extend_from_slice(&be32(self.hash_iterations));
+        out.extend_from_slice(&KEYRING_SALT);
+        out.extend_from_slice(&[0; 16]); // four reserved words
+        out.extend_from_slice(&be32(
+            self.declared_item_count.unwrap_or(self.items.len() as u32)
+        ));
+        for item in &self.items {
+            item.encode(&mut out);
+        }
+        out.extend_from_slice(&be32(
+            self.declared_ciphertext_len
+                .unwrap_or(self.ciphertext.len() as u32),
+        ));
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    /// The display name a parse of an honest file must produce.
+    pub fn honest_display_name(&self) -> Option<String> {
+        if self.null_name {
+            return Some(String::new());
+        }
+        if self.declared_name_len.is_some() {
+            return None;
+        }
+        std::str::from_utf8(&self.name).ok().map(str::to_string)
+    }
+
+    /// Whether [`import_formats::parse_keyring_header`] **must** accept these
+    /// bytes, and produce exactly the fields they were built from.
+    ///
+    /// This is the point of the type: a target that only asserts "no panic"
+    /// would pass on a parser that returned an empty inventory for every
+    /// input, and would not notice a generator that stopped reaching the item
+    /// loop at all.
+    pub fn parses(&self) -> bool {
+        self.raw.is_none()
+            && (self.major, self.minor) == (0, 0)
+            && self.honest_display_name().is_some()
+            && self.declared_item_count.is_none()
+            && self.declared_ciphertext_len.is_none()
+            && self.items.iter().all(KeyringItemSpec::is_honest)
+    }
+}
+
+/// One folder in a KWallet cleartext index.
+#[derive(Debug)]
+pub struct WalletFolderSpec {
+    pub hash: [u8; 16],
+    pub entries: Vec<[u8; 16]>,
+    pub declared_entry_count: Option<u32>,
+}
+
+impl<'a> Arbitrary<'a> for WalletFolderSpec {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let hash = u.arbitrary::<[u8; 16]>()?;
+        let n = u.int_in_range(0..=3)?;
+        let mut entries = Vec::new();
+        for _ in 0..n {
+            if u.is_empty() {
+                break;
+            }
+            entries.push(u.arbitrary::<[u8; 16]>()?);
+        }
+        Ok(Self {
+            hash,
+            entries,
+            declared_entry_count: maybe_declared(u)?,
+        })
+    }
+}
+
+impl WalletFolderSpec {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.hash);
+        out.extend_from_slice(&be32(
+            self.declared_entry_count
+                .unwrap_or(self.entries.len() as u32),
+        ));
+        for e in &self.entries {
+            out.extend_from_slice(e);
+        }
+    }
+
+    fn is_honest(&self) -> bool {
+        self.declared_entry_count.is_none()
+    }
+
+    /// Bytes this folder occupies in the index when honestly encoded.
+    pub fn encoded_len(&self) -> usize {
+        20 + 16 * self.entries.len()
+    }
+}
+
+/// A `.kwl` file's cleartext index.
+#[derive(Debug)]
+pub struct WalletBytes {
+    pub raw: Option<Vec<u8>>,
+    pub major: u8,
+    pub minor: u8,
+    pub folders: Vec<WalletFolderSpec>,
+    pub declared_folder_count: Option<u32>,
+    /// The encrypted half, which the parser must stop before.
+    pub ciphertext: Vec<u8>,
+}
+
+impl<'a> Arbitrary<'a> for WalletBytes {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        let raw = if u.ratio(1, 8)? {
+            Some(u.arbitrary()?)
+        } else {
+            None
+        };
+        // Minor 0 is the KWallet4 layout, a different file entirely, so 0.1
+        // is the one accepted version and the one to weight towards.
+        let (major, minor) = if u.ratio(4, 5)? {
+            (0, 1)
+        } else {
+            (u.int_in_range(0..=2)?, u.int_in_range(0..=2)?)
+        };
+        let n = u.int_in_range(0..=4)?;
+        let mut folders = Vec::new();
+        for _ in 0..n {
+            if u.is_empty() {
+                break;
+            }
+            folders.push(WalletFolderSpec::arbitrary(u)?);
+        }
+        let declared_folder_count = maybe_declared(u)?;
+        let clen = u.int_in_range(0..=32)?;
+        let mut ciphertext = vec![0u8; clen];
+        u.fill_buffer(&mut ciphertext)?;
+        Ok(Self {
+            raw,
+            major,
+            minor,
+            folders,
+            declared_folder_count,
+            ciphertext,
+        })
+    }
+}
+
+impl WalletBytes {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        if let Some(raw) = &self.raw {
+            return raw.clone();
+        }
+        let mut out = import_formats::KWALLET_MAGIC.to_vec();
+        out.extend_from_slice(&[self.major, self.minor, 3, 2]);
+        out.extend_from_slice(&be32(
+            self.declared_folder_count
+                .unwrap_or(self.folders.len() as u32),
+        ));
+        for f in &self.folders {
+            f.encode(&mut out);
+        }
+        out.extend_from_slice(&self.ciphertext);
+        out
+    }
+
+    /// Where an honest index ends, which is where the parser must stop.
+    pub fn index_end(&self) -> usize {
+        import_formats::KWALLET_MAGIC.len()
+            + 4
+            + 4
+            + self
+                .folders
+                .iter()
+                .map(WalletFolderSpec::encoded_len)
+                .sum::<usize>()
+    }
+
+    /// Whether [`import_formats::parse_wallet_header`] **must** accept these
+    /// bytes.
+    pub fn parses(&self) -> bool {
+        self.raw.is_none()
+            && (self.major, self.minor) == (0, 1)
+            && self.declared_folder_count.is_none()
+            && self.folders.iter().all(WalletFolderSpec::is_honest)
     }
 }

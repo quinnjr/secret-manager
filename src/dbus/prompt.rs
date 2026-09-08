@@ -114,45 +114,23 @@ impl Prompt {
     }
 }
 
-/// True for a codepoint in general category `Cf` (format), `Co` (private use)
-/// or `Cn` (unassigned-but-reserved-for-formatting) that a toolkit may act on
-/// rather than draw. (`Cs`, the surrogates, cannot occur in a Rust `str` at
-/// all, so there is nothing to filter for them.)
-///
-/// `char::is_control()` covers only `Cc`, which leaves the whole invisible
-/// half of the problem intact: `U+00AD` (soft hyphen), `U+061C` (Arabic letter
-/// mark), `U+200B..U+200F` (zero-width space/joiners and the LTR/RTL marks),
-/// `U+2060` (word joiner) and `U+FEFF` (zero-width no-break space) all survive
-/// it. The marks among them still reorder neutral text in a GTK/Qt dialog, and
-/// the zero-width ones let a label split a word an operator is scanning for
-/// ("de\u{200B}lete"). Enumerated explicitly rather than pulled from a unicode
-/// crate; the list is the set of `Cf`/`Cs`/`Co` ranges plus the `Cn`
-/// codepoints reserved for formatting use (MEDIUM 1).
-pub(crate) fn is_invisible_format(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'
-        | '\u{0600}'..='\u{0605}'
-        | '\u{061C}'
-        | '\u{06DD}'
-        | '\u{070F}'
-        | '\u{08E2}'
-        | '\u{180E}'
-        | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{206F}'
-        | '\u{E000}'..='\u{F8FF}'
-        | '\u{FEFF}'
-        | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{110BD}'
-        | '\u{110CD}'
-        | '\u{1D173}'..='\u{1D17A}'
-        | '\u{E0001}'
-        | '\u{E0020}'..='\u{E007F}'
-        | '\u{F0000}'..='\u{FFFFD}'
-        | '\u{100000}'..='\u{10FFFD}'
-    )
-}
+// The dialogs and the terminal share one table, and it lives in
+// `crate::vault::format` because `src/vault/` is also the PAM cdylib's half
+// of the crate and cannot reach into anything behind the `daemon` feature.
+// The copy that used to be here, and the copy in `src/cli/secrets.rs`, had
+// already drifted once — the terminal's table was the narrower one, so a
+// private-use codepoint a dialog refused to draw still reached an `sm ssh
+// list` row. One table is the fix; re-exported under the old name so
+// `display_label` and `crate::fuzz_api` read unchanged.
+//
+// It is `char::is_control()` that the table exists to complete: that is
+// general category `Cc` only, which leaves every invisible formatter intact
+// — `U+00AD` (soft hyphen), `U+061C` (Arabic letter mark), `U+200B..U+200F`
+// (zero-width space/joiners and the LTR/RTL marks), `U+2060` (word joiner)
+// and `U+FEFF` all survive it. The marks among them still reorder neutral
+// text in a GTK/Qt dialog, and the zero-width ones let a label split a word
+// an operator is scanning for ("de\u{200B}lete") (MEDIUM 1).
+pub(crate) use crate::vault::format::is_invisible_format;
 
 /// Render a client-supplied label for a pinentry dialog.
 ///
@@ -178,6 +156,17 @@ pub(crate) fn is_invisible_format(c: char) -> bool {
 ///
 /// Whitespace runs then collapse to single spaces, and the result is truncated
 /// to 64 characters plus a trailing ellipsis (so at most 65 characters).
+///
+/// It shares the *table* with `vault::format::escape_control` and not the
+/// function, deliberately: that escaper renders each offending character as
+/// `\xNN` per UTF-8 byte, which is right for a terminal row (nothing is
+/// lost, and the reader can see what was there) and wrong for a pinentry
+/// dialog, where a label of escapes is both unreadable and free to grow the
+/// text several-fold inside a fixed box. A dialog wants the character
+/// *gone* — invisible formatters dropped, control characters and the
+/// daemon's own `"`/`(`/`)` turned into a space — followed by the collapse
+/// and the truncation that no escaper does. Changing this to call
+/// `escape_control` would change what every consent dialog shows.
 pub fn display_label(label: &str) -> String {
     const MAX: usize = 64;
     let cleaned: String = label

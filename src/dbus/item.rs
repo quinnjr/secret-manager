@@ -98,7 +98,9 @@ impl Item {
             let vault = vault.lock().await;
             let item = vault.item(&self.id)?;
             let (parameters, value) = cipher.encrypt(&item.secret);
-            (parameters, value, item.content_type.clone())
+            // `Plain` hands back the plaintext itself; taking ownership here
+            // is what wipes it when the reply is done with.
+            (parameters, Zeroizing::new(value), item.content_type.clone())
         };
         // Only an authorised read counts as activity. Touching first meant any
         // bus client could refresh `last_activity` with a bogus or another

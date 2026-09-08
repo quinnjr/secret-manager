@@ -166,7 +166,7 @@ impl Client {
         SecretStruct {
             session: self.session.clone(),
             parameters,
-            value,
+            value: Zeroizing::new(value),
             content_type: content_type.to_string(),
         }
     }

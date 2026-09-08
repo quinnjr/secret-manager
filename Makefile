@@ -112,7 +112,7 @@ FUZZ_TARGETS = vault_decode vault_roundtrip vault_open_unlock vault_items_codec 
                kdf_params protocol_frame protocol_roundtrip dh_peer_public \
                session_cipher display_label escape_control_sanitize \
                pinentry_escape dbus_paths askpass_prompt config_toml \
-               attribute_index
+               attribute_index import_keyring_header import_wallet_header
 # Seconds per target. The default is a smoke test — enough to catch a target
 # that no longer builds or that crashes on its own seed corpus.
 FUZZ_TIME ?= 60
@@ -172,9 +172,11 @@ coverage-gaps:
 
 # Verify docs/install-debian.md on a real Debian box. Needs vagrant and a
 # provider; see docs/vagrant.md. Exits non-zero if any documented step fails.
+# `vagrant up` already runs all three provisioners on a new box, so this is
+# just `up`. Re-running only the checks on an existing box is
+# `vagrant provision --provision-with verify`, per docs/vagrant.md.
 vagrant-verify:
 	vagrant up
-	vagrant provision --provision-with verify
 
 vagrant-clean:
 	vagrant destroy -f

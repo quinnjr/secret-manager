@@ -38,28 +38,43 @@ use std::fmt;
 /// it, and never printed as anything but hex in a mismatch line.
 pub type Fingerprint = [u8; 32];
 
-/// `for (k,v) sorted by k: u32be(len k) || k || u32be(len v) || v`.
+/// `for (k,v) sorted by k: u64be(len k) || k || u64be(len v) || v`.
 ///
 /// The length prefixes are the whole point: without them `{"a": "bc"}` and
 /// `{"ab": "c"}` serialise to the same bytes and two items with genuinely
 /// different attribute sets get the same fingerprint — the failure this
 /// verification exists to catch, silently passing itself.
+///
+/// The prefix is `u64` and not `u32` because a `u32` one is a *lossy* length:
+/// `len as u32` truncates above 4 GiB and hands back exactly the ambiguity
+/// the prefix was added to remove. A `usize` never truncates into a `u64` on
+/// any target this runs on.
 pub fn canonical_attrs(attributes: &BTreeMap<String, String>) -> Vec<u8> {
     // `BTreeMap` iteration is already sorted by key, which is the sort the
     // spec asks for; nothing here re-sorts, so nothing here can sort
     // differently on the two sides.
     let mut out = Vec::new();
     for (k, v) in attributes {
-        out.extend_from_slice(&(k.len() as u32).to_be_bytes());
-        out.extend_from_slice(k.as_bytes());
-        out.extend_from_slice(&(v.len() as u32).to_be_bytes());
-        out.extend_from_slice(v.as_bytes());
+        push_prefixed(&mut out, k.as_bytes());
+        push_prefixed(&mut out, v.as_bytes());
     }
     out
 }
 
-/// `SHA-256(canonical_attrs || 0 || label || 0 || content_type || 0 ||
-/// SHA-256(secret))`.
+/// `u64be(len) || bytes`.
+fn push_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+/// `SHA-256(canonical_attrs || u64be(len label) || label || u64be(len
+/// content_type) || content_type || SHA-256(secret))`.
+///
+/// The label and the content type are length-prefixed for the same reason the
+/// attributes are: joined by a bare separator byte, the pair `("ab", "c")` and
+/// the pair `("a", "bc")` produce the same bytes once the separator is one of
+/// the characters a label may contain, and two different items share a
+/// fingerprint.
 ///
 /// The secret is hashed before it is mixed in, so this function's caller can
 /// hold the digest of an item it no longer has the bytes of, and so no code
@@ -71,13 +86,12 @@ pub fn fingerprint(
     content_type: &str,
     secret: &[u8],
 ) -> Fingerprint {
+    let mut prefixed = Vec::new();
+    push_prefixed(&mut prefixed, label.as_bytes());
+    push_prefixed(&mut prefixed, content_type.as_bytes());
     let mut h = Sha256::new();
     h.update(canonical_attrs(attributes));
-    h.update([0u8]);
-    h.update(label.as_bytes());
-    h.update([0u8]);
-    h.update(content_type.as_bytes());
-    h.update([0u8]);
+    h.update(&prefixed);
     h.update(Sha256::digest(secret));
     h.finalize().into()
 }
@@ -358,7 +372,12 @@ fn hex(bytes: &[u8]) -> String {
 /// decrypted name beside them. See this module's header — it is a comparison
 /// against a foreign file, never a security decision, and nothing else in
 /// this crate may call it.
-pub fn md5(bytes: &[u8]) -> Md5Hash {
+///
+/// `pub(crate)`, so that "nothing else may call it" is enforced at the crate
+/// boundary by the compiler rather than only asserted in a comment: an MD5
+/// exported to every downstream consumer is an invitation to use it for
+/// something other than the one comparison it exists for.
+pub(crate) fn md5(bytes: &[u8]) -> Md5Hash {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
@@ -492,13 +511,25 @@ pub fn md5(bytes: &[u8]) -> Md5Hash {
 /// The attribute *values* are here because the call needs them; they are the
 /// one place in this module values exist, they never reach a report, and
 /// [`ProbeResult`] deliberately cannot carry them back.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProbeQuery {
     pub attributes: BTreeMap<String, String>,
     /// How many source items carry exactly this attribute set. Normally 1;
     /// more when the source itself held duplicates, and then the destination
     /// must hold that many too.
     pub expected: usize,
+}
+
+/// Keys only, as [`super::SourceItem`] does. A derived `Debug` on the one
+/// type in this module that holds attribute *values* is how those values
+/// reach a log line or a panic message.
+impl fmt::Debug for ProbeQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProbeQuery")
+            .field("attribute_keys", &self.keys())
+            .field("expected", &self.expected)
+            .finish()
+    }
 }
 
 impl ProbeQuery {
@@ -614,17 +645,25 @@ pub fn tally_with_probes(items: &[ItemReport], probes: &[ProbeResult]) -> Tally 
     let mut tally = Tally::default();
     for item in items {
         if item.is_refused() {
-            tally.refused += 1;
+            tally.record_refused();
             continue;
         }
         let downgraded = failed.iter().any(|keys| **keys == item.attribute_keys);
+        // Counted through `Tally`'s own recording API rather than by touching
+        // its counters: this function and `ImportReport::push` are the two
+        // places a tally is built, and they must agree about what each
+        // category means.
         match item.outcome {
-            Some(Outcome::FullyPortable) if !downgraded => tally.fully_portable += 1,
-            Some(Outcome::FullyPortable) | Some(Outcome::AttributesPreserved) => {
-                tally.attributes_preserved += 1;
+            Some(Outcome::FullyPortable) if !downgraded => {
+                tally.record_outcome(Outcome::FullyPortable);
             }
-            Some(Outcome::PreservedOnly) => tally.preserved_only += 1,
-            None => tally.refused += 1,
+            Some(Outcome::FullyPortable | Outcome::AttributesPreserved) => {
+                tally.record_outcome(Outcome::AttributesPreserved);
+            }
+            Some(Outcome::PreservedOnly) => tally.record_outcome(Outcome::PreservedOnly),
+            // No outcome and no refusal is a bug in whoever built the report;
+            // counting it as refused keeps the totals adding up.
+            None => tally.record_refused(),
         }
     }
     tally
@@ -643,23 +682,49 @@ pub const BUCKET_BOUNDS: [usize; 7] = [0, 16, 64, 256, 1024, 16 * 1024, 256 * 10
 /// Source against destination, this localises what a fingerprint mismatch
 /// only detects: a stripped trailing newline moves items one bucket down at a
 /// specific size, a UTF-8 re-encoding moves the multibyte ones up.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Histogram {
     /// One count per bucket, plus the open-ended one.
     counts: Vec<usize>,
 }
 
+/// A deserialized histogram's length is checked, not trusted: `counts` comes
+/// off a JSON report anyone may have edited, and a short vector would make
+/// [`Histogram::add`] index out of bounds.
+impl<'de> Deserialize<'de> for Histogram {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let counts = Vec::<usize>::deserialize(d)?;
+        if counts.is_empty() {
+            return Ok(Self::new());
+        }
+        if counts.len() != Histogram::BUCKETS {
+            return Err(serde::de::Error::custom(format!(
+                "a histogram has {} buckets, not {}",
+                Histogram::BUCKETS,
+                counts.len()
+            )));
+        }
+        Ok(Self { counts })
+    }
+}
+
 impl Histogram {
+    /// The bounded buckets plus the open-ended one.
+    const BUCKETS: usize = BUCKET_BOUNDS.len() + 1;
+
     pub fn new() -> Self {
         Self {
-            counts: vec![0; BUCKET_BOUNDS.len() + 1],
+            counts: vec![0; Self::BUCKETS],
         }
     }
 
     pub fn add(&mut self, len: usize) {
-        if self.counts.is_empty() {
-            self.counts = vec![0; BUCKET_BOUNDS.len() + 1];
+        // Resize rather than test for empty: a `counts` of any other wrong
+        // length would index out of bounds below, and `Default` alone can
+        // produce one.
+        if self.counts.len() != Self::BUCKETS {
+            self.counts.resize(Self::BUCKETS, 0);
         }
         let bucket = BUCKET_BOUNDS
             .iter()
@@ -709,16 +774,30 @@ pub struct HistogramDiff {
     pub destination: usize,
 }
 
+/// Over the *longer* of the two, never the shorter: a `zip` stops at the
+/// shorter side, so a difference in a trailing bucket — the open-ended one,
+/// where a truncation to a huge length lands — would read as no difference at
+/// all.
 pub fn compare_histograms(source: &Histogram, destination: &Histogram) -> Vec<HistogramDiff> {
-    source
-        .rows()
-        .into_iter()
-        .zip(destination.rows())
-        .filter(|((_, s), (_, d))| s != d)
-        .map(|((bucket, s), (_, d))| HistogramDiff {
-            bucket,
-            source: s,
-            destination: d,
+    let src = source.rows();
+    let dst = destination.rows();
+    (0..src.len().max(dst.len()))
+        .filter_map(|i| {
+            let s = src.get(i).map_or(0, |(_, n)| *n);
+            let d = dst.get(i).map_or(0, |(_, n)| *n);
+            if s == d {
+                return None;
+            }
+            let bucket = src
+                .get(i)
+                .or_else(|| dst.get(i))
+                .map(|(label, _)| label.clone())
+                .unwrap_or_default();
+            Some(HistogramDiff {
+                bucket,
+                source: s,
+                destination: d,
+            })
         })
         .collect()
 }
@@ -873,6 +952,25 @@ mod tests {
         );
     }
 
+    /// The same collision, one field further along: with `label` and
+    /// `content_type` joined by a bare `0x00` instead of length-prefixed, a
+    /// label that itself contains a NUL moves the boundary and two different
+    /// items hash the same.
+    #[test]
+    fn the_label_and_content_type_are_prefixed_too() {
+        let a = attrs(&[]);
+        assert_ne!(
+            fingerprint(&a, "x\u{0}y", "text/plain", b"s"),
+            fingerprint(&a, "x", "y\u{0}text/plain", b"s"),
+        );
+        // And a label whose bytes are a prefix of the next field's is not the
+        // same item either.
+        assert_ne!(
+            fingerprint(&a, "ab", "c", b"s"),
+            fingerprint(&a, "a", "bc", b"s"),
+        );
+    }
+
     /// An empty value and an absent key are different attribute sets, which
     /// the prefixes also have to distinguish.
     #[test]
@@ -990,13 +1088,37 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(hex(&md5(input.as_bytes())), *expected, "{input:?}");
         }
-        // 56 bytes is the length that forces a second padding block, and the
-        // 80-byte vector above already crosses one; this pins the boundary
-        // itself, where an off-by-one in the padding loop lives.
-        let fifty_six = md5(b"12345678901234567890123456789012345678901234567890123456");
-        let fifty_five = md5(b"1234567890123456789012345678901234567890123456789012345");
-        assert_ne!(fifty_six, fifty_five);
-        assert_eq!(hex(&fifty_six), "49f193adce178490e34d1b3a4ec0064c");
+        // The padding boundaries, each against a golden digest rather than
+        // against each other: a padding bug that corrupts two neighbouring
+        // lengths equally still leaves them unequal, so `assert_ne!` alone
+        // pins nothing. 55/56 is where the second block starts and 119/120 is
+        // where the third does.
+        let boundaries: &[(&str, &str)] = &[
+            (
+                "1234567890123456789012345678901234567890123456789012345",
+                "c9ccf168914a1bcfc3229f1948e67da0",
+            ),
+            (
+                "12345678901234567890123456789012345678901234567890123456",
+                "49f193adce178490e34d1b3a4ec0064c",
+            ),
+            (
+                "12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789",
+                "6261005311809757906e04c0d670492d",
+            ),
+            (
+                "123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "1d453b96d48d5e0cec4a20a71fecaa81",
+            ),
+        ];
+        for (input, expected) in boundaries {
+            assert_eq!(
+                hex(&md5(input.as_bytes())),
+                *expected,
+                "{} bytes",
+                input.len()
+            );
+        }
     }
 
     #[test]
@@ -1122,6 +1244,39 @@ mod tests {
         assert_eq!((diff[0].source, diff[0].destination), (2, 3));
         assert!(compare_histograms(&source, &source).is_empty());
         assert!(Histogram::new().is_empty());
+    }
+
+    /// `counts` comes off a JSON file and is not trusted: a short vector would
+    /// make `add` index out of bounds, and a comparison that stopped at the
+    /// shorter side would call a difference in the trailing buckets equal.
+    #[test]
+    fn a_histogram_validates_its_length_and_compares_over_the_longer_one() {
+        let full = serde_json::to_string(&Histogram::of_lengths([1])).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Histogram>(&full).unwrap(),
+            Histogram::of_lengths([1])
+        );
+        // Too short to index, and too long to be this histogram: both refused
+        // rather than accepted and indexed into.
+        assert!(serde_json::from_str::<Histogram>("[1,2,3]").is_err());
+        assert!(
+            serde_json::from_str::<Histogram>("[0,0,0,0,0,0,0,0,0,0]").is_err(),
+            "an over-long histogram is not this histogram"
+        );
+        // An empty vector is the default, and adding to it must not panic.
+        let mut empty: Histogram = serde_json::from_str("[]").unwrap();
+        empty.add(1_000_000);
+        assert_eq!(empty.total(), 1);
+
+        // The open-ended bucket is the last one, so a `zip` against a shorter
+        // side is exactly where a real difference would be dropped.
+        let short = Histogram { counts: vec![0; 3] };
+        let long = Histogram::of_lengths([1_000_000]);
+        let diff = compare_histograms(&short, &long);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!((diff[0].source, diff[0].destination), (0, 1));
+        assert!(diff[0].bucket.ends_with('+'), "{:?}", diff[0].bucket);
+        assert_eq!(compare_histograms(&long, &short).len(), 1);
     }
 
     #[test]

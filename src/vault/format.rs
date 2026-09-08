@@ -120,6 +120,170 @@ pub const MAX_ATTRIBUTE_VALUE: usize = 512;
 /// Real clients send `text/plain` or `application/octet-stream`.
 pub const MAX_ITEM_CONTENT_TYPE: usize = 256;
 
+/// One of the six per-item limits above, as a value.
+///
+/// The *constants* had already been hoisted here so there is one number per
+/// cap; the *predicates* had not, and there were three hand-maintained copies
+/// of "which caps, measured how, in what order" — the D-Bus entry points in
+/// `dbus::collection`, `Vault::import_items`'s re-application of them, and
+/// `import::check_caps`'s pre-flight. Three copies of an ordering is the
+/// worst kind to let drift: the symptom of a disagreement is a pre-check that
+/// passes an item `import_items` then refuses halfway through a migration.
+/// So the predicate lives here too, and each layer maps [`CapViolation`] into
+/// its own error type rather than re-deciding what "too large" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Cap {
+    Secret,
+    Label,
+    AttributeCount,
+    AttributeKey,
+    AttributeValue,
+    ContentType,
+}
+
+impl Cap {
+    /// The limit this cap enforces.
+    pub const fn limit(self) -> usize {
+        match self {
+            Cap::Secret => MAX_ITEM_SECRET,
+            Cap::Label => MAX_ITEM_LABEL,
+            Cap::AttributeCount => MAX_ITEM_ATTRIBUTES,
+            Cap::AttributeKey => MAX_ATTRIBUTE_KEY,
+            Cap::AttributeValue => MAX_ATTRIBUTE_VALUE,
+            Cap::ContentType => MAX_ITEM_CONTENT_TYPE,
+        }
+    }
+
+    /// The cap's name as an error message spells it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Cap::Secret => "secret",
+            Cap::Label => "label",
+            Cap::AttributeCount => "attribute count",
+            Cap::AttributeKey => "attribute name",
+            Cap::AttributeValue => "attribute value",
+            Cap::ContentType => "content type",
+        }
+    }
+
+    /// Measure one value against this cap. `actual` is a *count* — a byte
+    /// length for every cap but [`Cap::AttributeCount`], which counts pairs.
+    ///
+    /// The comparison is `>`, so a value of exactly `limit()` is accepted.
+    /// This is the only place that decides that, which is what stops a `>=`
+    /// creeping into one of the three layers and silently stranding data at
+    /// the boundary.
+    pub const fn check(self, actual: usize) -> Option<CapViolation> {
+        if actual > self.limit() {
+            Some(CapViolation {
+                cap: self,
+                actual,
+                limit: self.limit(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for Cap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A cap and the size that broke it. Sizes only ever travel as *numbers*:
+/// this never carries the oversized value itself, so it is safe to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapViolation {
+    pub cap: Cap,
+    pub actual: usize,
+    pub limit: usize,
+}
+
+/// The first of the six per-item caps this item violates, or `None`.
+///
+/// The order is fixed here and nowhere else: secret, label, content type,
+/// attribute count, then the attribute pairs in `BTreeMap` order, name before
+/// value. Every caller reports the same cap for the same item.
+pub fn check_caps(
+    label: &str,
+    attributes: &BTreeMap<String, String>,
+    secret_len: usize,
+    content_type: &str,
+) -> Option<CapViolation> {
+    Cap::Secret
+        .check(secret_len)
+        .or_else(|| Cap::Label.check(label.len()))
+        .or_else(|| Cap::ContentType.check(content_type.len()))
+        .or_else(|| Cap::AttributeCount.check(attributes.len()))
+        .or_else(|| {
+            attributes.iter().find_map(|(k, v)| {
+                Cap::AttributeKey
+                    .check(k.len())
+                    .or_else(|| Cap::AttributeValue.check(v.len()))
+            })
+        })
+}
+
+/// Characters that are neither `char::is_control` nor visible: bidi
+/// overrides, zero-width joiners, the private-use planes, the tag block.
+///
+/// `char::is_control` is general category `Cc` only, so everything here
+/// survives it while still being able to reorder or hide the text around it
+/// in a terminal or a dialog.
+pub fn is_invisible_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061C}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{08E2}'
+        | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}'
+        | '\u{E000}'..='\u{F8FF}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}'
+        | '\u{110CD}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}'
+        | '\u{E0020}'..='\u{E007F}'
+        | '\u{F0000}'..='\u{FFFFD}'
+        | '\u{100000}'..='\u{10FFFD}'
+    )
+}
+
+/// Render peer-supplied text so it cannot move a cursor, clear a line or
+/// reorder what is printed around it: every control character and every
+/// invisible formatter becomes `\xNN` per UTF-8 byte.
+///
+/// `CLAUDE.md`: "text from a peer is sanitized before it reaches a log or a
+/// dialog." This copy lives in `vault::format` rather than in `cli` or
+/// `dbus`, because `src/vault/` is compiled into the PAM cdylib as well and
+/// may not reach into anything behind the `daemon` feature — the same reason
+/// the per-item caps above live here.
+pub fn escape_control(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    let mut scratch = [0u8; 4];
+    for ch in s.chars() {
+        if ch.is_control() || is_invisible_format(ch) {
+            for b in ch.encode_utf8(&mut scratch).as_bytes() {
+                let _ = write!(out, "\\x{b:02x}");
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub id: String,

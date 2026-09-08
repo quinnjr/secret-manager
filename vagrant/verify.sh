@@ -6,7 +6,20 @@
 # Every check prints ok/FAIL and the script exits non-zero if any failed, so
 # `vagrant up` is itself the test run.
 set -u
-cd "$HOME/secret-manager"
+
+# This script uninstalls, then reinstalls, whatever `secret-manager` build
+# happens to be on the machine it runs on. That is fine inside the Vagrant
+# box the Vagrantfile names "secret-manager-debian" and nowhere else — run
+# it on a developer's own machine and it uninstalls and reinstalls their
+# live install from an arbitrary build. Refuse outside the box.
+if [ "$(hostname)" != "secret-manager-debian" ]; then
+    echo "FAIL    refusing to run outside the secret-manager-debian Vagrant box" >&2
+    echo "        (hostname is '$(hostname)'; this script uninstalls and" >&2
+    echo "        reinstalls secret-manager and must not touch a real machine)" >&2
+    exit 1
+fi
+
+cd "$HOME/secret-manager" || { echo "FAIL    cd to \$HOME/secret-manager" >&2; exit 1; }
 export PATH="$HOME/.cargo/bin:$PATH"
 
 fails=0
@@ -32,7 +45,8 @@ echo "== a real session, a real vault, a real secret =="
 # dbus-run-session gives a private session bus with no desktop. The daemon
 # is started by hand rather than by systemd --user, which is not running in
 # a `vagrant ssh` context.
-cat > /tmp/session-test.sh <<'INNER'
+session_test="$(mktemp)"
+cat > "$session_test" <<'INNER'
 set -eu
 export PATH="$HOME/.cargo/bin:$PATH"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/rt-$$}"
@@ -85,9 +99,9 @@ sm status | grep -qi lock
 
 echo "INNER-OK"
 INNER
-chmod +x /tmp/session-test.sh
 
-out="$(dbus-run-session -- sh /tmp/session-test.sh 2>&1)"
+out="$(dbus-run-session -- sh "$session_test" 2>&1)"
+rm -f "$session_test"
 if printf '%s' "$out" | grep -q INNER-OK; then
     ok "daemon, vault, sm round trip, secret-tool interop both ways, lock"
 else
@@ -110,8 +124,15 @@ sudo make uninstall >/dev/null 2>&1
 check "binary gone after uninstall"      "[ ! -e /usr/bin/secret-manager ]"
 check "sm symlink gone after uninstall"  "[ ! -e /usr/bin/sm ]"
 check "PAM module gone after uninstall"  "[ ! -e '$PAMSO' ]"
-# Reinstall so `vagrant ssh` leaves a working box to poke at.
-sudo make install >/dev/null 2>&1
+
+echo "== reinstall, so \`vagrant ssh\` leaves a working box to poke at =="
+if install_out="$(sudo make install 2>&1)"; then
+    ok "reinstall after uninstall"
+else
+    fail "reinstall after uninstall — box now has secret-manager uninstalled"
+    printf '%s\n' "$install_out" | sed 's/^/        /'
+fi
+check "binary back after reinstall"      "[ -e /usr/bin/secret-manager ]"
 
 echo
 if [ "$fails" -eq 0 ]; then

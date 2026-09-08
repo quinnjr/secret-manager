@@ -16,7 +16,10 @@ spec and the source of truth for the format and the protocol; its amendment
 section records deliberate changes. `docs/security-audit-2026-09-06.md`
 records two security audits and what each finding's fix was.
 `docs/superpowers/specs/2026-09-08-migration-assistant.md` specs `sm import`,
-which moves a user off gnome-keyring or kwallet; it is proposed, not built.
+which moves a user off gnome-keyring or kwallet; it is implemented
+(`src/cli/import.rs`). The KWallet and gnome-keyring decommissioning steps in
+the install guides remain reasoned rather than verified on a live desktop
+session, and `sm import` says so.
 
 ## Build and test
 

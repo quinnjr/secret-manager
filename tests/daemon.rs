@@ -456,7 +456,7 @@ async fn locked_search_off_hides_attributes_until_unlock() {
     let secret = secret_manager::dbus::session::SecretStruct {
         session,
         parameters: vec![],
-        value: b"s".to_vec(),
+        value: b"s".to_vec().into(),
         content_type: "text/plain".into(),
     };
     let (item, _) = coll.create_item(props, &secret, false).await.unwrap();

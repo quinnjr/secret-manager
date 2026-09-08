@@ -1,7 +1,10 @@
 # secret-manager migration assistant
 
 Date: 2026-09-08
-Status: proposed
+Status: implemented (`src/cli/import.rs`, wired as `Command::Import`). The
+KWallet and gnome-keyring decommissioning steps remain reasoned rather than
+verified on a live desktop session; everything else here is built, and the
+fingerprint definition below was tightened during implementation
 
 ## Goal
 
@@ -429,13 +432,18 @@ secret.
 **Fingerprints.** For each item, source and destination:
 
 ```
-fp = SHA-256( canonical_attrs || 0x00 || label || 0x00 || content_type
-              || 0x00 || SHA-256(secret) )
-canonical_attrs = for (k,v) sorted by k:  u32be(len k) || k || u32be(len v) || v
+fp = SHA-256( canonical_attrs || u64be(len label) || label
+              || u64be(len content_type) || content_type || SHA-256(secret) )
+canonical_attrs = for (k,v) sorted by k:  u64be(len k) || k || u64be(len v) || v
 ```
 
 The length prefixes are load-bearing — without them `{"a":"bc"}` and
-`{"ab":"c"}` collide. The sorted fingerprint lists must match; mismatches are
+`{"ab":"c"}` collide. Implementation tightened this twice against the first
+draft: the prefixes are `u64be`, not `u32be`, since a `u32` truncates above
+4 GiB and reintroduces the ambiguity it exists to remove; and `label` and
+`content_type` are length-prefixed too rather than joined with `0x00`, because
+a Rust `String` may contain NUL and two different items could otherwise share
+a fingerprint. The sorted fingerprint lists must match; mismatches are
 reported by attribute *keys* and object path, never values.
 
 **An independent count.** Both sources' cleartext headers give an item count

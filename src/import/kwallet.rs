@@ -29,14 +29,14 @@
 //! `Registry credentials for https://index.docker.io/v1/`. Splitting a
 //! sidecar key on `/` therefore cannot recover `(folder, entry)`. The walk
 //! goes the other way: it has the folder and the entry from `folderList` and
-//! `entryList`, and *composes* the lookup key with [`sidecar_key`]. Rows the
+//! `entryList`, and *composes* the lookup key with `sidecar_key`. Rows the
 //! walk never composes a key for are reported by
 //! [`Extraction::unresolved_sidecar_rows`] rather than dropped.
 //!
 //! # Nothing here logs a secret, and nothing logs an attribute value
 //!
 //! Secret bytes live in [`Zeroizing`] from the moment they leave zbus.
-//! [`SidecarEntry`]'s `Debug` prints attribute *names* only, for the same
+//! `SidecarEntry`'s `Debug` prints attribute *names* only, for the same
 //! reason [`super::SourceItem`]'s does: `server=`, `user=` and `url=` have no
 //! business in a log line. Everything this module reads — a wallet file, a
 //! JSON sidecar, a D-Bus reply — is attacker-influenced, so every length is
@@ -46,6 +46,8 @@
 use super::{Provenance, Refusal, SourceItem, XDG_SCHEMA, check_caps};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io::Read;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
@@ -57,7 +59,7 @@ use zeroize::{Zeroize, Zeroizing};
 /// The bus name KWallet 6 owns. Deliberately *not* `org.kde.kwalletd5`: the
 /// same process owns both here, but the 5 name is a compatibility alias and
 /// may be answered by an older daemon on a mixed system.
-pub const SERVICE: &str = "org.kde.kwalletd6";
+pub(crate) const SERVICE: &str = "org.kde.kwalletd6";
 
 /// The one object that exports `org.kde.KWallet`.
 pub const OBJECT_PATH: &str = "/modules/kwalletd6";
@@ -68,13 +70,13 @@ pub const OBJECT_PATH: &str = "/modules/kwalletd6";
 /// list — it survives the import and the user will see it in KWallet's
 /// configuration afterwards — so it is stable and honest rather than
 /// randomised or borrowed from another application.
-pub const APP_ID: &str = "secret-manager-import";
+pub(crate) const APP_ID: &str = "secret-manager-import";
 
 /// `wId` for a process with no window. KWallet uses it only to parent the
 /// unlock dialog.
-pub const NO_WINDOW: i64 = 0;
+pub(crate) const NO_WINDOW: i64 = 0;
 
-/// How long [`open_wallet`] waits for `walletAsyncOpened` before giving up.
+/// How long `open_wallet` waits for `walletAsyncOpened` before giving up.
 ///
 /// The bound exists because the failure it guards is a *hang*, not an error:
 /// `openAsync` returns a transaction id immediately whether or not anything
@@ -83,39 +85,64 @@ pub const NO_WINDOW: i64 = 0;
 /// the dialog and type a password.
 pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long any *other* D-Bus call to kwalletd may take.
+///
+/// [`DEFAULT_OPEN_TIMEOUT`] bounds only the wait for `walletAsyncOpened`, and
+/// that is not the only place a dialog can appear: KWallet's *per-application*
+/// access prompt ("allow secret-manager-import to read this wallet?") is
+/// raised inside a `readPassword`/`readEntry`, not at open. An unbounded read
+/// therefore reproduces exactly the hang [`open_wallet`] exists to prevent.
+/// Every call is bounded; a read that expires costs one entry, not the import.
+pub(crate) const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long the `close` at the end of [`extract`] may take. Shorter than
+/// [`DEFAULT_CALL_TIMEOUT`] because nothing is waiting on its answer and its
+/// failure is already ignored: the only thing a long wait buys is a longer
+/// hang.
+pub(crate) const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long [`open_wallet`] keeps listening for a wallet that timed out.
+///
+/// A [`KWalletError::OpenTimedOut`] does not cancel anything: the transaction
+/// is still live inside kwalletd, and a user who finds the dialog ten minutes
+/// later opens the wallet against [`APP_ID`] — producing a handle nobody is
+/// listening for and nobody will ever close. The grace task exists so that
+/// handle is closed rather than held for the life of the session.
+pub(crate) const OPEN_GRACE: Duration = Duration::from_secs(600);
+
 /// The largest sidecar this module will read into memory. The measured file
 /// is 21 KiB for 66 entries; 16 MiB is four orders of magnitude of headroom
 /// and still a bound.
-pub const MAX_SIDECAR_BYTES: u64 = 16 << 20;
+pub(crate) const MAX_SIDECAR_BYTES: u64 = 16 << 20;
 
 /// The largest number of rows a sidecar may declare.
-pub const MAX_SIDECAR_ROWS: usize = 100_000;
+pub(crate) const MAX_SIDECAR_ROWS: usize = 100_000;
 
 /// The largest number of entries a serialised `QMap` may declare, checked
 /// before anything is allocated for it.
-pub const MAX_MAP_ENTRIES: usize = 4096;
+pub(crate) const MAX_MAP_ENTRIES: usize = 4096;
 
 /// The largest number of entries one walk will produce, across all folders.
 /// A wallet larger than this is not a wallet, it is a denial of service.
-pub const MAX_ENTRIES: usize = 200_000;
+pub(crate) const MAX_ENTRIES: usize = 200_000;
 
 /// Attribute recording the KWallet folder. See
 /// [`the `kwallet:` prefix`](self#the-kwallet-prefix-is-added-only-where-it-is-free).
-pub const ATTR_FOLDER: &str = "kwallet:folder";
+pub(crate) const ATTR_FOLDER: &str = "kwallet:folder";
 /// Attribute recording the KWallet entry name.
-pub const ATTR_KEY: &str = "kwallet:key";
+pub(crate) const ATTR_KEY: &str = "kwallet:key";
 /// Attribute recording the KWallet entry type.
-pub const ATTR_TYPE: &str = "kwallet:type";
+pub(crate) const ATTR_TYPE: &str = "kwallet:type";
 
 /// Sidecar field holding the creation time, as a decimal string of Unix
 /// seconds.
-pub const FDO_CREATED: &str = "$fdo_created";
+pub(crate) const FDO_CREATED: &str = "$fdo_created";
 /// Sidecar field holding the modification time.
-pub const FDO_MODIFIED: &str = "$fdo_modified";
+pub(crate) const FDO_MODIFIED: &str = "$fdo_modified";
 /// Sidecar field holding the content type.
-pub const FDO_MIME_TYPE: &str = "$fdo_mime_type";
+pub(crate) const FDO_MIME_TYPE: &str = "$fdo_mime_type";
 /// Sidecar field holding the libsecret attribute map.
-pub const FDO_ATTRIBUTES: &str = "attributes";
+pub(crate) const FDO_ATTRIBUTES: &str = "attributes";
 
 const CT_PASSWORD: &str = "text/plain";
 const CT_STREAM: &str = "application/octet-stream";
@@ -198,7 +225,7 @@ impl fmt::Display for EntryType {
 // ---------------------------------------------------------------------------
 
 /// Why a sidecar could not be read at all. A *row* that is malformed is not
-/// an error — see [`Sidecar::skipped_rows`] — because one bad row must not
+/// an error — see `Sidecar::skipped_rows` — because one bad row must not
 /// cost the user 65 good ones.
 #[derive(Debug, thiserror::Error)]
 pub enum SidecarError {
@@ -241,8 +268,17 @@ pub enum MapDecodeError {
     TooManyPairs { declared: usize, limit: usize },
     #[error("a string in the serialised map has an odd byte length ({len}) and cannot be UTF-16")]
     OddStringLength { len: usize },
-    #[error("a string in the serialised map is not valid UTF-16")]
-    BadUtf16,
+    /// The bytes *are* a legal `QString` — Qt permits an unpaired surrogate,
+    /// and a null `QString` is distinct from an empty one — but Rust's
+    /// `String` has no way to say so.
+    ///
+    /// This replaces what used to be reported as "not valid UTF-16" and as
+    /// "a key appears twice, which a QMap cannot produce". Both were refusals
+    /// — and both should stay refusals, since a lossy import is worse than
+    /// none — but neither message named what happened: the wallet is fine,
+    /// and it is our representation that is narrower than Qt's.
+    #[error("the serialised map cannot be represented faithfully: {what}")]
+    Unrepresentable { what: &'static str },
     #[error("a key appears twice in the serialised map, which a QMap cannot produce")]
     DuplicateKey,
     #[error("{trailing} bytes remain after the serialised map, so this is not a QMap")]
@@ -261,6 +297,14 @@ pub enum KWalletError {
     ServiceUnavailable,
     #[error("KWallet has no wallet named {wallet}")]
     NoSuchWallet { wallet: String },
+    /// The name would not address a wallet, and — because it is interpolated
+    /// into the sidecar's filename — could address a file outside
+    /// `kwalletd/`. Refused before either the bus or the filesystem sees it.
+    #[error(
+        "{wallet:?} is not a usable KWallet wallet name: a name may not be empty, be \".\" or \
+         \"..\", or contain \"/\" or a NUL byte"
+    )]
+    InvalidWalletName { wallet: String },
     #[error(
         "the wallet {wallet} is closed and there is no display for KWallet's unlock dialog \
          (neither DISPLAY nor WAYLAND_DISPLAY is set). The dialog is a Qt widget and cannot \
@@ -272,9 +316,23 @@ pub enum KWalletError {
     OpenRefused { wallet: String, code: i32 },
     #[error(
         "KWallet did not open the wallet {wallet} within {timeout:?}: the unlock dialog is \
-         probably waiting for an answer nobody can give"
+         probably waiting for an answer nobody can give. The request was not cancelled — \
+         kwalletd may still open the wallet if the dialog is answered, in which case it will be \
+         held by \"{APP_ID}\"; check KWallet's own configuration and close it there if so"
     )]
     OpenTimedOut { wallet: String, timeout: Duration },
+    /// A wallet-level call did not answer inside `DEFAULT_CALL_TIMEOUT`.
+    /// A *per-entry* call that expires costs one entry — see
+    /// [`SkipReason::Unreadable`] — but there is no wallet without its folder
+    /// list.
+    #[error(
+        "KWallet did not answer {call} within {timeout:?}; kwalletd may be waiting on a prompt \
+         nobody can see"
+    )]
+    CallTimedOut {
+        call: &'static str,
+        timeout: Duration,
+    },
     #[error("the walk produced more than {limit} entries, which is not a wallet")]
     TooManyEntries { limit: usize },
     #[error(transparent)]
@@ -297,7 +355,7 @@ pub enum KWalletError {
 /// timestamp becomes `0` rather than `now()` — see [`super::SourceItem`] for
 /// why an import must never stamp its own clock onto the user's items.
 #[derive(Clone, Default, PartialEq, Eq)]
-pub struct SidecarEntry {
+pub(crate) struct SidecarEntry {
     pub created: Option<u64>,
     pub modified: Option<u64>,
     pub content_type: Option<String>,
@@ -344,30 +402,44 @@ impl Sidecar {
 
     /// Reads and parses `path`, or yields [`Sidecar::empty`] if it does not
     /// exist.
+    /// One open, one bounded read: the `stat` and the read are the *same*
+    /// file, so the size the limit was checked against is the size that is
+    /// allocated. Bounding a separate `stat` and then re-opening the path
+    /// bounds nothing — the file can grow, or become another file, in
+    /// between — so the [`std::io::Read::take`] is the guarantee and the
+    /// `metadata` call is only an early refusal.
     pub fn load(path: &Path) -> Result<Self, SidecarError> {
-        let meta = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::empty()),
-            Err(source) => {
-                return Err(SidecarError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
+        let io = |source| SidecarError::Io {
+            path: path.to_path_buf(),
+            source,
         };
-        // Bound before reading, not after: the point of the limit is to not
-        // allocate the file.
-        if meta.len() > MAX_SIDECAR_BYTES {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::empty()),
+            Err(source) => return Err(io(source)),
+        };
+        let len = file.metadata().map_err(io)?.len();
+        if len > MAX_SIDECAR_BYTES {
             return Err(SidecarError::TooLarge {
                 path: path.to_path_buf(),
-                len: meta.len(),
+                len,
                 limit: MAX_SIDECAR_BYTES,
             });
         }
-        let text = std::fs::read_to_string(path).map_err(|source| SidecarError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        // One byte past the limit, so a file that grew between the `stat` and
+        // the read is caught rather than silently truncated into a parse
+        // error that blames the JSON.
+        let mut text = String::with_capacity(len as usize);
+        file.take(MAX_SIDECAR_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(io)?;
+        if text.len() as u64 > MAX_SIDECAR_BYTES {
+            return Err(SidecarError::TooLarge {
+                path: path.to_path_buf(),
+                len: text.len() as u64,
+                limit: MAX_SIDECAR_BYTES,
+            });
+        }
         Self::parse(&text, path)
     }
 
@@ -377,7 +449,7 @@ impl Sidecar {
     /// the real file also carries wallet-level `$fdo_created` and
     /// `$fdo_modified` as bare strings at the root. Those are not entries and
     /// are not an error; they are counted in [`Sidecar::skipped_rows`].
-    pub fn parse(text: &str, path: &Path) -> Result<Self, SidecarError> {
+    pub(crate) fn parse(text: &str, path: &Path) -> Result<Self, SidecarError> {
         let root: serde_json::Value =
             serde_json::from_str(text).map_err(|source| SidecarError::Json {
                 path: path.to_path_buf(),
@@ -412,7 +484,7 @@ impl Sidecar {
     }
 
     /// The row for `"<folder>/<entry>"`, composed by [`sidecar_key`].
-    pub fn get(&self, key: &str) -> Option<&SidecarEntry> {
+    pub(crate) fn get(&self, key: &str) -> Option<&SidecarEntry> {
         self.entries.get(key)
     }
 
@@ -427,12 +499,12 @@ impl Sidecar {
     /// Root values that were not objects, so cannot be entries. The wallet's
     /// own `$fdo_created`/`$fdo_modified` are two of these in every real
     /// file.
-    pub fn skipped_rows(&self) -> usize {
+    pub(crate) fn skipped_rows(&self) -> usize {
         self.skipped_rows
     }
 
     /// The row keys, so a caller can diff them against what the walk resolved.
-    pub fn keys(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
     }
 }
@@ -507,13 +579,37 @@ fn parse_row(row: &serde_json::Map<String, serde_json::Value>) -> SidecarEntry {
     }
 }
 
+/// Whether `wallet` may be interpolated into a filename and sent to KWallet.
+///
+/// The name reaches this module from the command line, and it is interpolated
+/// into `<wallet>_attributes.json` — so `../../.ssh/id` would compose a path
+/// outside `kwalletd/` entirely. None of the rejected forms names a wallet
+/// KWallet could have created, so nothing is lost by refusing them.
+pub(crate) fn wallet_name_is_usable(wallet: &str) -> bool {
+    !wallet.is_empty()
+        && wallet != "."
+        && wallet != ".."
+        && !wallet.contains('/')
+        && !wallet.contains('\0')
+}
+
 /// The sidecar path for a wallet: `$XDG_DATA_HOME/kwalletd/<wallet>_attributes.json`.
+///
+/// A name `wallet_name_is_usable` rejects yields the empty path, which
+/// [`Sidecar::load`] reports as "no sidecar" — it never composes a path that
+/// could leave `kwalletd/`. The name itself is refused with
+/// [`KWalletError::InvalidWalletName`] by [`extract`], which is where the
+/// user sees a message; this function has no error channel and does not need
+/// one, because refusing to *name* a file is the whole of its job.
 pub fn sidecar_path(wallet: &str) -> PathBuf {
+    if !wallet_name_is_usable(wallet) {
+        return PathBuf::new();
+    }
     kwalletd_dir().join(format!("{wallet}_attributes.json"))
 }
 
 /// `$XDG_DATA_HOME/kwalletd`, with the XDG fallback.
-pub fn kwalletd_dir() -> PathBuf {
+pub(crate) fn kwalletd_dir() -> PathBuf {
     match std::env::var_os("XDG_DATA_HOME") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => crate::config::home_dir().join(".local/share"),
@@ -525,7 +621,7 @@ pub fn kwalletd_dir() -> PathBuf {
 ///
 /// Composed, never parsed back: see the module docs for why splitting on `/`
 /// cannot work.
-pub fn sidecar_key(folder: &str, entry: &str) -> String {
+pub(crate) fn sidecar_key(folder: &str, entry: &str) -> String {
     format!("{folder}/{entry}")
 }
 
@@ -559,7 +655,7 @@ pub fn sidecar_key(folder: &str, entry: &str) -> String {
 /// no key may repeat (a `QMap` cannot produce that), and the buffer must be
 /// consumed **exactly**. A stream that is not this format fails at least one
 /// of those, and a failure refuses the entry rather than writing a guess.
-pub fn decode_qmap(bytes: &[u8]) -> Result<Vec<(String, String)>, MapDecodeError> {
+pub(crate) fn decode_qmap(bytes: &[u8]) -> Result<MapPairs, MapDecodeError> {
     let mut r = Reader::new(bytes);
     let declared = r.u32("pair count")?;
     // Every pair is two strings, each at least a 4-byte length. Reject an
@@ -579,15 +675,41 @@ pub fn decode_qmap(bytes: &[u8]) -> Result<Vec<(String, String)>, MapDecodeError
         });
     }
 
-    let mut pairs = Vec::with_capacity(count);
-    let mut seen = BTreeSet::new();
+    // `pairs` wipes itself on drop, so every `?` below — not only the happy
+    // path — wipes the plaintext decoded so far. Malformed input is exactly
+    // when that matters: it is the one case where the values are abandoned
+    // mid-map.
+    let mut pairs = MapPairs(Vec::with_capacity(count));
+    // Digests, never the keys themselves: a `BTreeSet<String>` of map keys is
+    // a second, un-zeroized copy of half the plaintext, dropped to the
+    // allocator on every path. A 32-byte digest answers "have I seen this?"
+    // without ever holding the answer's preimage.
+    let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+    // A null `QString` and an empty one are different on the wire and the
+    // same in Rust. If both appear as keys the collision is ours, not the
+    // wallet's, and saying "a QMap cannot produce that" would be false.
+    let mut saw_null_key = false;
+    let mut saw_empty_key = false;
     for _ in 0..count {
-        let key = r.qstring("map key")?;
-        let value = r.qstring("map value")?;
-        if !seen.insert(key.clone()) {
+        let (key, key_was_null) = r.qstring("map key")?;
+        let (value, _) = r.qstring("map value")?;
+        if key.is_empty() {
+            if key_was_null {
+                saw_null_key = true;
+            } else {
+                saw_empty_key = true;
+            }
+        }
+        if !seen.insert(digest(&key)) {
+            if saw_null_key && saw_empty_key {
+                return Err(MapDecodeError::Unrepresentable {
+                    what: "the map has both a null and an empty string as keys, and Rust's \
+                           String cannot tell them apart",
+                });
+            }
             return Err(MapDecodeError::DuplicateKey);
         }
-        pairs.push((key, value));
+        pairs.0.push((key, value));
     }
     if r.remaining() != 0 {
         return Err(MapDecodeError::TrailingBytes {
@@ -597,38 +719,103 @@ pub fn decode_qmap(bytes: &[u8]) -> Result<Vec<(String, String)>, MapDecodeError
     Ok(pairs)
 }
 
+/// The decoded pairs of a `QMap`, wiped on drop.
+///
+/// The keys and the values are the map entry's *plaintext*. A bare
+/// `Vec<(String, String)>` is wiped only where a caller remembers to, which
+/// on an error path is nowhere; making the wipe a `Drop` makes it
+/// unconditional and makes forgetting it impossible.
+pub(crate) struct MapPairs(Vec<(String, String)>);
+
+impl Drop for MapPairs {
+    fn drop(&mut self) {
+        for (k, v) in &mut self.0 {
+            k.zeroize();
+            v.zeroize();
+        }
+    }
+}
+
+impl Deref for MapPairs {
+    type Target = [(String, String)];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// Keys and values alike are secret; only the count may be printed.
+impl fmt::Debug for MapPairs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MapPairs({} pairs, redacted)", self.0.len())
+    }
+}
+
+/// A digest of a map key, so duplicate detection never keeps a second copy of
+/// the plaintext.
+fn digest(key: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(key.as_bytes()).into()
+}
+
 /// Canonical JSON for a decoded map: an object with keys in sorted order and
 /// no insignificant whitespace, so re-importing the same wallet produces the
 /// same bytes.
 ///
 /// The pairs are borrowed rather than moved so the caller keeps ownership of
 /// the plaintext and can zeroize it; see [`read_map_secret`].
-pub fn qmap_to_canonical_json(
-    pairs: &[(String, String)],
+///
+/// # The buffer is sized before it is written, not grown while it is
+///
+/// `serde_json::to_vec` starts small and *doubles*. Each abandoned
+/// intermediate is a prefix of the serialised map — that is, of the secret —
+/// handed back to the allocator un-wiped, and wrapping only the final
+/// allocation in [`Zeroizing`] does nothing about them. So the capacity is
+/// computed up front from the worst case JSON string escaping can produce
+/// (`\uXXXX`, six bytes per input byte) and the value is written into that
+/// buffer, which therefore never reallocates and never leaves a copy behind.
+///
+/// This takes [`MapPairs`] rather than a bare slice because the duplicate-key
+/// rule is [`decode_qmap`]'s: a `BTreeMap` silently keeps the *last* of any
+/// repeated key, so handing this function pairs that did not come through the
+/// decoder would lose data under a name that promises canonical output.
+pub(crate) fn qmap_to_canonical_json(
+    pairs: &MapPairs,
 ) -> Result<Zeroizing<Vec<u8>>, MapDecodeError> {
     let canonical: BTreeMap<&str, &str> = pairs
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    serde_json::to_vec(&canonical)
-        .map(Zeroizing::new)
-        .map_err(|e| MapDecodeError::Json(e.to_string()))
+    // `{}` plus, per pair, two quoted strings at six bytes per byte, a colon
+    // and a comma.
+    let mut capacity = 2usize;
+    for (k, v) in pairs.iter() {
+        capacity = capacity.saturating_add(
+            k.len()
+                .saturating_add(v.len())
+                .saturating_mul(6)
+                .saturating_add(6),
+        );
+    }
+    let mut buf = Zeroizing::new(Vec::<u8>::with_capacity(capacity));
+    serde_json::to_writer(&mut *buf, &canonical)
+        .map_err(|e| MapDecodeError::Json(e.to_string()))?;
+    debug_assert!(
+        buf.len() <= capacity,
+        "the canonical-JSON buffer reallocated, so a plaintext prefix was leaked"
+    );
+    Ok(buf)
 }
 
 /// [`decode_qmap`] then [`qmap_to_canonical_json`], zeroizing the decoded
 /// plaintext on the way out.
 ///
 /// The intermediate `String`s hold the map's values, which are secret. They
-/// are wiped here rather than left to the allocator, which is the whole
-/// reason this wrapper exists instead of the caller chaining the two.
-pub fn read_map_secret(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, MapDecodeError> {
-    let mut pairs = decode_qmap(bytes)?;
-    let json = qmap_to_canonical_json(&pairs);
-    for (k, v) in &mut pairs {
-        k.zeroize();
-        v.zeroize();
-    }
-    json
+/// are wiped by [`MapPairs`]'s `Drop` — unconditionally, on the error path as
+/// much as the happy one — which is the whole reason this wrapper exists
+/// instead of the caller chaining the two.
+pub(crate) fn read_map_secret(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, MapDecodeError> {
+    let pairs = decode_qmap(bytes)?;
+    qmap_to_canonical_json(&pairs)
 }
 
 /// A bounds-checked cursor. Every read names the field it was reading so a
@@ -663,13 +850,22 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn qstring(&mut self, field: &'static str) -> Result<String, MapDecodeError> {
+    /// Returns the decoded string and whether it was Qt's *null* string,
+    /// which the caller needs because a null and an empty `QString` are
+    /// distinct on the wire and identical here.
+    ///
+    /// The string is built by hand rather than with
+    /// `collect::<Result<String, _>>()` because that discards a partially
+    /// decoded `String` — a prefix of the plaintext — straight to the
+    /// allocator when a code unit does not decode. Here the partial value is
+    /// wiped before the error leaves.
+    fn qstring(&mut self, field: &'static str) -> Result<(String, bool), MapDecodeError> {
         let len = self.u32(field)?;
         // Qt's null QString. Not the same as an empty one on the wire; both
         // become an empty Rust `String`, which is the only representation we
         // have and which round-trips through JSON identically.
         if len == u32::MAX {
-            return Ok(String::new());
+            return Ok((String::new(), true));
         }
         let len = len as usize;
         if !len.is_multiple_of(2) {
@@ -679,9 +875,20 @@ impl<'a> Reader<'a> {
         let units = raw
             .chunks_exact(2)
             .map(|c| u16::from_be_bytes([c[0], c[1]]));
-        char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .map_err(|_| MapDecodeError::BadUtf16)
+        let mut out = String::with_capacity(len / 2);
+        for unit in char::decode_utf16(units) {
+            match unit {
+                Ok(c) => out.push(c),
+                Err(_) => {
+                    out.zeroize();
+                    return Err(MapDecodeError::Unrepresentable {
+                        what: "a string contains an unpaired UTF-16 surrogate, which QString \
+                               allows and Rust's String cannot hold",
+                    });
+                }
+            }
+        }
+        Ok((out, false))
     }
 }
 
@@ -731,20 +938,38 @@ impl<'a> Reader<'a> {
 /// content type must describe what we stored, not what KWallet held. Saying
 /// `text/plain` about a JSON object would be a lie the sidecar merely
 /// inherited.
-pub fn map_entry(
+///
+/// # A `kwallet:` attribute the sidecar already carries is left alone
+///
+/// Nothing stops a libsecret client from having written an attribute literally
+/// named `kwallet:folder`. Overwriting it would change the lookup for an
+/// attribute we did not write — the same identity argument as above, one key
+/// at a time — so the insert is `or_insert` and each collision is counted
+/// through `conflicts` rather than resolved silently.
+pub(crate) fn map_entry(
     wallet: &str,
     folder: &str,
     entry: &str,
     entry_type: EntryType,
     secret: Zeroizing<Vec<u8>>,
     sidecar: Option<&SidecarEntry>,
+    conflicts: &mut usize,
 ) -> SourceItem {
     let mut attributes = sidecar.map(|s| s.attributes.clone()).unwrap_or_default();
 
     if !attributes.contains_key(XDG_SCHEMA) {
-        attributes.insert(ATTR_FOLDER.to_string(), folder.to_string());
-        attributes.insert(ATTR_KEY.to_string(), entry.to_string());
-        attributes.insert(ATTR_TYPE.to_string(), entry_type.attribute_value());
+        for (name, value) in [
+            (ATTR_FOLDER, folder.to_string()),
+            (ATTR_KEY, entry.to_string()),
+            (ATTR_TYPE, entry_type.attribute_value()),
+        ] {
+            match attributes.entry(name.to_string()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(value);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => *conflicts += 1,
+            }
+        }
     }
 
     let content_type = match entry_type {
@@ -787,7 +1012,7 @@ pub fn map_entry(
     default_service = "org.kde.kwalletd6",
     default_path = "/modules/kwalletd6"
 )]
-pub trait KWallet {
+pub(crate) trait KWallet {
     /// Every wallet's name.
     #[zbus(name = "wallets")]
     fn wallets(&self) -> zbus::Result<Vec<String>>;
@@ -864,18 +1089,40 @@ pub trait KWallet {
 // Opening
 // ---------------------------------------------------------------------------
 
+/// Bounds one D-Bus call at the wallet level.
+///
+/// `zbus` has no default reply timeout: a method call on a wedged peer waits
+/// for the lifetime of the process. Every call this module makes goes through
+/// this or through [`DbusReader`]'s per-entry equivalent.
+async fn bounded<T>(
+    call: &'static str,
+    timeout: Duration,
+    fut: impl std::future::Future<Output = zbus::Result<T>>,
+) -> Result<T, KWalletError> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(KWalletError::CallTimedOut { call, timeout }),
+    }
+}
+
 /// Whether anything could display KWallet's Qt unlock dialog.
-pub fn has_display() -> bool {
+pub(crate) fn has_display() -> bool {
     ["WAYLAND_DISPLAY", "DISPLAY"]
         .iter()
         .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()))
 }
 
 /// True if `org.kde.kwalletd6` has an owner on this bus.
-pub async fn service_is_running(conn: &zbus::Connection) -> Result<bool, KWalletError> {
+pub(crate) async fn service_is_running(conn: &zbus::Connection) -> Result<bool, KWalletError> {
     let dbus = zbus::fdo::DBusProxy::new(conn).await?;
     let name = zbus::names::BusName::try_from(SERVICE).map_err(zbus::Error::from)?;
-    Ok(dbus.name_has_owner(name).await?)
+    match tokio::time::timeout(DEFAULT_CALL_TIMEOUT, dbus.name_has_owner(name)).await {
+        Ok(r) => Ok(r?),
+        Err(_) => Err(KWalletError::CallTimedOut {
+            call: "NameHasOwner",
+            timeout: DEFAULT_CALL_TIMEOUT,
+        }),
+    }
 }
 
 /// A wallet held open by [`APP_ID`].
@@ -884,7 +1131,16 @@ pub async fn service_is_running(conn: &zbus::Connection) -> Result<bool, KWallet
 /// and a `Drop` that cannot `await` would either block or silently skip. The
 /// close is explicit and every path in [`extract`] takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WalletHandle(pub i32);
+pub(crate) struct WalletHandle(i32);
+
+impl WalletHandle {
+    /// The wire handle. Private field, public reader: a `WalletHandle` names
+    /// a wallet this process holds open, and a value anyone can construct
+    /// from any `i32` is not that.
+    pub(crate) const fn raw(self) -> i32 {
+        self.0
+    }
+}
 
 /// Opens a wallet, without ever blocking on the unlock dialog.
 ///
@@ -893,17 +1149,35 @@ pub struct WalletHandle(pub i32);
 /// `walletAsyncOpened` can be emitted before the method reply is even
 /// delivered — and a missed signal is an import that waits out the whole
 /// timeout for an event that already happened.
-pub async fn open_wallet(
-    proxy: &KWalletProxy<'_>,
+///
+/// # A timeout does not cancel the open
+///
+/// `openAsync` has no cancel. When the wait expires the transaction is still
+/// live inside kwalletd, and if the user answers the dialog afterwards the
+/// wallet opens against [`APP_ID`] and emits a handle — one nobody is
+/// listening for and nobody will ever `close`, which is exactly the lasting
+/// side effect this module promises not to leave. So the stream is not
+/// dropped on expiry: it is handed to a bounded grace task
+/// ([`OPEN_GRACE`]) that closes a late handle if one arrives. The error is
+/// still returned immediately; the grace task never affects the caller.
+///
+/// The connection is taken rather than a proxy because the grace task
+/// outlives this call and needs a proxy it owns.
+pub(crate) async fn open_wallet(
+    conn: &zbus::Connection,
     wallet: &str,
     timeout: Duration,
 ) -> Result<WalletHandle, KWalletError> {
     use futures_util::StreamExt;
 
+    let proxy = KWalletProxy::new(conn).await?;
+
     // If it is already open there is no dialog to worry about. If it is not,
     // and nothing can draw one, say so now rather than after two minutes of
     // silence: this is the SSH case, and a clear refusal is the entire point.
-    let already_open = proxy.is_open(wallet).await.unwrap_or(false);
+    let already_open = bounded("isOpen", DEFAULT_CALL_TIMEOUT, proxy.is_open(wallet))
+        .await
+        .unwrap_or(false);
     if !already_open && !has_display() {
         return Err(KWalletError::NoDisplay {
             wallet: wallet.to_string(),
@@ -912,7 +1186,12 @@ pub async fn open_wallet(
 
     let mut opened = proxy.receive_wallet_async_opened().await?;
 
-    let tid = proxy.open_async(wallet, NO_WINDOW, APP_ID, false).await?;
+    let tid = bounded(
+        "openAsync",
+        DEFAULT_CALL_TIMEOUT,
+        proxy.open_async(wallet, NO_WINDOW, APP_ID, false),
+    )
+    .await?;
     // A negative return is the error; non-negative is the transaction id.
     if tid < 0 {
         return Err(KWalletError::OpenRefused {
@@ -921,20 +1200,23 @@ pub async fn open_wallet(
         });
     }
 
+    let timed_out = || KWalletError::OpenTimedOut {
+        wallet: wallet.to_string(),
+        timeout,
+    };
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let signal = tokio::time::timeout_at(deadline, opened.next())
-            .await
-            .map_err(|_| KWalletError::OpenTimedOut {
-                wallet: wallet.to_string(),
-                timeout,
-            })?;
+        let signal = match tokio::time::timeout_at(deadline, opened.next()).await {
+            Ok(s) => s,
+            Err(_) => {
+                spawn_open_grace(proxy, opened, tid);
+                return Err(timed_out());
+            }
+        };
         let Some(signal) = signal else {
-            // The stream ended: the connection went away.
-            return Err(KWalletError::OpenTimedOut {
-                wallet: wallet.to_string(),
-                timeout,
-            });
+            // The stream ended: the connection went away, so there is nothing
+            // left to hear a late handle on and no way to close one.
+            return Err(timed_out());
         };
         let args = signal.args()?;
         // Another application's open is none of our business.
@@ -950,6 +1232,38 @@ pub async fn open_wallet(
         }
         return Ok(WalletHandle(handle));
     }
+}
+
+/// Keeps listening for `tid` after [`open_wallet`] has given up, and closes
+/// the wallet if it opens.
+///
+/// Bounded by [`OPEN_GRACE`] rather than unbounded: an import that has
+/// already reported failure must not leave a task alive for the life of the
+/// process either. If the wallet opens after the grace expires the handle is
+/// genuinely lost, which is what [`KWalletError::OpenTimedOut`]'s message
+/// tells the user to check for.
+fn spawn_open_grace(proxy: KWalletProxy<'static>, mut opened: walletAsyncOpenedStream, tid: i32) {
+    use futures_util::StreamExt;
+
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + OPEN_GRACE;
+        loop {
+            let Ok(Some(signal)) = tokio::time::timeout_at(deadline, opened.next()).await else {
+                return;
+            };
+            let Ok(args) = signal.args() else { continue };
+            if *args.tid() != tid {
+                continue;
+            }
+            let handle = *args.handle();
+            if handle >= 0 {
+                let _ =
+                    tokio::time::timeout(DEFAULT_CLOSE_TIMEOUT, proxy.close(handle, false, APP_ID))
+                        .await;
+            }
+            return;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -982,6 +1296,17 @@ pub enum SkipReason {
     /// Every read this module knows how to try failed.
     #[error("KWallet would not hand over the entry: {0}")]
     Unreadable(String),
+    /// `entryType` failed, so the entry's type is not known.
+    ///
+    /// This is a refusal and not a default. Falling back to
+    /// [`EntryType::Unknown`] routes the entry to `readEntry`, whose bytes for
+    /// a `Map` are the *undecoded* QDataStream — which would then be written
+    /// as the secret, labelled with the sidecar's `application/json`, and
+    /// counted as imported. That is the exact outcome `decode_qmap` refuses,
+    /// reached by a path the decoder never sees, and a false success on a
+    /// secret cannot be undone later.
+    #[error("KWallet would not report the entry's type, so it cannot be read safely: {0}")]
+    TypeUnavailable(String),
 }
 
 /// An item the walk produced but will not write, with the spec's reason.
@@ -991,6 +1316,15 @@ pub struct RefusedEntry {
     pub label: String,
     pub refusal: Refusal,
 }
+
+/// The number of non-object root values a real `<wallet>_attributes.json`
+/// always has: the wallet's own `$fdo_created` and `$fdo_modified`, which are
+/// bare strings at the root and are not entries.
+///
+/// Anything beyond these two is a sidecar in a shape this module does not
+/// understand, and every entry it should have described will import with no
+/// attributes at all — see [`Extraction::unexpected_sidecar_rows`].
+pub const EXPECTED_NON_ENTRY_ROWS: usize = 2;
 
 /// Everything one wallet's walk produced.
 ///
@@ -1017,16 +1351,43 @@ pub struct Extraction {
     /// Sidecar rows whose key no entry in the wallet composed. Stale rows
     /// `ksecretd` left behind, or rows for a folder the walk could not read.
     pub unresolved_sidecar_rows: Vec<String>,
+    /// Sidecar keys that **more than one** `(folder, entry)` pair composes,
+    /// and which were therefore used by none of them.
+    ///
+    /// `sidecar_key("accounts/3", "1")` and `sidecar_key("accounts", "3/1")`
+    /// are the same string, so a wallet holding both an `accounts` and an
+    /// `accounts/3` folder can have two distinct entries pointing at one row.
+    /// Applying it to either would attach another item's `xdg:schema`,
+    /// `server=` and `user=` — under `replace` semantics, a secret written
+    /// under a different item's identity. Both entries are therefore treated
+    /// as having no sidecar row, and the key is listed here.
+    pub ambiguous_sidecar_keys: Vec<String>,
     /// Root values in the sidecar that were not objects — the wallet's own
     /// `$fdo_created` and `$fdo_modified` are two of these in every real file.
+    /// See [`Extraction::unexpected_sidecar_rows`], which is the number worth
+    /// showing a user.
     pub skipped_sidecar_rows: usize,
     /// Sidecar fields that were present but unusable, summed over all rows.
     pub malformed_sidecar_fields: usize,
-    /// Entries whose declared type was `Password` but whose `readPassword`
-    /// failed, and which `readEntry` recovered. The count exists because the
-    /// type numbering is a claim about another project's enum, and a nonzero
-    /// value here is the evidence that it is wrong.
+    /// Entries whose declared type was `Password`, whose `readPassword`
+    /// failed, and which `readEntry` then **recovered**. Counted on success
+    /// only: an entry both reads failed for is in `skipped`, and counting it
+    /// here as well would make this number, and the sentence the CLI prints
+    /// about it, false.
+    ///
+    /// The count exists because the type numbering is a claim about another
+    /// project's enum, and a nonzero value here is the evidence that it is
+    /// wrong.
     pub password_read_fallbacks: usize,
+    /// The same, for a `Map` whose `readMap` failed and whose `readEntry`
+    /// returned the identical bytes. The *decode* has no fallback; the read
+    /// does, and it is counted for the same reason.
+    pub map_read_fallbacks: usize,
+    /// Entries whose sidecar row already carried an attribute named
+    /// `kwallet:folder`, `kwallet:key` or `kwallet:type`. The sidecar's value
+    /// was kept — overwriting an attribute we did not write changes a lookup
+    /// — and the collision is counted rather than resolved silently.
+    pub attribute_conflicts: usize,
     /// Folders `entryList` refused. Their entries are unreachable and their
     /// sidecar rows will show up in `unresolved_sidecar_rows`.
     pub unreadable_folders: Vec<String>,
@@ -1037,7 +1398,169 @@ impl Extraction {
     pub fn seen(&self) -> usize {
         self.items.len() + self.refused.len() + self.skipped.len()
     }
+
+    /// Non-object sidecar rows beyond the two every real file has.
+    ///
+    /// Zero is the normal case and says nothing. A nonzero value says the
+    /// sidecar is not the shape this module parses — the whole file may have
+    /// parsed "successfully" with no entries at all, in which case every item
+    /// imports attribute-less and *nothing else in this struct says so*.
+    /// `entries_without_sidecar` will be high, but that is also what a wallet
+    /// of native KWallet entries looks like, so it cannot distinguish the two.
+    /// This can, and a caller that does not surface it turns a silently
+    /// degraded import into a reported success.
+    pub fn unexpected_sidecar_rows(&self) -> usize {
+        self.skipped_sidecar_rows
+            .saturating_sub(EXPECTED_NON_ENTRY_ROWS)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Reading, and the seam that makes the walk testable
+// ---------------------------------------------------------------------------
+
+/// Why one read failed. Separate from [`KWalletError`] because these are
+/// per-entry: a wedged read costs one entry, not the import.
+#[derive(Debug, Clone)]
+pub(crate) enum ReadError {
+    /// KWallet answered with an error.
+    Failed(String),
+    /// KWallet did not answer at all inside the bound.
+    TimedOut { call: &'static str },
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReadError::Failed(e) => f.write_str(e),
+            ReadError::TimedOut { call } => {
+                write!(f, "{call} did not answer within {DEFAULT_CALL_TIMEOUT:?}")
+            }
+        }
+    }
+}
+
+/// The reads [`walk`] performs, and nothing else.
+///
+/// This exists so the walk can be driven by something other than a live
+/// kwalletd. `walk` used to take a concrete `&KWalletProxy`, which meant its
+/// decisions — what a failed `entryType` does, which sidecar row an entry
+/// gets, when a fallback is counted — could only be asserted by reimplementing
+/// them in a test, and a test that reimplements the thing it checks passes
+/// after the real code stops doing it.
+///
+/// It is deliberately read-only and deliberately handle-free: the handle is
+/// the implementation's business, so nothing that drives a walk can address a
+/// wallet it was not given.
+pub(crate) trait WalletReader {
+    async fn folder_list(&self) -> Result<Vec<String>, ReadError>;
+    async fn entry_list(&self, folder: &str) -> Result<Vec<String>, ReadError>;
+    async fn entry_type(&self, folder: &str, entry: &str) -> Result<i32, ReadError>;
+    /// `Zeroizing` because a password is a password even before we decide
+    /// what to do with it.
+    async fn read_password(
+        &self,
+        folder: &str,
+        entry: &str,
+    ) -> Result<Zeroizing<String>, ReadError>;
+    async fn read_map(&self, folder: &str, entry: &str) -> Result<Zeroizing<Vec<u8>>, ReadError>;
+    async fn read_entry(&self, folder: &str, entry: &str) -> Result<Zeroizing<Vec<u8>>, ReadError>;
+}
+
+/// The live implementation: one open wallet, over D-Bus, with every call
+/// bounded.
+pub(crate) struct DbusReader<'a> {
+    proxy: &'a KWalletProxy<'a>,
+    handle: WalletHandle,
+    timeout: Duration,
+}
+
+impl<'a> DbusReader<'a> {
+    pub(crate) fn new(proxy: &'a KWalletProxy<'a>, handle: WalletHandle) -> Self {
+        Self {
+            proxy,
+            handle,
+            timeout: DEFAULT_CALL_TIMEOUT,
+        }
+    }
+
+    async fn call<T>(
+        &self,
+        call: &'static str,
+        fut: impl std::future::Future<Output = zbus::Result<T>>,
+    ) -> Result<T, ReadError> {
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(ReadError::Failed(e.to_string())),
+            Err(_) => Err(ReadError::TimedOut { call }),
+        }
+    }
+}
+
+impl WalletReader for DbusReader<'_> {
+    async fn folder_list(&self) -> Result<Vec<String>, ReadError> {
+        self.call(
+            "folderList",
+            self.proxy.folder_list(self.handle.raw(), APP_ID),
+        )
+        .await
+    }
+
+    async fn entry_list(&self, folder: &str) -> Result<Vec<String>, ReadError> {
+        self.call(
+            "entryList",
+            self.proxy.entry_list(self.handle.raw(), folder, APP_ID),
+        )
+        .await
+    }
+
+    async fn entry_type(&self, folder: &str, entry: &str) -> Result<i32, ReadError> {
+        self.call(
+            "entryType",
+            self.proxy
+                .entry_type(self.handle.raw(), folder, entry, APP_ID),
+        )
+        .await
+    }
+
+    async fn read_password(
+        &self,
+        folder: &str,
+        entry: &str,
+    ) -> Result<Zeroizing<String>, ReadError> {
+        self.call(
+            "readPassword",
+            self.proxy
+                .read_password(self.handle.raw(), folder, entry, APP_ID),
+        )
+        .await
+        .map(Zeroizing::new)
+    }
+
+    async fn read_map(&self, folder: &str, entry: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        self.call(
+            "readMap",
+            self.proxy
+                .read_map(self.handle.raw(), folder, entry, APP_ID),
+        )
+        .await
+        .map(Zeroizing::new)
+    }
+
+    async fn read_entry(&self, folder: &str, entry: &str) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+        self.call(
+            "readEntry",
+            self.proxy
+                .read_entry(self.handle.raw(), folder, entry, APP_ID),
+        )
+        .await
+        .map(Zeroizing::new)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The walk
+// ---------------------------------------------------------------------------
 
 /// Walks one wallet and produces its items.
 ///
@@ -1051,40 +1574,77 @@ pub async fn extract(
     sidecar: &Sidecar,
     open_timeout: Duration,
 ) -> Result<Extraction, KWalletError> {
+    // Before the bus and before the filesystem: a name that cannot be a
+    // wallet name is refused where the user can see why.
+    if !wallet_name_is_usable(wallet) {
+        return Err(KWalletError::InvalidWalletName {
+            wallet: wallet.to_string(),
+        });
+    }
     if !service_is_running(conn).await? {
         return Err(KWalletError::ServiceUnavailable);
     }
     let proxy = KWalletProxy::new(conn).await?;
-    if !proxy.wallets().await?.iter().any(|w| w == wallet) {
+    let wallets = bounded("wallets", DEFAULT_CALL_TIMEOUT, proxy.wallets()).await?;
+    if !wallets.iter().any(|w| w == wallet) {
         return Err(KWalletError::NoSuchWallet {
             wallet: wallet.to_string(),
         });
     }
 
-    let handle = open_wallet(&proxy, wallet, open_timeout).await?;
-    let walked = walk(&proxy, wallet, handle, sidecar).await;
+    let handle = open_wallet(conn, wallet, open_timeout).await?;
+    let walked = walk(&DbusReader::new(&proxy, handle), wallet, sidecar).await;
     // Deliberately not `?`: a failed close must not mask the walk's result,
-    // and there is nothing a caller could do about it.
-    let _ = proxy.close(handle.0, false, APP_ID).await;
+    // and there is nothing a caller could do about it. Bounded on a shorter
+    // leash than a read, because nothing is waiting on its answer.
+    let _ = tokio::time::timeout(
+        DEFAULT_CLOSE_TIMEOUT,
+        proxy.close(handle.raw(), false, APP_ID),
+    )
+    .await;
     walked
 }
 
+/// One folder and the entries in it, as the listing pass found them.
+struct Listing {
+    folder: String,
+    entries: Vec<String>,
+}
+
 /// The walk itself, with the wallet already open.
-async fn walk(
-    proxy: &KWalletProxy<'_>,
+///
+/// # Why the listing is a separate pass
+///
+/// A sidecar key is *composed* from `(folder, entry)`, which removes the
+/// ambiguity of parsing one back — but not the ambiguity of the composition
+/// itself. Two different pairs can compose the same key, and applying that one
+/// row to both would give one entry the other's attribute map. The only way to
+/// know a key is unique is to have composed every key first, so the listing
+/// happens up front and the reads happen after.
+async fn walk<R: WalletReader>(
+    reader: &R,
     wallet: &str,
-    handle: WalletHandle,
     sidecar: &Sidecar,
 ) -> Result<Extraction, KWalletError> {
-    let h = handle.0;
     let mut out = Extraction {
         skipped_sidecar_rows: sidecar.skipped_rows(),
         ..Default::default()
     };
-    let mut resolved: BTreeSet<String> = BTreeSet::new();
 
-    for folder in proxy.folder_list(h, APP_ID).await? {
-        let entries = match proxy.entry_list(h, &folder, APP_ID).await {
+    // -- pass one: list, and count how many pairs claim each sidecar key ----
+    let folders = reader.folder_list().await.map_err(|e| match e {
+        ReadError::TimedOut { call } => KWalletError::CallTimedOut {
+            call,
+            timeout: DEFAULT_CALL_TIMEOUT,
+        },
+        ReadError::Failed(e) => KWalletError::Dbus(zbus::Error::Failure(e)),
+    })?;
+
+    let mut listings: Vec<Listing> = Vec::new();
+    let mut claims: BTreeMap<String, usize> = BTreeMap::new();
+    let mut listed = 0usize;
+    for folder in folders {
+        let entries = match reader.entry_list(&folder).await {
             Ok(e) => e,
             Err(_) => {
                 out.unreadable_folders.push(folder);
@@ -1095,13 +1655,32 @@ async fn walk(
             out.empty_folders += 1;
             continue;
         }
-        if out.seen() + entries.len() > MAX_ENTRIES {
+        listed = listed.saturating_add(entries.len());
+        if listed > MAX_ENTRIES {
             return Err(KWalletError::TooManyEntries { limit: MAX_ENTRIES });
         }
+        for entry in &entries {
+            *claims.entry(sidecar_key(&folder, entry)).or_insert(0) += 1;
+        }
+        listings.push(Listing { folder, entries });
+    }
+    out.ambiguous_sidecar_keys = claims
+        .iter()
+        .filter(|(key, n)| **n > 1 && sidecar.get(key).is_some())
+        .map(|(key, _)| key.clone())
+        .collect();
 
+    // -- pass two: read ----------------------------------------------------
+    let mut resolved: BTreeSet<String> = BTreeSet::new();
+    for Listing { folder, entries } in listings {
         for entry in entries {
             let key = sidecar_key(&folder, &entry);
-            let row = sidecar.get(&key);
+            // A key more than one pair composes belongs to none of them. The
+            // entry is treated exactly as one with no sidecar row, which is a
+            // real and already-handled state, rather than being given a row
+            // that may describe a different item.
+            let unique = claims.get(&key).copied().unwrap_or(0) == 1;
+            let row = if unique { sidecar.get(&key) } else { None };
             if row.is_some() {
                 resolved.insert(key);
             } else {
@@ -1110,14 +1689,26 @@ async fn walk(
             out.malformed_sidecar_fields += row.map_or(0, |r| r.malformed_fields);
 
             let provenance = Provenance::kwallet(wallet, &folder, &entry);
-            let entry_type = EntryType::from_code(
-                proxy
-                    .entry_type(h, &folder, &entry, APP_ID)
-                    .await
-                    .unwrap_or(EntryType::Unknown.code()),
-            );
 
-            let secret = match read_secret(proxy, h, &folder, &entry, entry_type, &mut out).await {
+            // A failed `entryType` is a refusal, not a default. Treating it as
+            // `Unknown` routes the entry to `readEntry`, whose bytes for a
+            // `Map` are the undecoded QDataStream — which would then be stored
+            // as the secret, labelled `application/json` by the sidecar, and
+            // counted as imported. A false success on a secret is permanent,
+            // and this is the one path the decoder's refusal never sees.
+            let entry_type = match reader.entry_type(&folder, &entry).await {
+                Ok(code) => EntryType::from_code(code),
+                Err(e) => {
+                    out.skipped.push(SkippedEntry {
+                        provenance,
+                        label: entry,
+                        reason: SkipReason::TypeUnavailable(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+
+            let secret = match read_secret(reader, &folder, &entry, entry_type, &mut out).await {
                 Ok(s) => s,
                 Err(reason) => {
                     out.skipped.push(SkippedEntry {
@@ -1129,7 +1720,15 @@ async fn walk(
                 }
             };
 
-            let item = map_entry(wallet, &folder, &entry, entry_type, secret, row);
+            let item = map_entry(
+                wallet,
+                &folder,
+                &entry,
+                entry_type,
+                secret,
+                row,
+                &mut out.attribute_conflicts,
+            );
             // Checked before anything is written: an import that fails halfway
             // leaves the user worse off than one that refuses at the start.
             if let Some(refusal) = check_caps(
@@ -1164,64 +1763,60 @@ async fn walk(
 /// still another project's enum reached over a wire that reports it as a bare
 /// integer. So a `Password` whose `readPassword` fails falls back to
 /// `readEntry` — the raw bytes are the same bytes — and the fallback is
-/// *counted*, so a wrong assumption shows up as a number in the report rather
-/// than as a pile of missing items.
+/// *counted* when it works, so a wrong assumption shows up as a number in the
+/// report rather than as a pile of missing items. An entry both reads failed
+/// for is not a fallback: it is a skip, and counting it as both would make the
+/// number mean nothing.
 ///
-/// A `Map` gets no such fallback. Its bytes are not the secret; the decoded
-/// map is, and an undecodable map is refused with a reason rather than
+/// A `Map`'s *read* falls back the same way and is counted the same way; its
+/// **decode** is what gets no fallback. Its bytes are not the secret, the
+/// decoded map is, and an undecodable map is refused with a reason rather than
 /// written as an opaque blob that no one will ever recognise.
-async fn read_secret(
-    proxy: &KWalletProxy<'_>,
-    handle: i32,
+async fn read_secret<R: WalletReader>(
+    reader: &R,
     folder: &str,
     entry: &str,
     entry_type: EntryType,
     out: &mut Extraction,
 ) -> Result<Zeroizing<Vec<u8>>, SkipReason> {
     match entry_type {
-        EntryType::Password => {
-            match proxy.read_password(handle, folder, entry, APP_ID).await {
-                // `into_bytes` moves the buffer, so no un-zeroized copy of the
-                // password is left behind by the conversion.
-                Ok(s) => Ok(Zeroizing::new(s.into_bytes())),
-                Err(first) => {
-                    out.password_read_fallbacks += 1;
-                    proxy
-                        .read_entry(handle, folder, entry, APP_ID)
-                        .await
-                        .map(Zeroizing::new)
-                        .map_err(|second| {
-                            SkipReason::Unreadable(format!(
-                                "readPassword failed ({first}) and readEntry failed ({second})"
-                            ))
-                        })
-                }
+        EntryType::Password => match reader.read_password(folder, entry).await {
+            // The `String` is moved out of the `Zeroizing` wrapper and its
+            // buffer reused, so the conversion leaves no un-zeroized copy.
+            Ok(mut s) => Ok(Zeroizing::new(std::mem::take(&mut *s).into_bytes())),
+            Err(first) => {
+                let recovered = reader.read_entry(folder, entry).await.map_err(|second| {
+                    SkipReason::Unreadable(format!(
+                        "readPassword failed ({first}) and readEntry failed ({second})"
+                    ))
+                })?;
+                // Counted here and not before the attempt: a fallback that did
+                // not recover anything is a skip, not a recovery.
+                out.password_read_fallbacks += 1;
+                Ok(recovered)
             }
-        }
+        },
         EntryType::Map => {
-            let raw = match proxy.read_map(handle, folder, entry, APP_ID).await {
-                Ok(v) => Zeroizing::new(v),
+            let raw = match reader.read_map(folder, entry).await {
+                Ok(v) => v,
                 Err(e) => {
                     // `readEntry` returns the identical bytes for a map entry,
                     // so it is a legitimate retry for a refused `readMap` —
                     // and the decode below is what actually decides.
-                    proxy
-                        .read_entry(handle, folder, entry, APP_ID)
-                        .await
-                        .map(Zeroizing::new)
-                        .map_err(|second| {
-                            SkipReason::Unreadable(format!(
-                                "readMap failed ({e}) and readEntry failed ({second})"
-                            ))
-                        })?
+                    let recovered = reader.read_entry(folder, entry).await.map_err(|second| {
+                        SkipReason::Unreadable(format!(
+                            "readMap failed ({e}) and readEntry failed ({second})"
+                        ))
+                    })?;
+                    out.map_read_fallbacks += 1;
+                    recovered
                 }
             };
             Ok(read_map_secret(&raw)?)
         }
-        EntryType::Stream | EntryType::Unknown | EntryType::Other(_) => proxy
-            .read_entry(handle, folder, entry, APP_ID)
+        EntryType::Stream | EntryType::Unknown | EntryType::Other(_) => reader
+            .read_entry(folder, entry)
             .await
-            .map(Zeroizing::new)
             .map_err(|e| SkipReason::Unreadable(e.to_string())),
     }
 }
@@ -1293,6 +1888,7 @@ mod tests {
             EntryType::Password,
             secret(),
             Some(&row),
+            &mut 0,
         );
         assert_eq!(item.attributes, row.attributes);
         for added in [ATTR_FOLDER, ATTR_KEY, ATTR_TYPE] {
@@ -1318,6 +1914,7 @@ mod tests {
             EntryType::Password,
             secret(),
             Some(&row),
+            &mut 0,
         );
         assert_eq!(item.attributes, row.attributes);
         assert_eq!(item.outcome(), Outcome::AttributesPreserved);
@@ -1335,6 +1932,7 @@ mod tests {
             EntryType::Password,
             secret(),
             Some(&row),
+            &mut 0,
         );
         let added: BTreeSet<&str> = item
             .attributes
@@ -1368,6 +1966,7 @@ mod tests {
             EntryType::Password,
             secret(),
             None,
+            &mut 0,
         );
         assert_eq!(item.attributes.len(), 3);
         assert_eq!(item.attributes[ATTR_KEY], "/home/joseph/.ssh/id_ed25519");
@@ -1375,10 +1974,11 @@ mod tests {
         assert_eq!(item.content_type, "text/plain");
         // Never `now()`.
         assert_eq!((item.created, item.modified), (0, 0));
-        // Three `kwallet:` attributes are still attributes, so this is
-        // "attributes preserved" rather than "preserved only" — the honest
-        // reading, since `sm get kwallet:folder=... kwallet:key=...` works.
-        assert_eq!(item.outcome(), Outcome::AttributesPreserved);
+        // The three `kwallet:` keys are ones *we* synthesised, so
+        // `Outcome::classify` does not count them: nothing that existed
+        // before the import was preserved, and an item findable only by a
+        // name this import invented is "preserved only".
+        assert_eq!(item.outcome(), Outcome::PreservedOnly);
     }
 
     /// The label is the entry name and the timestamps are the sidecar's.
@@ -1392,6 +1992,7 @@ mod tests {
             EntryType::Password,
             secret(),
             Some(&row),
+            &mut 0,
         );
         assert_eq!(item.label, "my router");
         assert_eq!(item.created, 1_699_383_593);
@@ -1412,13 +2013,13 @@ mod tests {
             (EntryType::Other(9), "application/octet-stream"),
         ];
         for (ty, expected) in cases {
-            let item = map_entry("w", "f", "e", ty, secret(), None);
+            let item = map_entry("w", "f", "e", ty, secret(), None, &mut 0);
             assert_eq!(item.content_type, expected, "{ty} with no sidecar");
             assert_eq!(item.attributes[ATTR_TYPE], ty.attribute_value());
 
             let mut row = sidecar_entry(&[]);
             row.content_type = Some("text/plain; charset=utf8".into());
-            let item = map_entry("w", "f", "e", ty, secret(), Some(&row));
+            let item = map_entry("w", "f", "e", ty, secret(), Some(&row), &mut 0);
             let with_sidecar = if ty == EntryType::Map {
                 "application/json"
             } else {
@@ -1509,7 +2110,15 @@ mod tests {
         let row = s.get("f/e").unwrap();
         assert_eq!(row.content_type, None);
         assert_eq!(row.malformed_fields, 0);
-        let item = map_entry("w", "f", "e", EntryType::Stream, secret(), Some(row));
+        let item = map_entry(
+            "w",
+            "f",
+            "e",
+            EntryType::Stream,
+            secret(),
+            Some(row),
+            &mut 0,
+        );
         assert_eq!(item.content_type, "application/octet-stream");
     }
 
@@ -1570,24 +2179,21 @@ mod tests {
                 .is_some()
         );
         assert!(s.get(&sidecar_key("accounts", "3/1")).is_some());
-        // Two different `(folder, entry)` pairs compose the *same* key, so
-        // the reverse — splitting a key back into a pair — has no unique
-        // answer. That is exactly why the walk composes rather than parses:
-        // it already knows which pair is real, and never has to guess.
+    }
+
+    /// Composing removes the ambiguity of *parsing* a key. It does not remove
+    /// the ambiguity of the composition, and this collision is a bug, not a
+    /// safety argument: two different `(folder, entry)` pairs name one row, so
+    /// a wallet holding both would give two entries the same attribute map —
+    /// including the other item's `xdg:schema`, `server=` and `user=`.
+    /// `walk` therefore refuses such a key for every claimant; see
+    /// `a_sidecar_key_two_entries_claim_is_used_by_neither`.
+    #[test]
+    fn one_sidecar_key_can_name_two_different_entries() {
         assert_eq!(
             sidecar_key("accounts/3", "1"),
             sidecar_key("accounts", "3/1")
         );
-    }
-
-    /// A key no entry composes is a real condition — a stale row `ksecretd`
-    /// left behind — and is reported, not dropped.
-    #[test]
-    fn unresolvable_keys_are_visible_to_the_caller() {
-        let s = parse(r#"{"Gone/away": {"attributes": {}}, "Here/now": {"attributes": {}}}"#);
-        let resolved = BTreeSet::from([sidecar_key("Here", "now")]);
-        let unresolved: Vec<&str> = s.keys().filter(|k| !resolved.contains(*k)).collect();
-        assert_eq!(unresolved, ["Gone/away"]);
     }
 
     #[test]
@@ -1693,7 +2299,7 @@ mod tests {
         bytes.extend_from_slice(&[0x00, b'k', 0x00, b'v']); // "kv", UTF-16BE
         bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // null value
         let pairs = decode_qmap(&bytes).unwrap();
-        assert_eq!(pairs, [("kv".to_string(), String::new())]);
+        assert_eq!(*pairs, [("kv".to_string(), String::new())]);
     }
 
     /// Non-ASCII and astral-plane characters are the case a naive latin-1
@@ -1702,7 +2308,7 @@ mod tests {
     fn utf16_surrogate_pairs_survive() {
         let bytes = qmap_bytes(&[("kéy", "🔑 välue")]);
         let pairs = decode_qmap(&bytes).unwrap();
-        assert_eq!(pairs, [("kéy".to_string(), "🔑 välue".to_string())]);
+        assert_eq!(*pairs, [("kéy".to_string(), "🔑 välue".to_string())]);
     }
 
     /// Every way the bytes can fail to be a `QMap` is a refusal, never a
@@ -1745,12 +2351,19 @@ mod tests {
             decode_qmap(&odd),
             Err(MapDecodeError::OddStringLength { len: 3 })
         ));
-        // An unpaired surrogate.
+        // An unpaired surrogate is a *legal* QString that Rust's String
+        // cannot hold, so the message must say so rather than blame the
+        // wallet for corruption that is not there.
         let mut bad = 1u32.to_be_bytes().to_vec();
         bad.extend_from_slice(&2u32.to_be_bytes());
         bad.extend_from_slice(&0xD800u16.to_be_bytes());
         bad.extend_from_slice(&0u32.to_be_bytes());
-        assert!(matches!(decode_qmap(&bad), Err(MapDecodeError::BadUtf16)));
+        match decode_qmap(&bad) {
+            Err(MapDecodeError::Unrepresentable { what }) => {
+                assert!(what.contains("surrogate"), "{what}");
+            }
+            other => panic!("expected Unrepresentable, got {other:?}"),
+        }
         // A QMap cannot hold a key twice, so a stream that does is not one.
         let dup = qmap_bytes(&[("k", "1"), ("k", "2")]);
         assert!(matches!(
@@ -1780,44 +2393,493 @@ mod tests {
         }
     }
 
+    // -- the walk, driven by a fake wallet ---------------------------------
+
+    /// An in-memory [`WalletReader`].
+    ///
+    /// The point of the seam. Every decision the walk makes — what a failed
+    /// `entryType` costs, which sidecar row an entry is given, when a
+    /// fallback counts as a recovery — is a decision about a *reply*, and
+    /// until there was something other than kwalletd that could produce a
+    /// reply, none of them could be asserted except by writing the same
+    /// filter twice and calling the agreement a test.
+    #[derive(Default)]
+    struct FakeWallet {
+        folders: Vec<(String, Vec<String>)>,
+        unreadable: BTreeSet<String>,
+        types: BTreeMap<(String, String), Result<i32, String>>,
+        passwords: BTreeMap<(String, String), Result<String, String>>,
+        maps: BTreeMap<(String, String), Result<Vec<u8>, String>>,
+        raw: BTreeMap<(String, String), Result<Vec<u8>, String>>,
+    }
+
+    impl FakeWallet {
+        fn folder(mut self, folder: &str, entries: &[&str]) -> Self {
+            self.folders.push((
+                folder.to_string(),
+                entries.iter().map(|e| (*e).to_string()).collect(),
+            ));
+            self
+        }
+
+        /// A plain password entry: the type resolves and `readPassword` works.
+        fn password(mut self, folder: &str, entry: &str, value: &str) -> Self {
+            let k = (folder.to_string(), entry.to_string());
+            self.types.insert(k.clone(), Ok(EntryType::Password.code()));
+            self.passwords.insert(k, Ok(value.to_string()));
+            self
+        }
+
+        fn entry_type(mut self, folder: &str, entry: &str, ty: Result<i32, &str>) -> Self {
+            self.types.insert(
+                (folder.to_string(), entry.to_string()),
+                ty.map_err(str::to_string),
+            );
+            self
+        }
+
+        fn read_password(mut self, folder: &str, entry: &str, v: Result<&str, &str>) -> Self {
+            self.passwords.insert(
+                (folder.to_string(), entry.to_string()),
+                v.map(str::to_string).map_err(str::to_string),
+            );
+            self
+        }
+
+        fn read_map(mut self, folder: &str, entry: &str, v: Result<Vec<u8>, &str>) -> Self {
+            self.maps.insert(
+                (folder.to_string(), entry.to_string()),
+                v.map_err(str::to_string),
+            );
+            self
+        }
+
+        fn read_entry(mut self, folder: &str, entry: &str, v: Result<Vec<u8>, &str>) -> Self {
+            self.raw.insert(
+                (folder.to_string(), entry.to_string()),
+                v.map_err(str::to_string),
+            );
+            self
+        }
+    }
+
+    fn looked_up<T: Clone>(
+        table: &BTreeMap<(String, String), Result<T, String>>,
+        folder: &str,
+        entry: &str,
+    ) -> Result<T, ReadError> {
+        match table.get(&(folder.to_string(), entry.to_string())) {
+            Some(Ok(v)) => Ok(v.clone()),
+            Some(Err(e)) => Err(ReadError::Failed(e.clone())),
+            None => Err(ReadError::Failed("no such entry".into())),
+        }
+    }
+
+    impl WalletReader for FakeWallet {
+        async fn folder_list(&self) -> Result<Vec<String>, ReadError> {
+            Ok(self.folders.iter().map(|(f, _)| f.clone()).collect())
+        }
+
+        async fn entry_list(&self, folder: &str) -> Result<Vec<String>, ReadError> {
+            if self.unreadable.contains(folder) {
+                return Err(ReadError::Failed("refused".into()));
+            }
+            Ok(self
+                .folders
+                .iter()
+                .find(|(f, _)| f == folder)
+                .map(|(_, e)| e.clone())
+                .unwrap_or_default())
+        }
+
+        async fn entry_type(&self, folder: &str, entry: &str) -> Result<i32, ReadError> {
+            looked_up(&self.types, folder, entry)
+        }
+
+        async fn read_password(
+            &self,
+            folder: &str,
+            entry: &str,
+        ) -> Result<Zeroizing<String>, ReadError> {
+            looked_up(&self.passwords, folder, entry).map(Zeroizing::new)
+        }
+
+        async fn read_map(
+            &self,
+            folder: &str,
+            entry: &str,
+        ) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+            looked_up(&self.maps, folder, entry).map(Zeroizing::new)
+        }
+
+        async fn read_entry(
+            &self,
+            folder: &str,
+            entry: &str,
+        ) -> Result<Zeroizing<Vec<u8>>, ReadError> {
+            looked_up(&self.raw, folder, entry).map(Zeroizing::new)
+        }
+    }
+
+    async fn walked(reader: &FakeWallet, sidecar: &Sidecar) -> Extraction {
+        walk(reader, "kdewallet", sidecar).await.unwrap()
+    }
+
+    /// **The one that must never regress.** `entryType` failing used to
+    /// default to `Unknown`, which dispatches to `readEntry` — and for a `Map`
+    /// those bytes are the *undecoded* QDataStream. The blob was written as
+    /// the secret, given the sidecar's `application/json` content type, and
+    /// counted as imported: a false success on a secret, reached by the one
+    /// path the decoder's refusal never sees.
+    #[tokio::test]
+    async fn a_refused_entry_type_is_skipped_rather_than_read_as_raw_bytes() {
+        let blob = qmap_bytes(&[("user", "joseph"), ("password", "hunter2")]);
+        let fake = FakeWallet::default()
+            .folder("Secret Service", &["credential"])
+            .entry_type("Secret Service", "credential", Err("no such entry"))
+            .read_entry("Secret Service", "credential", Ok(blob.clone()));
+        let sidecar =
+            parse(r#"{"Secret Service/credential": {"$fdo_mime_type": "application/json"}}"#);
+
+        let out = walked(&fake, &sidecar).await;
+
+        assert!(
+            out.items.is_empty(),
+            "the entry was imported: {:?}",
+            out.items
+        );
+        assert_eq!(out.skipped.len(), 1);
+        assert!(
+            matches!(out.skipped[0].reason, SkipReason::TypeUnavailable(_)),
+            "{:?}",
+            out.skipped[0].reason
+        );
+        // And in particular the raw stream never became a secret.
+        assert!(!out.items.iter().any(|i| *i.secret == blob));
+    }
+
+    /// A sidecar key two `(folder, entry)` pairs compose belongs to neither.
+    /// Applying it to either would give one entry the other's `xdg:schema`,
+    /// `server=` and `user=` — under `replace` semantics, a secret written
+    /// under a different item's identity.
+    #[tokio::test]
+    async fn a_sidecar_key_two_entries_claim_is_used_by_neither() {
+        let fake = FakeWallet::default()
+            .folder("accounts/3", &["1"])
+            .password("accounts/3", "1", "one")
+            .folder("accounts", &["3/1"])
+            .password("accounts", "3/1", "two");
+        let sidecar = parse(
+            r#"{"accounts/3/1": {"attributes": {"xdg:schema": "org.freedesktop.Secret.Generic",
+                                                "server": "example.com"}}}"#,
+        );
+
+        let out = walked(&fake, &sidecar).await;
+
+        assert_eq!(out.items.len(), 2);
+        for item in &out.items {
+            assert!(
+                !item.attributes.contains_key("xdg:schema"),
+                "an ambiguous row was applied: {:?}",
+                item.attributes.keys().collect::<Vec<_>>()
+            );
+            assert!(!item.attributes.contains_key("server"));
+            // Treated exactly as an entry with no row: the `kwallet:` keys.
+            assert!(item.attributes.contains_key(ATTR_FOLDER));
+        }
+        assert_eq!(out.ambiguous_sidecar_keys, ["accounts/3/1"]);
+        assert_eq!(out.entries_without_sidecar, 2);
+        // Nothing claimed the row, so it is also reported as unresolved
+        // rather than quietly counting as used.
+        assert_eq!(out.unresolved_sidecar_rows, ["accounts/3/1"]);
+    }
+
+    /// A row exactly one pair composes is still applied. The refusal above
+    /// must not cost the ordinary case.
+    #[tokio::test]
+    async fn an_unambiguous_sidecar_key_is_still_applied() {
+        let fake = FakeWallet::default()
+            .folder("accounts", &["3/1"])
+            .password("accounts", "3/1", "two");
+        let sidecar = parse(r#"{"accounts/3/1": {"attributes": {"server": "example.com"}}}"#);
+
+        let out = walked(&fake, &sidecar).await;
+
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].attributes["server"], "example.com");
+        assert!(out.ambiguous_sidecar_keys.is_empty());
+        assert_eq!(out.entries_without_sidecar, 0);
+        assert!(out.unresolved_sidecar_rows.is_empty());
+    }
+
+    /// A key no entry composes is a real condition — a stale row `ksecretd`
+    /// left behind — and is reported, not dropped. Asserted through `walk`,
+    /// because a test that reimplements `walk`'s filter still passes after
+    /// `walk` stops applying it.
+    #[tokio::test]
+    async fn unresolvable_keys_are_visible_to_the_caller() {
+        let fake = FakeWallet::default()
+            .folder("Here", &["now"])
+            .password("Here", "now", "v");
+        let sidecar = parse(r#"{"Gone/away": {"attributes": {}}, "Here/now": {"attributes": {}}}"#);
+
+        let out = walked(&fake, &sidecar).await;
+
+        assert_eq!(out.unresolved_sidecar_rows, ["Gone/away"]);
+        assert_eq!(out.items.len(), 1);
+    }
+
+    /// The fallback counter names what `readEntry` *recovered*. An entry both
+    /// reads failed for is a skip; counting it here as well would make the
+    /// number — and the sentence the CLI prints about it — false.
+    #[tokio::test]
+    async fn a_password_fallback_is_counted_only_when_it_recovers() {
+        let fake = FakeWallet::default()
+            .folder("f", &["recovered", "lost"])
+            .entry_type("f", "recovered", Ok(EntryType::Password.code()))
+            .read_password("f", "recovered", Err("not a password"))
+            .read_entry("f", "recovered", Ok(b"hunter2".to_vec()))
+            .entry_type("f", "lost", Ok(EntryType::Password.code()))
+            .read_password("f", "lost", Err("not a password"))
+            .read_entry("f", "lost", Err("denied"));
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(
+            out.password_read_fallbacks, 1,
+            "an entry that was skipped was counted as a recovery"
+        );
+    }
+
+    /// A `Map`'s *read* does fall back, and is counted. Only the **decode**
+    /// has no fallback — the module docs used to say otherwise, and nothing
+    /// counted the map fallbacks at all.
+    #[tokio::test]
+    async fn a_map_read_falls_back_and_is_counted() {
+        let good = qmap_bytes(&[("user", "joseph")]);
+        let fake = FakeWallet::default()
+            .folder("f", &["m"])
+            .entry_type("f", "m", Ok(EntryType::Map.code()))
+            .read_map("f", "m", Err("refused"))
+            .read_entry("f", "m", Ok(good));
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert_eq!(out.map_read_fallbacks, 1);
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(
+            std::str::from_utf8(&out.items[0].secret).unwrap(),
+            r#"{"user":"joseph"}"#
+        );
+    }
+
+    /// An undecodable map is refused however its bytes were obtained. The
+    /// decode is the thing with no fallback.
+    #[tokio::test]
+    async fn an_undecodable_map_is_skipped_not_stored_as_a_blob() {
+        let fake = FakeWallet::default()
+            .folder("f", &["m"])
+            .entry_type("f", "m", Ok(EntryType::Map.code()))
+            .read_map("f", "m", Ok(b"hunter2".to_vec()));
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert!(out.items.is_empty());
+        assert!(matches!(
+            out.skipped[0].reason,
+            SkipReason::MapUndecodable(_)
+        ));
+    }
+
+    /// A sidecar attribute already named `kwallet:folder` is ours to read,
+    /// not to overwrite: an attribute we did not write and then changed is a
+    /// changed lookup. Kept, and counted.
+    #[tokio::test]
+    async fn an_existing_kwallet_attribute_is_kept_and_counted() {
+        let fake = FakeWallet::default()
+            .folder("Passwords", &["router"])
+            .password("Passwords", "router", "v");
+        let sidecar =
+            parse(r#"{"Passwords/router": {"attributes": {"kwallet:folder": "theirs"}}}"#);
+
+        let out = walked(&fake, &sidecar).await;
+
+        assert_eq!(out.items[0].attributes[ATTR_FOLDER], "theirs");
+        assert_eq!(out.attribute_conflicts, 1);
+    }
+
+    /// A sidecar in an unexpected shape parses "successfully" with no entries
+    /// at all, and every entry then imports attribute-less. The only signal
+    /// is this number, so it has to be reachable.
+    #[test]
+    fn extra_non_entry_sidecar_rows_are_surfaced() {
+        let ordinary = Extraction {
+            skipped_sidecar_rows: EXPECTED_NON_ENTRY_ROWS,
+            ..Default::default()
+        };
+        assert_eq!(ordinary.unexpected_sidecar_rows(), 0);
+        let odd = Extraction {
+            skipped_sidecar_rows: 68,
+            ..Default::default()
+        };
+        assert_eq!(odd.unexpected_sidecar_rows(), 66);
+    }
+
+    /// A name that is not a wallet name never reaches the bus, and never
+    /// composes a sidecar path that could leave `kwalletd/`.
+    #[test]
+    fn a_wallet_name_that_could_escape_the_directory_is_refused() {
+        for bad in ["", ".", "..", "../../.ssh/id", "a/b", "a\0b"] {
+            assert!(!wallet_name_is_usable(bad), "{bad:?} accepted");
+            assert_eq!(sidecar_path(bad), PathBuf::new(), "{bad:?} composed a path");
+        }
+        assert!(wallet_name_is_usable("kdewallet"));
+    }
+
+    // -- properties --------------------------------------------------------
+
+    /// `decode_qmap` is the one parser in this module fed by a live foreign
+    /// daemon, over a wire that carries a bare byte array. Two properties: it
+    /// never panics on anything, and it is exact on everything it accepts.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Arbitrary bytes either decode or produce a typed error. Never
+            /// a panic, never an unbounded allocation.
+            #[test]
+            fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+                let _ = decode_qmap(&bytes);
+            }
+
+            /// Bytes that begin with a plausible count are the interesting
+            /// shape: random input bounces off the length check and never
+            /// reaches the string decoder.
+            #[test]
+            fn plausible_streams_never_panic(
+                count in 0u32..8,
+                rest in proptest::collection::vec(any::<u8>(), 0..256),
+            ) {
+                let mut bytes = count.to_be_bytes().to_vec();
+                bytes.extend_from_slice(&rest);
+                let _ = decode_qmap(&bytes);
+            }
+
+            /// Every map Qt could have written round-trips exactly: same
+            /// pairs out, and canonical JSON that re-reads as the same map.
+            #[test]
+            fn well_formed_maps_round_trip(
+                pairs in proptest::collection::btree_map(".{0,24}", ".{0,24}", 0..12),
+            ) {
+                let wire: Vec<(&str, &str)> =
+                    pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let bytes = qmap_bytes(&wire);
+                let decoded = decode_qmap(&bytes).expect("a well-formed map was refused");
+                let back: BTreeMap<String, String> = decoded.iter().cloned().collect();
+                prop_assert_eq!(&back, &pairs);
+
+                let json = read_map_secret(&bytes).expect("a well-formed map was refused");
+                let parsed: BTreeMap<String, String> =
+                    serde_json::from_slice(&json).expect("canonical JSON did not re-read");
+                prop_assert_eq!(parsed, pairs);
+            }
+
+            /// One byte removed from a well-formed stream is never accepted:
+            /// the buffer must be consumed exactly, which is what makes "this
+            /// is not a QMap" detectable at all.
+            #[test]
+            fn a_truncated_map_is_always_refused(
+                pairs in proptest::collection::btree_map("[a-z]{1,8}", "[a-z]{0,8}", 1..6),
+                cut in 1usize..8,
+            ) {
+                let wire: Vec<(&str, &str)> =
+                    pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let bytes = qmap_bytes(&wire);
+                let cut = cut.min(bytes.len());
+                prop_assert!(decode_qmap(&bytes[..bytes.len() - cut]).is_err());
+            }
+        }
+    }
+
     // -- live service ------------------------------------------------------
 
-    /// A read-only sanity check against a real `kwalletd6`, when there is
-    /// one. It never opens a closed wallet: that would raise a password
-    /// dialog in the middle of `cargo test`. Like `tests/pam_stack.rs`, it
-    /// prints why it skipped rather than passing vacuously.
+    /// A read-only sanity check against a real `kwalletd6`, opted into with
+    /// `SM_KWALLET_LIVE=1`.
+    ///
+    /// The gate is the whole design. `cargo test` captures `println!`, so a
+    /// version that printed "SKIPPED" and returned reported PASS identically
+    /// whether kwalletd was there or not — which is the one thing a live test
+    /// must not do, because the only reason to have it is to find out that
+    /// the assumptions are wrong. Unset, it says on stderr that it skipped.
+    /// Set, every step is required: the service, the wallet list, and a real
+    /// walk of an open wallet.
+    ///
+    /// It never opens a *closed* wallet even when opted in: that raises a
+    /// password dialog, and a test may not do that.
     #[tokio::test]
     async fn live_kwalletd_agrees_with_this_modules_assumptions() {
-        let Ok(conn) = zbus::Connection::session().await else {
-            println!("SKIPPED: no session bus");
+        // `eprintln!` and not `println!`: a skip has to be visible.
+        if std::env::var_os("SM_KWALLET_LIVE").is_none() {
+            eprintln!(
+                "SKIPPED live_kwalletd_agrees_with_this_modules_assumptions: set \
+                 SM_KWALLET_LIVE=1, with a kwalletd6 running and a wallet already open, to run it"
+            );
             return;
-        };
-        match service_is_running(&conn).await {
-            Ok(true) => {}
-            _ => {
-                println!("SKIPPED: {SERVICE} has no owner on the session bus");
-                return;
-            }
         }
+        let conn = zbus::Connection::session()
+            .await
+            .expect("SM_KWALLET_LIVE is set but there is no session bus");
+        assert!(
+            service_is_running(&conn)
+                .await
+                .expect("NameHasOwner failed"),
+            "SM_KWALLET_LIVE is set but {SERVICE} has no owner on the session bus"
+        );
         let proxy = KWalletProxy::new(&conn).await.unwrap();
-        let wallets = proxy.wallets().await.unwrap();
+        // Not `unwrap()`: a denied `wallets()` is a result about KWallet's
+        // policy, and "the call was refused" is what the run has to say.
+        let wallets = bounded("wallets", DEFAULT_CALL_TIMEOUT, proxy.wallets())
+            .await
+            .expect("kwalletd refused the wallets() call");
+        assert!(!wallets.is_empty(), "kwalletd reports no wallets");
         println!("live kwalletd6: {} wallet(s)", wallets.len());
+
+        let mut walked_any = false;
         for wallet in &wallets {
-            let open = proxy.is_open(wallet).await.unwrap_or(false);
+            let open = bounded("isOpen", DEFAULT_CALL_TIMEOUT, proxy.is_open(wallet))
+                .await
+                .unwrap_or(false);
             // Names and counts only. Never a value, never a secret.
             println!("  wallet {wallet:?} open={open}");
-            let path = sidecar_path(wallet);
-            match Sidecar::load(&path) {
-                Ok(s) => println!(
-                    "  sidecar {} row(s), {} non-object root value(s)",
-                    s.len(),
-                    s.skipped_rows()
-                ),
-                Err(e) => println!("  sidecar unreadable: {e}"),
-            }
+            let sidecar = Sidecar::load(&sidecar_path(wallet)).expect("the sidecar is unreadable");
+            println!(
+                "  sidecar {} row(s), {} non-object root value(s)",
+                sidecar.len(),
+                sidecar.skipped_rows()
+            );
             if !open {
-                println!("  SKIPPED the walk: the wallet is closed and opening it would prompt");
+                println!("  not walked: the wallet is closed and opening it would prompt");
+                continue;
             }
+            // Already open, so this cannot raise a dialog.
+            let out = extract(&conn, wallet, &sidecar, Duration::from_secs(10))
+                .await
+                .expect("the walk failed");
+            println!(
+                "  walked: {} item(s), {} skipped, {} refused, {} ambiguous key(s)",
+                out.items.len(),
+                out.skipped.len(),
+                out.refused.len(),
+                out.ambiguous_sidecar_keys.len()
+            );
+            walked_any = true;
         }
+        assert!(
+            walked_any,
+            "SM_KWALLET_LIVE is set but no wallet was open, so nothing was walked; open one first"
+        );
     }
 }

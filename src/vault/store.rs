@@ -106,9 +106,33 @@ enum ItemDelta {
 /// that tie-break arbitrary exactly where the user has duplicate-looking
 /// credentials.
 ///
+/// **The timestamps are taken verbatim and are not validated.** They are not
+/// clamped to the present, not required to be ordered, and not required to be
+/// non-zero: a caller may hand over a `modified` far in the future or a
+/// `created` after it, and the value is written and later reported as
+/// `Item.Created`/`Item.Modified` unchanged. That is deliberate. The only
+/// consumer that *orders* on `modified` is `sm get`'s duplicate tie-break,
+/// and any bus client can already win that tie-break by writing an item, so
+/// clamping would buy nothing while silently corrupting the timestamps of
+/// legitimately old data - which is precisely the data an import exists to
+/// carry across.
+///
+/// The corollary is that the tie-break is only as good as the source. A
+/// gnome-keyring item carries both stamps, so it survives intact.
+/// `src/import/kwallet.rs` has no timestamps for an entry with no sidecar and
+/// lands `(0, 0)` for it: for that source the tie-break this type exists to
+/// make non-arbitrary is arbitrary again, all such items compare equal, and
+/// `Item.Modified` reports the Unix epoch - 1970 - to any bus client that
+/// reads it.
+///
 /// The id is not a field: ids stay daemon-assigned (a fresh uuid v4, as
 /// [`Vault::insert_item`] assigns), because nothing needs a source id
 /// preserved and letting a caller choose one invites collisions.
+///
+/// `#[non_exhaustive]`, so a later field is not a breaking change for a
+/// struct-literal construction outside this crate. Build one with
+/// [`ImportItem::new`] and assign the rest.
+#[non_exhaustive]
 pub struct ImportItem {
     pub label: String,
     pub attributes: BTreeMap<String, String>,
@@ -116,6 +140,30 @@ pub struct ImportItem {
     pub content_type: String,
     pub created: u64,
     pub modified: u64,
+}
+
+impl ImportItem {
+    /// An import item with every field given. The constructor exists so that
+    /// adding a field to this type stays a non-breaking change: it is the one
+    /// construction that keeps compiling, and `#[non_exhaustive]` makes it
+    /// the only one available outside the crate.
+    pub fn new(
+        label: String,
+        attributes: BTreeMap<String, String>,
+        secret: Zeroizing<Vec<u8>>,
+        content_type: String,
+        created: u64,
+        modified: u64,
+    ) -> Self {
+        ImportItem {
+            label,
+            attributes,
+            secret,
+            content_type,
+            created,
+            modified,
+        }
+    }
 }
 
 impl std::fmt::Debug for ImportItem {
@@ -133,16 +181,31 @@ impl std::fmt::Debug for ImportItem {
 
 /// A label as an error message may carry it: the label is caller-supplied and
 /// may be over its own cap, and the message must stay small enough to log.
+///
+/// The label is *peer* data — `sm import` reads it out of a gnome-keyring
+/// file or a KWallet sidecar — and `VaultError::ImportTooLarge` is the first
+/// `VaultError` variant to carry arbitrary peer text at all. `CliError`'s
+/// `From<VaultError>` is `e.to_string()`, printed to a terminal raw, so
+/// `CLAUDE.md`'s rule applies here and not only on the parallel path in
+/// `src/cli/import.rs`: escape before it can reach a log or a dialog.
+///
+/// Escaping happens **before** truncation. Truncating first would cut the
+/// raw label at a byte the escaper never sees, so the tail of a multi-byte
+/// character could be dropped while its lead byte — a control character or
+/// half a bidi override — stayed; escaping first means the only thing a cut
+/// can damage is inert ASCII like `\x1b`, and the 64-byte budget bounds what
+/// is actually printed rather than what was measured.
 fn label_excerpt(label: &str) -> String {
     const MAX: usize = 64;
-    if label.len() <= MAX {
-        return label.to_string();
+    let escaped = format::escape_control(label);
+    if escaped.len() <= MAX {
+        return escaped;
     }
     let end = (0..=MAX)
         .rev()
-        .find(|i| label.is_char_boundary(*i))
+        .find(|i| escaped.is_char_boundary(*i))
         .unwrap_or(0);
-    format!("{}...", &label[..end])
+    format!("{}...", &escaped[..end])
 }
 
 /// Re-apply the per-item caps the D-Bus layer enforces on every `CreateItem`
@@ -153,80 +216,26 @@ fn label_excerpt(label: &str) -> String {
 /// collection the daemon serves happily but that no D-Bus client could ever
 /// have created, and whose items may be unreadable or unmodifiable through
 /// the very API they exist to be reached by.
+///
+/// Which caps, measured how, in which order is [`format::check_caps`]'s
+/// decision, shared with `dbus::collection` and with `import`'s pre-flight
+/// check; all this adds is the mapping into [`VaultError::ImportTooLarge`].
 fn check_import_item(index: usize, item: &ImportItem) -> Result<(), VaultError> {
-    fn too_large(
-        index: usize,
-        label: &str,
-        what: &'static str,
-        len: usize,
-        limit: usize,
-    ) -> VaultError {
-        VaultError::ImportTooLarge {
+    match format::check_caps(
+        &item.label,
+        &item.attributes,
+        item.secret.len(),
+        &item.content_type,
+    ) {
+        None => Ok(()),
+        Some(v) => Err(VaultError::ImportTooLarge {
             index,
-            label: label_excerpt(label),
-            what,
-            len,
-            limit,
-        }
+            label: label_excerpt(&item.label),
+            what: v.cap.as_str(),
+            len: v.actual,
+            limit: v.limit,
+        }),
     }
-    let l = &item.label;
-    if item.secret.len() > format::MAX_ITEM_SECRET {
-        return Err(too_large(
-            index,
-            l,
-            "secret",
-            item.secret.len(),
-            format::MAX_ITEM_SECRET,
-        ));
-    }
-    if item.label.len() > format::MAX_ITEM_LABEL {
-        return Err(too_large(
-            index,
-            l,
-            "label",
-            item.label.len(),
-            format::MAX_ITEM_LABEL,
-        ));
-    }
-    if item.content_type.len() > format::MAX_ITEM_CONTENT_TYPE {
-        return Err(too_large(
-            index,
-            l,
-            "content type",
-            item.content_type.len(),
-            format::MAX_ITEM_CONTENT_TYPE,
-        ));
-    }
-    if item.attributes.len() > format::MAX_ITEM_ATTRIBUTES {
-        return Err(too_large(
-            index,
-            l,
-            "attribute count",
-            item.attributes.len(),
-            format::MAX_ITEM_ATTRIBUTES,
-        ));
-    }
-    for (k, v) in &item.attributes {
-        if k.len() > format::MAX_ATTRIBUTE_KEY {
-            return Err(too_large(
-                index,
-                l,
-                "attribute name",
-                k.len(),
-                format::MAX_ATTRIBUTE_KEY,
-            ));
-        }
-        if v.len() > format::MAX_ATTRIBUTE_VALUE {
-            return Err(too_large(
-                index,
-                l,
-                "attribute value",
-                v.len(),
-                format::MAX_ATTRIBUTE_VALUE,
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub struct Vault {
@@ -246,6 +255,14 @@ pub struct Vault {
     /// [`format::MAX_VAULT_BYTES`]. Overridable only in tests, so the
     /// refusal can be exercised without building a quarter-gigabyte vault.
     size_limit: u64,
+    /// How many times `save_with` has run: what the "one save" claim of
+    /// [`Vault::import_items`] means, and the only way to observe it. A
+    /// successful save renames its temp file away and leaves the directory
+    /// looking exactly as one save or two hundred would, so counting is not
+    /// an alternative to a reachable assertion - it is the only assertion
+    /// there is. Test-only, so the shipped struct is unchanged.
+    #[cfg(test)]
+    saves: u32,
     /// Set once this vault's file has been unlinked by a confirmed delete.
     /// Every save refuses afterwards, so a writer that had already taken a
     /// reference to this vault - and is only now getting its turn on the
@@ -340,6 +357,8 @@ impl Vault {
             index_attributes: true,
             index_warning: None,
             size_limit: format::MAX_VAULT_BYTES,
+            #[cfg(test)]
+            saves: 0,
             retired: false,
         };
         Ok(vault)
@@ -363,6 +382,8 @@ impl Vault {
             index_attributes: true,
             index_warning: None,
             size_limit: format::MAX_VAULT_BYTES,
+            #[cfg(test)]
+            saves: 0,
             retired: false,
         })
     }
@@ -389,6 +410,12 @@ impl Vault {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_size_limit_for_tests(&mut self, limit: u64) {
         self.size_limit = limit;
+    }
+
+    /// How many times this vault has attempted a save; see the `saves` field.
+    #[cfg(test)]
+    fn saves_for_tests(&self) -> u32 {
+        self.saves
     }
 
     /// True when the on-disk index carries attribute hashes for any item.
@@ -867,7 +894,20 @@ impl Vault {
     /// clone every secret in the collection on the success path too.
     ///
     /// Timestamps are taken verbatim from each [`ImportItem`]; ids are
-    /// assigned here, one fresh uuid v4 per item.
+    /// assigned here, one fresh uuid v4 per item. See [`ImportItem`] for what
+    /// "verbatim" costs: they are unvalidated, and one source supplies zeros.
+    ///
+    /// **Duplicate attribute sets are neither replaced nor deduplicated.**
+    /// Unlike [`Vault::insert_item`], which takes a `replace` flag and can
+    /// overwrite an item with the same attributes, this appends every element
+    /// unconditionally: two elements of one batch with identical attributes
+    /// both land, as does an element whose attributes match an item already in
+    /// the collection. Nothing later resolves that - `sm get` reports the pair
+    /// as ambiguous for as long as they both exist, and only an explicit
+    /// delete removes one. Callers wanting at most one item per attribute set
+    /// must guarantee it themselves. The CLI's does, by refusing to import
+    /// into a collection that already exists, but that is a property of that
+    /// caller and not of this method.
     pub fn import_items(&mut self, items: Vec<ImportItem>) -> Result<(), VaultError> {
         // Refuse a locked vault before validating, so the error a caller sees
         // first is the one it can actually do something about.
@@ -1035,6 +1075,10 @@ impl Vault {
         &mut self,
         publish: impl FnOnce(&Path, &[u8]) -> Result<(), VaultError>,
     ) -> Result<(), VaultError> {
+        #[cfg(test)]
+        {
+            self.saves += 1;
+        }
         // Before the lock check, and before anything is mutated: a deleted
         // collection has no file to write and must not grow one back.
         if self.retired {
@@ -2080,15 +2124,27 @@ mod tests {
         assert_ne!(ids[0], ids[1]);
     }
 
-    /// A large batch goes in as one save. The save *count* is not directly
-    /// observable - `save` keeps no counter and a successful `write_atomic`
-    /// leaves no trace of the temp file it renamed - so what is asserted is
-    /// the reachable invariant: 200 items arrive, in order, and the directory
-    /// holds nothing but the vault afterwards.
+    /// A large batch goes in as one save.
+    ///
+    /// The two things a caller can see - 200 items arrive, and the directory
+    /// holds nothing but the vault - hold identically if this looped
+    /// `insert_item` 200 times, because every save renames its temp file
+    /// away; asserting only those left the whole stated point of the API
+    /// untested. `Vault` therefore keeps a `#[cfg(test)]` save counter, and
+    /// the count is what is asserted here.
+    ///
+    /// The counter was chosen over the alternative - a `size_limit` a full
+    /// batch exceeds but a prefix does not, so N saves leave a prefix on disk
+    /// while one save leaves the file untouched - because that one proves
+    /// "not 200 saves" only through a *failed* import, at a threshold that
+    /// has to be re-tuned whenever the encoding's overhead moves, and says
+    /// nothing about the successful path this test is named for.
     #[test]
     fn import_items_takes_a_large_batch_in_one_go() {
         let (dir, path) = tmp();
         let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        // `create` writes the file, so the baseline is taken after it.
+        let saves_before = v.saves_for_tests();
         let batch: Vec<ImportItem> = (0..200)
             .map(|n| {
                 import(
@@ -2101,6 +2157,11 @@ mod tests {
             .collect();
         v.import_items(batch).unwrap();
         assert_eq!(v.items().unwrap().len(), 200);
+        assert_eq!(
+            v.saves_for_tests() - saves_before,
+            1,
+            "200 items cost more than one save: the batch was written item by item"
+        );
 
         let mut reopened = Vault::open(&path).unwrap();
         reopened.unlock(b"pw").unwrap();
@@ -2198,15 +2259,77 @@ mod tests {
         }
 
         // Exactly at each cap is accepted, so the checks are not off by one.
+        // All six are exercised at the boundary and not only at limit+1: an
+        // accidental `>=` in any of them refuses data that is legal, and it
+        // does so silently, mid-migration. The attribute set carries the full
+        // `MAX_ITEM_ATTRIBUTES` pairs, one of them with a name of exactly
+        // `MAX_ATTRIBUTE_KEY` bytes and a value of exactly
+        // `MAX_ATTRIBUTE_VALUE`.
         let mut at_cap = import("edge", b"s", 1, 2);
         at_cap.secret = Zeroizing::new(vec![0u8; format::MAX_ITEM_SECRET]);
         at_cap.label = "L".repeat(format::MAX_ITEM_LABEL);
         at_cap.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE);
-        at_cap.attributes = (0..format::MAX_ITEM_ATTRIBUTES)
+        at_cap.attributes = (0..format::MAX_ITEM_ATTRIBUTES - 1)
             .map(|n| (format!("{n:0>3}"), "v".to_string()))
             .collect();
+        at_cap.attributes.insert(
+            "k".repeat(format::MAX_ATTRIBUTE_KEY),
+            "v".repeat(format::MAX_ATTRIBUTE_VALUE),
+        );
+        assert_eq!(at_cap.attributes.len(), format::MAX_ITEM_ATTRIBUTES);
+        assert!(
+            at_cap
+                .attributes
+                .keys()
+                .any(|k| k.len() == format::MAX_ATTRIBUTE_KEY)
+        );
+        assert!(
+            at_cap
+                .attributes
+                .values()
+                .any(|x| x.len() == format::MAX_ATTRIBUTE_VALUE)
+        );
         v.import_items(vec![at_cap]).unwrap();
         assert_eq!(v.items().unwrap().len(), 2);
+    }
+
+    /// The label a refusal names is peer data - it comes out of a
+    /// gnome-keyring file or a KWallet sidecar - and `CliError`'s
+    /// `From<VaultError>` prints `e.to_string()` to a terminal raw, so it is
+    /// escaped before it ever reaches the message. Escaping happens before
+    /// the excerpt is cut, so no cut can leave a live control byte behind.
+    #[test]
+    fn import_too_large_escapes_the_label_in_its_message() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+
+        // A short label: escaped, uncut.
+        let mut hostile = import("x", b"s", 1, 2);
+        hostile.label = "a\u{1b}[2K\u{202e}b".to_string();
+        hostile.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE + 1);
+        let msg = v.import_items(vec![hostile]).unwrap_err().to_string();
+        assert!(
+            !msg.chars()
+                .any(|c| c.is_control() || format::is_invisible_format(c)),
+            "a control character survived into the message: {msg:?}"
+        );
+        assert!(msg.contains("a\\x1b[2K"), "not escaped: {msg:?}");
+        assert!(msg.contains("\\xe2\\x80\\xae"), "RLO not escaped: {msg:?}");
+
+        // A long one: the excerpt is cut *after* escaping, so the cut can
+        // only ever land inside inert ASCII.
+        let mut long = import("y", b"s", 1, 2);
+        long.label = "\u{1b}".repeat(400);
+        long.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE + 1);
+        let msg = v.import_items(vec![long]).unwrap_err().to_string();
+        assert!(
+            !msg.chars().any(|c| c.is_control()),
+            "a control character survived the truncation: {msg:?}"
+        );
+        assert!(
+            msg.contains("..."),
+            "a long label was not truncated: {msg:?}"
+        );
     }
 
     /// An empty batch changes nothing and does not rewrite the file, and a

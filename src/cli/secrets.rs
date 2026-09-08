@@ -3,16 +3,19 @@
 use super::client::{Client, ItemInfo};
 use super::{CliError, read_secret_from_stdin};
 // A terminal row and a dialog line have the same problem, so they use the
-// same table: `crate::dbus::prompt::is_invisible_format`. This file used to
-// carry its own narrower copy, which omitted the private-use planes, the
-// Arabic number signs, the interlinear annotations and the tag characters —
-// all of which a font may render as anything at all, or as nothing — so a
-// planted item could hide part of an `sm ssh list` row that the dialogs
-// already refused to hide. Found by `fuzz_targets/escape_control_sanitize.rs`
-// on U+F0000; keeping one table is what stops the two drifting again.
-use crate::dbus::prompt::is_invisible_format;
+// same escaper, and it lives in `crate::vault::format` — always compiled,
+// because `src/vault/` is the PAM cdylib's half of the crate too, and the
+// PAM module has peer-supplied text of its own to render. This file used to
+// carry its own copy of the function *and* of the character table, and the
+// table was the narrower one: it omitted the private-use planes, the Arabic
+// number signs, the interlinear annotations and the tag characters — all of
+// which a font may render as anything at all, or as nothing — so a planted
+// item could hide part of an `sm ssh list` row that the dialogs already
+// refused to hide. Found by `fuzz_targets/escape_control_sanitize.rs` on
+// U+F0000; one definition is what stops the two drifting again, and the
+// re-export keeps `super::secrets::escape_control` working for the dozens of
+// call sites (and for `crate::fuzz_api`) that name it here.
 use std::collections::{BTreeMap, HashSet};
-use std::fmt::Write as _;
 use std::io::Write;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -105,25 +108,10 @@ async fn find_inner(
 /// Render a string for a terminal: labels and attribute values come from argv
 /// or from any bus client, so a `\r`, an ANSI escape or a bidi override could
 /// erase, forge or reorder `sm list` rows. Anything below U+0020, plus DEL and
-/// the invisible formatters above, becomes `\xNN` per UTF-8 byte.
-pub(crate) fn escape_control(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut scratch = [0u8; 4];
-    for ch in s.chars() {
-        if ch.is_control() || is_invisible_format(ch) {
-            // `write!` into the buffer we already have: this runs per
-            // attribute key and value per `sm list` row, and on every daemon
-            // error, so the old `ch.to_string()` plus a `format!` per byte was
-            // two allocations for every escaped byte.
-            for b in ch.encode_utf8(&mut scratch).as_bytes() {
-                let _ = write!(out, "\\x{b:02x}");
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
+/// the invisible formatters, becomes `\xNN` per UTF-8 byte.
+///
+/// One definition, in `vault::format`; see the note at the top of this file.
+pub(crate) use crate::vault::format::escape_control;
 
 #[cfg(test)]
 mod tests {

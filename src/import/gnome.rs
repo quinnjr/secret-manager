@@ -53,17 +53,18 @@ use crate::dbus::proxies::{CollectionProxy, ItemProxy, PromptProxy, ServiceProxy
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
 use futures_util::StreamExt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use zbus::Connection;
 use zbus::connection::Builder;
 use zbus::proxy::CacheProperties;
 use zbus::zvariant::{OwnedObjectPath, Value};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 // --------------------------------------------------------------------------
 // Item types
@@ -236,8 +237,14 @@ pub fn classify_bus_owner(busctl_status: Option<&str>, ps_command: Option<&str>)
 /// Runs `busctl --user status org.freedesktop.secrets` and then
 /// `ps -p <pid> -o cmd=`, each under [`COMMAND_TIMEOUT`].
 ///
-/// Reusable on purpose: the CLI asks this question before it offers any
-/// session-bus route, and the answer is the same question this module asks.
+/// **Nothing in the shipped code path calls this.** It is written to be the
+/// precondition of a session-bus route, and the only production caller it is
+/// intended for is `extract_gnome` in `src/cli/import.rs`, which does not yet
+/// invoke it — today that function goes straight to
+/// [`extract_over_private_bus`], which stands up its own gnome-keyring and so
+/// cannot read the wrong provider. Until the CLI wires
+/// [`require_gnome_keyring_owner`] in, this function and everything it feeds
+/// are reachable only from this module's tests.
 pub async fn secrets_bus_owner() -> Result<BusOwner, GnomeError> {
     let status = run_capture("busctl", &["--user", "status", SECRETS_BUS_NAME]).await?;
     let Some(pid) = status.as_deref().and_then(parse_busctl_pid) else {
@@ -247,11 +254,20 @@ pub async fn secrets_bus_owner() -> Result<BusOwner, GnomeError> {
     Ok(classify_bus_owner(status.as_deref(), ps.as_deref()))
 }
 
-/// The precondition, with no override flag.
+/// The precondition a session-bus route needs — **not currently called**.
 ///
 /// A `--from` that disagrees with the bus is a user error worth stopping for,
 /// not a warning worth printing: the failure it prevents is a silent,
-/// successful-looking migration of the wrong data.
+/// successful-looking migration of the wrong data. That is the argument for
+/// the check; it is not a description of what runs today.
+///
+/// No production code calls this. [`GnomeError::WrongBusOwner`] is therefore
+/// unconstructible outside this module, even though `src/cli/import.rs`
+/// already classifies it. The intended caller is `extract_gnome` in
+/// `src/cli/import.rs`, which must call this before it offers any route that
+/// reads `org.freedesktop.secrets` from the *real* session bus; the private-bus
+/// route it uses today does not need it, because the daemon it reads is one it
+/// started itself. There is deliberately no override flag when it is wired in.
 pub async fn require_gnome_keyring_owner() -> Result<BusOwner, GnomeError> {
     let owner = secrets_bus_owner().await?;
     if owner.is_gnome_keyring() {
@@ -293,7 +309,10 @@ async fn run_capture(program: &str, args: &[&str]) -> Result<Option<String>, Gno
     if !out.status.success() {
         return Ok(None);
     }
-    Ok(String::from_utf8(out.stdout).ok())
+    // Lossy, not `from_utf8().ok()`: a stray non-UTF-8 byte in a `ps` line
+    // must not turn into the same `None` that means "the command failed",
+    // which is the answer that decides an owner is unidentified.
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
 }
 
 // --------------------------------------------------------------------------
@@ -313,6 +332,31 @@ pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// latency, and long enough that a prompter which *is* present (a session-bus
 /// route, a test) has room to answer.
 pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// One aggregate bound on the per-item `GetSecret` fallback.
+///
+/// Without it the fallback is N × [`CALL_TIMEOUT`] with no deadline at all, so
+/// a source that answers every call slowly turns a batch that failed once into
+/// an unbounded walk. The batch is the fast path; this is the slow one, and it
+/// gets a budget rather than a per-call allowance.
+pub const SECRETS_FALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The most collections a source may offer before the walk refuses it.
+///
+/// Nothing on the wire bounds these lists, and the failure this module exists
+/// to avoid is a truncated migration that reports success — so the cap refuses
+/// rather than truncating. Both numbers are far above any real keyring: the
+/// author's machine has 3 collections and 28 items in the largest.
+pub const MAX_COLLECTIONS: usize = 512;
+/// The most items one collection may offer before the walk refuses it.
+pub const MAX_ITEMS_PER_COLLECTION: usize = 100_000;
+/// How much of `gnome-keyring-daemon`'s stderr is kept for an error message.
+///
+/// Bounded on purpose in both directions: an unread pipe fills at 64 KiB and
+/// blocks the child, and an unbounded buffer lets the child choose how much of
+/// our memory to spend. What matters is the first line or two — "The password
+/// or PIN is incorrect" — which is why the *head* is kept and the tail
+/// dropped.
+pub const STDERR_CAPTURE_LIMIT: usize = 4096;
 
 /// Every way this module can fail, each one named so a report can say which.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -333,11 +377,14 @@ pub enum GnomeError {
     #[error("the private session bus did not print an address within {waited:?}")]
     BusNeverReady { waited: Duration },
 
+    /// `detail` carries what the daemon said on stderr and the last error the
+    /// readiness poll saw, so the message can name the cause — a wrong
+    /// password above all — instead of guessing at it.
     #[error(
         "gnome-keyring-daemon did not take {SECRETS_BUS_NAME} on the private bus within \
-         {waited:?}; the password may be wrong"
+         {waited:?}: {detail}"
     )]
-    KeyringNeverReady { waited: Duration },
+    KeyringNeverReady { waited: Duration, detail: String },
 
     #[error("gnome-keyring-daemon exited before it took {SECRETS_BUS_NAME}: {detail}")]
     KeyringExited { detail: String },
@@ -356,11 +403,48 @@ pub enum GnomeError {
     #[error("the unlock prompt for {object} was dismissed")]
     PromptDismissed { object: String },
 
+    /// `Service.Unlock` returned neither the object nor a prompt. Distinct
+    /// from [`GnomeError::UnanswerablePrompt`], which used to be reported
+    /// here and made three false claims about it: there was no prompt, no
+    /// prompter was involved, and nothing was waited for.
+    #[error(
+        "gnome-keyring did not unlock {object} and offered no prompt to unlock it with, \
+         so nothing further can be tried"
+    )]
+    UnlockOfferedNothing { object: String },
+
+    /// The prompt completed without being dismissed, and the objects it says
+    /// it unlocked do not include the one we asked for. A prompt that
+    /// completes is not a prompt that succeeded, and this is the difference.
+    #[error("the unlock prompt for {object} completed without unlocking it")]
+    PromptUnlockedNothing { object: String },
+
+    #[error(
+        "the source offered {count} {what}, over the {limit} this import accepts; \
+         refusing rather than reading part of it"
+    )]
+    TooMany {
+        what: &'static str,
+        count: usize,
+        limit: usize,
+    },
+
     #[error("{call} failed: {message}")]
     Bus { call: String, message: String },
 
     #[error("{call} did not answer within {waited:?}")]
     CallTimeout { call: String, waited: Duration },
+
+    #[error(
+        "this gnome-keyring holds no keyring named '{container}'; it holds {available}. \
+         Import names one keyring, so a name that matches none of them would import \
+         nothing and report success"
+    )]
+    NoSuchCollection {
+        container: String,
+        /// The labels the walk did see, already sanitized for display.
+        available: String,
+    },
 
     #[error("could not open a session with gnome-keyring: {message}")]
     NoSession { message: String },
@@ -382,6 +466,47 @@ async fn call<T>(
         })?
         .map_err(|e| GnomeError::Bus {
             call: name.to_string(),
+            message: e.to_string(),
+        })
+}
+
+/// Builds any of the generated proxies at `path`, with property caching off
+/// and both failure modes named by `call`.
+///
+/// The same six-line builder-plus-`map_err` block appeared once per proxy
+/// type; the generated proxies all implement [`zbus::proxy::Defaults`] and
+/// `From<zbus::Proxy>`, which is exactly the bound that lets one function
+/// stand in for all of them.
+async fn proxy_at<T>(conn: &Connection, call: &str, path: &OwnedObjectPath) -> Result<T, GnomeError>
+where
+    T: zbus::proxy::Defaults + From<zbus::Proxy<'static>>,
+{
+    zbus::proxy::Builder::<'static, T>::new(conn)
+        .path(path.clone())
+        .map_err(|e| GnomeError::Bus {
+            call: call.to_string(),
+            message: e.to_string(),
+        })?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .map_err(|e| GnomeError::Bus {
+            call: call.to_string(),
+            message: e.to_string(),
+        })
+}
+
+/// [`proxy_at`] for a proxy that carries its own default path.
+async fn proxy_default<T>(conn: &Connection, call: &str) -> Result<T, GnomeError>
+where
+    T: zbus::proxy::Defaults + From<zbus::Proxy<'static>>,
+{
+    zbus::proxy::Builder::<'static, T>::new(conn)
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .map_err(|e| GnomeError::Bus {
+            call: call.to_string(),
             message: e.to_string(),
         })
 }
@@ -448,10 +573,67 @@ impl Drop for PrivateDir {
 /// Dropping it kills both children. [`PrivateKeyring::shutdown`] is the
 /// ordinary path and waits for them; `Drop` is the backstop for a panic or an
 /// early return, which is why both exist.
+/// The head of a child's stderr, collected by a task so the pipe never fills.
+///
+/// A `gnome-keyring-daemon` that refuses the password says so on stderr and
+/// nowhere else; piping that and never reading it threw away the cause of
+/// every startup failure and, at 64 KiB, would have blocked the child.
+#[derive(Clone, Default)]
+struct StderrTail(Arc<Mutex<String>>);
+
+impl StderrTail {
+    /// Reads `stderr` to EOF on a task, keeping at most
+    /// [`STDERR_CAPTURE_LIMIT`] bytes.
+    fn drain(stderr: tokio::process::ChildStderr) -> StderrTail {
+        let tail = StderrTail::default();
+        let sink = tail.0.clone();
+        tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut buf = [0u8; 1024];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        let Ok(mut held) = sink.lock() else { return };
+                        if held.len() >= STDERR_CAPTURE_LIMIT {
+                            continue;
+                        }
+                        let room = STDERR_CAPTURE_LIMIT - held.len();
+                        let chunk = &buf[..n.min(room)];
+                        held.push_str(&String::from_utf8_lossy(chunk));
+                    }
+                }
+            }
+        });
+        tail
+    }
+
+    /// What the daemon said, sanitised: it is peer text on its way to a
+    /// terminal, so it goes through [`display_label`] like every other.
+    /// `None` when it said nothing.
+    fn text(&self) -> Option<String> {
+        let held = self.0.lock().ok()?;
+        let trimmed = held.trim();
+        (!trimmed.is_empty()).then(|| display_label(trimmed))
+    }
+
+    /// `detail` for an error, combining what the daemon said with whatever
+    /// else the caller knows. Never empty, so no message ends in a colon.
+    fn detail(&self, fallback: &str) -> String {
+        match self.text() {
+            Some(said) => format!("{fallback}; gnome-keyring-daemon said: {said}"),
+            None => format!("{fallback}; it printed nothing on stderr"),
+        }
+    }
+}
+
 pub struct PrivateKeyring {
     bus: Reaped,
     keyring: Reaped,
     address: String,
+    /// What the private gnome-keyring printed on stderr, so a failure can
+    /// name its cause instead of saying the password "may" be wrong.
+    stderr: StderrTail,
     /// Mode-0700, removed on drop, and never `/run/user/<uid>/keyring`: a
     /// private control directory is what keeps this daemon from colliding
     /// with a real one.
@@ -536,15 +718,23 @@ impl PrivateKeyring {
             started.env("XDG_DATA_HOME", home);
         }
 
-        let keyring = Reaped(Some(started.spawn().map_err(|e| GnomeError::Spawn {
+        let mut child = started.spawn().map_err(|e| GnomeError::Spawn {
             program: GNOME_KEYRING_PROGRAM.into(),
             message: e.to_string(),
-        })?));
+        })?;
+        // Drained immediately: an unread 64 KiB pipe blocks the child, and
+        // the only account of a wrong password is on it.
+        let stderr = match child.stderr.take() {
+            Some(pipe) => StderrTail::drain(pipe),
+            None => StderrTail::default(),
+        };
+        let keyring = Reaped(Some(child));
 
         let mut this = PrivateKeyring {
             bus,
             keyring,
             address,
+            stderr,
             _control_dir: control_dir,
         };
         // From here every failure goes through `shutdown`, so neither child
@@ -561,6 +751,7 @@ impl PrivateKeyring {
     }
 
     async fn feed_password(&mut self, password: &Zeroizing<Vec<u8>>) -> Result<(), GnomeError> {
+        let stderr = self.stderr.clone();
         let Some(child) = self.keyring.0.as_mut() else {
             return Err(GnomeError::KeyringExited {
                 detail: "the daemon was never spawned".into(),
@@ -589,7 +780,7 @@ impl PrivateKeyring {
                 waited: COMMAND_TIMEOUT,
             })?
             .map_err(|e| GnomeError::KeyringExited {
-                detail: e.to_string(),
+                detail: stderr.detail(&format!("writing the password failed: {e}")),
             })?;
         // Dropping the pipe is the EOF the reader may be waiting for.
         drop(stdin);
@@ -598,29 +789,49 @@ impl PrivateKeyring {
 
     /// Polls until gnome-keyring owns [`SECRETS_BUS_NAME`] on the private bus,
     /// or the child dies, or [`STARTUP_TIMEOUT`] expires.
+    /// The bus connection is built **once** and the property call is what
+    /// repeats. Rebuilding a whole `Connection` every 100 ms for up to 200
+    /// iterations is 200 handshakes to answer one question, and discarding
+    /// every error left [`GnomeError::KeyringNeverReady`] unable to say what
+    /// had failed. The last error is kept and reported.
     async fn await_name(&mut self) -> Result<(), GnomeError> {
         let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        let mut proxy: Option<ServiceProxy<'static>> = None;
+        let mut last_error = String::from("it never answered a property call");
         loop {
             if let Some(child) = self.keyring.0.as_mut()
                 && let Ok(Some(status)) = child.try_wait()
             {
                 return Err(GnomeError::KeyringExited {
-                    detail: format!("exited with {status}"),
+                    detail: self.stderr.detail(&format!("exited with {status}")),
                 });
             }
-            if let Ok(builder) = Builder::address(self.address.as_str())
-                && let Ok(conn) = builder.build().await
-                && let Ok(proxy) = ServiceProxy::builder(&conn)
-                    .cache_properties(CacheProperties::No)
-                    .build()
-                    .await
-                && proxy.collections().await.is_ok()
-            {
-                return Ok(());
+            if proxy.is_none() {
+                // The bus is up before the keyring is, so a connection that
+                // fails here is retried; one that succeeds is kept.
+                match Builder::address(self.address.as_str()) {
+                    Ok(builder) => match builder.build().await {
+                        Ok(conn) => {
+                            match proxy_default::<ServiceProxy<'static>>(&conn, "Service").await {
+                                Ok(p) => proxy = Some(p),
+                                Err(e) => last_error = e.to_string(),
+                            }
+                        }
+                        Err(e) => last_error = e.to_string(),
+                    },
+                    Err(e) => last_error = e.to_string(),
+                }
+            }
+            if let Some(proxy) = proxy.as_ref() {
+                match proxy.collections().await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => last_error = e.to_string(),
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(GnomeError::KeyringNeverReady {
                     waited: STARTUP_TIMEOUT,
+                    detail: self.stderr.detail(&display_label(&last_error)),
                 });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -702,40 +913,28 @@ pub async fn await_prompt(
     prompt: &OwnedObjectPath,
     timeout: Duration,
 ) -> Result<zbus::zvariant::OwnedValue, GnomeError> {
-    let proxy = PromptProxy::builder(conn)
-        .path(prompt.clone())
-        .map(|b| b.cache_properties(CacheProperties::No))
-        .map_err(|e| GnomeError::Bus {
-            call: "Prompt".into(),
-            message: e.to_string(),
-        })?
-        .build()
-        .await
-        .map_err(|e| GnomeError::Bus {
-            call: "Prompt".into(),
-            message: e.to_string(),
-        })?;
+    let proxy: PromptProxy<'static> = proxy_at(conn, "Prompt", prompt).await?;
     let mut completed = call("Prompt.Completed subscribe", proxy.receive_completed()).await?;
     call("Prompt.Prompt", proxy.prompt("")).await?;
 
     let signal = match tokio::time::timeout(timeout, completed.next()).await {
-        Ok(Some(signal)) => signal,
-        Ok(None) => {
-            return Err(GnomeError::UnanswerablePrompt {
-                object: prompt.as_str().to_string(),
-                waited: timeout,
-            });
-        }
-        Err(_) => {
-            // Best effort: the dialog nobody can answer should not outlive us
-            // either. Its failure is not interesting — the prompt is already
-            // being reported as unanswerable.
-            let _ = tokio::time::timeout(COMMAND_TIMEOUT, proxy.dismiss()).await;
-            return Err(GnomeError::UnanswerablePrompt {
-                object: prompt.as_str().to_string(),
-                waited: timeout,
-            });
-        }
+        Ok(Some(signal)) => Some(signal),
+        // A stream that ends without a signal and a wait that expires are the
+        // same outcome — no answer — so they take the same exit, dismiss
+        // included. Dismissing on only one of the two left a dialog alive for
+        // a caller that had stopped listening, which is the thing the doc
+        // above promises does not happen.
+        Ok(None) | Err(_) => None,
+    };
+    let Some(signal) = signal else {
+        // Best effort: the dialog nobody can answer should not outlive us
+        // either. Its failure is not interesting — the prompt is already
+        // being reported as unanswerable.
+        let _ = tokio::time::timeout(COMMAND_TIMEOUT, proxy.dismiss()).await;
+        return Err(GnomeError::UnanswerablePrompt {
+            object: prompt.as_str().to_string(),
+            waited: timeout,
+        });
     };
     let args = signal.args().map_err(|e| GnomeError::Bus {
         call: "Prompt.Completed".into(),
@@ -797,7 +996,9 @@ pub struct CollectionSummary {
 pub struct ExtractedItem {
     pub item: SourceItem,
     /// gnome-keyring's `Item.Type` string, or `None` when the daemon does not
-    /// expose the property.
+    /// expose the property at all. Never `None` because the read *failed*:
+    /// an item whose type could not be read is refused rather than carried,
+    /// so this is an absent property and never an unanswered one.
     pub item_type: Option<String>,
 }
 
@@ -840,6 +1041,13 @@ pub struct Extraction {
     /// No item exposed `Item.Type`, so the chained-item refusal could not be
     /// evaluated on this source. A refusal that cannot fire is worse than
     /// none, because it looks like protection; the caller must say so.
+    ///
+    /// Set only when no item answered the property with a type. An item whose
+    /// type read *failed* does not clear this flag and does not need to: it is
+    /// refused outright, so the refusal did fire for it. This is the backstop
+    /// for a provider that has no `Type` property at all, and it was never a
+    /// backstop for a single flaky read — which is why that case is refused
+    /// per item rather than left to this flag.
     pub item_type_unavailable: bool,
 }
 
@@ -849,6 +1057,27 @@ impl Extraction {
     /// so — this names why.
     pub fn unanswerable_collections(&self) -> impl Iterator<Item = &CollectionSummary> {
         self.collections.iter().filter(|c| c.unanswerable_prompt)
+    }
+
+    /// The distinct containers the items came from, in walk order.
+    ///
+    /// A walk with no [`ExtractOptions::only_container`] covers *every*
+    /// keyring the source daemon holds, so a caller that labels its
+    /// destination collection after one of them is telling the truth only when
+    /// this has one element. Either name the keyring in the options, or read
+    /// this and label honestly; the caller must not assume it walked one.
+    pub fn containers(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for container in self
+            .items
+            .iter()
+            .map(|e| e.item.provenance.container.as_str())
+        {
+            if !out.contains(&container) {
+                out.push(container);
+            }
+        }
+        out
     }
 }
 
@@ -863,6 +1092,26 @@ pub struct ExtractOptions {
     /// `XDG_DATA_HOME` for the private gnome-keyring, or `None` for the
     /// user's own. See [`PrivateKeyring::start`].
     pub data_home: Option<PathBuf>,
+    /// Walk **only** the collection with this container name, or every
+    /// collection when `None`.
+    ///
+    /// A gnome-keyring session exposes every keyring it holds, so an
+    /// unfiltered walk is a walk of all of them. The caller, meanwhile,
+    /// located *one* `.keyring` file and labels the destination collection
+    /// after it — so on a user with `login.keyring` and `work.keyring` the
+    /// items of both were written into one collection named after whichever
+    /// the `default` file happened to name. A label that misdescribes its
+    /// contents is the one thing a migration report must not produce, and the
+    /// walk is the side that can fix it: the caller cannot un-mix items after
+    /// the fact.
+    ///
+    /// The name is matched against the same string the walk records in each
+    /// item's [`Provenance`]: `Collection.Label`, or the last segment of the
+    /// object path when the label is empty. That is the keyring's display
+    /// name, which is exactly what the `.keyring` header carries. A name that
+    /// matches no collection is [`GnomeError::NoSuchCollection`] rather than
+    /// an empty, successful import.
+    pub only_container: Option<String>,
 }
 
 impl Default for ExtractOptions {
@@ -871,6 +1120,7 @@ impl Default for ExtractOptions {
             prompt_timeout: PROMPT_TIMEOUT,
             prefer_dh: true,
             data_home: None,
+            only_container: None,
         }
     }
 }
@@ -911,14 +1161,7 @@ pub async fn extract(
     conn: &Connection,
     options: &ExtractOptions,
 ) -> Result<Extraction, GnomeError> {
-    let service = ServiceProxy::builder(conn)
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(|e| GnomeError::Bus {
-            call: "Service".into(),
-            message: e.to_string(),
-        })?;
+    let service: ServiceProxy<'static> = proxy_default(conn, "Service").await?;
 
     let (session, cipher, algorithm, plain_fallback_reason) =
         open_session(&service, options.prefer_dh).await?;
@@ -933,141 +1176,211 @@ pub async fn extract(
         item_type_unavailable: false,
     };
 
-    let default_path = call("Service.ReadAlias", service.read_alias("default"))
-        .await
-        .ok()
-        .filter(|p| p.as_str() != NO_PROMPT);
-
-    let mut saw_type = false;
-    let mut saw_item = false;
-
-    for path in call("Service.Collections", service.collections()).await? {
-        if is_session_collection(path.as_str()) {
-            continue;
-        }
-        let collection = CollectionProxy::builder(conn)
-            .path(path.clone())
-            .map(|b| b.cache_properties(CacheProperties::No))
-            .map_err(|e| GnomeError::Bus {
-                call: "Collection".into(),
-                message: e.to_string(),
-            })?
-            .build()
+    // Every `?` from here to the close belongs to this block, not to the
+    // function: the session holds the transport key, and closing it only on
+    // the success path left one open on the source daemon for every failure.
+    let walked = async {
+        let default_path = call("Service.ReadAlias", service.read_alias("default"))
             .await
-            .map_err(|e| GnomeError::Bus {
-                call: "Collection".into(),
-                message: e.to_string(),
-            })?;
+            .ok()
+            .filter(|p| p.as_str() != NO_PROMPT);
 
-        let label = call("Collection.Label", collection.label())
-            .await
-            .unwrap_or_default();
-        let container = if label.is_empty() {
-            path.as_str().rsplit('/').next().unwrap_or("keyring").into()
-        } else {
-            label.clone()
-        };
-        let locked = call("Collection.Locked", collection.locked())
-            .await
-            .unwrap_or(true);
+        let mut saw_type = false;
+        let mut saw_item = false;
+        // Every container name the walk saw, filtered or not, so a filter that
+        // matches nothing can say what was actually there.
+        let mut seen_containers: Vec<String> = Vec::new();
 
-        let mut summary = CollectionSummary {
-            path: path.as_str().to_string(),
-            label,
-            locked,
-            created: call("Collection.Created", collection.created())
-                .await
-                .unwrap_or(0),
-            modified: call("Collection.Modified", collection.modified())
-                .await
-                .unwrap_or(0),
-            item_count: 0,
-            unanswerable_prompt: false,
-        };
-
-        if locked {
-            match unlock(conn, &service, &path, options.prompt_timeout).await {
-                Ok(()) => summary.locked = false,
-                Err(GnomeError::UnanswerablePrompt { .. } | GnomeError::PromptDismissed { .. }) => {
-                    // Named, reported, and survivable: the other keyrings are
-                    // still worth reading, and the report says this one was
-                    // not.
-                    summary.unanswerable_prompt = true;
-                    out.collections.push(summary);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
+        let collections = call("Service.Collections", service.collections()).await?;
+        if collections.len() > MAX_COLLECTIONS {
+            return Err(GnomeError::TooMany {
+                what: "collections",
+                count: collections.len(),
+                limit: MAX_COLLECTIONS,
+            });
         }
 
-        if default_path.as_ref().is_some_and(|d| *d == path) {
-            out.default_collection = Some(container.clone());
-        }
-
-        let items = call("Collection.Items", collection.items()).await?;
-        summary.item_count = items.len();
-        out.collections.push(summary);
-
-        // Two passes. The first reads *about* every item; the second fetches
-        // secrets for the ones that are not refused, so an unlock credential's
-        // bytes never cross the bus at all.
-        let mut candidates = Vec::new();
-        for item_path in items {
-            saw_item = true;
-            let meta = read_metadata(conn, &item_path, &container).await?;
-            if meta.item_type.is_some() {
-                saw_type = true;
-            }
-            if meta
-                .item_type
-                .as_deref()
-                .is_some_and(is_unlock_credential_type)
-            {
-                let code = meta
-                    .item_type
-                    .as_deref()
-                    .and_then(item_type_code)
-                    .unwrap_or(ITEM_TYPE_CHAINED_KEYRING_PASSWORD);
-                out.refused.push(ItemReport::refused(
-                    meta.provenance,
-                    meta.label,
-                    Refusal::ChainedKeyringItem { item_type: code },
-                ));
+        for path in collections {
+            if is_session_collection(path.as_str()) {
                 continue;
             }
-            candidates.push((item_path, meta));
+            let collection: CollectionProxy<'static> = proxy_at(conn, "Collection", &path).await?;
+
+            let label = call("Collection.Label", collection.label())
+                .await
+                .unwrap_or_default();
+            let container = if label.is_empty() {
+                path.as_str().rsplit('/').next().unwrap_or("keyring").into()
+            } else {
+                label.clone()
+            };
+            seen_containers.push(container.clone());
+            // Filtered here, before the unlock and before any summary: a
+            // keyring the caller did not name must not be unlocked, must not
+            // prompt, and must not contribute items to a collection labelled
+            // after a different keyring. See `ExtractOptions::only_container`.
+            if options
+                .only_container
+                .as_ref()
+                .is_some_and(|only| *only != container)
+            {
+                continue;
+            }
+
+            let locked = call("Collection.Locked", collection.locked())
+                .await
+                .unwrap_or(true);
+
+            let mut summary = CollectionSummary {
+                path: path.as_str().to_string(),
+                label,
+                locked,
+                created: call("Collection.Created", collection.created())
+                    .await
+                    .unwrap_or(0),
+                modified: call("Collection.Modified", collection.modified())
+                    .await
+                    .unwrap_or(0),
+                item_count: 0,
+                unanswerable_prompt: false,
+            };
+
+            if locked {
+                match unlock(conn, &service, &path, options.prompt_timeout).await {
+                    Ok(()) => summary.locked = false,
+                    Err(
+                        GnomeError::UnanswerablePrompt { .. }
+                        | GnomeError::PromptDismissed { .. }
+                        | GnomeError::UnlockOfferedNothing { .. }
+                        | GnomeError::PromptUnlockedNothing { .. },
+                    ) => {
+                        // Named, reported, and survivable: the other keyrings are
+                        // still worth reading, and the report says this one was
+                        // not.
+                        summary.unanswerable_prompt = true;
+                        out.collections.push(summary);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            if default_path.as_ref().is_some_and(|d| *d == path) {
+                out.default_collection = Some(container.clone());
+            }
+
+            // A collection whose item list cannot be read is *not* made a
+            // per-collection skip: unlike an item, it has no report to carry the
+            // shortfall, so continuing here would drop an unknown number of items
+            // out of a run that then claims success. Aborting is the loud
+            // failure, and it is the right one.
+            let items = call("Collection.Items", collection.items()).await?;
+            if items.len() > MAX_ITEMS_PER_COLLECTION {
+                return Err(GnomeError::TooMany {
+                    what: "items in one collection",
+                    count: items.len(),
+                    limit: MAX_ITEMS_PER_COLLECTION,
+                });
+            }
+            summary.item_count = items.len();
+            out.collections.push(summary);
+
+            // Two passes. The first reads *about* every item; the second fetches
+            // secrets for the ones that are not refused, so an unlock credential's
+            // bytes never cross the bus at all.
+            let mut candidates = Vec::new();
+            for item_path in items {
+                saw_item = true;
+                let meta = match read_metadata(conn, &item_path, &container).await? {
+                    Metadata::Read(meta) => *meta,
+                    Metadata::Refused(report) => {
+                        out.refused.push(*report);
+                        continue;
+                    }
+                };
+                match &meta.item_type {
+                    ItemType::Known(t) => {
+                        saw_type = true;
+                        if is_unlock_credential_type(t) {
+                            let code =
+                                item_type_code(t).unwrap_or(ITEM_TYPE_CHAINED_KEYRING_PASSWORD);
+                            out.refused.push(ItemReport::refused(
+                                meta.provenance,
+                                meta.label,
+                                Refusal::ChainedKeyringItem { item_type: code },
+                            ));
+                            continue;
+                        }
+                    }
+                    // The property is absent, which is a provider whose types we
+                    // cannot see — benign, and the item is carried.
+                    ItemType::Unsupported => {}
+                    // The property exists and the read failed. That is refused,
+                    // not carried: `is_unlock_credential_type` on a type we could
+                    // not read is false, so carrying it would import an unlock
+                    // credential on the strength of a failed read, and the read
+                    // that failed is one the foreign daemon controls.
+                    ItemType::Unreadable(_) => {
+                        out.refused.push(ItemReport::refused(
+                            meta.provenance,
+                            meta.label,
+                            // What is true is that the read failed — not that
+                            // the item is a chained-keyring password. Recording
+                            // the refusal it protects against would put "item
+                            // type 3 unlocks another keyring" in a security
+                            // report about an item whose type nobody knows.
+                            Refusal::UnreadableItemType,
+                        ));
+                        continue;
+                    }
+                }
+                candidates.push((item_path, meta));
+            }
+
+            fetch_secrets(
+                &Walk {
+                    conn,
+                    service: &service,
+                    session: &session,
+                    cipher: &cipher,
+                },
+                candidates,
+                &mut out.items,
+                &mut out.refused,
+            )
+            .await?;
         }
 
-        fetch_secrets(
-            conn,
-            &service,
-            &session,
-            &cipher,
-            candidates,
-            &mut out.items,
-            &mut out.refused,
-        )
-        .await?;
-    }
+        if let Some(only) = &options.only_container
+            && !seen_containers.iter().any(|c| c == only)
+        {
+            return Err(GnomeError::NoSuchCollection {
+                container: display_label(only),
+                available: if seen_containers.is_empty() {
+                    "none".to_string()
+                } else {
+                    seen_containers
+                        .iter()
+                        .map(|c| format!("'{}'", display_label(c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            });
+        }
 
-    out.item_type_unavailable = saw_item && !saw_type;
+        out.item_type_unavailable = saw_item && !saw_type;
+        Ok(out)
+    }
+    .await;
 
     // The session holds the transport key; close it rather than leaving it
-    // for the daemon to garbage-collect when we disconnect.
-    if let Ok(proxy) = SessionProxy::builder(conn)
-        .path(session.clone())
-        .map(|b| b.cache_properties(CacheProperties::No))
-        .map_err(|e| GnomeError::Bus {
-            call: "Session".into(),
-            message: e.to_string(),
-        })?
-        .build()
-        .await
-    {
+    // for the daemon to garbage-collect when we disconnect. Unconditional:
+    // it runs before the walk's error is propagated, not instead of it.
+    if let Ok(proxy) = proxy_at::<SessionProxy<'static>>(conn, "Session", &session).await {
         let _ = tokio::time::timeout(COMMAND_TIMEOUT, proxy.close()).await;
     }
 
-    Ok(out)
+    walked
 }
 
 /// `OpenSession`, DH first.
@@ -1102,7 +1415,14 @@ async fn open_session(
                 return Ok((path, cipher, ALGORITHM_DH, None));
             }
             Err(e) => {
-                let reason = format!("the source refused {ALGORITHM_DH}: {e}");
+                // The peer chose this text and it is printed verbatim by
+                // `sm import`, which interpolates `plain_fallback_reason`
+                // without escaping it. Sanitised here, at construction, so
+                // there is no unsanitised copy for a caller to reach.
+                let reason = format!(
+                    "the source refused {ALGORITHM_DH}: {}",
+                    display_label(&e.to_string())
+                );
                 let (_, path) = call(
                     "Service.OpenSession(plain)",
                     service.open_session(ALGORITHM_PLAIN, &Value::from("")),
@@ -1138,25 +1458,96 @@ async fn unlock(
         return Ok(());
     }
     if prompt.as_str() == NO_PROMPT {
-        // No prompt and not unlocked: nothing further can be done, and this
-        // is the same shortfall an unanswerable prompt produces.
-        return Err(GnomeError::UnanswerablePrompt {
+        // No prompt and not unlocked: nothing further can be done. The same
+        // shortfall as an unanswerable prompt, but not the same event — it is
+        // reported as itself rather than as a wait that never happened.
+        return Err(GnomeError::UnlockOfferedNothing {
             object: path.as_str().to_string(),
-            waited: Duration::ZERO,
         });
     }
-    await_prompt(conn, &prompt, prompt_timeout).await?;
+    // The `Completed` signal's result is `ao`: the objects the prompt
+    // actually unlocked. Discarding it made a prompt that completed with
+    // `dismissed = false` and an empty result look like a success, so the
+    // collection was marked unlocked, `GetSecrets` then failed on it, and the
+    // per-item fallback aborted the whole migration instead of skipping one
+    // collection. A prompt that completes is not a prompt that succeeded.
+    let result = await_prompt(conn, &prompt, prompt_timeout).await?;
+    let unlocked = Vec::<OwnedObjectPath>::try_from(result).unwrap_or_default();
+    if !unlocked.contains(path) {
+        return Err(GnomeError::PromptUnlockedNothing {
+            object: path.as_str().to_string(),
+        });
+    }
     Ok(())
 }
 
 /// Everything about one item except its secret.
+/// What one metadata read produced: everything the walk needs, or a per-item
+/// refusal to record before moving to the next item.
+///
+/// The refusal is a value rather than an error because the distinction it
+/// draws is the one that matters here — a `GnomeError` aborts the walk and
+/// discards every item already read, and one item whose attributes the source
+/// daemon would not return is not a reason to lose the other twenty-seven.
+enum Metadata {
+    Read(Box<ItemMetadata>),
+    Refused(Box<ItemReport>),
+}
+
 struct ItemMetadata {
     label: String,
     attributes: BTreeMap<String, String>,
     created: u64,
     modified: u64,
-    item_type: Option<String>,
+    item_type: ItemType,
     provenance: Provenance,
+}
+
+/// What one `Item.Type` read established — three outcomes, not two.
+///
+/// Collapsing them into `Option<String>` is what made the chained-keyring
+/// refusal fail open: `None` meant both "this provider has no `Type`
+/// property", which is benign, and "the read errored or timed out", which is
+/// the case the foreign daemon controls and the one an unlock credential
+/// would arrive through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ItemType {
+    /// The daemon answered with a type string.
+    Known(String),
+    /// The daemon answered `UnknownProperty` or `InvalidArgs`: it does not
+    /// implement the property at all. Our own daemon answers this way.
+    Unsupported,
+    /// The read failed or timed out. Nothing was established.
+    Unreadable(String),
+}
+
+impl ItemType {
+    /// The type string, for a report — `None` for both non-answers, which is
+    /// the shape [`ExtractedItem`] and the report have always spoken in.
+    fn known(&self) -> Option<&str> {
+        match self {
+            ItemType::Known(t) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Classifies one property-read outcome. A D-Bus method error naming
+    /// `UnknownProperty` or `InvalidArgs` is the daemon saying the property
+    /// does not exist; **everything else** — any other error, and the timeout
+    /// — is a read that failed.
+    fn classify(outcome: Result<zbus::Result<String>, tokio::time::error::Elapsed>) -> ItemType {
+        match outcome {
+            Ok(Ok(t)) => ItemType::Known(t),
+            Ok(Err(zbus::Error::MethodError(name, _, _)))
+                if name.as_str().ends_with(".UnknownProperty")
+                    || name.as_str().ends_with(".InvalidArgs") =>
+            {
+                ItemType::Unsupported
+            }
+            Ok(Err(e)) => ItemType::Unreadable(display_label(&e.to_string())),
+            Err(_) => ItemType::Unreadable(format!("it did not answer within {CALL_TIMEOUT:?}")),
+        }
+    }
 }
 
 /// gnome-keyring's non-standard `Type` property, and nothing else.
@@ -1180,71 +1571,76 @@ async fn read_metadata(
     conn: &Connection,
     path: &OwnedObjectPath,
     container: &str,
-) -> Result<ItemMetadata, GnomeError> {
-    let item = ItemProxy::builder(conn)
-        .path(path.clone())
-        .map(|b| b.cache_properties(CacheProperties::No))
-        .map_err(|e| GnomeError::Bus {
-            call: "Item".into(),
-            message: e.to_string(),
-        })?
-        .build()
-        .await
-        .map_err(|e| GnomeError::Bus {
-            call: "Item".into(),
-            message: e.to_string(),
-        })?;
+) -> Result<Metadata, GnomeError> {
+    let item: ItemProxy<'static> = proxy_at(conn, "Item", path).await?;
+
+    let provenance = Provenance::gnome(container, path_item_id(path.as_str()));
+    let label = call("Item.Label", item.label()).await.unwrap_or_default();
 
     // D-Bus `s` and the `a{ss}` attribute map are validated UTF-8 by the
-    // marshaller, so `Refusal::NonUtf8Attribute` cannot arise on this route:
-    // a non-UTF-8 attribute could not have reached the bus in the first
-    // place. The KWallet sidecar is where that refusal earns its keep.
-    let attributes: BTreeMap<String, String> = call("Item.Attributes", item.attributes())
-        .await?
-        .into_iter()
-        .collect();
+    // marshaller, so an attribute that is not UTF-8 cannot arise on this
+    // route: it could not have reached the bus in the first place. There is
+    // therefore no encoding refusal here, and `SourceItem`'s doc records why
+    // one would have to be added alongside any future route that reads raw
+    // attribute bytes.
+    //
+    // The read *failing* is a different thing, and it is a per-item refusal
+    // rather than a `?`: attributes are the item's identity, so an item whose
+    // map we could not read must not be written, but one such item is no
+    // reason to discard every item the walk has already collected. Same shape
+    // as a cap violation — refuse the item, continue the walk. `Label`,
+    // `Created`, `Modified` and `Type` all degrade rather than abort too.
+    let attributes: BTreeMap<String, String> =
+        match call("Item.Attributes", item.attributes()).await {
+            Ok(pairs) => pairs.into_iter().collect(),
+            Err(_) => {
+                return Ok(Metadata::Refused(Box::new(ItemReport::refused(
+                    provenance,
+                    label,
+                    Refusal::UnreadableAttributes,
+                ))));
+            }
+        };
 
-    let item_type = GnomeItemProxy::builder(conn)
-        .path(path.clone())
-        .map(|b| b.cache_properties(CacheProperties::No))
-        .map_err(|e| GnomeError::Bus {
-            call: "Item".into(),
-            message: e.to_string(),
-        })?
-        .build()
-        .await
-        .ok();
-    let item_type = match item_type {
-        // Tolerated, not required: a provider without the property is not an
-        // error, it is a provider whose types we cannot see.
-        Some(proxy) => tokio::time::timeout(CALL_TIMEOUT, proxy.type_())
-            .await
-            .ok()
-            .and_then(Result::ok),
-        None => None,
+    // Three outcomes, never two. A proxy that cannot even be built is an
+    // unreadable type, not an absent one: nothing was established either way,
+    // and the direction that guesses "absent" is the direction that imports
+    // an unlock credential.
+    let item_type = match proxy_at::<GnomeItemProxy<'static>>(conn, "Item.Type", path).await {
+        Ok(proxy) => ItemType::classify(tokio::time::timeout(CALL_TIMEOUT, proxy.type_()).await),
+        Err(e) => ItemType::Unreadable(e.to_string()),
     };
 
-    Ok(ItemMetadata {
-        label: call("Item.Label", item.label()).await.unwrap_or_default(),
+    Ok(Metadata::Read(Box::new(ItemMetadata {
+        label,
         attributes,
         created: call("Item.Created", item.created()).await.unwrap_or(0),
         modified: call("Item.Modified", item.modified()).await.unwrap_or(0),
         item_type,
-        provenance: Provenance::gnome(container, path_item_id(path.as_str())),
-    })
+        provenance,
+    })))
 }
 
 /// `Service.GetSecrets` for the whole batch, per-item `GetSecret` for whatever
 /// it left out.
 ///
+/// The four things every secret fetch needs and none of them varies within a
+/// walk: the connection, the service proxy, the session, and its cipher.
+///
+/// Grouping them is what retires the `#[allow(clippy::too_many_arguments)]`
+/// this function used to carry — the lint was right that seven positional
+/// parameters, four of them fixed context, is a call nobody can read.
+struct Walk<'a> {
+    conn: &'a Connection,
+    service: &'a ServiceProxy<'a>,
+    session: &'a OwnedObjectPath,
+    cipher: &'a SessionCipher,
+}
+
 /// One round trip rather than N, which also halves the window in which
 /// plaintext is in flight.
-#[allow(clippy::too_many_arguments)]
 async fn fetch_secrets(
-    conn: &Connection,
-    service: &ServiceProxy<'_>,
-    session: &OwnedObjectPath,
-    cipher: &SessionCipher,
+    walk: &Walk<'_>,
     candidates: Vec<(OwnedObjectPath, ItemMetadata)>,
     items: &mut Vec<ExtractedItem>,
     refused: &mut Vec<ItemReport>,
@@ -1253,37 +1649,101 @@ async fn fetch_secrets(
         return Ok(());
     }
     let paths: Vec<OwnedObjectPath> = candidates.iter().map(|(p, _)| p.clone()).collect();
-    let mut batch = tokio::time::timeout(CALL_TIMEOUT, service.get_secrets(&paths, session))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    // The cause of a failed batch is kept rather than erased. Erasing it made
+    // the run degrade silently to N individual calls, and the error the user
+    // finally saw came from a different call site with the batch's cause
+    // destroyed.
+    let (mut batch, batch_failure) =
+        match tokio::time::timeout(CALL_TIMEOUT, walk.service.get_secrets(&paths, walk.session))
+            .await
+        {
+            Ok(Ok(batch)) => (batch, None),
+            Ok(Err(e)) => (
+                HashMap::new(),
+                Some(format!(
+                    "Service.GetSecrets failed: {}",
+                    display_label(&e.to_string())
+                )),
+            ),
+            Err(_) => (
+                HashMap::new(),
+                Some(format!(
+                    "Service.GetSecrets did not answer within {CALL_TIMEOUT:?}"
+                )),
+            ),
+        };
 
+    // One deadline for the whole fallback, not one per call: N items at
+    // `CALL_TIMEOUT` each is an unbounded walk in every way that matters.
+    let drained = tokio::time::timeout(
+        SECRETS_FALLBACK_TIMEOUT,
+        drain_batch(
+            walk,
+            candidates,
+            &mut batch,
+            batch_failure.as_deref(),
+            items,
+            refused,
+        ),
+    )
+    .await;
+
+    // `SecretStruct::value` is a plain `Vec<u8>` and, on a `plain` session,
+    // it is the plaintext — a whole collection's worth of it held at once.
+    // Whatever is left in the map on any path out of here is wiped by hand,
+    // because the type does not wipe itself.
+    for secret in batch.values_mut() {
+        secret.value.zeroize();
+        secret.parameters.zeroize();
+    }
+    batch.clear();
+
+    match drained {
+        Ok(result) => result,
+        Err(_) => Err(GnomeError::CallTimeout {
+            call: match batch_failure {
+                Some(cause) => format!("Item.GetSecret for the whole batch (after {cause})"),
+                None => "Item.GetSecret for the items the batch left out".into(),
+            },
+            waited: SECRETS_FALLBACK_TIMEOUT,
+        }),
+    }
+}
+
+/// The per-item half of [`fetch_secrets`], split out so one timeout can bound
+/// the whole of it and so its `?` paths still reach the wipe above.
+async fn drain_batch(
+    walk: &Walk<'_>,
+    candidates: Vec<(OwnedObjectPath, ItemMetadata)>,
+    batch: &mut HashMap<OwnedObjectPath, crate::dbus::session::SecretStruct>,
+    batch_failure: Option<&str>,
+    items: &mut Vec<ExtractedItem>,
+    refused: &mut Vec<ItemReport>,
+) -> Result<(), GnomeError> {
     for (path, meta) in candidates {
-        let secret = match batch.remove(&path) {
+        let mut secret = match batch.remove(&path) {
             Some(s) => s,
             None => {
-                let item = ItemProxy::builder(conn)
-                    .path(path.clone())
-                    .map(|b| b.cache_properties(CacheProperties::No))
-                    .map_err(|e| GnomeError::Bus {
-                        call: "Item".into(),
-                        message: e.to_string(),
-                    })?
-                    .build()
+                let item: ItemProxy<'static> = proxy_at(walk.conn, "Item", &path).await?;
+                call("Item.GetSecret", item.get_secret(walk.session))
                     .await
-                    .map_err(|e| GnomeError::Bus {
-                        call: "Item".into(),
-                        message: e.to_string(),
-                    })?;
-                call("Item.GetSecret", item.get_secret(session)).await?
+                    // The batch's cause travels with the per-item failure it
+                    // caused, instead of being replaced by it.
+                    .map_err(|e| match batch_failure {
+                        Some(cause) => GnomeError::Bus {
+                            call: "Item.GetSecret".into(),
+                            message: format!("{e} (the batch had already failed: {cause})"),
+                        },
+                        None => e,
+                    })?
             }
         };
-        let plaintext = cipher
-            .decrypt(&secret.parameters, &secret.value)
-            .map_err(|e| GnomeError::Decrypt {
-                message: e.to_string(),
-            })?;
+        let plaintext = cipher_decrypt(walk.cipher, &secret);
+        // Wiped the moment it has been copied out, so the transport buffer
+        // does not sit in memory for the rest of the collection's walk.
+        secret.value.zeroize();
+        secret.parameters.zeroize();
+        let plaintext = plaintext?;
 
         let source = SourceItem {
             label: meta.label,
@@ -1307,10 +1767,23 @@ async fn fetch_secrets(
         }
         items.push(ExtractedItem {
             item: source,
-            item_type: meta.item_type,
+            item_type: meta.item_type.known().map(str::to_string),
         });
     }
     Ok(())
+}
+
+/// One decrypt, named so the wipe that must follow it cannot be skipped by an
+/// early `?`.
+fn cipher_decrypt(
+    cipher: &SessionCipher,
+    secret: &crate::dbus::session::SecretStruct,
+) -> Result<Zeroizing<Vec<u8>>, GnomeError> {
+    cipher
+        .decrypt(&secret.parameters, &secret.value)
+        .map_err(|e| GnomeError::Decrypt {
+            message: e.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -1611,23 +2084,33 @@ mod tests {
         }
     }
 
-    /// `None`, with a printed reason, when this machine has no `dbus-daemon`.
-    /// Never a vacuous pass.
-    fn private_bus() -> Option<Bus> {
+    /// A private bus, or the reason there is none.
+    ///
+    /// The reason is the point. Collapsing "not installed", "spawned but said
+    /// nothing" and "printed an empty address" into one `None` meant every
+    /// caller printed "dbus-daemon is not installed" — so a *broken*
+    /// `dbus-daemon` reported as an absent one and every test using it passed
+    /// vacuously, which is exactly what the skip is supposed to prevent.
+    fn private_bus() -> Result<Bus, String> {
         let mut child = StdCommand::new("dbus-daemon")
             .args(["--session", "--nofork", "--nopidfile", "--print-address"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .ok()?;
+            .map_err(|e| format!("dbus-daemon could not be started: {e}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "dbus-daemon's stdout was not a pipe".to_string())?;
         let mut line = String::new();
-        let stdout = child.stdout.take()?;
-        StdBufReader::new(stdout).read_line(&mut line).ok()?;
+        StdBufReader::new(stdout)
+            .read_line(&mut line)
+            .map_err(|e| format!("dbus-daemon printed no address: {e}"))?;
         let address = line.trim().to_string();
         if address.is_empty() {
-            return None;
+            return Err("dbus-daemon started and printed an empty address".into());
         }
-        Some(Bus { address, child })
+        Ok(Bus { address, child })
     }
 
     /// A prompt that behaves exactly as one does on a bus with no prompter:
@@ -1683,9 +2166,12 @@ mod tests {
     /// running past both.
     #[tokio::test]
     async fn an_unanswerable_prompt_times_out_with_a_named_error() {
-        let Some(bus) = private_bus() else {
-            println!("SKIPPED: dbus-daemon is not installed, so no private bus can be started");
-            return;
+        let bus = match private_bus() {
+            Ok(bus) => bus,
+            Err(reason) => {
+                println!("SKIPPED: {reason}");
+                return;
+            }
         };
         let prompted = Arc::new(Mutex::new(0));
         let dismissed = Arc::new(Mutex::new(0));
@@ -1747,9 +2233,12 @@ mod tests {
     /// tests say `UnanswerablePrompt`, and only this one catches that.
     #[tokio::test]
     async fn a_prompt_that_completes_is_not_reported_as_unanswerable() {
-        let Some(bus) = private_bus() else {
-            println!("SKIPPED: dbus-daemon is not installed, so no private bus can be started");
-            return;
+        let bus = match private_bus() {
+            Ok(bus) => bus,
+            Err(reason) => {
+                println!("SKIPPED: {reason}");
+                return;
+            }
         };
         let _server = Builder::address(bus.address.as_str())
             .unwrap()
@@ -1779,6 +2268,696 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
+    // A prompt that completes and unlocks nothing
+    // ----------------------------------------------------------------
+
+    /// A prompt that completes **successfully** and unlocks nothing:
+    /// `dismissed` is false and the result is an empty `ao`.
+    struct EmptyResultPrompt;
+
+    #[zbus::interface(name = "org.freedesktop.Secret.Prompt")]
+    impl EmptyResultPrompt {
+        async fn prompt(
+            &self,
+            _window_id: &str,
+            #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        ) {
+            let empty: Vec<OwnedObjectPath> = Vec::new();
+            let _ = EmptyResultPrompt::completed(&emitter, false, &Value::from(empty)).await;
+        }
+        fn dismiss(&self) {}
+
+        #[zbus(signal)]
+        async fn completed(
+            emitter: &zbus::object_server::SignalEmitter<'_>,
+            dismissed: bool,
+            result: &Value<'_>,
+        ) -> zbus::Result<()>;
+    }
+
+    /// The same, but its result actually names the object it unlocked.
+    struct UnlockingPrompt {
+        unlocked: OwnedObjectPath,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Secret.Prompt")]
+    impl UnlockingPrompt {
+        async fn prompt(
+            &self,
+            _window_id: &str,
+            #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        ) {
+            let unlocked = vec![self.unlocked.clone()];
+            let _ = UnlockingPrompt::completed(&emitter, false, &Value::from(unlocked)).await;
+        }
+        fn dismiss(&self) {}
+
+        #[zbus(signal)]
+        async fn completed(
+            emitter: &zbus::object_server::SignalEmitter<'_>,
+            dismissed: bool,
+            result: &Value<'_>,
+        ) -> zbus::Result<()>;
+    }
+
+    /// A `Service` whose `Unlock` unlocks nothing and hands back one prompt.
+    struct UnlockService {
+        prompt: OwnedObjectPath,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Secret.Service")]
+    impl UnlockService {
+        fn unlock(
+            &self,
+            _objects: Vec<OwnedObjectPath>,
+        ) -> (Vec<OwnedObjectPath>, OwnedObjectPath) {
+            (Vec::new(), self.prompt.clone())
+        }
+    }
+
+    /// `Prompt.Completed` carries the objects the prompt actually unlocked,
+    /// and a prompt that completes is not a prompt that succeeded. Throwing
+    /// the result away made an empty `ao` with `dismissed = false` look like
+    /// a successful unlock, so the collection was marked unlocked, its
+    /// `GetSecrets` then failed, and the per-item fallback aborted the whole
+    /// migration instead of skipping one keyring.
+    ///
+    /// Both directions are asserted in one test on purpose: the negative half
+    /// alone would still pass if `unlock` had simply started refusing every
+    /// prompt.
+    #[tokio::test]
+    async fn a_prompt_that_unlocks_nothing_is_not_a_successful_unlock() {
+        let bus = match private_bus() {
+            Ok(bus) => bus,
+            Err(reason) => {
+                println!("SKIPPED: {reason}");
+                return;
+            }
+        };
+        let target =
+            OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/locked").unwrap();
+        let _server = Builder::address(bus.address.as_str())
+            .unwrap()
+            .name(SECRETS_BUS_NAME)
+            .unwrap()
+            .serve_at(
+                "/svc/empty",
+                UnlockService {
+                    prompt: OwnedObjectPath::try_from("/prompt/empty").unwrap(),
+                },
+            )
+            .unwrap()
+            .serve_at(
+                "/svc/full",
+                UnlockService {
+                    prompt: OwnedObjectPath::try_from("/prompt/full").unwrap(),
+                },
+            )
+            .unwrap()
+            .serve_at("/prompt/empty", EmptyResultPrompt)
+            .unwrap()
+            .serve_at(
+                "/prompt/full",
+                UnlockingPrompt {
+                    unlocked: target.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let client = Builder::address(bus.address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let service_at = async |path: &str| -> ServiceProxy<'static> {
+            ServiceProxy::builder(&client)
+                .path(path.to_string())
+                .unwrap()
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await
+                .unwrap()
+        };
+
+        let empty = service_at("/svc/empty").await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            unlock(&client, &empty, &target, Duration::from_secs(10)),
+        )
+        .await
+        .expect("unlock blocked forever");
+        match result {
+            Err(GnomeError::PromptUnlockedNothing { object }) => {
+                assert_eq!(object, target.as_str());
+            }
+            other => panic!("expected PromptUnlockedNothing, got {other:?}"),
+        }
+
+        let full = service_at("/svc/full").await;
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            unlock(&client, &full, &target, Duration::from_secs(10)),
+        )
+        .await
+        .expect("unlock blocked forever")
+        .expect("a prompt that named the object should be a successful unlock");
+    }
+
+    // ----------------------------------------------------------------
+    // An Item whose Type cannot be read
+    // ----------------------------------------------------------------
+
+    const FAKE_COLLECTION: &str = "/org/freedesktop/secrets/collection/test";
+    const FAKE_UNREADABLE_ITEM: &str = "/org/freedesktop/secrets/collection/test/1";
+    const FAKE_READABLE_ITEM: &str = "/org/freedesktop/secrets/collection/test/2";
+    const FAKE_ATTRLESS_ITEM: &str = "/org/freedesktop/secrets/collection/test/3";
+
+    /// Every path whose secret was asked for, by any route. The assertion the
+    /// refusal is worth making is not "it was not imported" but "its bytes
+    /// never crossed the bus".
+    type Fetched = Arc<Mutex<Vec<String>>>;
+
+    struct TypeService {
+        fetched: Fetched,
+        /// The collection paths this service exposes. Per-test, because
+        /// "every keyring the daemon holds" is itself under test.
+        collections: Vec<&'static str>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Secret.Service")]
+    impl TypeService {
+        fn open_session(
+            &self,
+            algorithm: &str,
+            _input: Value<'_>,
+        ) -> zbus::fdo::Result<(zbus::zvariant::OwnedValue, OwnedObjectPath)> {
+            if algorithm != ALGORITHM_PLAIN {
+                return Err(zbus::fdo::Error::NotSupported(algorithm.to_string()));
+            }
+            Ok((
+                Value::from("").try_to_owned().unwrap(),
+                OwnedObjectPath::try_from("/session/1").unwrap(),
+            ))
+        }
+
+        fn read_alias(&self, _name: &str) -> OwnedObjectPath {
+            OwnedObjectPath::try_from(NO_PROMPT).unwrap()
+        }
+
+        fn get_secrets(
+            &self,
+            items: Vec<OwnedObjectPath>,
+            session: OwnedObjectPath,
+        ) -> HashMap<OwnedObjectPath, crate::dbus::session::SecretStruct> {
+            let mut out = HashMap::new();
+            for path in items {
+                self.fetched.lock().unwrap().push(path.as_str().to_string());
+                out.insert(
+                    path,
+                    crate::dbus::session::SecretStruct {
+                        session: session.clone(),
+                        parameters: Vec::new(),
+                        value: b"batched-secret".to_vec().into(),
+                        content_type: "text/plain".into(),
+                    },
+                );
+            }
+            out
+        }
+
+        #[zbus(property)]
+        fn collections(&self) -> Vec<OwnedObjectPath> {
+            self.collections
+                .iter()
+                .map(|p| OwnedObjectPath::try_from(*p).unwrap())
+                .collect()
+        }
+    }
+
+    /// The item list is per-test rather than fixed: each test serves exactly
+    /// the items it names, so one test's extra item cannot change another's
+    /// counts.
+    struct FakeCollection {
+        items: Vec<&'static str>,
+        label: &'static str,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Secret.Collection")]
+    impl FakeCollection {
+        #[zbus(property)]
+        fn items(&self) -> Vec<OwnedObjectPath> {
+            self.items
+                .iter()
+                .map(|p| OwnedObjectPath::try_from(*p).unwrap())
+                .collect()
+        }
+        #[zbus(property)]
+        fn label(&self) -> String {
+            self.label.into()
+        }
+        #[zbus(property)]
+        fn locked(&self) -> bool {
+            false
+        }
+        #[zbus(property)]
+        fn created(&self) -> u64 {
+            1_788_893_013
+        }
+        #[zbus(property)]
+        fn modified(&self) -> u64 {
+            1_788_893_014
+        }
+    }
+
+    struct FakeItem {
+        path: &'static str,
+        label: &'static str,
+        /// `None` makes the `Type` property **fail**, which is the case under
+        /// test: not absent, not answered — errored.
+        item_type: Option<&'static str>,
+        /// `true` makes the `Attributes` property **fail**: the daemon has the
+        /// item and will not say what its attribute set is.
+        attributes_fail: bool,
+        fetched: Fetched,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Secret.Item")]
+    impl FakeItem {
+        fn get_secret(&self, session: OwnedObjectPath) -> crate::dbus::session::SecretStruct {
+            self.fetched.lock().unwrap().push(self.path.to_string());
+            crate::dbus::session::SecretStruct {
+                session,
+                parameters: Vec::new(),
+                value: b"per-item-secret".to_vec().into(),
+                content_type: "text/plain".into(),
+            }
+        }
+        #[zbus(property)]
+        fn attributes(&self) -> zbus::fdo::Result<HashMap<String, String>> {
+            if self.attributes_fail {
+                return Err(zbus::fdo::Error::Failed(
+                    "attributes are unavailable".into(),
+                ));
+            }
+            Ok(HashMap::from([(
+                "server".to_string(),
+                "example.com".to_string(),
+            )]))
+        }
+        #[zbus(property)]
+        fn label(&self) -> String {
+            self.label.into()
+        }
+        #[zbus(property)]
+        fn created(&self) -> u64 {
+            1_788_893_013
+        }
+        #[zbus(property)]
+        fn modified(&self) -> u64 {
+            1_788_893_014
+        }
+        #[zbus(property, name = "Type")]
+        fn item_type(&self) -> zbus::fdo::Result<String> {
+            match self.item_type {
+                Some(t) => Ok(t.to_string()),
+                None => Err(zbus::fdo::Error::Failed("no idea".into())),
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // One keyring, or all of them
+    // ----------------------------------------------------------------
+
+    const LOGIN_COLLECTION: &str = "/org/freedesktop/secrets/collection/login";
+    const LOGIN_ITEM: &str = "/org/freedesktop/secrets/collection/login/1";
+    const WORK_COLLECTION: &str = "/org/freedesktop/secrets/collection/work";
+    const WORK_ITEM: &str = "/org/freedesktop/secrets/collection/work/1";
+
+    /// **A walk covers every keyring the daemon holds, and the caller labels
+    /// its destination after one of them.**
+    ///
+    /// So without a filter the items of `Work` are written into a collection
+    /// named `Login` — a label that misdescribes its contents, which is the
+    /// one thing a migration must not produce. `only_container` is the fix,
+    /// and [`Extraction::containers`] is what a caller that does not filter
+    /// must consult before it labels anything.
+    #[tokio::test]
+    async fn a_filtered_walk_reads_one_keyring_and_an_unfiltered_one_reads_them_all() {
+        let bus = match private_bus() {
+            Ok(bus) => bus,
+            Err(reason) => {
+                println!("SKIPPED: {reason}");
+                return;
+            }
+        };
+        let fetched: Fetched = Arc::new(Mutex::new(Vec::new()));
+        let _server = Builder::address(bus.address.as_str())
+            .unwrap()
+            .name(SECRETS_BUS_NAME)
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/secrets",
+                TypeService {
+                    fetched: fetched.clone(),
+                    collections: vec![LOGIN_COLLECTION, WORK_COLLECTION],
+                },
+            )
+            .unwrap()
+            .serve_at(
+                LOGIN_COLLECTION,
+                FakeCollection {
+                    items: vec![LOGIN_ITEM],
+                    label: "Login",
+                },
+            )
+            .unwrap()
+            .serve_at(
+                WORK_COLLECTION,
+                FakeCollection {
+                    items: vec![WORK_ITEM],
+                    label: "Work",
+                },
+            )
+            .unwrap()
+            .serve_at(
+                LOGIN_ITEM,
+                FakeItem {
+                    path: LOGIN_ITEM,
+                    label: "Login item",
+                    item_type: Some(TYPE_GENERIC),
+                    attributes_fail: false,
+                    fetched: fetched.clone(),
+                },
+            )
+            .unwrap()
+            .serve_at(
+                WORK_ITEM,
+                FakeItem {
+                    path: WORK_ITEM,
+                    label: "Work item",
+                    item_type: Some(TYPE_GENERIC),
+                    attributes_fail: false,
+                    fetched: fetched.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let client = Builder::address(bus.address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let plain = ExtractOptions {
+            prefer_dh: false,
+            ..ExtractOptions::default()
+        };
+
+        // Unfiltered: both keyrings, and the walk says so rather than leaving
+        // the caller to assume it read the one it named.
+        let all = extract(&client, &plain)
+            .await
+            .expect("the unfiltered walk failed");
+        assert_eq!(all.containers(), vec!["Login", "Work"], "{:?}", all.items);
+        assert_eq!(all.collections.len(), 2);
+
+        // Filtered: only the named keyring, and every item's provenance
+        // agrees with the label the caller will use.
+        let only_work = ExtractOptions {
+            only_container: Some("Work".to_string()),
+            ..plain.clone()
+        };
+        let work = extract(&client, &only_work)
+            .await
+            .expect("the filtered walk failed");
+        assert_eq!(work.containers(), vec!["Work"], "{:?}", work.items);
+        let labels: Vec<&str> = work.items.iter().map(|e| e.item.label.as_str()).collect();
+        assert_eq!(labels, vec!["Work item"]);
+        assert_eq!(
+            work.collections.len(),
+            1,
+            "a keyring that was not walked must not be summarised: {:?}",
+            work.collections
+        );
+
+        // The unnamed keyring's secret never crossed the bus.
+        let fetched_paths = fetched.lock().unwrap().clone();
+        assert_eq!(
+            fetched_paths.iter().filter(|p| *p == LOGIN_ITEM).count(),
+            1,
+            "the filtered walk fetched a secret from the keyring it was told to skip: \
+             {fetched_paths:?}"
+        );
+
+        // A name that matches nothing is an error, not a successful import of
+        // nothing at all.
+        let missing = ExtractOptions {
+            only_container: Some("Nonexistent".to_string()),
+            ..plain
+        };
+        match extract(&client, &missing).await {
+            Err(GnomeError::NoSuchCollection {
+                container,
+                available,
+            }) => {
+                assert_eq!(container, "Nonexistent");
+                assert!(
+                    available.contains("Login") && available.contains("Work"),
+                    "{available}"
+                );
+            }
+            other => panic!("expected NoSuchCollection, got {other:?}"),
+        }
+    }
+
+    /// **One unreadable attribute map refuses one item, not the run.**
+    ///
+    /// `Item.Attributes` used to be read with `?`, so a single item the source
+    /// daemon would not describe aborted the whole walk and discarded every
+    /// item already collected — while `Label`, `Created`, `Modified` and
+    /// `Type` on the same object all degraded gracefully. The item still may
+    /// not be written: attributes are how every libsecret client finds its
+    /// secret again, and a copy with a guessed map is a secret nothing can
+    /// look up. So it is refused, named in the report, and the walk goes on.
+    #[tokio::test]
+    async fn an_unreadable_attribute_map_refuses_one_item_and_not_the_walk() {
+        let bus = match private_bus() {
+            Ok(bus) => bus,
+            Err(reason) => {
+                println!("SKIPPED: {reason}");
+                return;
+            }
+        };
+        let fetched: Fetched = Arc::new(Mutex::new(Vec::new()));
+        let _server = Builder::address(bus.address.as_str())
+            .unwrap()
+            .name(SECRETS_BUS_NAME)
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/secrets",
+                TypeService {
+                    fetched: fetched.clone(),
+                    collections: vec![FAKE_COLLECTION],
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_COLLECTION,
+                FakeCollection {
+                    items: vec![FAKE_ATTRLESS_ITEM, FAKE_READABLE_ITEM],
+                    label: "Test",
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_ATTRLESS_ITEM,
+                FakeItem {
+                    path: FAKE_ATTRLESS_ITEM,
+                    label: "Attributes Cannot Be Read",
+                    item_type: Some(TYPE_GENERIC),
+                    attributes_fail: true,
+                    fetched: fetched.clone(),
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_READABLE_ITEM,
+                FakeItem {
+                    path: FAKE_READABLE_ITEM,
+                    label: "Ordinary",
+                    item_type: Some(TYPE_GENERIC),
+                    attributes_fail: false,
+                    fetched: fetched.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let client = Builder::address(bus.address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let options = ExtractOptions {
+            prefer_dh: false,
+            ..ExtractOptions::default()
+        };
+        let extraction = tokio::time::timeout(Duration::from_secs(30), extract(&client, &options))
+            .await
+            .expect("the walk blocked forever")
+            .expect("one unreadable attribute map must not abort the walk");
+
+        // The item after it in walk order is still imported: that is the half
+        // the `?` used to throw away.
+        let labels: Vec<&str> = extraction
+            .items
+            .iter()
+            .map(|e| e.item.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["Ordinary"], "{:?}", extraction.items);
+
+        assert_eq!(extraction.refused.len(), 1, "{:?}", extraction.refused);
+        let refused = &extraction.refused[0];
+        assert_eq!(refused.label, "Attributes Cannot Be Read");
+        assert_eq!(refused.refusals, vec![Refusal::UnreadableAttributes]);
+        assert!(refused.attribute_keys.is_empty());
+        assert_eq!(refused.secret_len, 0);
+        assert_eq!(refused.outcome, None);
+
+        // Refused before the second pass, so its bytes never crossed the bus.
+        let fetched = fetched.lock().unwrap().clone();
+        assert!(
+            !fetched.iter().any(|p| p == FAKE_ATTRLESS_ITEM),
+            "the secret of an item with no readable attributes was fetched: {fetched:?}"
+        );
+    }
+
+    /// **The refusal must not fail open on the one input the foreign daemon
+    /// controls.** A `Type` read that *errors* is not a provider without the
+    /// property: nothing was established, so the item may be an unlock
+    /// credential for another keyring, and importing it on the strength of a
+    /// failed read is the failure this module exists to prevent.
+    ///
+    /// Collapsing the three outcomes into `Option<String>` made
+    /// `is_unlock_credential_type(None)` false, so the item was carried, its
+    /// secret fetched, and it was imported with nothing said — the
+    /// `item_type_unavailable` backstop cannot fire, because the *other* item
+    /// here exposes its type perfectly well.
+    #[tokio::test]
+    async fn an_item_whose_type_cannot_be_read_is_refused_not_imported() {
+        let bus = match private_bus() {
+            Ok(bus) => bus,
+            Err(reason) => {
+                println!("SKIPPED: {reason}");
+                return;
+            }
+        };
+        let fetched: Fetched = Arc::new(Mutex::new(Vec::new()));
+        let _server = Builder::address(bus.address.as_str())
+            .unwrap()
+            .name(SECRETS_BUS_NAME)
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/secrets",
+                TypeService {
+                    fetched: fetched.clone(),
+                    collections: vec![FAKE_COLLECTION],
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_COLLECTION,
+                FakeCollection {
+                    items: vec![FAKE_UNREADABLE_ITEM, FAKE_READABLE_ITEM],
+                    label: "Test",
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_UNREADABLE_ITEM,
+                FakeItem {
+                    path: FAKE_UNREADABLE_ITEM,
+                    label: "Type Cannot Be Read",
+                    item_type: None,
+                    attributes_fail: false,
+                    fetched: fetched.clone(),
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_READABLE_ITEM,
+                FakeItem {
+                    path: FAKE_READABLE_ITEM,
+                    label: "Ordinary",
+                    item_type: Some(TYPE_GENERIC),
+                    attributes_fail: false,
+                    fetched: fetched.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let client = Builder::address(bus.address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let options = ExtractOptions {
+            prefer_dh: false,
+            ..ExtractOptions::default()
+        };
+        let extraction = tokio::time::timeout(Duration::from_secs(30), extract(&client, &options))
+            .await
+            .expect("the walk blocked forever")
+            .expect("the walk itself failed");
+
+        // The ordinary item still comes through, so the refusal is selective
+        // rather than a blanket failure that would pass this test vacuously.
+        let labels: Vec<&str> = extraction
+            .items
+            .iter()
+            .map(|e| e.item.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["Ordinary"], "{:?}", extraction.items);
+
+        assert_eq!(extraction.refused.len(), 1, "{:?}", extraction.refused);
+        let refused = &extraction.refused[0];
+        assert_eq!(refused.label, "Type Cannot Be Read");
+        assert!(refused.is_refused());
+        assert_eq!(refused.secret_len, 0);
+        // The refusal says what is true — the type could not be read — and
+        // not "type 3 unlocks another keyring", which is a claim about an item
+        // whose type nobody established.
+        assert_eq!(refused.refusals, vec![Refusal::UnreadableItemType]);
+
+        // The point of refusing before the second pass: the bytes never
+        // crossed the bus at all.
+        let fetched = fetched.lock().unwrap().clone();
+        assert!(
+            !fetched.iter().any(|p| p == FAKE_UNREADABLE_ITEM),
+            "the secret of an item with an unreadable type was fetched: {fetched:?}"
+        );
+        assert!(
+            fetched.iter().any(|p| p == FAKE_READABLE_ITEM),
+            "the ordinary item's secret was never fetched: {fetched:?}"
+        );
+
+        // One item did expose its type, so the backstop is silent — which is
+        // exactly why it cannot stand in for this refusal.
+        assert!(!extraction.item_type_unavailable);
+    }
+
+    // ----------------------------------------------------------------
     // The live path
     // ----------------------------------------------------------------
 
@@ -1789,20 +2968,24 @@ mod tests {
     fn live_prerequisites() -> bool {
         let mut missing = Vec::new();
         for program in ["dbus-daemon", GNOME_KEYRING_PROGRAM] {
-            if StdCommand::new(program)
+            // `is_err()` alone accepts a binary that ran and exited
+            // non-zero, which is a broken tool reported as a present one.
+            let ran = StdCommand::new(program)
                 .arg("--version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
-                .is_err()
-            {
+                .status();
+            if !matches!(ran, Ok(status) if status.success()) {
                 missing.push(program);
             }
         }
         if missing.is_empty() {
             return true;
         }
-        println!("SKIPPED: {} is not installed", missing.join(", "));
+        println!(
+            "SKIPPED: {} is not installed, or did not answer --version successfully",
+            missing.join(", ")
+        );
         false
     }
 
@@ -2096,7 +3279,7 @@ mod tests {
             let struct_ = crate::dbus::session::SecretStruct {
                 session: session.clone(),
                 parameters: Vec::new(),
-                value: secret.to_vec(),
+                value: secret.to_vec().into(),
                 content_type: "text/plain".into(),
             };
             collection

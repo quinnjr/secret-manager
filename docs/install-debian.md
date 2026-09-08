@@ -95,6 +95,10 @@ before agreeing.
 
 ### KWallet
 
+This section — `ksecretd`'s behaviour, the file paths, the PAM stack
+contents — was reasoned from Debian's packaging, not checked on a live KDE
+session; see `docs/vagrant.md`.
+
 KWallet claims `org.freedesktop.secrets` through `ksecretd`, and it does so
 at runtime — it will hold the name even when the system activation file
 names gnome-keyring, so the `cp` above does not displace it. Turning it off
@@ -107,10 +111,12 @@ kwriteconfig6 --file kwalletrc --group Wallet --key Enabled false
 ```
 
 (System Settings › KDE Wallet is the same setting. `kwriteconfig5` on a
-Plasma 5 system, which is what Debian stable ships. Without the key, the
-default is enabled.)
+Plasma 5 system — Debian 12 (bookworm). Debian 13 (trixie) ships Plasma 6
+and needs `kwriteconfig6`, as above. Without the key, the default is
+enabled.)
 
-Stop it being activated on demand, under both of its other names:
+Stop it being activated on demand, under both of its other names. This
+truncates any override already at these paths — check first if you have one:
 
 ```sh
 mkdir -p ~/.local/share/dbus-1/services
