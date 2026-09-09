@@ -7,6 +7,7 @@ use super::require_sender;
 use super::session::SecretStruct;
 use super::state::{Shared, VaultRef, block_in_place};
 use crate::session::SessionCipher;
+use crate::vault::format::Cap;
 use std::collections::HashMap;
 use zbus::Connection;
 use zbus::interface;
@@ -155,16 +156,14 @@ impl Item {
             let plaintext = cipher
                 .decrypt(&secret.parameters, &secret.value)
                 .map_err(Error::failed)?;
-            // The same cap `CreateItem` enforces. Without it here the cap is
-            // only a speed bump: create a one-byte item, then replace its
-            // secret with a hundred megabytes and the collection is past the
-            // vault size limit anyway, at which point it stops saving
+            // The same cap `CreateItem` enforces, through the same `Cap`, so
+            // a boundary change here is one edit and not four. Without it the
+            // cap is only a speed bump: create a one-byte item, then replace
+            // its secret with a hundred megabytes and the collection is past
+            // the vault size limit anyway, at which point it stops saving
             // entirely. Found while auditing negative-test coverage.
-            if plaintext.len() > collection::MAX_ITEM_SECRET {
-                return Err(Error::invalid_args(format!(
-                    "secret is too large; at most {} bytes per item",
-                    collection::MAX_ITEM_SECRET
-                )));
+            if let Some(over) = Cap::Secret.check(plaintext.len()) {
+                return Err(Error::invalid_args(collection::cap_message(over)));
             }
             let content_type = secret.content_type.clone();
             block_in_place(|| {

@@ -8,8 +8,11 @@
 //! of them is driven here through `cli::import::Extractor`, so the pipeline's
 //! rules are asserted with no gnome-keyring and no kwalletd anywhere.
 
+mod common;
+
+use common::Fixture;
 use secret_manager::cli::import::{
-    Extraction, Extractor, ImportArgs, ImportEnv, Imported, NotMigrated, SourceArg,
+    DaemonTarget, Extraction, Extractor, ImportArgs, ImportEnv, Imported, NotMigrated, SourceArg,
 };
 use secret_manager::cli::{Cli, CliError, Command};
 use secret_manager::config::Config;
@@ -150,10 +153,37 @@ fn env_for(root: &Path, vault_dir: &Path) -> ImportEnv {
     // and `XDG_RUNTIME_DIR`. That is `unsafe` in edition 2024 because it races
     // every other thread in the same binary, and `cargo test` runs these tests
     // in parallel with two that read the environment to build a child
-    // process's. The probes come back *not issued* either way, which is
-    // unproved and not a failure — the same answer a machine with no daemon
-    // gives.
-    env.reach_the_daemon = false;
+    // process's.
+    //
+    // `None` is honest about what it means: there is no daemon, so the probes
+    // come back *not issued* — unproved, and not a pass. The tests that have
+    // to exercise the probe say so by naming one instead, with
+    // `env_against(&fixture)` below.
+    env.daemon = DaemonTarget::None;
+    env
+}
+
+/// The same environment, pointed at the fixture's private bus and control
+/// socket: a real daemon, on a bus nothing else can see.
+///
+/// This is what the probe path never had. `reach_the_daemon = false` in every
+/// call site meant the suite asserted the check had *not* been made — two
+/// tests pinned `not_issued == 2` — while the code that issues it went
+/// unexecuted, which is how it came to search the wrong daemon and to expect
+/// the wrong number.
+fn env_against(fixture: &Fixture, root: &Path) -> ImportEnv {
+    let mut config = Config::default();
+    config.vault.dir = fixture.data_dir.path().join("secret-manager");
+    config.vault.locked_search = true;
+    config.kdf.m_cost_kib = 8;
+    config.kdf.t_cost = 1;
+    config.kdf.p_cost = 1;
+    let mut env = ImportEnv::new(config, keyring_dir(root));
+    env.new_password = Box::new(|_| Ok(Zeroizing::new(PASSWORD.to_string())));
+    env.daemon = DaemonTarget::At {
+        bus_address: fixture.bus.address.clone(),
+        control_socket: fixture.control_socket(),
+    };
     env
 }
 
@@ -506,18 +536,21 @@ async fn a_walk_that_missed_an_item_fails_the_run() {
     );
 }
 
-/// The gnome walk is over the *daemon*, which holds every keyring in the
-/// directory — not only the one `default` names. So the independent total is
-/// the sum of every header there, and a login-plus-one setup (the ordinary
-/// one) must not fail a faithful import because the walk produced more items
-/// than one file's header declares.
+/// The walk and the independent count have one scope, and it is the keyring
+/// `default` names.
+///
+/// `ExtractOptions::only_container` restricts the walk to that one keyring, so
+/// the header total is that one file's. Summing every `.keyring` in the
+/// directory against a walk of one is a guaranteed mismatch — 6 declared, 3
+/// walked — for the ordinary login-plus-one setup, raised after the collection
+/// has already been written.
 #[tokio::test]
-async fn the_independent_count_covers_every_keyring_the_walk_reaches() {
+async fn the_independent_count_is_scoped_to_the_keyring_that_is_walked() {
     let root = tempfile::tempdir().unwrap();
     let vaults = tempfile::tempdir().unwrap();
     let env = env_for(root.path(), vaults.path());
     // A second keyring beside the first, and a `default` naming which of them
-    // the destination is labelled after.
+    // the destination is labelled after. The walk never enters it.
     std::fs::copy(
         env.source_dir.join("Sample keyring.keyring"),
         env.source_dir.join("Other keyring.keyring"),
@@ -525,27 +558,17 @@ async fn the_independent_count_covers_every_keyring_the_walk_reaches() {
     .unwrap();
     std::fs::write(env.source_dir.join("default"), "Sample keyring\n").unwrap();
 
-    // Six items across the two keyrings: the walk sees both, because the
-    // daemon does.
-    let mut both = sample_items();
-    both.extend(sample_items());
-    let fake = Fake {
-        items: both,
-        refusals: vec![sample_refusal(), sample_refusal()],
-        skipped: Vec::new(),
-    };
-
     let report_path = root.path().join("two-keyrings.json");
     let mut a = args(true);
     a.report = Some(report_path.clone());
-    secret_manager::cli::import::run_with(a, &fake, &env)
+    secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
         .await
-        .expect("6 walked against 3+3 in the two headers is not a shortfall");
+        .expect("3 walked against the walked keyring's own 3 is not a shortfall");
     let parsed: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
     assert_eq!(
         parsed["verification"]["count"],
-        serde_json::json!({ "header_item_count": 6, "walked": 6 })
+        serde_json::json!({ "header_item_count": 3, "walked": 3 })
     );
     // And the destination is still labelled after the keyring `default` names.
     assert_eq!(parsed["collection"], serde_json::json!("Sample keyring"));
@@ -691,4 +714,177 @@ async fn import_never_merges_into_an_existing_collection() {
         .expect("a dry run reports rather than refuses");
     assert_eq!(std::fs::read(&existing).unwrap(), b"not touched");
     assert_eq!(files_in(vaults.path()), ["sample_keyring.vault"]);
+}
+
+// --------------------------------------------------------------------------
+// The lookup probe, against a daemon that answers
+// --------------------------------------------------------------------------
+
+/// The check this module calls "the one that matters", exercised for the first
+/// time.
+///
+/// Every call site of the old `reach_the_daemon` seam set it to `false`, and
+/// two tests positively asserted `not_issued == 2` — so the suite pinned that
+/// the probe had *not* run, and the code that issues it went unexecuted. What
+/// shipped behind that: the probe queried whoever owned `org.freedesktop.secrets`
+/// on the session bus, which the command had just required to be
+/// gnome-keyring — the source — so for a keyring named `login` it counted
+/// *source* items through a matching object-path prefix and reported PASS.
+///
+/// Here it runs against a real `secret-manager` on the fixture's private bus,
+/// and every probe has to come back found.
+// A real daemon on the fixture's bus answers on other threads; the control
+// socket call the import makes is blocking, so this needs more than one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lookup_probe_runs_against_our_own_daemon_and_finds_every_item() {
+    let fixture = Fixture::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let env = env_against(&fixture, root.path());
+
+    let report_path = root.path().join("probe.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+        .await
+        .expect("a faithful import must pass its own lookup probe");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(
+        parsed["verification"]["probes"],
+        serde_json::json!({ "passed": 2, "failed": 0, "not_issued": 0 }),
+        "the probe did not run against the daemon: {parsed}"
+    );
+    // Nothing is left unproved, so the run is entitled to recommend
+    // decommissioning the old provider.
+    assert!(
+        parsed["verification"]["failed_probes"]
+            .as_array()
+            .is_none_or(|a| a.is_empty())
+    );
+}
+
+/// `SearchItems` is **subset** matching, so a probe for `{server, user}`
+/// returns the item that also carries an `xdg:schema`.
+///
+/// The plan counted items whose attribute map was *equal* to the query, so on
+/// the ordinary source that holds both an item and a more-specific sibling the
+/// smaller probe expected 1 and found 2 — and a byte-perfect import failed
+/// verification, with every item sharing that key set downgraded on the way
+/// out.
+// A real daemon on the fixture's bus answers on other threads; the control
+// socket call the import makes is blocking, so this needs more than one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_expects_what_subset_matching_actually_returns() {
+    let fixture = Fixture::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let env = env_against(&fixture, root.path());
+
+    let fake = Fake {
+        items: vec![
+            item(
+                2,
+                "router",
+                &[("server", "r.example"), ("user", "joseph")],
+                b"a",
+            ),
+            // The same two attributes, plus the schema every libsecret client
+            // writes. A probe for the pair returns both of these.
+            item(
+                5,
+                "router, from libsecret",
+                &[
+                    ("server", "r.example"),
+                    ("user", "joseph"),
+                    ("xdg:schema", "org.freedesktop.Secret.Generic"),
+                ],
+                b"b",
+            ),
+        ],
+        refusals: vec![sample_refusal()],
+        skipped: Vec::new(),
+    };
+
+    let report_path = root.path().join("subset.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect("an item and its more-specific sibling are both a faithful import");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(
+        parsed["verification"]["probes"],
+        serde_json::json!({ "passed": 2, "failed": 0, "not_issued": 0 }),
+        "{parsed}"
+    );
+    // And nothing was downgraded: the probe changed no item's classification.
+    assert_eq!(parsed["tally"], parsed["tally_before_probe"], "{parsed}");
+}
+
+/// A failed verification publishes **nothing**.
+///
+/// `set_default_alias` and the daemon `Reload` used to run unconditionally,
+/// fifty-one lines before the gate, so a run that ended "verification did not
+/// pass" left `default` pointing at the new collection, the daemon holding it,
+/// and the file on disk — which then made the retry fail on the "already
+/// exists" refusal, naming a file that same run had created.
+// A real daemon on the fixture's bus answers on other threads; the control
+// socket call the import makes is blocking, so this needs more than one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_verification_moves_no_alias_and_leaves_no_collection() {
+    use secret_manager::protocol::{Request, Response, call};
+
+    let fixture = Fixture::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let env = env_against(&fixture, root.path());
+    let vault_dir = fixture.data_dir.path().join("secret-manager");
+
+    // Two items walked against the golden keyring's declared three: the count
+    // check fails, after a perfectly good write.
+    let fake = Fake {
+        items: sample_items(),
+        refusals: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let mut a = args(false);
+    a.set_default = true;
+    let err = secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect_err("2 walked against 3 in the header is a failure");
+    let message = err.to_string();
+    assert!(message.contains("Nothing was published"), "{message}");
+
+    // The collection this run created is gone, so the next attempt is not
+    // refused against it.
+    assert!(
+        !vault_dir.join("sample_keyring.vault").exists(),
+        "the collection outlived the failure: {:?}",
+        files_in(&vault_dir)
+    );
+    // `default` still points where it did.
+    let aliases = std::fs::read_to_string(vault_dir.join("aliases.toml")).unwrap();
+    assert!(
+        !aliases.contains("sample_keyring"),
+        "the alias moved anyway: {aliases}"
+    );
+    // And the daemon was never told to load it.
+    let socket = fixture.control_socket();
+    let status = tokio::task::spawn_blocking(move || call(&socket, &Request::Status))
+        .await
+        .unwrap();
+    let Ok(Response::Status { collections, .. }) = status else {
+        panic!("the fixture daemon did not answer Status: {status:?}");
+    };
+    assert!(
+        !collections.iter().any(|c| c.id == "sample_keyring"),
+        "the daemon was told to load a collection that failed verification"
+    );
+
+    // The remedy actually works: the same command again, over a source that
+    // adds up, is not refused by a leftover.
+    secret_manager::cli::import::run_with(args(false), &Fake::sample(), &env)
+        .await
+        .expect("the retry must not be blocked by the failed run's own file");
 }

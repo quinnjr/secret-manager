@@ -235,13 +235,24 @@ impl<'a> Cursor<'a> {
         Ok(declared as usize)
     }
 
-    /// gnome-keyring's length-prefixed string. `0xffffffff` is its NULL.
-    fn opt_string(&mut self, field: &'static str) -> Result<Option<String>, HeaderError> {
+    /// gnome-keyring's length prefix. `0xffffffff` is its NULL marker — not
+    /// a length — so it is answered with `None` rather than run through
+    /// [`Self::count`], which would (rightly) refuse four billion bytes as
+    /// impossible. Every length prefix in the format carries this marker, so
+    /// every reader of one goes through here.
+    fn opt_len(&mut self, field: &'static str) -> Result<Option<usize>, HeaderError> {
         let len = self.u32(field)?;
         if len == u32::MAX {
             return Ok(None);
         }
-        let len = self.count(len, 1, field)?;
+        Ok(Some(self.count(len, 1, field)?))
+    }
+
+    /// gnome-keyring's length-prefixed string. `0xffffffff` is its NULL.
+    fn opt_string(&mut self, field: &'static str) -> Result<Option<String>, HeaderError> {
+        let Some(len) = self.opt_len(field)? else {
+            return Ok(None);
+        };
         let bytes = self.take(len, field)?;
         let s = std::str::from_utf8(bytes).map_err(|_| HeaderError::NonUtf8 { field })?;
         Ok(Some(s.to_string()))
@@ -427,9 +438,15 @@ fn parse_keyring_item(c: &mut Cursor<'_>) -> Result<KeyringItemIndex, HeaderErro
             // A hashed string value: the 32-character hex of its unsalted
             // MD5, length-prefixed. Skipped, not kept.
             ATTR_TYPE_STRING => {
-                let len = c.u32("attribute value")?;
-                let len = c.count(len, 1, "attribute value")?;
-                let _hashed = c.take(len, "attribute value")?;
+                // Through `opt_len`, because a hashed *value* carries the
+                // same `0xffffffff` NULL marker the name does. Reading the
+                // length by hand made one NULL-valued attribute — which
+                // gnome-keyring itself reads back fine — fail the whole
+                // file, taking the inventory's unlock-credential warning
+                // with it.
+                if let Some(len) = c.opt_len("attribute value")? {
+                    let _hashed = c.take(len, "attribute value")?;
+                }
             }
             ATTR_TYPE_UINT32 => {
                 let _hashed = c.u32("attribute value")?;
@@ -1073,6 +1090,34 @@ mod tests {
                 field: "attribute name"
             })
         );
+    }
+
+    /// A NULL *value* is not a four-billion-byte value. gnome-keyring writes
+    /// the same `0xffffffff` marker for an absent hashed value as it does for
+    /// an absent name, and reads such a file back without complaint; refusing
+    /// it here took the whole keyring out of `--inventory`, unlock-credential
+    /// warning included.
+    #[test]
+    fn a_null_valued_attribute_is_read_rather_than_refused() {
+        let bytes = keyring_prologue("x", 1, 1)
+            .u32(7)
+            .u32(ITEM_TYPE_CHAINED_KEYRING_PASSWORD)
+            .u32(2)
+            // A string attribute whose hashed value is NULL.
+            .str("server")
+            .u32(ATTR_TYPE_STRING)
+            .u32(u32::MAX)
+            .raw(&hashed("account").done())
+            .u32(0)
+            .done();
+        let inv = parse_keyring_header(&bytes).unwrap();
+        assert_eq!(inv.items.len(), 1);
+        assert_eq!(
+            inv.items[0].attribute_keys.iter().collect::<Vec<_>>(),
+            ["account", "server"]
+        );
+        // The security-relevant output survives with it.
+        assert_eq!(inv.unlock_credential_count(), 1);
     }
 
     #[test]

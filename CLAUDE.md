@@ -177,9 +177,17 @@ still answer, so the proof needs no duration and cannot flake. That is the
 half a green run *can* establish; beside it sits the half it cannot, because
 what has to hold is a property of the source and not of one execution.
 
-That half is a `syn`-based scan of `src/dbus/` and `src/daemon.rs` — the real
-Rust grammar, not a lexer — which builds the call graph and asks of every
-statement whether it can run with a lock held. It refuses a second
+That half is a `syn`-based scan of `src/dbus/`, `src/vault/`, `src/daemon.rs`
+and `src/kdf.rs` — the real Rust grammar, not a lexer — which builds the call
+graph and asks of every statement whether it can run with a lock held.
+`src/vault/` is in the set because the blocking work is: every `Vault` mutator
+ends in `save`'s `write_all`/`sync_all`/`rename`, and `unlock`,
+`verify_password`, `change_password` and `create` run Argon2 as well. It used
+to be outside, with a hand-maintained list of five `Vault` method names
+standing in for it — which had already gone stale, missing `change_password`
+while naming a `save` that is private to `vault::store` and could never fire.
+Coverage is the call graph's now, not a list's, and `crypto::derive_key` is
+named blocking so `CLAUDE.md`'s Argon2 rule below has a rule in the scan. It refuses a second
 acquisition, and blocking work: an `fsync` stops the same tasks a bad `.await`
 would, and phrasing the rule for awaits alone is what let the original bug
 through. **Because it follows calls to a fixed point, no rule here is

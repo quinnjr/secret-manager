@@ -81,11 +81,20 @@ busctl --user status org.freedesktop.secrets   → PID
 ps -p <PID> -o cmd=                            → identity
 ```
 
-`sm import --from gnome-keyring` **refuses to use the session-bus route**
-unless that command names `gnome-keyring-daemon`. It says who does own the
-name and what to do about it. This check is not advisory and has no override
-flag; a `--from` that disagrees with the bus is a user error worth stopping
-for, not a warning worth printing.
+`sm import --from gnome-keyring` **names the owner in a warning** before it
+asks for a password, so a user who believes they are reading gnome-keyring
+learns that something else holds the name.
+
+This was specified as a hard refusal with no override, and implemented that
+way, and that was wrong — recorded here because the reasoning is worth
+keeping. A refusal keyed on the session bus makes the command unusable in
+precisely its intended situation: the install guides tell the user to mask
+gnome-keyring, so the name is then unowned or held by secret-manager, and
+both were refused. It also protects nothing on this route, since the private
+bus never consults the session bus at all. The danger is real but it is a
+question about *which source you are reading*, not a precondition on a bus
+this route does not use — so it warns, and `Unowned` and secret-manager's own
+daemon are silent, because those are the states our own instructions produce.
 
 KWallet needs no such check, because the assistant does not use the Secret
 Service name for it at all (see below).
@@ -455,7 +464,13 @@ mangled, using only hashes.
 
 **A lookup probe, which is the one that matters.** For each distinct source
 attribute set, issue `SearchItems` against the running daemon with exactly
-those attributes and assert it returns exactly one item. The fingerprints
+those attributes and assert it returns every item whose attribute set is a
+superset of them — `SearchItems` matches subsets, so an item carrying one
+extra attribute legitimately answers a narrower query, and demanding exactly
+one match fails a faithful import. The probe also proves it is talking to
+*our* daemon, by comparing the pid behind the bus name against the peer of
+our own control socket; an unprovable target is reported as not issued rather
+than as a pass. The fingerprints
 prove the data copied; this proves it is *findable*, which is the actual
 promise. Its pass/fail counts are what populate the three-way tally.
 

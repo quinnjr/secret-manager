@@ -35,19 +35,32 @@
 //! only place attribute values exist is inside a [`verify::ProbeQuery`],
 //! which is consumed by a D-Bus call and never rendered.
 //!
-//! **The independent count is taken over everything the walk can reach.** For
-//! gnome-keyring that is *every* keyring the private daemon holds, not the one
-//! [`locate`] named: the walk enumerates collections over the bus and has no
-//! way to be told "only this file". So the header total is summed across every
-//! `.keyring` in the source directory, which is the side of the disagreement
-//! that can be fixed here — restricting the walk is a change to the transport
-//! in `src/import/gnome.rs`. If any sibling header cannot be read the total is
-//! not taken at all: a check that is *not made* is reported as unproved, and a
-//! wrong total would fail a good import.
+//! **The independent count and the walk have one scope: the container the
+//! user named.** `ExtractOptions::only_container` tells the gnome walk which
+//! keyring to enumerate, so the walk covers exactly the one [`locate`] chose,
+//! and the header total is that one file's `item_count()`. The two halves have
+//! to agree about *what* they are counting or the check fails a faithful
+//! import: summing every `.keyring` in the directory against a walk of one is
+//! a guaranteed mismatch for anyone with a second keyring, raised after the
+//! collection has already been written. Widening the walk is not the
+//! alternative — a collection labelled after one keyring must not hold the
+//! items of another.
+//!
+//! **A dry run writes nothing, and neither does a real one, at the source.**
+//! The gnome route spawns a `gnome-keyring-daemon --unlock`, and that child
+//! reads *and writes* whatever `XDG_DATA_HOME` points it at: it rewrites
+//! keyring files it opens and creates a `login.keyring` where there is none.
+//! So the child is never pointed at the user's own directory. It is given a
+//! private snapshot — a copy of the source directory in a 0700 temp dir,
+//! removed when the extraction ends — which is what makes "the source was not
+//! modified" a fact about the filesystem rather than a sentence in the report.
 //!
 //! **The surface below the command itself is test-only.** [`Extraction`],
-//! [`Imported`], [`Extractor`], [`ImportEnv`] and [`run_with`] exist so the
-//! pipeline can be driven with no gnome-keyring and no kwalletd anywhere; they
+//! [`Imported`], [`Extractor`], [`ImportEnv`], [`DaemonTarget`] and
+//! [`run_with`] exist so the pipeline can be driven with no gnome-keyring and
+//! no kwalletd anywhere — and, with [`DaemonTarget::At`], against a real
+//! daemon on a bus nothing else can see, which is what the lookup probe needs
+//! to be exercised at all; they
 //! are `pub` under the `test-util` feature and `pub(crate)` otherwise, because
 //! `CLAUDE.md` is explicit that test scaffolding must not widen the shipped
 //! API, and they are `#[non_exhaustive]` so a field added to one of them is
@@ -124,9 +137,9 @@ pub struct ImportArgs {
 // `pub` for the integration tests that drive the pipeline, `pub(crate)`
 // otherwise: see this module's header.
 #[cfg(any(test, feature = "test-util"))]
-pub use self::pipeline::{ImportEnv, run_with};
+pub use self::pipeline::{DaemonTarget, ImportEnv, run_with};
 #[cfg(not(any(test, feature = "test-util")))]
-pub(crate) use self::pipeline::{ImportEnv, run_with};
+pub(crate) use self::pipeline::{DaemonTarget, ImportEnv, run_with};
 #[cfg(any(test, feature = "test-util"))]
 pub use self::transport::{Extraction, Extractor, Imported, NotMigrated};
 #[cfg(not(any(test, feature = "test-util")))]
@@ -240,13 +253,19 @@ mod transport {
 }
 
 /// The live transports.
-struct LiveExtractor;
+///
+/// `source_dir` is here because the gnome route must not point its private
+/// `gnome-keyring-daemon` at the user's own `$XDG_DATA_HOME`: it snapshots
+/// this directory and reads the copy. See [`snapshot_source_dir`].
+struct LiveExtractor {
+    source_dir: PathBuf,
+}
 
 impl Extractor for LiveExtractor {
     fn extract<'a>(&'a self, source: Source, container_hint: &'a str) -> transport::Extracting<'a> {
         Box::pin(async move {
             match source {
-                Source::GnomeKeyring => extract_gnome(container_hint).await,
+                Source::GnomeKeyring => extract_gnome(&self.source_dir, container_hint).await,
                 Source::KWallet => extract_kwallet(container_hint).await,
             }
         })
@@ -256,38 +275,47 @@ impl Extractor for LiveExtractor {
 /// gnome-keyring, over a private bus with a private daemon: the real session
 /// bus is never displaced, and the password goes to the child's stdin.
 ///
-/// The bus-owner precondition runs first, and it is a hard refusal with no
-/// override. The private bus means the session bus's owner cannot *technically*
-/// block the extraction — the daemon read below is one this process started.
-/// That is not the reason the check exists. `org.freedesktop.secrets` owned by
-/// something that is not `gnome-keyring-daemon` — `ksecretd`, in the case this
-/// was written for — means gnome-keyring is not the provider the user has been
-/// using, and "migrate gnome-keyring" would faithfully migrate a set of
-/// keyrings nobody has written to since the other provider took over. Every
-/// check in this command would agree, because both halves read the same wrong
-/// source. The user's belief about what is being migrated is the thing being
-/// verified, and nothing downstream can verify it.
+/// **The session bus's owner is a warning here, never a refusal.** This route
+/// does not use the session bus at all: it stands up its own `dbus-daemon` and
+/// its own `gnome-keyring-daemon` and reads `keyrings/` off disk, so nothing
+/// about who owns `org.freedesktop.secrets` can make it read the wrong
+/// provider, and the honest precondition — is there a keyring directory with a
+/// keyring in it — is [`locate`]'s, made before this function is reached.
 ///
-/// It runs *before* the password prompt: there is no point asking for a
-/// password to read the wrong source, and a refusal after the prompt reads as
-/// "your password was wrong".
-async fn extract_gnome(container: &str) -> Result<Extraction, CliError> {
-    gnome::require_gnome_keyring_owner()
-        .await
-        .map_err(|e| match e {
-            // The variant's own text names the owner and the two remedies —
-            // migrate that provider instead, or stop it and log back in. What
-            // it cannot say, because it does not know which route asked, is why
-            // a private-bus extraction refuses on the strength of the *session*
-            // bus, so that is added here.
-            e @ gnome::GnomeError::WrongBusOwner { .. } => CliError::Unreachable(format!(
-                "{} This command would have read gnome-keyring's own keyrings over a private \
-                 bus and reported success, so the refusal is not about reachability: it is \
-                 that the keyrings on disk are not where your secrets have been going.",
-                escape_control(&e.to_string())
-            )),
-            other => gnome_error(other),
-        })?;
+/// What the owner *does* say is worth saying: a name held by `ksecretd` means
+/// the files below are not where this user's secrets have been going, and the
+/// import will faithfully copy a stale keyring. That is a fact about the
+/// source, so it is printed and the run continues.
+///
+/// Refusing on it was worse than useless. The install guides *mask*
+/// gnome-keyring, so the name is either unowned or held by us on every machine
+/// this command exists for — and both were refused, which made `sm import
+/// --from gnome-keyring` impossible in exactly the state it is run from.
+///
+/// The warning is printed *before* the password prompt: a user who learns
+/// their source is stale should learn it before typing a password for it.
+async fn extract_gnome(source_dir: &Path, container: &str) -> Result<Extraction, CliError> {
+    let mut notes = Vec::new();
+    // A `busctl`/`ps` that will not answer is not a reason to stop: it costs
+    // the user a sentence, not the migration.
+    match gnome::secrets_bus_owner().await {
+        Ok(owner) => {
+            if let Some(warning) = owner.foreign_provider_warning() {
+                eprintln!("warning: {}", escape_control(&warning));
+                notes.push(warning);
+            }
+        }
+        Err(e) => eprintln!(
+            "warning: could not tell who owns org.freedesktop.secrets ({}), so this run \
+             cannot say whether the keyrings it is about to read are the ones your session \
+             has been using.",
+            escape_control(&e.to_string())
+        ),
+    }
+    // Before the password prompt, and before the child that would write to it:
+    // the private gnome-keyring gets a copy of the source directory and the
+    // user's own is never opened for writing. See `gnome::KeyringSnapshot`.
+    let snapshot = gnome::KeyringSnapshot::create(source_dir).map_err(gnome_error)?;
     let password = super::read_password(
         "gnome-keyring login password (it is sent to a private gnome-keyring-daemon, \
          never stored)",
@@ -296,18 +324,19 @@ async fn extract_gnome(container: &str) -> Result<Extraction, CliError> {
     // Only the keyring the user named. Without this the walk covers every
     // collection the private daemon exposes, so items from keyrings they did
     // not ask for land in a collection labelled after the one they did — and
-    // the label then misdescribes its own contents.
+    // the label then misdescribes its own contents. It is also the scope the
+    // independent count is taken over; the two must not disagree.
     let walked = gnome::extract_over_private_bus(
         &password,
         &gnome::ExtractOptions {
             only_container: Some(container.to_string()),
+            data_home: Some(snapshot.data_home().to_path_buf()),
             ..Default::default()
         },
     )
     .await
     .map_err(gnome_error)?;
 
-    let mut notes = Vec::new();
     if let Some(reason) = &walked.plain_fallback_reason {
         notes.push(format!(
             "the session with the source daemon was plaintext, not DH-encrypted: {reason}"
@@ -340,7 +369,18 @@ async fn extract_gnome(container: &str) -> Result<Extraction, CliError> {
             })
             .collect(),
         refusals: walked.refused,
-        skipped: Vec::new(),
+        // Items the source daemon would not hand over, or would not hand over
+        // intelligibly. Each one is a per-item failure the walk continued
+        // past, and each is named here rather than counted: `NotMigrated` is
+        // exactly the shape for a loss no `Refusal` variant covers.
+        skipped: walked
+            .skipped
+            .into_iter()
+            .map(|s| NotMigrated {
+                label: s.label,
+                reason: s.reason,
+            })
+            .collect(),
         empty_folders: 0,
         notes,
     })
@@ -479,9 +519,9 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
 fn gnome_error(e: gnome::GnomeError) -> CliError {
     let text = escape_control(&e.to_string());
     match e {
-        gnome::GnomeError::WrongBusOwner { .. }
-        | gnome::GnomeError::BusNeverReady { .. }
-        | gnome::GnomeError::KeyringNeverReady { .. } => CliError::Unreachable(text),
+        gnome::GnomeError::BusNeverReady { .. } | gnome::GnomeError::KeyringNeverReady { .. } => {
+            CliError::Unreachable(text)
+        }
         _ => CliError::Failed(text),
     }
 }
@@ -500,9 +540,9 @@ struct SourceFile {
     path: PathBuf,
     inventory: Inventory,
     /// The independent item count the walk is measured against, from the
-    /// cleartext header(s) — summed over every keyring the gnome walk reaches,
-    /// and the single wallet's entry count for KWallet. `None` when it could
-    /// not be taken, which is reported as *not made* rather than as a failure.
+    /// cleartext header of **this** file: the keyring the walk is restricted
+    /// to, or the wallet that is opened. `None` when it could not be taken,
+    /// which is reported as *not made* rather than as a failure.
     header_item_count: Option<usize>,
 }
 
@@ -634,50 +674,18 @@ fn locate(source: Source, dir: &Path) -> Result<SourceFile, CliError> {
                 Err(e) => return Err(header_io(&default_file, e)),
             };
 
-            // The walk covers every keyring the private daemon holds, so the
-            // independent total has to as well; see this module's header.
-            let mut total = Some(0usize);
-            let mut chosen_inventory = None;
-            for path in &candidates {
-                let parsed = read_source(path).and_then(|bytes| {
-                    parse_keyring_header(&bytes).map_err(|e| header_error(path, &e))
-                });
-                match parsed {
-                    Ok(inventory) => {
-                        if let Some(sum) = total.as_mut() {
-                            *sum += inventory.item_count();
-                        }
-                        if *path == chosen {
-                            chosen_inventory = Some(inventory);
-                        }
-                    }
-                    Err(e) if *path == chosen => return Err(e),
-                    Err(e) => {
-                        eprintln!(
-                            "warning: {} could not be read ({}), so the item count cannot be \
-                             taken over every keyring the walk reaches and the count check is \
-                             not made.",
-                            escape_control(&path.display().to_string()),
-                            escape_control(&e.to_string())
-                        );
-                        total = None;
-                    }
-                }
-            }
-            let inventory = match chosen_inventory {
-                Some(inventory) => inventory,
-                // The `default` file named a keyring the listing did not
-                // produce; read it on its own and take no total.
-                None => {
-                    total = None;
-                    let bytes = read_source(&chosen)?;
-                    parse_keyring_header(&bytes).map_err(|e| header_error(&chosen, &e))?
-                }
-            };
+            // One keyring is walked — `ExtractOptions::only_container` names
+            // it — so one keyring's header is the independent total. Summing
+            // the siblings here is what made the check fail every user with a
+            // second `.keyring`: six declared against three walked, raised
+            // after the collection had already been written. The two halves
+            // count the same thing or they compare nothing.
+            let bytes = read_source(&chosen)?;
+            let inventory = parse_keyring_header(&bytes).map_err(|e| header_error(&chosen, &e))?;
             Ok(SourceFile {
                 path: chosen,
+                header_item_count: Some(inventory.item_count()),
                 inventory: Inventory::Keyring(Box::new(inventory)),
-                header_item_count: total,
             })
         }
         Source::KWallet => {
@@ -807,9 +815,19 @@ struct ReportFile<'a> {
 }
 
 impl<'a> ReportFile<'a> {
+    /// `probed_tally` and `items` are passed together, and they are *the same
+    /// pair*: the tally the probe produced and the items the probe downgraded.
+    ///
+    /// They used to be the post-probe tally beside the pre-probe items, which
+    /// made the file one its own reader rejects — `ImportReport`'s
+    /// `Deserialize` recomputes the tally from the items and errors on a
+    /// disagreement — and the file is written before the failure return, so it
+    /// was produced in exactly the case a user pastes into a bug report. See
+    /// [`downgrade_items`].
     fn new(
         report: &'a ImportReport,
         probed_tally: &'a Tally,
+        items: &'a [ItemReport],
         verification: &'a Verification,
         not_migrated: &'a [NotMigrated],
         notes: &'a [String],
@@ -820,7 +838,7 @@ impl<'a> ReportFile<'a> {
             collection: &report.collection,
             tally: probed_tally,
             tally_before_probe: &report.tally,
-            items: &report.items,
+            items,
             empty_folders: report.empty_folders,
             header_item_count: report.header_item_count,
             verification,
@@ -829,6 +847,68 @@ impl<'a> ReportFile<'a> {
             written,
         }
     }
+}
+
+/// The items, with the probe's verdict applied to each one's outcome.
+///
+/// `verify::tally_with_probes` downgrades a `FullyPortable` item whose
+/// attribute key set failed its probe; this applies the same rule to the item
+/// rows, so the report's `tally` and its `items` add up to each other. The
+/// matching is by key set for the same reason it is there: an [`ItemReport`]
+/// holds no attribute values, and two attribute sets sharing a key set share
+/// the pessimistic verdict.
+fn downgrade_items(items: &[ItemReport], failed: &[ProbeResult]) -> Vec<ItemReport> {
+    let failed: Vec<&AttributeKeys> = failed
+        .iter()
+        .filter(|p| p.found.is_some() && !p.passed())
+        .map(|p| &p.attribute_keys)
+        .collect();
+    items
+        .iter()
+        .map(|item| {
+            let mut item = item.clone();
+            if item.outcome == Some(crate::import::Outcome::FullyPortable)
+                && failed.iter().any(|keys| **keys == item.attribute_keys)
+            {
+                item.outcome = Some(crate::import::Outcome::AttributesPreserved);
+            }
+            item
+        })
+        .collect()
+}
+
+/// [`verify::probe_plan`], with the expectation corrected for what
+/// `SearchItems` actually does.
+///
+/// `SearchItems` is **subset** matching — `src/vault/store.rs` and
+/// `src/vault/format.rs` both index on it — so a probe for `{server, user}`
+/// returns every item carrying at least those two, including the one that also
+/// carries an `xdg:schema`. `probe_plan` counts items whose attribute map is
+/// *equal* to the query, so on the ordinary source that holds both, the probe
+/// for the smaller set expects 1 and finds 2, and a byte-perfect import fails
+/// verification — and `tally_with_probes` then downgrades every item sharing
+/// that key set.
+///
+/// The expectation is therefore the number of source items whose attributes
+/// are a **superset** of the query, which is exactly what the daemon will
+/// return from a faithful import of them.
+///
+/// This belongs in `verify::probe_plan` itself, next to the `expected` field
+/// it computes; it is here because that file is not this change's to edit.
+fn probe_plan(items: &[SourceItem]) -> Vec<verify::ProbeQuery> {
+    let mut plan = verify::probe_plan(items);
+    for query in &mut plan {
+        query.expected = items
+            .iter()
+            .filter(|item| {
+                query
+                    .attributes
+                    .iter()
+                    .all(|(k, v)| item.attributes.get(k) == Some(v))
+            })
+            .count();
+    }
+    plan
 }
 
 fn write_report(path: &Path, file: &ReportFile<'_>) -> Result<(), CliError> {
@@ -888,7 +968,10 @@ fn write_report_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
 pub async fn run(args: ImportArgs) -> Result<(), CliError> {
     let source: Source = args.from.into();
     let env = ImportEnv::new(load_config()?, source_dir(source)?);
-    run_with(args, &LiveExtractor, &env).await
+    let extractor = LiveExtractor {
+        source_dir: env.source_dir.clone(),
+    };
+    run_with(args, &extractor, &env).await
 }
 
 mod pipeline {
@@ -915,24 +998,44 @@ mod pipeline {
         pub source_dir: PathBuf,
         /// See [`PasswordReader`]. Defaults to [`read_new_password`].
         pub new_password: PasswordReader,
-        /// Whether this run may reach the running daemon at all: the `Reload`
-        /// over the control socket and the lookup probe over the session bus.
-        ///
-        /// `true` everywhere in production. It is a field rather than a
-        /// question answered from the environment because the only other way
-        /// to keep an in-process test off the developer's own daemon is to
-        /// point `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` at nothing
-        /// with `std::env::set_var` — which, in edition 2024, is `unsafe`
-        /// precisely because it races every other thread in the same test
-        /// binary, and `cargo test` runs tests in parallel. The addresses
-        /// themselves cannot be carried here: `protocol::socket_path` and
-        /// `cli::client::Client::connect` read the environment inside
-        /// themselves, and neither is this module's to change.
-        ///
-        /// Turning it off does not fake a pass. The probes come back *not
-        /// issued*, which `Verification::unproved` reports as a check that was
-        /// not made — exactly what they are on a machine with no daemon.
-        pub reach_the_daemon: bool,
+        /// Which daemon this run reloads and probes. See [`DaemonTarget`].
+        pub daemon: DaemonTarget,
+    }
+
+    /// The running daemon this import publishes to, and then questions.
+    ///
+    /// This replaces a `reach_the_daemon: bool` that every one of the nine
+    /// tests set to `false`, so the whole probe path — the one this module
+    /// calls "the check that matters" — shipped with the suite *pinning that
+    /// it had not run. The boolean could not be anything else: it named no
+    /// daemon, so the only alternative to "the developer's own" was "none".
+    ///
+    /// An address can be a third thing. [`DaemonTarget::At`] is a real daemon on a
+    /// private bus, which is what `tests/common`'s fixture already stands up
+    /// for eleven other integration binaries, so the probe is now exercised
+    /// against a daemon that answers rather than against a `false`.
+    // Production constructs `FromEnvironment` and nothing else — the other two
+    // exist for the tests, like `Extraction` and `PasswordReader` above, and
+    // like them they are `pub` only under `test-util`. The allow is for the
+    // shipped build, where they are the unused half of a test seam rather than
+    // dead code anyone could reach.
+    #[cfg_attr(not(any(test, feature = "test-util")), allow(dead_code))]
+    pub enum DaemonTarget {
+        /// The user's own: `DBUS_SESSION_BUS_ADDRESS` and
+        /// `$XDG_RUNTIME_DIR/secret-manager/control.sock`. Production, and
+        /// nothing else.
+        FromEnvironment,
+        /// A specific one. The two addresses travel together because the
+        /// probe's whole validity rests on them being the *same process*; see
+        /// [`probe_target`].
+        At {
+            bus_address: String,
+            control_socket: PathBuf,
+        },
+        /// There is none. Every probe comes back *not issued*, which
+        /// `Verification::unproved` reports as a check that was not made —
+        /// exactly what it is on a machine with no daemon.
+        None,
     }
 
     impl ImportEnv {
@@ -941,7 +1044,7 @@ mod pipeline {
                 config,
                 source_dir,
                 new_password: Box::new(read_new_password),
-                reach_the_daemon: true,
+                daemon: DaemonTarget::FromEnvironment,
             }
         }
     }
@@ -1065,39 +1168,102 @@ mod pipeline {
                 Ok(dest) => destination = Some(dest),
                 Err(e) => return Err(unlink_partial(&vault_path, e)),
             }
-            if args.set_default {
-                set_default_alias(config, &id);
-            }
-            if env.reach_the_daemon {
-                notify_daemon();
-            }
         }
 
         // ---------------------------------------------------------------
         // Verify
         // ---------------------------------------------------------------
-        let probes = if args.dry_run || !env.reach_the_daemon {
-            verify::probe_plan(&items)
-                .iter()
-                .map(ProbeResult::not_issued)
-                .collect()
-        } else {
-            run_probes(&items, &id, config.vault.locked_search).await
-        };
-        let verification = verify_import(
-            &file,
-            &items,
+        //
+        // In two stages, and the order is the whole point. Everything except
+        // the lookup probe is offline — the count against the cleartext
+        // header, the fingerprints against the decrypted file, the length
+        // histogram — and none of it needs the daemon. So it is taken *first*,
+        // while the only thing this run has done is create a file nobody has
+        // been told about. A failure there is reversible: unlink and nothing
+        // remains, because the alias has not moved and the daemon has not been
+        // asked to load anything.
+        //
+        // Both of those used to happen fifty-one lines before the gate, so a
+        // failed verification left `default` pointing at the new collection,
+        // the daemon holding it, and the retry blocked by the "already exists"
+        // refusal — against a file that run had created.
+        let plan = probe_plan(&items);
+        let walked =
             // Skipped entries were in the file too, so they count towards the
             // independent total; leaving them out would hide the shortfall the
             // count check exists to expose.
-            report.tally.seen() + extraction.skipped.len(),
+            report.tally.seen() + extraction.skipped.len();
+        let mut verification = verify_import(
+            &file,
+            &items,
+            walked,
             destination.as_ref(),
-            probes,
+            plan.iter().map(ProbeResult::not_issued).collect(),
         );
-        let probed_tally = verify::tally_with_probes(&report.items, &verification.failed_probes);
+        if !verification.passed() {
+            // Nothing was published, so the file goes and the error says so
+            // rather than the reverse.
+            let report_file = ReportFile::new(
+                &report,
+                // The probe was never issued, so it downgraded nothing and the
+                // two tallies are the same one.
+                &report.tally,
+                &report.items,
+                &verification,
+                &extraction.skipped,
+                &extraction.notes,
+                !args.dry_run,
+            );
+            print_report(&file, &id, &report_file, destination_exists);
+            if let Some(path) = &args.report {
+                write_report(path, &report_file)?;
+                println!(
+                    "\nReport written to {}",
+                    escape_control(&path.display().to_string())
+                );
+            }
+            let e = CliError::Failed(format!(
+                "verification did not pass; the lines above name every check that failed. \
+                 Nothing was published: the `default` alias was not moved, no daemon was \
+                 told to load anything, {} and the source files were not touched.",
+                if args.dry_run {
+                    "nothing was written,"
+                } else {
+                    "the collection this run created has been removed again,"
+                }
+            ));
+            return Err(if args.dry_run {
+                e
+            } else {
+                unlink_partial(&vault_path, e)
+            });
+        }
+
+        // Only now is the collection published: the daemon is told to rescan,
+        // which is what gives the probe below something to find.
+        if !args.dry_run {
+            notify_daemon(&env.daemon);
+        }
+        if !args.dry_run {
+            let probes = run_probes(&plan, &id, config.vault.locked_search, &env.daemon).await;
+            verification.probes = verify::ProbeSummary::of(&probes);
+            verification.failed_probes = probes
+                .into_iter()
+                .filter(|p| p.found.is_some() && !p.passed())
+                .collect();
+        }
+
+        // The probe's verdict is applied to the items *and* to the tally, so
+        // the two agree: `ImportReport`'s own deserializer recomputes the
+        // tally from the items and refuses a file where they disagree, which
+        // is what `--report` used to write in exactly the case a user would
+        // paste into a bug report.
+        let probed_items = downgrade_items(&report.items, &verification.failed_probes);
+        let probed_tally = verify::tally_with_probes(&probed_items, &verification.failed_probes);
         let report_file = ReportFile::new(
             &report,
             &probed_tally,
+            &probed_items,
             &verification,
             &extraction.skipped,
             &extraction.notes,
@@ -1115,11 +1281,28 @@ mod pipeline {
         }
 
         if !verification.passed() {
-            return Err(CliError::Failed(
-                "verification did not pass; the lines above name every check that failed. \
-                 The source files were not touched."
-                    .into(),
-            ));
+            // The bytes are right — every offline check passed above — and the
+            // daemon has been told to load the collection, so unlinking now
+            // would take a good file away from a daemon that still holds it in
+            // memory. The file stays, the alias does not move, and the error
+            // names both.
+            return Err(CliError::Failed(format!(
+                "the collection was written correctly but a libsecret client could not find \
+                 every item in it; the lines above name each attribute set that did not come \
+                 back. {} is on disk and a running daemon has loaded it, the `default` alias \
+                 was not moved, and the source files were not touched. Either check it by \
+                 hand with `sm list --collection {}`, or remove that file and restart the \
+                 daemon before importing again.",
+                escape_control(&vault_path.display().to_string()),
+                escape_control(&id)
+            )));
+        }
+        // Last, and only once every check that could be made has passed: the
+        // alias is the one destination effect a user notices, and moving it
+        // over a failed migration points `default` at a collection this run is
+        // about to call broken.
+        if args.set_default && !args.dry_run {
+            set_default_alias(config, &id);
         }
         Ok(())
     }
@@ -1167,8 +1350,15 @@ fn set_default_alias(config: &Config, id: &str) {
 }
 
 /// Tell a running daemon to rescan, so the probe below has something to find.
-fn notify_daemon() {
-    let Ok(path) = socket_path() else { return };
+fn notify_daemon(target: &DaemonTarget) {
+    let path = match target {
+        DaemonTarget::None => return,
+        DaemonTarget::At { control_socket, .. } => control_socket.clone(),
+        DaemonTarget::FromEnvironment => {
+            let Ok(path) = socket_path() else { return };
+            path
+        }
+    };
     match call(&path, &Request::Reload) {
         Ok(Response::Error(e)) => {
             eprintln!(
@@ -1184,14 +1374,132 @@ fn notify_daemon() {
     }
 }
 
+/// The pid of whatever answers the control socket, from `SO_PEERCRED`.
+///
+/// `std::os::unix::net::UnixStream::peer_cred` is still unstable, and
+/// `protocol::peer_uid` — which does exactly this for the uid — is private to
+/// that module, so the three lines are here. Nothing is sent: the connection
+/// is opened for the kernel's answer about who is on the other end and then
+/// dropped.
+fn control_socket_peer_pid(socket: &Path) -> std::io::Result<i32> {
+    use std::os::fd::AsRawFd;
+    let stream = std::os::unix::net::UnixStream::connect(socket)?;
+    // SAFETY: ucred is plain data; all-zero is a valid initial value.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `stream` owns a valid socket fd for the duration of the call,
+    // and `cred`/`len` are live, correctly sized out-parameters for
+    // SO_PEERCRED.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred.pid)
+}
+
+/// A session-bus connection and the proof that the service on it is *our*
+/// daemon, or a sentence saying why the probe cannot be issued.
+///
+/// This is the correction the probe needed most. `SearchItems` was issued to
+/// whoever owns `org.freedesktop.secrets` on the session bus, and the run that
+/// reached this point had just been required to prove that owner was
+/// `gnome-keyring-daemon` — the *source*. For a keyring named `login` the
+/// destination id is `login` too, so the object-path prefix filter matched
+/// gnome-keyring's own item paths and the probe counted source items and
+/// reported PASS while proving nothing at all; for a keyring named anything
+/// else it matched nothing and failed a byte-perfect import.
+///
+/// So the probe has to establish who it is talking to, and the only thing that
+/// establishes it is identity with the process on the other end of *our*
+/// control socket — the socket under `$XDG_RUNTIME_DIR` whose peer we compare
+/// by pid. A name matched by process *name* would be a guess (an in-process
+/// daemon runs under the test binary's name, and a same-uid impostor may pick
+/// any name it likes); a pid from `SO_PEERCRED` against a pid from
+/// `GetConnectionUnixProcessID` is the same kernel telling us twice.
+///
+/// Anything it cannot establish is *unproved*, never a pass and never a
+/// failure: no daemon, no answer, two different processes. Each returns the
+/// sentence the user is shown.
+async fn probe_target(target: &DaemonTarget) -> Result<zbus::Connection, String> {
+    let (bus, socket) = match target {
+        DaemonTarget::None => {
+            return Err("this run was given no daemon to probe".to_string());
+        }
+        DaemonTarget::At {
+            bus_address,
+            control_socket,
+        } => (Some(bus_address.clone()), control_socket.clone()),
+        DaemonTarget::FromEnvironment => (
+            None,
+            socket_path().map_err(|e| format!("no control socket: {e}"))?,
+        ),
+    };
+
+    // Ours by construction: the socket lives under `$XDG_RUNTIME_DIR`, and
+    // whoever answers it is the daemon this CLI already trusts with vault
+    // keys.
+    let ours = control_socket_peer_pid(&socket).map_err(|e| {
+        format!(
+            "the daemon's control socket at {} did not answer ({e})",
+            escape_control(&socket.display().to_string())
+        )
+    })?;
+
+    let conn = match &bus {
+        Some(address) => zbus::connection::Builder::address(address.as_str())
+            .map_err(|e| format!("bad bus address: {e}"))?
+            .build()
+            .await
+            .map_err(|e| format!("cannot connect to the session bus: {e}"))?,
+        None => zbus::Connection::session()
+            .await
+            .map_err(|e| format!("cannot connect to the session bus: {e}"))?,
+    };
+    let dbus = zbus::fdo::DBusProxy::new(&conn)
+        .await
+        .map_err(|e| format!("cannot reach the bus daemon: {e}"))?;
+    let name = zbus::names::BusName::try_from(gnome::SECRETS_BUS_NAME)
+        .map_err(|e| format!("bad bus name: {e}"))?;
+    let owner = dbus
+        .get_connection_unix_process_id(name)
+        .await
+        .map_err(|e| {
+            format!(
+                "nothing owns {} on the session bus ({e})",
+                gnome::SECRETS_BUS_NAME
+            )
+        })?;
+    if i64::from(owner) != i64::from(ours) {
+        return Err(format!(
+            "{} on the session bus is owned by pid {owner}, which is not the pid {ours} that \
+             answers this machine's secret-manager control socket. The probe would have \
+             questioned a different provider about our collection",
+            gnome::SECRETS_BUS_NAME
+        ));
+    }
+    Ok(conn)
+}
+
 /// The lookup probe: one `SearchItems` per distinct source attribute set.
 ///
 /// This is the check that matters. The fingerprints prove the bytes copied;
 /// this proves a libsecret client can still find them, which is the actual
-/// promise. A daemon that cannot be reached makes every probe *not issued* —
-/// unproved, never passed.
-async fn run_probes(items: &[SourceItem], id: &str, locked_search: bool) -> Vec<ProbeResult> {
-    let plan = verify::probe_plan(items);
+/// promise. A daemon that cannot be reached, or that cannot be shown to be
+/// ours, makes every probe *not issued* — unproved, never passed.
+async fn run_probes(
+    plan: &[verify::ProbeQuery],
+    id: &str,
+    locked_search: bool,
+    target: &DaemonTarget,
+) -> Vec<ProbeResult> {
     if plan.is_empty() {
         return Vec::new();
     }
@@ -1212,8 +1520,25 @@ async fn run_probes(items: &[SourceItem], id: &str, locked_search: bool) -> Vec<
         );
         return plan.iter().map(ProbeResult::not_issued).collect();
     }
-    let client = match super::client::Client::connect().await {
+    let conn = match probe_target(target).await {
         Ok(c) => c,
+        Err(why) => {
+            eprintln!(
+                "warning: the lookup probe could not run ({}), so discoverability is \
+                 unproved. Start the daemon and run `sm list` to check by hand.",
+                escape_control(&why)
+            );
+            return plan.iter().map(ProbeResult::not_issued).collect();
+        }
+    };
+    // No session is opened: `SearchItems` returns object paths and no secret,
+    // so the probe never asks the daemon to hand one back.
+    let service = match crate::dbus::proxies::ServiceProxy::builder(&conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+    {
+        Ok(s) => s,
         Err(e) => {
             eprintln!(
                 "warning: the lookup probe could not run ({}), so discoverability is \
@@ -1230,8 +1555,13 @@ async fn run_probes(items: &[SourceItem], id: &str, locked_search: bool) -> Vec<
     // - a spurious failure that fails the whole run after a good write.
     let prefix = format!("{}/", paths::collection(id).as_str());
     let mut out = Vec::with_capacity(plan.len());
-    for query in &plan {
-        match client.search(&query.attributes).await {
+    for query in plan {
+        let map: std::collections::HashMap<&str, &str> = query
+            .attributes
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        match service.search_items(map).await {
             // Both halves count: `SearchItems` returns unlocked and locked
             // matches separately, and a locked match is still findable - the
             // hashed attribute index is what makes search work on a locked
@@ -1650,6 +1980,74 @@ mod tests {
         }
     }
 
+    /// The report `--report` writes must be a report its own parser accepts.
+    ///
+    /// `ImportReport`'s `Deserialize` recomputes the tally from the items and
+    /// refuses a file where the two disagree — which is exactly what this
+    /// command used to write, because it paired the post-probe `tally` with
+    /// the un-downgraded `items`. And it is written *before* the failure
+    /// return, so the unreadable file was produced in precisely the case a
+    /// user pastes into a bug report.
+    #[test]
+    fn the_written_report_parses_back_as_the_report_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.json");
+
+        let item = hostile_item();
+        let mut report = ImportReport::new(Source::GnomeKeyring, "Sample keyring");
+        report.push(ItemReport::imported(&item));
+        assert_eq!(report.tally.fully_portable(), 1);
+
+        // One probe, for this item's own attribute set, that came back empty:
+        // the attributes are on disk and the daemon does not return the item.
+        let plan = probe_plan(std::slice::from_ref(&item));
+        let failed: Vec<ProbeResult> = plan.iter().map(|q| ProbeResult::new(q, 0)).collect();
+        assert!(!failed[0].passed());
+
+        let verification = Verification {
+            count: verify::CountCheck::new(Some(1), 1),
+            fingerprint_mismatches: Vec::new(),
+            fingerprints_compared: Some(1),
+            hash_table_misses: Vec::new(),
+            hash_table_checked: None,
+            probes: verify::ProbeSummary::of(&failed),
+            failed_probes: failed,
+            source_lengths: Histogram::of_lengths(std::iter::once(item.secret.len())),
+            destination_lengths: None,
+            length_differences: Vec::new(),
+        };
+
+        let probed_items = downgrade_items(&report.items, &verification.failed_probes);
+        let probed_tally = verify::tally_with_probes(&probed_items, &verification.failed_probes);
+        // The probe downgraded it, so the tally the file carries is not the
+        // one the items would have added up to a moment ago.
+        assert_eq!(probed_tally.fully_portable(), 0);
+        assert_eq!(probed_tally.attributes_preserved(), 1);
+        let report_file = ReportFile::new(
+            &report,
+            &probed_tally,
+            &probed_items,
+            &verification,
+            &[],
+            &[],
+            true,
+        );
+        write_report(&path, &report_file).unwrap();
+
+        let json = std::fs::read_to_string(&path).unwrap();
+        let parsed: ImportReport = serde_json::from_str(&json).unwrap_or_else(|e| {
+            panic!("the report this command writes does not parse: {e}\n{json}")
+        });
+        assert_eq!(parsed.tally, probed_tally);
+        // And the pre-probe tally is still in the file, because the difference
+        // between the two is itself a finding.
+        let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            raw["tally_before_probe"]["fully_portable"],
+            serde_json::json!(1)
+        );
+    }
+
     /// The module's central claim, asserted against the bytes the product
     /// actually writes.
     ///
@@ -1708,9 +2106,11 @@ mod tests {
             reason: "the map would not decode".to_string(),
         }];
         let notes = vec!["the session with the source daemon was plaintext".to_string()];
+        let probed_items = downgrade_items(&report.items, &verification.failed_probes);
         let report_file = ReportFile::new(
             &report,
             &probed_tally,
+            &probed_items,
             &verification,
             &not_migrated,
             &notes,

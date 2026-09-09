@@ -133,6 +133,10 @@ pub fn is_unlock_credential_type(item_type: &str) -> bool {
 /// The program name a `--from gnome-keyring` session-bus route requires.
 pub const GNOME_KEYRING_PROGRAM: &str = "gnome-keyring-daemon";
 
+/// Our own daemon's program name. An owner that is *us* is the ordinary
+/// post-install state, not a foreign provider to warn about.
+pub const OUR_PROGRAM: &str = "secret-manager";
+
 /// The name both providers, and we, compete for.
 pub const SECRETS_BUS_NAME: &str = "org.freedesktop.secrets";
 
@@ -165,6 +169,51 @@ impl BusOwner {
                 program_name(command) == Some(GNOME_KEYRING_PROGRAM)
             }
             _ => false,
+        }
+    }
+
+    /// True for a `Process` whose argv[0] basename is [`OUR_PROGRAM`].
+    pub fn is_secret_manager(&self) -> bool {
+        match self {
+            BusOwner::Process { command, .. } => program_name(command) == Some(OUR_PROGRAM),
+            _ => false,
+        }
+    }
+
+    /// What to *tell the user* about this owner before a private-bus
+    /// gnome-keyring extraction, or `None` when there is nothing to say.
+    ///
+    /// The private-bus route reads `$XDG_DATA_HOME/keyrings` directly and
+    /// never touches the session bus, so who owns [`SECRETS_BUS_NAME`] cannot
+    /// block it and is not a precondition for it. What the owner *does* say is
+    /// which provider the user's secrets have actually been going to: a name
+    /// held by `ksecretd` means the keyrings on disk may be stale, and
+    /// "migrate gnome-keyring" would faithfully migrate a set of keyrings
+    /// nobody has written to since. That is a statement about the source, not
+    /// about reachability, so it is a warning and never a refusal — the user
+    /// may well be migrating exactly the stale keyrings on purpose.
+    ///
+    /// The two states this is deliberately silent about are the two the
+    /// install guides produce: nothing owns the name (gnome-keyring masked,
+    /// our daemon not yet started) and *we* own it. Refusing either is how
+    /// this command came to be unusable in the state it exists for.
+    pub fn foreign_provider_warning(&self) -> Option<String> {
+        match self {
+            BusOwner::Unowned => None,
+            _ if self.is_gnome_keyring() || self.is_secret_manager() => None,
+            BusOwner::Unidentified { .. } => Some(format!(
+                "{}, so this run cannot tell which provider your secrets have actually been \
+                 going to. If it is not gnome-keyring, the keyrings read below are stale and \
+                 this import will faithfully copy them.",
+                self.describe()
+            )),
+            BusOwner::Process { .. } => Some(format!(
+                "{}, which is neither {GNOME_KEYRING_PROGRAM} nor {OUR_PROGRAM}. Your secrets \
+                 have been going to that provider, so the gnome-keyring files read below may \
+                 be stale or empty and this import will faithfully copy whatever they hold. \
+                 If you meant to migrate that provider, run `sm import` against it instead.",
+                self.describe()
+            )),
         }
     }
 
@@ -237,14 +286,13 @@ pub fn classify_bus_owner(busctl_status: Option<&str>, ps_command: Option<&str>)
 /// Runs `busctl --user status org.freedesktop.secrets` and then
 /// `ps -p <pid> -o cmd=`, each under [`COMMAND_TIMEOUT`].
 ///
-/// **Nothing in the shipped code path calls this.** It is written to be the
-/// precondition of a session-bus route, and the only production caller it is
-/// intended for is `extract_gnome` in `src/cli/import.rs`, which does not yet
-/// invoke it — today that function goes straight to
-/// [`extract_over_private_bus`], which stands up its own gnome-keyring and so
-/// cannot read the wrong provider. Until the CLI wires
-/// [`require_gnome_keyring_owner`] in, this function and everything it feeds
-/// are reachable only from this module's tests.
+/// `extract_gnome` in `src/cli/import.rs` calls this for
+/// [`BusOwner::foreign_provider_warning`] alone: the private-bus route it uses
+/// stands up its own gnome-keyring against the files on disk, so the session
+/// bus's owner cannot make the extraction read the wrong provider — it can
+/// only tell the user that the files on disk are not where their secrets have
+/// been going. A session-bus route, if one is ever added, is the caller that
+/// would need this as a *precondition*.
 pub async fn secrets_bus_owner() -> Result<BusOwner, GnomeError> {
     let status = run_capture("busctl", &["--user", "status", SECRETS_BUS_NAME]).await?;
     let Some(pid) = status.as_deref().and_then(parse_busctl_pid) else {
@@ -252,31 +300,6 @@ pub async fn secrets_bus_owner() -> Result<BusOwner, GnomeError> {
     };
     let ps = run_capture("ps", &["-p", &pid.to_string(), "-o", "cmd="]).await?;
     Ok(classify_bus_owner(status.as_deref(), ps.as_deref()))
-}
-
-/// The precondition a session-bus route needs — **not currently called**.
-///
-/// A `--from` that disagrees with the bus is a user error worth stopping for,
-/// not a warning worth printing: the failure it prevents is a silent,
-/// successful-looking migration of the wrong data. That is the argument for
-/// the check; it is not a description of what runs today.
-///
-/// No production code calls this. [`GnomeError::WrongBusOwner`] is therefore
-/// unconstructible outside this module, even though `src/cli/import.rs`
-/// already classifies it. The intended caller is `extract_gnome` in
-/// `src/cli/import.rs`, which must call this before it offers any route that
-/// reads `org.freedesktop.secrets` from the *real* session bus; the private-bus
-/// route it uses today does not need it, because the daemon it reads is one it
-/// started itself. There is deliberately no override flag when it is wired in.
-pub async fn require_gnome_keyring_owner() -> Result<BusOwner, GnomeError> {
-    let owner = secrets_bus_owner().await?;
-    if owner.is_gnome_keyring() {
-        Ok(owner)
-    } else {
-        Err(GnomeError::WrongBusOwner {
-            owner: owner.describe(),
-        })
-    }
 }
 
 /// Runs a command to completion under [`COMMAND_TIMEOUT`], returning its
@@ -361,13 +384,6 @@ pub const STDERR_CAPTURE_LIMIT: usize = 4096;
 /// Every way this module can fail, each one named so a report can say which.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GnomeError {
-    /// The precondition. No override flag exists, deliberately.
-    #[error(
-        "refusing to read gnome-keyring from the session bus: {owner}, not {GNOME_KEYRING_PROGRAM}. \
-         Migrate that provider instead, or stop it and log back in so gnome-keyring takes the name."
-    )]
-    WrongBusOwner { owner: String },
-
     #[error("could not run {program}: {message}")]
     Spawn { program: String, message: String },
 
@@ -567,6 +583,71 @@ impl Drop for PrivateDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// A private copy of a `keyrings/` directory, and the `XDG_DATA_HOME` that
+/// points [`PrivateKeyring::start`] at it. Removed when it drops.
+///
+/// The child this feeds is **not a reader**: `gnome-keyring-daemon --unlock`
+/// rewrites the keyrings it opens and creates a `login.keyring` where there is
+/// none. Pointed at the user's own `$XDG_DATA_HOME` it does both to the files
+/// the import exists to leave alone — including on a `--dry-run`, whose whole
+/// promise is that nothing was written. No flag of ours suppresses those
+/// writes, so the only way to keep the promise is to give the child a copy and
+/// let it write to that.
+pub struct KeyringSnapshot {
+    dir: PrivateDir,
+}
+
+impl KeyringSnapshot {
+    /// Copies every regular file in `source_dir` into `<private>/keyrings/`.
+    ///
+    /// Each copy is created 0600 before anything is written into it, and the
+    /// directory above it is 0700 from `mkdir(2)` onwards, so the copies are
+    /// never briefly readable by another user. A file that cannot be copied is
+    /// an error and not a thinner source: an extraction that quietly read half
+    /// the keyrings would be measured against the header of all of them.
+    pub fn create(source_dir: &Path) -> Result<KeyringSnapshot, GnomeError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let io = |path: &Path, e: std::io::Error| GnomeError::Spawn {
+            program: format!(
+                "private copy of {}",
+                display_label(&path.display().to_string())
+            ),
+            message: e.to_string(),
+        };
+        let dir = PrivateDir::create().map_err(|e| io(Path::new("the temp directory"), e))?;
+        // gnome-keyring appends `keyrings/` to `XDG_DATA_HOME`, so the copy
+        // has to sit under that name whatever the original was called.
+        let dest = dir.path().join(KEYRINGS_SUBDIR);
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&dest)
+            .map_err(|e| io(&dest, e))?;
+        for entry in std::fs::read_dir(source_dir).map_err(|e| io(source_dir, e))? {
+            let entry = entry.map_err(|e| io(source_dir, e))?;
+            if !entry.file_type().map_err(|e| io(source_dir, e))?.is_file() {
+                continue;
+            }
+            let to = dest.join(entry.file_name());
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&to)
+                .map_err(|e| io(&to, e))?;
+            let mut from = std::fs::File::open(entry.path()).map_err(|e| io(&entry.path(), e))?;
+            std::io::copy(&mut from, &mut target).map_err(|e| io(&to, e))?;
+        }
+        Ok(KeyringSnapshot { dir })
+    }
+
+    /// The value to pass as [`ExtractOptions::data_home`].
+    pub fn data_home(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// The directory gnome-keyring reads under `XDG_DATA_HOME`.
+pub const KEYRINGS_SUBDIR: &str = "keyrings";
 
 /// A running gnome-keyring on a session bus nobody else can see.
 ///
@@ -1023,6 +1104,15 @@ impl ExtractedItem {
     }
 }
 
+/// One item the walk could not carry, and why. Label and reason only: both go
+/// through [`display_label`] on the way in, because both are peer text on
+/// their way to a terminal and to the report file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedEntry {
+    pub label: String,
+    pub reason: String,
+}
+
 /// Everything one walk produced.
 #[derive(Debug, Clone)]
 pub struct Extraction {
@@ -1030,6 +1120,23 @@ pub struct Extraction {
     /// Items that were read *about* and never read: an unlock credential's
     /// secret is not fetched at all, and a cap violation's is dropped.
     pub refused: Vec<ItemReport>,
+    /// Items the walk found and could not carry, for a reason
+    /// [`Refusal`](crate::import::Refusal) does not name: the source daemon
+    /// would not hand the secret over, or the session cipher would not decrypt
+    /// what it did hand over.
+    ///
+    /// These are per-*item* failures and are treated as such — one item an ACL
+    /// denies must not discard the four hundred already walked, which is
+    /// exactly the policy `check_caps` states for a cap violation fourteen
+    /// lines below the read. They are named rather than counted, because
+    /// "something did not come across" is the one thing a migration report may
+    /// not round off, and the CLI carries them into its own `not_migrated`
+    /// section.
+    ///
+    /// They would be `Refusal`s if `src/import/mod.rs` had a variant for an
+    /// unreadable secret; it has one for unreadable attributes and one for an
+    /// unreadable item type, and inventing neither is why this list exists.
+    pub skipped: Vec<SkippedEntry>,
     pub collections: Vec<CollectionSummary>,
     /// The label of the collection `ReadAlias("default")` names.
     pub default_collection: Option<String>,
@@ -1154,9 +1261,10 @@ pub async fn extract_over_private_bus(
 /// Walks a Secret Service provider on `conn`.
 ///
 /// Split from [`extract_over_private_bus`] so a caller that already has a
-/// connection — a two-bus test fixture, or a session-bus route that has passed
-/// [`require_gnome_keyring_owner`] — reuses the same walk rather than a second
-/// copy of it.
+/// connection — a two-bus test fixture, say — reuses the same walk rather than
+/// a second copy of it. There is no session-bus route: the private bus is what
+/// lets a migration run after secret-manager owns the name, which is when a
+/// user discovers they need one.
 pub async fn extract(
     conn: &Connection,
     options: &ExtractOptions,
@@ -1169,6 +1277,7 @@ pub async fn extract(
     let mut out = Extraction {
         items: Vec::new(),
         refused: Vec::new(),
+        skipped: Vec::new(),
         collections: Vec::new(),
         default_collection: None,
         algorithm,
@@ -1347,6 +1456,7 @@ pub async fn extract(
                 candidates,
                 &mut out.items,
                 &mut out.refused,
+                &mut out.skipped,
             )
             .await?;
         }
@@ -1644,6 +1754,7 @@ async fn fetch_secrets(
     candidates: Vec<(OwnedObjectPath, ItemMetadata)>,
     items: &mut Vec<ExtractedItem>,
     refused: &mut Vec<ItemReport>,
+    skipped: &mut Vec<SkippedEntry>,
 ) -> Result<(), GnomeError> {
     if candidates.is_empty() {
         return Ok(());
@@ -1684,6 +1795,7 @@ async fn fetch_secrets(
             batch_failure.as_deref(),
             items,
             refused,
+            skipped,
         ),
     )
     .await;
@@ -1712,6 +1824,18 @@ async fn fetch_secrets(
 
 /// The per-item half of [`fetch_secrets`], split out so one timeout can bound
 /// the whole of it and so its `?` paths still reach the wipe above.
+///
+/// **A failure to read or decrypt one item is that item's failure, not the
+/// run's.** It is recorded in `skipped` and the walk continues, which is the
+/// policy every other per-item problem here already follows: a cap violation
+/// refuses one item fourteen lines below, and an unreadable attribute map or
+/// item type refuses one item in the caller. One ACL-denied item out of five
+/// hundred used to discard the four hundred and ninety-nine already walked.
+///
+/// The one thing that is still the run's failure is a transport that produced
+/// *nothing*: if every candidate here failed and none succeeded, the first
+/// error is returned rather than a report saying five hundred items were
+/// "not migrated" over a green verification.
 async fn drain_batch(
     walk: &Walk<'_>,
     candidates: Vec<(OwnedObjectPath, ItemMetadata)>,
@@ -1719,23 +1843,51 @@ async fn drain_batch(
     batch_failure: Option<&str>,
     items: &mut Vec<ExtractedItem>,
     refused: &mut Vec<ItemReport>,
+    skipped: &mut Vec<SkippedEntry>,
 ) -> Result<(), GnomeError> {
+    // Items accounted for: carried, or deliberately refused. Not the ones that
+    // failed.
+    let mut carried = 0usize;
+    let mut first_failure: Option<GnomeError> = None;
+    let skip = |skipped: &mut Vec<SkippedEntry>,
+                first_failure: &mut Option<GnomeError>,
+                label: &str,
+                e: GnomeError| {
+        skipped.push(SkippedEntry {
+            label: display_label(label),
+            reason: display_label(&e.to_string()),
+        });
+        if first_failure.is_none() {
+            *first_failure = Some(e);
+        }
+    };
     for (path, meta) in candidates {
         let mut secret = match batch.remove(&path) {
             Some(s) => s,
             None => {
-                let item: ItemProxy<'static> = proxy_at(walk.conn, "Item", &path).await?;
-                call("Item.GetSecret", item.get_secret(walk.session))
-                    .await
-                    // The batch's cause travels with the per-item failure it
-                    // caused, instead of being replaced by it.
-                    .map_err(|e| match batch_failure {
-                        Some(cause) => GnomeError::Bus {
-                            call: "Item.GetSecret".into(),
-                            message: format!("{e} (the batch had already failed: {cause})"),
-                        },
-                        None => e,
-                    })?
+                let proxied: Result<ItemProxy<'static>, GnomeError> =
+                    proxy_at(walk.conn, "Item", &path).await;
+                let fetched = match proxied {
+                    Ok(item) => call("Item.GetSecret", item.get_secret(walk.session))
+                        .await
+                        // The batch's cause travels with the per-item failure
+                        // it caused, instead of being replaced by it.
+                        .map_err(|e| match batch_failure {
+                            Some(cause) => GnomeError::Bus {
+                                call: "Item.GetSecret".into(),
+                                message: format!("{e} (the batch had already failed: {cause})"),
+                            },
+                            None => e,
+                        }),
+                    Err(e) => Err(e),
+                };
+                match fetched {
+                    Ok(s) => s,
+                    Err(e) => {
+                        skip(skipped, &mut first_failure, &meta.label, e);
+                        continue;
+                    }
+                }
             }
         };
         let plaintext = cipher_decrypt(walk.cipher, &secret);
@@ -1743,7 +1895,13 @@ async fn drain_batch(
         // does not sit in memory for the rest of the collection's walk.
         secret.value.zeroize();
         secret.parameters.zeroize();
-        let plaintext = plaintext?;
+        let plaintext = match plaintext {
+            Ok(p) => p,
+            Err(e) => {
+                skip(skipped, &mut first_failure, &meta.label, e);
+                continue;
+            }
+        };
 
         let source = SourceItem {
             label: meta.label,
@@ -1763,14 +1921,23 @@ async fn drain_batch(
                 source.label.clone(),
                 violation,
             ));
+            carried += 1;
             continue;
         }
         items.push(ExtractedItem {
             item: source,
             item_type: meta.item_type.known().map(str::to_string),
         });
+        carried += 1;
     }
-    Ok(())
+    // Nothing was accounted for at all — neither carried nor deliberately
+    // refused: that is the transport, not five hundred individually unlucky
+    // items, and reporting it as the latter would hand the user a green
+    // verification over an empty collection.
+    match first_failure {
+        Some(e) if carried == 0 => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// One decrypt, named so the wipe that must follow it cannot be skipped by an
@@ -1820,14 +1987,20 @@ mod tests {
         );
         assert!(owner.is_gnome_keyring());
         assert!(owner.describe().contains("4242"));
+        assert_eq!(owner.foreign_provider_warning(), None);
     }
 
-    /// The case that motivates the whole check: on the author's machine
-    /// `ksecretd` owns the name while gnome-keyring is masked, so a
-    /// `--from gnome-keyring` that trusted the bus would have migrated
-    /// KWallet data and called it a success.
+    /// The case that motivates the check: on the author's machine `ksecretd`
+    /// owns the name while gnome-keyring is masked, so a `--from
+    /// gnome-keyring` that believed the bus would have migrated KWallet data
+    /// and called it a success.
+    ///
+    /// The private-bus route cannot make that mistake — it reads the keyring
+    /// files itself — so what is left is worth *saying*: the files it is about
+    /// to read are not where this user's secrets have been going. It is a
+    /// warning, and the extraction goes ahead.
     #[test]
-    fn the_wrong_owner_is_refused_and_named() {
+    fn a_foreign_owner_is_named_in_a_warning() {
         let owner = classify_bus_owner(
             Some(&busctl("7585")),
             Some("/usr/bin/ksecretd --pam-login 4 5\n"),
@@ -1836,13 +2009,19 @@ mod tests {
         let described = owner.describe();
         assert!(described.contains("ksecretd"), "{described}");
         assert!(described.contains("7585"), "{described}");
-        let err = GnomeError::WrongBusOwner { owner: described }.to_string();
-        assert!(err.contains("ksecretd"), "{err}");
-        assert!(err.contains(GNOME_KEYRING_PROGRAM), "{err}");
+        let warning = owner
+            .foreign_provider_warning()
+            .expect("a foreign provider is worth telling the user about");
+        assert!(warning.contains("ksecretd"), "{warning}");
+        assert!(warning.contains("stale"), "{warning}");
     }
 
+    /// The two states the install guides produce. Masking gnome-keyring leaves
+    /// the name unowned until our own daemon takes it, and both are the
+    /// ordinary state to run `sm import` from: neither is refused, and neither
+    /// is worth a warning.
     #[test]
-    fn no_owner_is_not_a_match() {
+    fn an_unowned_name_and_our_own_daemon_are_both_silent() {
         assert_eq!(classify_bus_owner(None, None), BusOwner::Unowned);
         assert_eq!(
             classify_bus_owner(Some("Failed to get PID: no such name\n"), None),
@@ -1850,18 +2029,29 @@ mod tests {
         );
         assert!(!BusOwner::Unowned.is_gnome_keyring());
         assert!(BusOwner::Unowned.describe().contains(SECRETS_BUS_NAME));
+        assert_eq!(BusOwner::Unowned.foreign_provider_warning(), None);
+
+        let ours = classify_bus_owner(
+            Some(&busctl("31")),
+            Some("/usr/local/bin/secret-manager --foreground\n"),
+        );
+        assert!(ours.is_secret_manager());
+        assert_eq!(ours.foreign_provider_warning(), None);
     }
 
-    /// An owner `ps` cannot describe is refused, not assumed. Empty output,
-    /// whitespace-only output and a failed `ps` are the same answer: we do not
-    /// know, so we do not proceed.
+    /// An owner `ps` cannot describe is not assumed to be anything. Empty
+    /// output, whitespace-only output and a failed `ps` are the same answer:
+    /// we do not know, so we say we do not know.
     #[test]
-    fn an_unreadable_ps_refuses_rather_than_assumes() {
+    fn an_unreadable_ps_says_so_rather_than_assuming() {
         for ps in [None, Some(""), Some("   \n\t")] {
             let owner = classify_bus_owner(Some(&busctl("99")), ps);
             assert_eq!(owner, BusOwner::Unidentified { pid: 99 }, "{ps:?}");
             assert!(!owner.is_gnome_keyring(), "{ps:?}");
+            assert!(!owner.is_secret_manager(), "{ps:?}");
             assert!(owner.describe().contains("99"));
+            let warning = owner.foreign_provider_warning().expect("{ps:?}");
+            assert!(warning.contains("99"), "{warning}");
         }
     }
 
@@ -2958,8 +3148,106 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
+    // The private copy the child is pointed at
+    // ----------------------------------------------------------------
+
+    /// Every regular file comes across, the copies are 0600 under a 0700
+    /// directory, and the layout is the one `XDG_DATA_HOME` implies — because
+    /// the whole point is that a child told to write to `keyrings/` writes
+    /// here and not in the user's home.
+    #[test]
+    fn a_snapshot_copies_the_directory_and_nothing_of_it_leaks() {
+        use std::os::unix::fs::PermissionsExt;
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("login.keyring"), b"keyring bytes").unwrap();
+        std::fs::write(source.path().join("default"), b"login\n").unwrap();
+        std::fs::create_dir(source.path().join("a-subdirectory")).unwrap();
+
+        let snapshot = KeyringSnapshot::create(source.path()).unwrap();
+        let copied = snapshot.data_home().join(KEYRINGS_SUBDIR);
+        assert_eq!(
+            std::fs::read(copied.join("login.keyring")).unwrap(),
+            b"keyring bytes"
+        );
+        assert_eq!(std::fs::read(copied.join("default")).unwrap(), b"login\n");
+        assert!(!copied.join("a-subdirectory").exists());
+        assert_eq!(
+            std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(copied.join("login.keyring"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        // What the child does to the copy stays in the copy.
+        std::fs::write(copied.join("login.keyring"), b"rewritten by the daemon").unwrap();
+        std::fs::write(copied.join("user.keystore"), b"created by the daemon").unwrap();
+        assert_eq!(
+            std::fs::read(source.path().join("login.keyring")).unwrap(),
+            b"keyring bytes"
+        );
+        assert!(!source.path().join("user.keystore").exists());
+
+        let path = snapshot.data_home().to_path_buf();
+        drop(snapshot);
+        assert!(!path.exists(), "the private copy outlived the extraction");
+    }
+
+    // ----------------------------------------------------------------
     // The live path
     // ----------------------------------------------------------------
+
+    /// The finding this exists for: `gnome-keyring-daemon --unlock` is not a
+    /// reader. Pointed at a directory it *writes* to it — it creates a
+    /// `login.keyring` where there is none, and rewrites what it opens — so a
+    /// run pointed at the user's own `$XDG_DATA_HOME` modifies the very files
+    /// `--dry-run` promises it has not touched.
+    ///
+    /// So the assertion is about the source directory, made against a real
+    /// daemon: start one on the snapshot of a directory, and afterwards that
+    /// directory holds exactly the bytes and exactly the names it started
+    /// with. Point the same daemon at the directory itself and it does not,
+    /// which is the bug.
+    #[tokio::test]
+    async fn a_live_daemon_writes_to_the_snapshot_and_not_to_the_source() {
+        if !live_prerequisites() {
+            return;
+        }
+        let source = tempfile::tempdir().expect("a writable temp directory");
+        let keyrings = source.path().join(KEYRINGS_SUBDIR);
+        std::fs::create_dir(&keyrings).unwrap();
+        // A directory with no `login.keyring` at all: the case where the child
+        // creates one.
+        std::fs::write(keyrings.join("default"), b"login\n").unwrap();
+        let before = std::fs::read(keyrings.join("default")).unwrap();
+
+        let snapshot = KeyringSnapshot::create(&keyrings).expect("the snapshot is made");
+        let password = Zeroizing::new(b"sm-import-snapshot-test".to_vec());
+        match PrivateKeyring::start(&password, Some(snapshot.data_home())).await {
+            Ok(mut keyring) => keyring.shutdown().await,
+            Err(e) => {
+                println!("SKIPPED: could not start a private gnome-keyring: {e}");
+                return;
+            }
+        }
+
+        let mut names: Vec<String> = std::fs::read_dir(&keyrings)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["default"],
+            "the daemon wrote into the user's own keyrings directory"
+        );
+        assert_eq!(std::fs::read(keyrings.join("default")).unwrap(), before);
+    }
 
     /// `false`, with a printed reason, when this machine cannot run the live
     /// extraction. A skip that says why is the only honest alternative to
@@ -2992,8 +3280,9 @@ mod tests {
     /// The synthetic tests above pin the *decision*; this pins the two command
     /// invocations that feed it. A `busctl` whose output format moved, or a
     /// `ps` invoked with the wrong flag, would leave every synthetic test green
-    /// while the real check answered `Unowned` for every machine — which is a
-    /// refusal, so it fails safe, but it would refuse everyone.
+    /// while the real check answered `Unowned` for every machine — which is
+    /// silence, so no import would break, but nobody would ever be told their
+    /// source is stale.
     #[tokio::test]
     async fn the_real_bus_owner_check_runs_against_the_real_tools() {
         for program in ["busctl", "ps"] {
@@ -3010,10 +3299,16 @@ mod tests {
         }
         let owner = secrets_bus_owner().await.expect("the check itself failed");
         match &owner {
-            // No session bus, or nobody serving secrets: a legitimate answer,
-            // and a refusal.
-            BusOwner::Unowned | BusOwner::Unidentified { .. } => {
+            // No session bus, or nobody serving secrets: a legitimate answer.
+            // `Unowned` is the state the install guides leave behind and is
+            // silent; an owner nobody could identify is worth a sentence.
+            BusOwner::Unowned => {
                 assert!(!owner.is_gnome_keyring());
+                assert_eq!(owner.foreign_provider_warning(), None);
+            }
+            BusOwner::Unidentified { .. } => {
+                assert!(!owner.is_gnome_keyring());
+                assert!(owner.foreign_provider_warning().is_some());
             }
             BusOwner::Process { pid, command } => {
                 assert!(*pid > 0);
@@ -3024,6 +3319,12 @@ mod tests {
                 assert_eq!(
                     owner.is_gnome_keyring(),
                     program_name(command) == Some(GNOME_KEYRING_PROGRAM)
+                );
+                // The two providers that need no warning are gnome-keyring
+                // itself and us.
+                assert_eq!(
+                    owner.foreign_provider_warning().is_none(),
+                    owner.is_gnome_keyring() || owner.is_secret_manager()
                 );
             }
         }

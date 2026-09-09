@@ -37,7 +37,7 @@ use crate::vault::format::{Cap, CapViolation};
 /// Render one cap violation as the `InvalidArgs` this layer has always
 /// returned. The wording is per-cap and unchanged, so no client-visible
 /// message moves.
-fn cap_message(v: CapViolation) -> String {
+pub(crate) fn cap_message(v: CapViolation) -> String {
     let limit = v.limit;
     match v.cap {
         Cap::Secret => format!("secret is too large; at most {limit} bytes per item"),

@@ -42,6 +42,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
+use secret_manager::import::Source;
 use secret_manager::import::formats::{
     self, HeaderError, KEYRING_MAGIC, KWALLET_MAGIC, KeyringInventory, MAX_SOURCE_BYTES,
     WalletInventory, parse_default_file, parse_keyring_header, parse_wallet_header,
@@ -530,12 +531,27 @@ proptest! {
     fn no_parser_panics_on_arbitrary_bytes(bytes in vec(any::<u8>(), 0..512)) {
         keyring_never_panics(&bytes);
         wallet_never_panics(&bytes);
-        // The parsers are independent: neither may be reached by the other's
-        // magic, and both must tolerate the other's file.
-        prop_assert!(matches!(
-            parse_wallet_header(&bytes),
-            Ok(_) | Err(_)
-        ));
+        // The parsers are independent, and the property is stronger than
+        // "neither panics": each refuses the other's file at its own magic,
+        // so no byte string can be read as both a keyring and a wallet.
+        let keyring = parse_keyring_header(&bytes);
+        let wallet = parse_wallet_header(&bytes);
+        prop_assert!(
+            !(keyring.is_ok() && wallet.is_ok()),
+            "one byte string parsed as both formats"
+        );
+        if keyring.is_ok() {
+            prop_assert!(
+                matches!(wallet, Err(HeaderError::BadMagic(Source::KWallet))),
+                "a keyring reached the wallet parser past its magic: {wallet:?}"
+            );
+        }
+        if wallet.is_ok() {
+            prop_assert!(
+                matches!(keyring, Err(HeaderError::BadMagic(Source::GnomeKeyring))),
+                "a wallet reached the keyring parser past its magic: {keyring:?}"
+            );
+        }
     }
 
     /// The structured keyring case, with the oracle attached: a file that is

@@ -172,11 +172,17 @@ coverage-gaps:
 
 # Verify docs/install-debian.md on a real Debian box. Needs vagrant and a
 # provider; see docs/vagrant.md. Exits non-zero if any documented step fails.
-# `vagrant up` already runs all three provisioners on a new box, so this is
-# just `up`. Re-running only the checks on an existing box is
+#
+# `--provision`, not a bare `up`: `vagrant up` runs the provisioners only when
+# it *creates* the box, so on every run after the first a bare `up` boots an
+# existing VM, runs no check at all and exits 0 — a target that cannot fail is
+# not a verification. With the flag the three provisioners run exactly once
+# per invocation, on a new box and an existing one alike, which is also why
+# this is not `up` followed by a separate `provision` (that would run them
+# twice on a fresh box). Re-running only the checks is
 # `vagrant provision --provision-with verify`, per docs/vagrant.md.
 vagrant-verify:
-	vagrant up
+	vagrant up --provision
 
 vagrant-clean:
 	vagrant destroy -f

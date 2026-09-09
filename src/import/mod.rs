@@ -58,10 +58,17 @@ pub const XDG_SCHEMA: &str = "xdg:schema";
 pub const SYNTHESISED_ATTRIBUTES: [&str; 3] =
     [kwallet::ATTR_FOLDER, kwallet::ATTR_KEY, kwallet::ATTR_TYPE];
 
-/// True for an attribute name this importer invented. See
+/// True for an attribute name this importer invented **on the KWallet
+/// path**, which is the only path that synthesises anything. See
 /// [`SYNTHESISED_ATTRIBUTES`].
-pub fn is_synthesised_attribute(key: &str) -> bool {
-    SYNTHESISED_ATTRIBUTES.contains(&key)
+///
+/// The source is a parameter and not an assumption: `kwallet:` is a
+/// user-writable namespace, so a gnome-keyring item may genuinely carry an
+/// attribute named `kwallet:folder` — unlikely, but it would be a real,
+/// searchable attribute that nothing here wrote, and discounting it would
+/// misreport the item as [`Outcome::PreservedOnly`].
+pub fn is_synthesised_attribute(source: Source, key: &str) -> bool {
+    source == Source::KWallet && SYNTHESISED_ATTRIBUTES.contains(&key)
 }
 
 /// Where an item came from.
@@ -182,7 +189,7 @@ impl fmt::Debug for SourceItem {
 impl SourceItem {
     /// See [`Outcome::classify`].
     pub fn outcome(&self) -> Outcome {
-        Outcome::classify(&self.attributes)
+        Outcome::classify(self.provenance.source, &self.attributes)
     }
 
     /// The first cap this item violates, if any. Checked *before* anything is
@@ -235,12 +242,17 @@ impl Outcome {
     /// non-empty" would report every native KWallet entry as "might work"
     /// when what is true of it is that no libsecret client that did not write
     /// it ever will find it.
-    pub fn classify(attributes: &BTreeMap<String, String>) -> Outcome {
+    ///
+    /// The denylist is scoped to the source that has one: only
+    /// `kwallet::map_entry` synthesises, so on the gnome-keyring path a
+    /// `kwallet:*` attribute is an ordinary attribute somebody wrote and
+    /// counts like any other.
+    pub fn classify(source: Source, attributes: &BTreeMap<String, String>) -> Outcome {
         match attributes.get(XDG_SCHEMA) {
             Some(schema) if !schema.is_empty() => Outcome::FullyPortable,
             _ if attributes
                 .keys()
-                .any(|k| !is_synthesised_attribute(k.as_str())) =>
+                .any(|k| !is_synthesised_attribute(source, k.as_str())) =>
             {
                 Outcome::AttributesPreserved
             }
@@ -759,7 +771,7 @@ mod tests {
             mapped
                 .attributes
                 .keys()
-                .all(|k| is_synthesised_attribute(k)),
+                .all(|k| is_synthesised_attribute(Source::KWallet, k)),
             "a key nobody synthesised crept into the fixture: {:?}",
             AttributeKeys::of(&mapped.attributes)
         );
@@ -783,11 +795,38 @@ mod tests {
             [kwallet::ATTR_FOLDER, kwallet::ATTR_KEY, kwallet::ATTR_TYPE]
         );
         for key in SYNTHESISED_ATTRIBUTES {
-            assert!(is_synthesised_attribute(key));
+            assert!(is_synthesised_attribute(Source::KWallet, key));
+            // Nothing synthesises on the gnome-keyring path, so the same
+            // name there is an attribute somebody wrote.
+            assert!(!is_synthesised_attribute(Source::GnomeKeyring, key));
         }
-        assert!(!is_synthesised_attribute(XDG_SCHEMA));
-        assert!(!is_synthesised_attribute("server"));
-        assert!(!is_synthesised_attribute("kwallet:folder2"));
+        assert!(!is_synthesised_attribute(Source::KWallet, XDG_SCHEMA));
+        assert!(!is_synthesised_attribute(Source::KWallet, "server"));
+        assert!(!is_synthesised_attribute(
+            Source::KWallet,
+            "kwallet:folder2"
+        ));
+    }
+
+    /// `kwallet:` is a user-writable namespace. A gnome-keyring item that
+    /// really carries `kwallet:folder` carries an attribute a client can
+    /// search on, and discounting it would report a preserved, searchable
+    /// item as one no client will ever find.
+    #[test]
+    fn the_denylist_does_not_reach_the_gnome_path() {
+        let synthesised: Vec<(&str, &str)> = SYNTHESISED_ATTRIBUTES
+            .iter()
+            .map(|k| (*k, "written by the user"))
+            .collect();
+        let map = attrs(&synthesised);
+        assert_eq!(
+            Outcome::classify(Source::KWallet, &map),
+            Outcome::PreservedOnly
+        );
+        assert_eq!(
+            Outcome::classify(Source::GnomeKeyring, &map),
+            Outcome::AttributesPreserved
+        );
     }
 
     /// An empty schema value matches nothing, so calling it portable would be
@@ -799,13 +838,15 @@ mod tests {
             Outcome::AttributesPreserved
         );
         assert_eq!(
-            Outcome::classify(&attrs(&[("xdg:schema", "")])),
+            Outcome::classify(Source::KWallet, &attrs(&[("xdg:schema", "")])),
             Outcome::AttributesPreserved
         );
     }
 
-    /// The three-way split is a property of the item alone. Nothing about the
-    /// source, the label or the secret may move an item between buckets.
+    /// The three-way split is a property of the item's attributes. Neither
+    /// the label nor the secret may move an item between buckets, and the
+    /// source only ever decides which names this importer wrote itself (see
+    /// `the_denylist_does_not_reach_the_gnome_path`).
     #[test]
     fn classification_ignores_everything_but_the_attributes() {
         let mut a = item(&[("server", "example.com")]);

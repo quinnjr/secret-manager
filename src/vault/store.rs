@@ -29,6 +29,13 @@ pub enum VaultError {
     SaltReused,
     #[error("collection label is too long ({len} bytes; limit is {limit})")]
     LabelTooLong { len: usize, limit: usize },
+    #[error("item {what} is {len}, over the limit of {limit}")]
+    ItemTooLarge {
+        /// Which cap was exceeded, in the words of the cap's own name.
+        what: &'static str,
+        len: usize,
+        limit: usize,
+    },
     #[error("import item {index} ({label}): {what} is {len}, over the limit of {limit}")]
     ImportTooLarge {
         /// Position of the offending item in the batch handed to
@@ -166,11 +173,19 @@ impl ImportItem {
     }
 }
 
+// Hand-written: the secret is redacted, and so are attribute *values*, which
+// are `server=`/`user=`/`url=` — the material an import report exists to keep
+// out of a log line. Keys only, as `import::SourceItem` prints them. (Spelt
+// out here rather than borrowing `import::AttributeKeys`: `src/vault` is
+// compiled into the PAM cdylib and `src/import` is `daemon`-only.)
 impl std::fmt::Debug for ImportItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImportItem")
             .field("label", &self.label)
-            .field("attributes", &self.attributes)
+            .field(
+                "attribute_keys",
+                &self.attributes.keys().collect::<Vec<_>>(),
+            )
             .field("secret", &"..")
             .field("content_type", &self.content_type)
             .field("created", &self.created)
@@ -220,6 +235,32 @@ fn label_excerpt(label: &str) -> String {
 /// Which caps, measured how, in which order is [`format::check_caps`]'s
 /// decision, shared with `dbus::collection` and with `import`'s pre-flight
 /// check; all this adds is the mapping into [`VaultError::ImportTooLarge`].
+/// The per-item caps, applied to one item's fields.
+///
+/// [`Vault::import_items`] had these and its two single-item siblings did
+/// not, which put the invariant at roughly eight call sites and made it
+/// structurally unenforceable for [`Vault::update_item`]: its `FnOnce(&mut
+/// Item)` can set any field to anything *after* a caller-side check has run,
+/// so the only place the check can be believed is inside, on the mutated
+/// item. The D-Bus layer still checks first — it must, because it owes the
+/// client a per-cap `InvalidArgs` message and this error is deliberately
+/// generic on the wire — so what this adds is the floor, not the diagnosis.
+fn check_item_caps(
+    label: &str,
+    attributes: &BTreeMap<String, String>,
+    secret_len: usize,
+    content_type: &str,
+) -> Result<(), VaultError> {
+    match format::check_caps(label, attributes, secret_len, content_type) {
+        None => Ok(()),
+        Some(v) => Err(VaultError::ItemTooLarge {
+            what: v.cap.as_str(),
+            len: v.actual,
+            limit: v.limit,
+        }),
+    }
+}
+
 fn check_import_item(index: usize, item: &ImportItem) -> Result<(), VaultError> {
     match format::check_caps(
         &item.label,
@@ -738,6 +779,27 @@ impl Vault {
         content_type: &str,
         replace: bool,
     ) -> Result<(String, bool), VaultError> {
+        check_item_caps(label, &attributes, secret.len(), content_type)?;
+        self.insert_item_unchecked(label, attributes, secret, content_type, replace)
+    }
+
+    /// [`Vault::insert_item`] without the cap check.
+    ///
+    /// Private, with exactly one production caller — the check is not
+    /// optional at the API. It is separate so the index tests can build the
+    /// one thing the caps make unbuildable and that `search_ids` must still
+    /// survive: an item whose attribute value is far over the cap, as a file
+    /// written by a build older than the cap, or by something that is not us,
+    /// can hold. `search_ids` answers on a *locked* vault straight from disk,
+    /// so that data reaches it whether the cap likes it or not.
+    fn insert_item_unchecked(
+        &mut self,
+        label: &str,
+        attributes: BTreeMap<String, String>,
+        secret: Vec<u8>,
+        content_type: &str,
+        replace: bool,
+    ) -> Result<(String, bool), VaultError> {
         let t = now();
         let items = self.items_mut()?;
         let pos = if replace {
@@ -786,9 +848,30 @@ impl Vault {
             // Only the one item `f` may touch is snapshotted; see
             // `restore_delta`.
             let prior = Box::new(items[index].clone());
-            let item = &mut items[index];
-            f(item);
-            item.modified = now();
+            {
+                let item = &mut items[index];
+                f(item);
+                item.modified = now();
+            }
+            // After `f`, not before: the closure is the mutation, so a
+            // caller-side check is a check of what the caller *meant* to
+            // write. Over a cap, the item is put back exactly as it was and
+            // nothing is saved — the same all-or-nothing the failed-write
+            // rollback gives.
+            let item = &items[index];
+            if let Some(v) = format::check_caps(
+                &item.label,
+                &item.attributes,
+                item.secret.len(),
+                &item.content_type,
+            ) {
+                items[index] = *prior;
+                return Err(VaultError::ItemTooLarge {
+                    what: v.cap.as_str(),
+                    len: v.actual,
+                    limit: v.limit,
+                });
+            }
             ItemDelta::Replaced { index, prior }
         };
         self.save_or_restore(delta, Self::restore_delta)
@@ -2293,6 +2376,123 @@ mod tests {
         assert_eq!(v.items().unwrap().len(), 2);
     }
 
+    /// `ImportItem` carries a secret *and* an attribute map whose values are
+    /// `server=`/`user=`/`url=` — the material the import report exists to
+    /// keep out of a log line. Both are redacted; the keys stay, as
+    /// `import::SourceItem` prints them.
+    #[test]
+    fn import_item_debug_redacts_the_secret_and_the_attribute_values() {
+        let mut it = import("label", b"hunter2", 1, 2);
+        it.attributes = attrs(&[("server", "secret-host.example.com")]);
+        let text = format!("{it:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("secret-host.example.com"), "{text}");
+        assert!(text.contains("server"), "{text}");
+    }
+
+    /// The same six caps, on the two single-item writers.
+    ///
+    /// `import_items` had them and its siblings did not, which put one
+    /// invariant at roughly eight call sites. `update_item` is the one that
+    /// could not be fixed from outside at all: its `FnOnce(&mut Item)` runs
+    /// after any caller-side check and can set any field to anything, so the
+    /// check has to be on the mutated item, inside.
+    #[test]
+    fn the_single_item_writers_enforce_the_caps_too() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let (id, _) = v
+            .insert_item(
+                "kept",
+                attrs(&[("k", "v")]),
+                b"s".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // `insert_item`, once per cap.
+        // Non-capturing, so each is a plain `fn` pointer.
+        type Case = (&'static str, fn(&mut Item));
+        let over: [Case; 6] = [
+            ("secret", |i: &mut Item| {
+                i.secret = Zeroizing::new(vec![0u8; format::MAX_ITEM_SECRET + 1]);
+            }),
+            ("label", |i: &mut Item| {
+                i.label = "L".repeat(format::MAX_ITEM_LABEL + 1);
+            }),
+            ("content type", |i: &mut Item| {
+                i.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE + 1);
+            }),
+            ("attribute count", |i: &mut Item| {
+                i.attributes = (0..=format::MAX_ITEM_ATTRIBUTES)
+                    .map(|n| (format!("k{n}"), "v".to_string()))
+                    .collect();
+            }),
+            ("attribute name", |i: &mut Item| {
+                i.attributes = attrs(&[(&"k".repeat(format::MAX_ATTRIBUTE_KEY + 1), "v")]);
+            }),
+            ("attribute value", |i: &mut Item| {
+                i.attributes = attrs(&[("k", &"v".repeat(format::MAX_ATTRIBUTE_VALUE + 1))]);
+            }),
+        ];
+
+        for (what, break_it) in over {
+            // `insert_item`: build the offending item by breaking a good one.
+            let mut probe = Item {
+                id: String::new(),
+                label: "probe".into(),
+                attributes: attrs(&[("k", "v")]),
+                secret: Zeroizing::new(b"s".to_vec()),
+                content_type: "text/plain".into(),
+                created: 0,
+                modified: 0,
+            };
+            break_it(&mut probe);
+            let err = v
+                .insert_item(
+                    &probe.label,
+                    probe.attributes.clone(),
+                    probe.secret.to_vec(),
+                    &probe.content_type,
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, VaultError::ItemTooLarge { what: got, .. } if *got == what),
+                "insert_item accepted an item over the {what} cap, or named the wrong \
+                 one: {err}"
+            );
+
+            // `update_item`: the closure breaks the cap *after* any check a
+            // caller could have made.
+            let err = v.update_item(&id, break_it).unwrap_err();
+            assert!(
+                matches!(&err, VaultError::ItemTooLarge { what: got, .. } if *got == what),
+                "update_item accepted a closure that broke the {what} cap: {err}"
+            );
+
+            // Neither wrote, and the refused update left the item as it was.
+            assert_eq!(v.items().unwrap().len(), 1, "{what}: an item was written");
+            let kept = &v.items().unwrap()[0];
+            assert_eq!(kept.label, "kept", "{what}: the item was mutated anyway");
+            assert_eq!(kept.attributes, attrs(&[("k", "v")]));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{what}: the vault was rewritten"
+            );
+        }
+
+        // Exactly at a cap is still accepted, so this is not an off-by-one.
+        v.update_item(&id, |i| {
+            i.label = "L".repeat(format::MAX_ITEM_LABEL);
+        })
+        .unwrap();
+        assert_eq!(v.items().unwrap()[0].label.len(), format::MAX_ITEM_LABEL);
+    }
+
     /// The label a refusal names is peer data - it comes out of a
     /// gnome-keyring file or a KWallet sidecar - and `CliError`'s
     /// `From<VaultError>` prints `e.to_string()` to a terminal raw, so it is
@@ -3469,8 +3669,13 @@ mod tests {
                 .0,
             );
         }
+        // `insert_item_unchecked`: the value is deliberately far over
+        // `MAX_ATTRIBUTE_VALUE`, which is the boundary's cap and not a
+        // property of a file on disk. This is the shape the index has to
+        // survive, and `search_ids` is the one path that reads it while
+        // locked.
         let hit = v
-            .insert_item(
+            .insert_item_unchecked(
                 "hit",
                 [
                     ("app".to_string(), "git".to_string()),
@@ -3528,8 +3733,10 @@ mod tests {
                 )
                 .unwrap();
             }
-            // Inserted last, so only one save pays for indexing it.
-            v.insert_item(
+            // Inserted last, so only one save pays for indexing it, and
+            // unchecked for the same reason as the test above: the value is
+            // over the boundary's cap on purpose.
+            v.insert_item_unchecked(
                 "hit",
                 [("big".to_string(), big.clone())].into(),
                 b"s".to_vec(),

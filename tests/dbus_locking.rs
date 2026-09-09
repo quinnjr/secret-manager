@@ -199,6 +199,44 @@ async fn a_write_stuck_on_one_collection_blocks_nothing_else() {
     assert_eq!(ids.len(), 1, "the answered write left nothing on disk");
 }
 
+/// The source the scan reads: every `.rs` under `src/dbus/` and `src/vault/`,
+/// plus `src/daemon.rs` and `src/kdf.rs`.
+///
+/// `src/vault/` is in the set not because the lock rules are about it, but
+/// because the blocking work is: every `Vault` mutator ends in `save`'s
+/// `write_all`/`sync_all`/`rename`, and `change_password`, `unlock`,
+/// `verify_password` and `create` run Argon2 as well. Parsed, those are call
+/// edges the graph follows to the real blocking call. Unparsed, they were a
+/// hand-maintained list of five method names in `BLOCKING_METHODS` — the
+/// wrong instrument, and it had already gone stale: ten public blocking
+/// `Vault` methods were missing from it, `change_password` (two Argon2 arenas
+/// and a whole-vault re-encrypt) among them, while `save`, which it did name,
+/// is private to `vault::store` and could never have fired from the files
+/// that were parsed. `src/kdf.rs` comes along so the derivation path is
+/// whole. See `the_scan_reaches_the_vaults_own_blocking_work`.
+fn production_files() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths: Vec<std::path::PathBuf> = ["src/dbus", "src/vault"]
+        .iter()
+        .flat_map(|dir| std::fs::read_dir(root.join(dir)).unwrap())
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .collect();
+    paths.push(root.join("src/daemon.rs"));
+    paths.push(root.join("src/kdf.rs"));
+    paths.sort();
+    assert!(paths.len() > 5, "the scan found almost nothing: {paths:?}");
+    paths
+        .iter()
+        .map(|p| {
+            (
+                p.strip_prefix(root).unwrap().display().to_string(),
+                std::fs::read_to_string(p).unwrap(),
+            )
+        })
+        .collect()
+}
+
 /// Nothing in the daemon holds one lock while acquiring another, and nothing
 /// blocks under one.
 ///
@@ -267,25 +305,7 @@ async fn a_write_stuck_on_one_collection_blocks_nothing_else() {
 /// call path instead of quietly picking one.
 #[test]
 fn no_source_file_acquires_a_lock_while_holding_one() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("src/dbus"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
-        .collect();
-    paths.push(root.join("src/daemon.rs"));
-    paths.sort();
-    assert!(paths.len() > 5, "the scan found almost nothing: {paths:?}");
-
-    let files: Vec<(String, String)> = paths
-        .iter()
-        .map(|p| {
-            (
-                p.strip_prefix(root).unwrap().display().to_string(),
-                std::fs::read_to_string(p).unwrap(),
-            )
-        })
-        .collect();
+    let files = production_files();
     let found = scan_files(&files);
 
     // Canaries. Each is a floor with room above it, and none pins the
@@ -346,6 +366,71 @@ fn no_source_file_acquires_a_lock_while_holding_one() {
          state mutex\":\n{}",
         found.offences.join("\n")
     );
+}
+
+/// The scan reaches the vault's own blocking work, through the call graph and
+/// not through a list of names.
+///
+/// This is the verification the widened path set needs, and the synthetic
+/// cases in [`the_scan_reports_the_source_it_claims_to_reject`] cannot give
+/// it: each of those is scanned in isolation and carries the definition it
+/// delegates to, so it proves the graph walk and says nothing about which
+/// files are read. Here the offender is one function appended to the *real*
+/// tree, calling a real `Vault` method that is defined in a file the scan
+/// used to skip.
+///
+/// `change_password` is the case the old name list missed. It was not on it
+/// — `import_items`, `insert_item`, `delete_items`, `set_label` and the
+/// unreachable `save` were — so the same guard region that reported
+/// `vault.import_items(batch)` reported *nothing* for a call that derives two
+/// Argon2 keys, re-encrypts the whole collection and `fsync`s twice under the
+/// global mutex. Revert either half of the fix — drop `src/vault` from
+/// [`production_files`], or drop `derive_key` from [`BLOCKING_FNS`] — and the
+/// corresponding case here goes green with the source unchanged.
+#[test]
+fn the_scan_reaches_the_vaults_own_blocking_work() {
+    // `Vault::from_a_fixture` does not exist, and that is the point: the
+    // scan types the local from the path in its initialiser, so `v` is a
+    // `Vault` and `v.change_password(…)` resolves into `src/vault/store.rs`,
+    // while the initialiser itself draws no edge and cannot be what the
+    // offence is reported for.
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "a whole-vault re-encrypt under the state guard",
+            "async fn offender(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let mut v = Vault::from_a_fixture();\n    \
+             v.change_password(old, new, kdf).unwrap();\n}\n",
+            "Vault::change_password",
+        ),
+        (
+            "an unlock under the state guard",
+            "async fn offender(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let mut v = Vault::from_a_fixture();\n    v.unlock(password).unwrap();\n}\n",
+            "Vault::unlock",
+        ),
+        (
+            "a direct Argon2 derivation under the state guard",
+            "async fn offender(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let key = crypto::derive_key(&password, &salt, kdf).unwrap();\n}\n",
+            "offender",
+        ),
+    ];
+    for (what, src, expect_in_path) in cases {
+        let mut files = production_files();
+        files.push(("synthetic.rs".to_string(), (*src).to_string()));
+        let found = scan_files(&files);
+        let reported: Vec<&String> = found
+            .offences
+            .iter()
+            .filter(|o| o.contains(expect_in_path))
+            .collect();
+        assert!(
+            !reported.is_empty(),
+            "the scan did not report {what}: no offence names `{expect_in_path}`, so \
+             the blocking work it does is outside what the scan can see:\n{}",
+            found.offences.join("\n")
+        );
+    }
 }
 
 /// The scanner, checked against source it is *supposed* to reject.
@@ -423,26 +508,62 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
             "async fn f() {\n    let g = self.state.lock().await;\n    \
              remove_file(&path)?;\n}\n",
         ),
+        // ---- The vault mutators, through the call graph. -----------------
+        // These used to be caught by name, from a hand-maintained list, because
+        // `src/vault/` was outside the parsed set. It is inside it now, so each
+        // of these carries the definition it delegates to and is reported for
+        // the reason the real tree reports it: the edge reaches the `fsync`.
         (
-            // `src/vault/store.rs` is outside the parsed set, so the
-            // `write_all`/`sync_all`/`rename` at the end of this call is
-            // reachable by no edge the scan can draw. It is caught by name or
-            // not at all — remove `import_items` from `BLOCKING_METHODS` and
-            // this case goes green while a whole-vault re-encrypt and two
-            // `fsync`s run under the global mutex.
             "a vault batch import under the state guard",
-            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
-             vault.import_items(batch)?;\n}\n",
+            "async fn f(state: &Shared, p: &Path) {\n    let st = state.lock().await;\n    \
+             let mut v = Vault::open(p)?;\n    v.import_items(batch)?;\n}\n\
+             impl Vault {\n    fn import_items(&mut self, items: Vec<ImportItem>) -> Result<()> {\n        \
+             self.save()\n    }\n    fn save(&mut self) -> Result<()> {\n        \
+             file.write_all(&bytes)?;\n        file.sync_all()\n    }\n}\n",
         ),
         (
             "a vault save under the state guard",
-            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
-             vault.save()?;\n}\n",
+            "async fn f(state: &Shared, p: &Path) {\n    let st = state.lock().await;\n    \
+             let mut v = Vault::open(p)?;\n    v.save()?;\n}\n\
+             impl Vault {\n    fn save(&mut self) -> Result<()> {\n        \
+             file.sync_all()\n    }\n}\n",
         ),
         (
             "a vault mutator under a collection lock, outside a block_in_place",
-            "async fn f() {\n    let mut v = vault.lock().await;\n    \
-             v.insert_item(label, attrs, secret, ct, false)?;\n}\n",
+            "async fn f(p: &Path) {\n    let mut v = vault.lock().await;\n    \
+             let mut owned = Vault::open(p)?;\n    \
+             owned.insert_item(label, attrs, secret, ct, false)?;\n}\n\
+             impl Vault {\n    fn insert_item(&mut self, l: &str, a: Attrs, s: Vec<u8>, c: &str, r: bool) -> Result<()> {\n        \
+             self.save()\n    }\n    fn save(&mut self) -> Result<()> {\n        \
+             file.sync_all()\n    }\n}\n",
+        ),
+        // ---- Argon2. -----------------------------------------------------
+        // `CLAUDE.md`: "Never run Argon2 under the state mutex". The rule had
+        // no case here at all, and the name list it relied on omitted every
+        // method that derives — swap `import_items` for `change_password` in
+        // the case above and the scan reported *zero* offences while two
+        // arenas, a whole-vault re-encrypt and two `fsync`s ran under the
+        // global mutex.
+        (
+            "a whole-vault re-encrypt under the state guard",
+            "async fn f(state: &Shared, p: &Path) {\n    let st = state.lock().await;\n    \
+             let mut v = Vault::open(p)?;\n    v.change_password(old, new, kdf)?;\n}\n\
+             impl Vault {\n    fn change_password(&mut self, old: &[u8], new: &[u8], kdf: KdfParams) -> Result<()> {\n        \
+             let key = crypto::derive_key(old, &self.salt, kdf)?;\n        \
+             self.save()\n    }\n    fn save(&mut self) -> Result<()> {\n        \
+             file.sync_all()\n    }\n}\n",
+        ),
+        (
+            "a direct Argon2 derivation under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let key = crypto::derive_key(&password, &salt, kdf)?;\n}\n",
+        ),
+        (
+            "an Argon2 derivation one `fn` deeper, under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let key = unlock_key(&password, &salt)?;\n}\n\
+             fn unlock_key(password: &[u8], salt: &[u8; 16]) -> Result<Key> {\n    \
+             crypto::derive_key(password, salt, KdfParams::default())\n}\n",
         ),
         (
             "blocking work under a guard bound in an outer block",
@@ -1056,28 +1177,19 @@ const BLOCKING_METHODS: &[&str] = &[
     // number of them in a loop, which is the shape the delegation rule below
     // exists for.
     "symlink_metadata",
-    // ---- The vault mutators. -----------------------------------------
-    // Every one of these ends in `Vault::save`: build the hashed index over
-    // the whole collection, postcard-encode every item, seal the entire blob,
-    // write a temp file, `fsync` it, rename, `fsync` the directory. That is
-    // the exact work `CLAUDE.md` says may not happen under the state mutex,
-    // and it is bounded by the data rather than by a constant.
-    //
-    // They have to be named, because the scan parses `src/dbus/` and
-    // `src/daemon.rs` and nothing else: `src/vault/store.rs` is never read,
-    // so no call edge ever reaches the `write_all`/`sync_all`/`rename` inside
-    // them and blocking work outside the parsed set is recognised by *name*
-    // alone. Without these entries `let st = state.lock().await; …
-    // vault.import_items(batch)` passes silently and does a whole-vault
-    // re-encrypt and two `fsync`s under the global mutex — precisely the bug
-    // this scan exists to prevent, and the one `import_items` newly makes
-    // easy to write. All five are listed rather than only the new one: the
-    // gap was never specific to it.
-    "import_items",
-    "insert_item",
-    "delete_items",
-    "set_label",
-    "save",
+    // The vault mutators are deliberately *not* named here. Every one of them
+    // ends in `Vault::save` — build the hashed index over the whole
+    // collection, postcard-encode every item, seal the blob, write a temp
+    // file, `fsync` it, rename, `fsync` the directory — and that is the exact
+    // work `CLAUDE.md` forbids under the state mutex. It used to be a list of
+    // five names, because `src/vault/` was outside the parsed set and blocking
+    // work outside it can only be recognised by name. A list is the wrong
+    // instrument: it silently omitted ten public blocking `Vault` methods,
+    // `change_password` among them, and it named `save`, which is private to
+    // `vault::store` and could never have fired from the files that were
+    // parsed. `src/vault/` is now parsed, so the call graph reaches the real
+    // `write_all`/`sync_all`/`rename` and the coverage is whatever the source
+    // actually does.
 ];
 
 /// The same, as the last segment of a called path: `remove_file(p)`,
@@ -1090,6 +1202,16 @@ const BLOCKING_FNS: &[&str] = &[
     "remove_file",
     "create_dir_all",
     "rename",
+    // Argon2id. `CLAUDE.md`: "Never run Argon2 under the state mutex" — a
+    // derivation is hundreds of milliseconds and a whole memory arena, which
+    // is blocking work by any reading of the rule, and until now the rule
+    // had nothing in this scan enforcing it. `crypto::derive_key` is where
+    // the arena is allocated and every derivation in the tree goes through
+    // it, `src/kdf.rs`'s bounded wrapper included, so naming it covers the
+    // direct call and, through the call graph, every `Vault` method that
+    // derives: `unlock`, `verify_password`, `change_password`, `create`,
+    // `open`.
+    "derive_key",
 ];
 
 /// The sanctioned escape hatch — for a collection's lock only.
@@ -2131,6 +2253,18 @@ fn run_pass(
 fn entry_points(reg: &Registry) -> Vec<(usize, Entry, String)> {
     let mut work = Vec::new();
     for (i, d) in reg.defs.iter().enumerate() {
+        // A `#[cfg(test)]` body is not a root. The rules are about what the
+        // daemon does with a lock held, and a unit test that locks a vault by
+        // hand and calls `Vault::unlock` on it — `src/dbus/state.rs`'s own
+        // fixtures do exactly that — is not the daemon doing anything. The
+        // production callers of the same methods are walked from their own
+        // roots, and `called_from_production` already refuses to count a test
+        // as a caller, so nothing this rule reports is lost. Before
+        // `src/vault/` was parsed these bodies resolved to no definition and
+        // the question never arose.
+        if d.in_test {
+            continue;
+        }
         work.push((i, Entry::NONE, d.display.clone()));
         if let Some((g, why)) = &d.seed {
             work.push((

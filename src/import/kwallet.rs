@@ -875,7 +875,17 @@ impl<'a> Reader<'a> {
         let units = raw
             .chunks_exact(2)
             .map(|c| u16::from_be_bytes([c[0], c[1]]));
-        let mut out = String::with_capacity(len / 2);
+        // `len` is the UTF-16 *byte* length, so the string holds `len / 2`
+        // code units. A code unit becomes at most three UTF-8 bytes — a
+        // surrogate pair is two units and four bytes, so the per-unit
+        // worst case is the 3-byte BMP scalar above U+07FF. Sizing at the
+        // code-unit count instead lets `push` grow and relocate the buffer,
+        // handing an un-wiped prefix of a decrypted key or value back to the
+        // allocator; `out.zeroize()` below and `MapPairs`'s `Drop` only ever
+        // reach the current allocation. This is the same reasoning
+        // `qmap_to_canonical_json` documents for its own buffer.
+        let capacity = len.saturating_mul(3) / 2;
+        let mut out = String::with_capacity(capacity);
         for unit in char::decode_utf16(units) {
             match unit {
                 Ok(c) => out.push(c),
@@ -888,6 +898,10 @@ impl<'a> Reader<'a> {
                 }
             }
         }
+        debug_assert!(
+            out.len() <= capacity,
+            "the QString buffer reallocated, so a plaintext prefix was leaked"
+        );
         Ok((out, false))
     }
 }
@@ -2309,6 +2323,43 @@ mod tests {
         let bytes = qmap_bytes(&[("kéy", "🔑 välue")]);
         let pairs = decode_qmap(&bytes).unwrap();
         assert_eq!(*pairs, [("kéy".to_string(), "🔑 välue".to_string())]);
+    }
+
+    /// The decoded string must never outgrow the buffer it was allocated
+    /// with. A `String` that reallocates copies the plaintext decoded so far
+    /// into a new allocation and frees the old one *unwiped* — neither
+    /// `zeroize` on the error path nor `MapPairs`'s `Drop` can reach a freed
+    /// allocation. A correctness assertion cannot see this, so what is
+    /// asserted here is the capacity: it must still be the one the decoder
+    /// asked for, because a grown buffer is a moved buffer.
+    #[test]
+    fn qstring_never_reallocates_and_so_never_leaks_a_plaintext_prefix() {
+        for value in [
+            "\u{7ff}".repeat(400), // two UTF-8 bytes, one code unit
+            "康".repeat(400),      // three UTF-8 bytes, one code unit — the worst case
+            "🔑".repeat(400),      // four UTF-8 bytes, two code units
+            "a康🔑\u{7ff}".repeat(100),
+        ] {
+            let bytes = qmap_bytes(&[("k", value.as_str())]);
+            let mut r = Reader::new(&bytes);
+            assert_eq!(r.u32("count").unwrap(), 1);
+            let (_key, _) = r.qstring("key").unwrap();
+            let (decoded, _) = r.qstring("value").unwrap();
+            assert_eq!(decoded, value, "the decode must still be correct");
+
+            // What `qstring` asks for: three bytes per UTF-16 code unit.
+            // Ask the allocator the same question rather than assuming
+            // `with_capacity` is exact.
+            let units = value.encode_utf16().count();
+            let want = String::with_capacity(units * 3).capacity();
+            assert_eq!(
+                decoded.capacity(),
+                want,
+                "the QString buffer reallocated while decoding {units} code units \
+                 into {} bytes, leaking an un-wiped plaintext prefix",
+                decoded.len(),
+            );
+        }
     }
 
     /// Every way the bytes can fail to be a `QMap` is a refusal, never a
