@@ -1,6 +1,6 @@
 mod common;
 
-use common::{Fixture, PASSWORD, wait_for};
+use common::{Fixture, PASSWORD, TestBus, wait_for};
 use futures_util::StreamExt;
 use secret_manager::dbus::paths;
 use secret_manager::dbus::proxies::{CollectionProxy, PromptProxy, ServiceProxy, SessionProxy};
@@ -286,6 +286,74 @@ async fn corrupt_vault_file_appears_locked_with_format_error() {
         ),
         other => panic!("{other:?}"),
     }
+    // `sm change-password` reaches the same collection through `ChangeKey`,
+    // and must not call a file that is on disk and unparseable "no
+    // collection" while `sm unlock` names the format error.
+    let key = key_for(&fx, "default", "whatever");
+    match control(
+        &fx,
+        Request::ChangeKey {
+            collection: "broken".into(),
+            old_key: key.clone(),
+            new_salt: [7u8; SALT_LEN],
+            new_kdf: KdfParams::FAST_FOR_TESTS,
+            new_key: key,
+        },
+    )
+    .await
+    {
+        Response::Error(msg) => assert!(
+            msg.to_lowercase().contains("magic")
+                || msg.to_lowercase().contains("format")
+                || msg.to_lowercase().contains("invalid"),
+            "expected a format error, got: {msg}"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A bare CLI invocation with an environment we control completely: no
+/// fixture daemon, so `sm daemon` reaches the failure the test is about.
+fn bare_daemon_cmd(home: &std::path::Path) -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::new(env!("CARGO_BIN_EXE_secret-manager"));
+    cmd.env_clear();
+    cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
+    cmd.envs(common::profiling_env());
+    cmd.env("HOME", home);
+    cmd.env("XDG_DATA_HOME", home);
+    cmd.env("XDG_CONFIG_HOME", home.join("config"));
+    cmd.arg("daemon");
+    cmd
+}
+
+/// The README lists an unset `XDG_RUNTIME_DIR` under exit 3 beside an
+/// unreachable bus, and every client command already returns 3 for it.
+/// `sm daemon` cannot locate its control socket without it.
+#[test]
+fn daemon_without_runtime_dir_exits_with_code_3() {
+    let bus = TestBus::start();
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = bare_daemon_cmd(home.path());
+    cmd.env("DBUS_SESSION_BUS_ADDRESS", &bus.address);
+    let out = cmd.timeout(Duration::from_secs(20)).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("XDG_RUNTIME_DIR"), "{stderr}");
+}
+
+/// A bus that cannot be reached is the other half of the same promise.
+#[test]
+fn daemon_with_unreachable_bus_exits_with_code_3() {
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = bare_daemon_cmd(home.path());
+    cmd.env("XDG_RUNTIME_DIR", home.path());
+    cmd.env(
+        "DBUS_SESSION_BUS_ADDRESS",
+        format!("unix:path={}", home.path().join("no-such-bus").display()),
+    );
+    let out = cmd.timeout(Duration::from_secs(20)).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
 }
 
 /// Once the daemon is up, the process must be non-dumpable so same-uid

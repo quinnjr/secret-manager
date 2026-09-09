@@ -451,6 +451,8 @@ pub enum FormatError {
     HeaderTooLarge(usize),
     #[error("vault file is too large to open ({0} bytes; limit is {MAX_VAULT_BYTES})")]
     VaultTooLarge(u64),
+    #[error("{0} unexpected bytes after the vault header")]
+    TrailingHeaderBytes(usize),
 }
 
 fn describe_version(v: u16) -> String {
@@ -493,15 +495,37 @@ pub fn header_prefix_len(prefix: &[u8]) -> Result<usize, FormatError> {
 }
 
 /// Decodes a header from at least the bytes [`header_prefix_len`] reports,
-/// applying the same version and KDF checks as [`VaultFile::decode`].
-pub fn decode_header(bytes: &[u8]) -> Result<Header, FormatError> {
+/// applying the same version and KDF checks as [`VaultFile::decode`],
+/// returning it with the length of the prefix it occupied.
+///
+/// `postcard::from_bytes` stops at the end of the first complete message and
+/// ignores whatever follows, so a `header_len` larger than the encoded body
+/// would decode successfully with the surplus silently absorbed into the
+/// associated data. Nothing we write can produce that - `header_bytes`
+/// declares exactly the length it encoded - and a file we did not write fails
+/// the tag anyway, because the surplus *is* inside the AAD. But the vault
+/// header is the other length-delimited region of attacker-supplied postcard
+/// in this crate, and `protocol::decode_frame` holds the same line for the
+/// same reason: a region that decodes must have been fully consumed, or "the
+/// header that was read" and "the header that was acted on" are different
+/// objects. So the remainder is required to be empty.
+fn decode_header_prefix(bytes: &[u8]) -> Result<(Header, usize), FormatError> {
     let need = header_prefix_len(bytes)?;
     if bytes.len() < need {
         return Err(FormatError::Truncated);
     }
-    let header: Header = postcard::from_bytes(&bytes[PREFIX_LEN..need])?;
+    let (header, rest): (Header, &[u8]) = postcard::take_from_bytes(&bytes[PREFIX_LEN..need])?;
+    if !rest.is_empty() {
+        return Err(FormatError::TrailingHeaderBytes(rest.len()));
+    }
     check_header(&header)?;
-    Ok(header)
+    Ok((header, need))
+}
+
+/// Decodes a header from at least the bytes [`header_prefix_len`] reports,
+/// applying the same version and KDF checks as [`VaultFile::decode`].
+pub fn decode_header(bytes: &[u8]) -> Result<Header, FormatError> {
+    Ok(decode_header_prefix(bytes)?.0)
 }
 
 fn check_header(header: &Header) -> Result<(), FormatError> {
@@ -561,12 +585,7 @@ impl VaultFile {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<VaultFile, FormatError> {
-        let need = header_prefix_len(bytes)?;
-        if bytes.len() < need {
-            return Err(FormatError::Truncated);
-        }
-        let header: Header = postcard::from_bytes(&bytes[PREFIX_LEN..need])?;
-        check_header(&header)?;
+        let (header, need) = decode_header_prefix(bytes)?;
         Ok(VaultFile {
             header,
             aad: bytes[..need].to_vec(),

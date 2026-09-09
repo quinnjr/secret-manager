@@ -681,6 +681,65 @@ async fn a_real_import_writes_a_collection_that_reopens_and_verifies() {
     assert_eq!(err.exit_code(), 2);
 }
 
+/// A `--report` that cannot be written is a warning, never an abort: on the
+/// verification-failure branch the unlink has to happen anyway.
+///
+/// `write_report(..)?` used to propagate from between the failed check and
+/// `unlink_partial`, so an unwritable report directory left the freshly
+/// created vault on disk — contradicting the error's own "has been removed
+/// again", and blocking the retry with the "never merges" refusal against a
+/// file that run had made.
+#[tokio::test]
+async fn a_failed_verification_removes_the_collection_even_when_the_report_cannot_be_written() {
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    // Three declared in the header, two walked: the count check fails.
+    let fake = Fake {
+        items: sample_items(),
+        refusals: Vec::new(),
+        skipped: Vec::new(),
+    };
+    // The parent does not exist, so the report's `O_EXCL` create fails.
+    let report_path = root.path().join("no-such-dir").join("report.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+
+    let err = secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect_err("2 walked against 3 in the header is a failure");
+    assert!(err.to_string().contains("verification"), "{err}");
+    assert!(!report_path.exists());
+    // The promise the message makes, kept: nothing of this run is left.
+    let left: Vec<String> = files_in(vaults.path())
+        .into_iter()
+        .filter(|n| n.ends_with(".vault"))
+        .collect();
+    assert!(left.is_empty(), "the failed run left {left:?} behind");
+}
+
+/// The same on the success path: the report is a diagnostic artifact, so an
+/// unwritable one must not turn a finished import into exit 1 with the
+/// collection on disk, the daemon holding it, and `--set-default` skipped.
+#[tokio::test]
+async fn a_report_that_cannot_be_written_does_not_fail_a_successful_import() {
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    let report_path = root.path().join("no-such-dir").join("report.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    a.set_default = true;
+
+    secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+        .await
+        .expect("an unwritable report is a warning, not a failed import");
+    assert!(!report_path.exists());
+    assert!(files_in(vaults.path()).contains(&"sample_keyring.vault".to_string()));
+    let aliases = std::fs::read_to_string(vaults.path().join("aliases.toml")).unwrap();
+    assert!(aliases.contains("sample_keyring"), "{aliases}");
+}
+
 /// A new collection, always. An id already in use is refused before a
 /// password is asked for, because merging into a collection the daemon holds
 /// is invisible until it restarts and is then overwritten by its next save.

@@ -206,14 +206,20 @@ async fn a_write_stuck_on_one_collection_blocks_nothing_else() {
 /// because the blocking work is: every `Vault` mutator ends in `save`'s
 /// `write_all`/`sync_all`/`rename`, and `change_password`, `unlock`,
 /// `verify_password` and `create` run Argon2 as well. Parsed, those are call
-/// edges the graph follows to the real blocking call. Unparsed, they were a
-/// hand-maintained list of five method names in `BLOCKING_METHODS` — the
-/// wrong instrument, and it had already gone stale: ten public blocking
-/// `Vault` methods were missing from it, `change_password` (two Argon2 arenas
-/// and a whole-vault re-encrypt) among them, while `save`, which it did name,
-/// is private to `vault::store` and could never have fired from the files
-/// that were parsed. `src/kdf.rs` comes along so the derivation path is
-/// whole. See `the_scan_reaches_the_vaults_own_blocking_work`.
+/// edges the graph follows toward the real blocking call. `src/kdf.rs` comes
+/// along so the derivation path is whole. See
+/// `the_scan_reaches_the_vaults_own_blocking_work`.
+///
+/// Parsing them did not make [`BLOCKING_METHODS`] redundant, which is what
+/// deleting the mutators from it assumed. The graph reaches
+/// `Vault::update_item` and stops one call short of the `fsync`, because
+/// `Vault::save` is `self.save_with(write_atomic)` and `save_with` publishes
+/// through `publish(&path, &bytes)` — a parameter, not a path, and a
+/// higher-order edge a signature-only view cannot draw. The list is back, as a
+/// backstop rather than as the coverage: the graph is what reaches whatever a
+/// future edit writes, and the list is what makes a rename unable to drop
+/// coverage silently. `the_scan_catches_a_vault_write_at_a_real_call_site`
+/// fails if either half goes.
 fn production_files() -> Vec<(String, String)> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut paths: Vec<std::path::PathBuf> = ["src/dbus", "src/vault"]
@@ -253,7 +259,10 @@ fn production_files() -> Vec<(String, String)> {
 ///
 /// * a `let`-bound `….lock().await` (or `.read()`, `.write()`, zbus's
 ///   `.get()`/`.get_mut()`, which are `RwLock`s by another name and are the
-///   ones that read as harmless), for as long as its binding lives;
+///   ones that read as harmless), for as long as its binding lives — and the
+///   binding is *typed*, from what the acquisition is a lock over, which is
+///   what makes `let mut vault = vault.lock().await; vault.update_item(…)`
+///   resolve into `src/vault/` at all;
 /// * a parameter of type `&ServiceState`, `&mut ServiceState` or
 ///   `MutexGuard<'_, ServiceState>`, which cannot be produced any other way,
 ///   so the whole body is inside the caller's region;
@@ -289,7 +298,24 @@ fn production_files() -> Vec<(String, String)> {
 /// A `match`/`while let`/`if let`/`for` scrutinee that locks is refused
 /// outright rather than modelled: a scrutinee is not a terminating scope, so
 /// the guard outlives every arm, and there is no shape of it in this daemon
-/// that is not better written as a `let`, a clone and a `drop`.
+/// that is not better written as a `let`, a clone and a `drop`. That includes
+/// a **let-chain** — `if let Some(x) = a.lock().await.f() && cond`, which
+/// parses as an `Expr::Binary` and used to walk straight past a rule that
+/// matched only a bare `Expr::Let`. See [`let_chain_locks`].
+///
+/// Under the **state** guard the rule about blocking work covers `.await` as
+/// well as a synchronous call, which is what `CLAUDE.md` has always said and
+/// what only half of was ever checked: a pinentry Assuan round trip, a
+/// `SignalEmitter` await, an `object_server().at(…)`, a `JoinHandle`, a
+/// control-socket read. Under a *collection's* lock an `.await` is ordinary
+/// and is not reported.
+///
+/// Which of the two locks an acquisition takes is answered by the receiver's
+/// **type** where the scan has one, and only otherwise by its name. Naming
+/// alone was a hole with a direction: a state lock reached through a binding
+/// not called `state`/`st`/`shared` classified as a collection lock, which
+/// then *permits* `block_in_place` — the one construct that is itself an
+/// offence under the state guard. See [`Walk::guard_of`].
 ///
 /// A `&Shared` parameter is deliberately *not* a region. [`Shared`] is
 /// `Arc<Mutex<ServiceState>>` — the lock, not a guard — so a function handed
@@ -431,6 +457,100 @@ fn the_scan_reaches_the_vaults_own_blocking_work() {
             found.offences.join("\n")
         );
     }
+}
+
+/// A vault write at a **real call site, in the shape the daemon actually
+/// writes it**, is reported.
+///
+/// This is the test the hole was hiding behind. `src/dbus/item.rs` writes
+///
+/// ```ignore
+/// let mut vault = vault.lock().await;
+/// block_in_place(|| vault.update_item(&self.id, f))
+/// ```
+///
+/// — a receiver that is a *guard*, not a local typed by its initialiser.
+/// `visit_local` refused to type a binding whose initialiser was an
+/// acquisition, so `vault` had no type, `Registry::resolve` dropped every
+/// method call on it, and nothing was ever followed into `src/vault/`. Delete
+/// the `block_in_place` from that line — a whole-vault re-encrypt and two
+/// `fsync`s, on the async worker — and the whole file passed, four of four.
+/// The three synthetic offenders that stood in for this passed because they
+/// were written `let mut owned = Vault::open(p)?;`, a shape that appears
+/// nowhere in `src/dbus/`.
+///
+/// Both halves of the repair are pinned here, and they are separate
+/// instruments:
+///
+/// * `sweep_dir_now` is not on any list. It is reported only because the
+///   guard binding is typed from its acquisition's receiver, so
+///   `Vault::sweep_dir_now` resolves and the graph walks on to
+///   `sweep_temp_files`'s `std::fs::read_dir`. Revert the guard-binding
+///   typing in [`Walk::visit_local`] and this case goes green.
+/// * `update_item` is on [`BLOCKING_METHODS`]. It is reported by name because
+///   the graph *cannot* reach its `fsync`: `Vault::save` is
+///   `self.save_with(write_atomic)` and `save_with` publishes through
+///   `publish(&path, &bytes)`, a parameter rather than a path, which a
+///   signature-only view cannot follow. Empty the mutator half of
+///   `BLOCKING_METHODS` and this case goes green.
+///
+/// Neither instrument covers the other. That is why both are here.
+#[test]
+fn the_scan_catches_a_vault_write_at_a_real_call_site() {
+    // `Item::vault` is the real `src/dbus/item.rs` helper returning
+    // `Option<VaultRef>`; the binding names are the real ones, shadowing
+    // included, because the shadowing is part of the shape that broke.
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "a graph-only blocking `Vault` method under a guard receiver",
+            "async fn offender(item: &Item) {\n    \
+             let vault = item.vault().await.unwrap();\n    \
+             let mut vault = vault.lock().await;\n    \
+             vault.sweep_dir_now();\n}\n",
+            "Vault::sweep_dir_now",
+        ),
+        (
+            "a named `Vault` mutator under a guard receiver",
+            "async fn offender(item: &Item) {\n    \
+             let vault = item.vault().await.unwrap();\n    \
+             let mut vault = vault.lock().await;\n    \
+             vault.update_item(id, f).ok();\n}\n",
+            "update_item",
+        ),
+    ];
+    for (what, src, expect_in_offence) in cases {
+        let mut files = production_files();
+        files.push(("synthetic.rs".to_string(), (*src).to_string()));
+        let found = scan_files(&files);
+        assert!(
+            found.offences.iter().any(|o| o.contains(expect_in_offence)),
+            "the scan did not report {what}: no offence names `{expect_in_offence}`, so a \
+             vault write through the receiver every `src/dbus/` write actually uses is \
+             still invisible:\n{}",
+            found.offences.join("\n")
+        );
+    }
+
+    // And the near-miss, at the same real call site: wrapped in the sanctioned
+    // `block_in_place` under the collection's lock, which is how
+    // `src/dbus/item.rs` is written today. The rule must watch that shape,
+    // not forbid it.
+    let mut files = production_files();
+    files.push((
+        "synthetic.rs".to_string(),
+        "async fn allowed(item: &Item) {\n    \
+         let vault = item.vault().await.unwrap();\n    \
+         let mut vault = vault.lock().await;\n    \
+         block_in_place(|| vault.update_item(id, f)).ok();\n}\n"
+            .to_string(),
+    ));
+    let found = scan_files(&files);
+    assert!(
+        !found.offences.iter().any(|o| o.contains("synthetic.rs")),
+        "the scan reported the sanctioned shape — a vault mutator inside \
+         `block_in_place` under a collection's lock — which `CLAUDE.md` requires:\n{}",
+        found.offences.join("\n")
+    );
 }
 
 /// The scanner, checked against source it is *supposed* to reject.
@@ -858,6 +978,142 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              async fn run(dir: &Path) -> Result<()> {\n    \
              let mut state = ServiceState::new(dir);\n    state.load_vaults()?;\n    Ok(())\n}\n",
         ),
+        // ---- The guard receiver: the shape production actually uses. -----
+        //
+        // Every vault offender above is written `let mut owned =
+        // Vault::open(p)?;` — a local typed by its initialiser. Nothing in
+        // `src/dbus/` is written that way. Every write there goes
+        //
+        //     let vault = self.vault().await.ok_or_else(…)?;
+        //     let mut vault = vault.lock().await;
+        //     block_in_place(|| vault.update_item(&self.id, f))
+        //
+        // and `visit_local` used to refuse to type a binding whose initialiser
+        // was an acquisition, so `vault` had no type, the method call resolved
+        // to nothing, and removing that `block_in_place` from the real
+        // `src/dbus/item.rs` left all four tests in this file green.
+        //
+        // `rewrite` is deliberately a name no list mentions: this case is
+        // reported only if the guard binding is typed from its acquisition's
+        // receiver. The binding before the lock is named `cell` rather than
+        // `vault` on purpose too — with both named `vault`, the ordinary local
+        // typing would answer for the shadowed one and the case would prove
+        // nothing about the guard.
+        (
+            "a blocking method on a guard receiver, under a collection's lock",
+            "type VaultRef = Arc<Mutex<Vault>>;\nstruct Item {\n    coll: VaultRef,\n}\n\
+             impl Item {\n    async fn update(&self) -> Result<()> {\n        \
+             let cell = self.coll.clone();\n        let mut vault = cell.lock().await;\n        \
+             vault.rewrite()\n    }\n}\n\
+             impl Vault {\n    fn rewrite(&mut self) -> Result<()> {\n        \
+             file.sync_all()\n    }\n}\n",
+        ),
+        (
+            "a blocking method on a guard receiver, under the state guard",
+            "type Shared = Arc<Mutex<ServiceState>>;\nstruct Service {\n    inner: Shared,\n}\n\
+             impl Service {\n    async fn touch(&self) -> Result<()> {\n        \
+             let cell = self.inner.clone();\n        let mut held = cell.lock().await;\n        \
+             held.rewrite()\n    }\n}\n\
+             impl ServiceState {\n    fn rewrite(&mut self) -> Result<()> {\n        \
+             file.sync_all()\n    }\n}\n",
+        ),
+        // ---- The name backstop, where the call graph structurally cannot
+        // ---- reach. `Vault::save` publishes through a *parameter*
+        // ---- (`save_with(write_atomic)` calling `publish(&path, &bytes)`),
+        // ---- which a signature-only view cannot follow, so the graph stops
+        // ---- one call short of the `fsync`. No definition is given here
+        // ---- either: this is exactly the case a list answers and a graph
+        // ---- does not.
+        (
+            "a `Vault` mutator whose definition the scan cannot see, under a guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let mut v = elsewhere();\n    v.change_password(old, new, kdf)?;\n}\n",
+        ),
+        (
+            "a `Vault` mutator on a guard receiver, outside a `block_in_place`",
+            "async fn f() {\n    let mut vault = vault.lock().await;\n    \
+             vault.import_items(batch)?;\n}\n",
+        ),
+        // ---- The `.await` half of rule one. ------------------------------
+        // `CLAUDE.md`: "Not an `.await` that can block, and not a synchronous
+        // blocking call either." Only the synchronous half was ever checked,
+        // so every one of these was invisible under the global mutex.
+        (
+            "a pinentry round trip under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let pin = ask_passphrase(&st.pinentry, &label).await?;\n}\n",
+        ),
+        (
+            "a signal emission under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             emitter.collection_created(&path).await.ok();\n}\n",
+        ),
+        (
+            "an object-server registration under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             conn.object_server().at(&path, iface).await?;\n}\n",
+        ),
+        (
+            // The case the clean list used to bless. Detaching work is fine;
+            // waiting for it under the guard holds the mutex for exactly as
+            // long as the blocking work runs, which is the whole offence.
+            "a `JoinHandle` awaited under the state guard",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let dir = st.vault_dir.clone();\n    \
+             tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir)).await.ok();\n}\n",
+        ),
+        (
+            "an `.await` in a helper handed `&ServiceState`",
+            "async fn reply(st: &ServiceState, sock: &mut UnixStream) -> Result<()> {\n    \
+             sock.read_exact(&mut buf).await?;\n    Ok(())\n}\n",
+        ),
+        // ---- The state lock reached through a name the heuristic did not
+        // ---- know. `receiver_kind` decided `Guard::State` from the binding
+        // ---- name alone, so a state lock under any other name classified as
+        // ---- a collection lock — and a collection lock is the one that
+        // ---- *permits* `block_in_place`, which is itself an offence under
+        // ---- the state guard. The asymmetry is safe when it over-flags and
+        // ---- unsafe when it exempts, and this is the exempting direction.
+        (
+            "`block_in_place` under a state lock reached through an unfamiliar name",
+            "type Shared = Arc<Mutex<ServiceState>>;\nstruct Housekeeping {\n    registry: Shared,\n}\n\
+             impl Housekeeping {\n    async fn sweep(&self) {\n        \
+             let mut inner = self.registry.lock().await;\n        \
+             block_in_place(|| inner.persist()).ok();\n    }\n}\n",
+        ),
+        (
+            "an fsync under a state lock reached through an unfamiliar name",
+            "type Shared = Arc<Mutex<ServiceState>>;\nstruct Housekeeping {\n    registry: Shared,\n}\n\
+             impl Housekeeping {\n    async fn sweep(&self) {\n        \
+             let inner = self.registry.lock().await;\n        \
+             file.sync_all()?;\n    }\n}\n",
+        ),
+        // ---- Let-chain scrutinees. `visit_expr_if`/`visit_expr_while`
+        // ---- matched a bare `Expr::Let` and nothing else, so a let-chain —
+        // ---- which parses as an `Expr::Binary` — walked past the scrutinee
+        // ---- rule entirely. The tree uses let-chains freely, so this is the
+        // ---- shape a future edit is most likely to take, and there was a
+        // ---- live one in `src/dbus/registry.rs` when this was written.
+        (
+            "a lock in an `if let` chain's first scrutinee",
+            "async fn f() {\n    if let Some(v) = self.state.lock().await.vault(id)\n        \
+             && v.is_ready()\n    {\n        v.save();\n    }\n}\n",
+        ),
+        (
+            "a lock in an `if let` chain's second scrutinee",
+            "async fn f() {\n    if let Ok(iface) = server.interface(path).await\n        \
+             && let Err(e) = iface.get().await.emit(sig).await\n    {\n        warn(e);\n    }\n}\n",
+        ),
+        (
+            "a lock in the plain operand beside a `let` in an `if` chain",
+            "async fn f() {\n    if let Some(v) = self.lookup(id)\n        \
+             && self.state.lock().await.is_ready()\n    {\n        v.save();\n    }\n}\n",
+        ),
+        (
+            "a lock in a `while let` chain's scrutinee",
+            "async fn f() {\n    while let Some(v) = self.state.lock().await.pop()\n        \
+             && !done\n    {\n        v.save();\n    }\n}\n",
+        ),
         (
             "regression: a lock taken inside a macro invocation under a guard",
             "async fn f() {\n    let g = self.state.lock().await;\n    \
@@ -1069,10 +1325,76 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              v.import_items(batch)?;\n}\n",
         ),
         (
+            // The near-miss for the guard-receiver offenders: the same
+            // receiver, the same method, inside the sanctioned wrapper under a
+            // collection's lock — which is exactly how `src/dbus/item.rs`
+            // writes it. Typing the guard binding must make this shape
+            // *visible*, not forbidden.
+            "a blocking method on a guard receiver, inside a `block_in_place`",
+            "type VaultRef = Arc<Mutex<Vault>>;\nstruct Item {\n    coll: VaultRef,\n}\n\
+             impl Item {\n    async fn update(&self) -> Result<()> {\n        \
+             let cell = self.coll.clone();\n        let mut vault = cell.lock().await;\n        \
+             block_in_place(|| vault.rewrite())\n    }\n}\n\
+             impl Vault {\n    fn rewrite(&mut self) -> Result<()> {\n        \
+             file.sync_all()\n    }\n}\n",
+        ),
+        (
+            // The near-miss for the misclassification offenders, differing in
+            // exactly one thing: what the field is a lock *over*. A `VaultRef`
+            // is a collection's lock however it is named, and
+            // `block_in_place` is what `CLAUDE.md` requires there.
+            "`block_in_place` under a collection lock reached through an unfamiliar name",
+            "type VaultRef = Arc<Mutex<Vault>>;\nstruct Housekeeping {\n    registry: VaultRef,\n}\n\
+             impl Housekeeping {\n    async fn sweep(&self) {\n        \
+             let mut inner = self.registry.lock().await;\n        \
+             block_in_place(|| inner.persist()).ok();\n    }\n}\n",
+        ),
+        (
+            // `CLAUDE.md` scopes the `.await` rule to the state mutex. Under a
+            // collection's lock an `.await` is ordinary: that lock is one
+            // collection's, and the sanctioned save is held across it.
+            "an `.await` under a collection's lock",
+            "async fn f() {\n    let mut vault = vault.lock().await;\n    \
+             emitter.item_created(&path).await.ok();\n}\n",
+        ),
+        (
+            "an `.await` after the state guard is dropped",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             let dir = st.vault_dir.clone();\n    drop(st);\n    \
+             emitter.collection_created(&dir).await.ok();\n}\n",
+        ),
+        (
+            // The acquisition that opens a region is not an offence against
+            // itself, and neither is one taken with nothing held.
+            "the `.await` that takes the state lock in the first place",
+            "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
+             st.touch();\n}\n",
+        ),
+        (
+            // A plain `if` condition is not a let-chain: its temporaries are
+            // dropped before the body runs, so the guard does not outlive the
+            // scrutinee and the rule does not apply.
+            "an `if` condition with no `let` in it, which locks",
+            "async fn f(state: &Shared) {\n    if state.lock().await.is_ready() {\n        \
+             log(\"ready\");\n    }\n}\n",
+        ),
+        (
+            "an `if let` chain whose scrutinees take no lock",
+            "async fn f() {\n    if let Some(v) = self.lookup(id)\n        \
+             && v.is_ready()\n    {\n        v.save();\n    }\n}\n",
+        ),
+        (
+            // The point of this case is that the closure's blocking body runs
+            // somewhere else and carries no guard with it. It used to `.await`
+            // the handle, which is a different thing entirely — awaiting a
+            // `JoinHandle` under the state guard holds the mutex for exactly
+            // as long as the blocking work takes — and it is now the offender
+            // "a `JoinHandle` awaited under the state guard" above. Detaching
+            // is allowed; waiting for the detached work under the guard is not.
             "work handed to a blocking pool under a guard, which takes nothing with it",
             "async fn f(state: &Shared) {\n    let st = state.lock().await;\n    \
              let dir = st.vault_dir.clone();\n    \
-             tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir)).await.ok();\n}\n",
+             tokio::task::spawn_blocking(move || std::fs::create_dir_all(&dir));\n}\n",
         ),
     ];
     for (what, src) in clean {
@@ -1177,21 +1499,53 @@ const BLOCKING_METHODS: &[&str] = &[
     // number of them in a loop, which is the shape the delegation rule below
     // exists for.
     "symlink_metadata",
-    // The vault mutators are deliberately *not* named here. Every one of them
-    // ends in `Vault::save` — build the hashed index over the whole
-    // collection, postcard-encode every item, seal the blob, write a temp
-    // file, `fsync` it, rename, `fsync` the directory — and that is the exact
-    // work `CLAUDE.md` forbids under the state mutex. It used to be a list of
-    // five names, because `src/vault/` was outside the parsed set and blocking
-    // work outside it can only be recognised by name. A list is the wrong
-    // instrument: it silently omitted ten public blocking `Vault` methods,
-    // `change_password` among them, and it named `save`, which is private to
-    // `vault::store` and could never have fired from the files that were
-    // parsed. `src/vault/` is now parsed, so the call graph reaches the real
-    // `write_all`/`sync_all`/`rename` and the coverage is whatever the source
-    // actually does.
+    // ---- The `Vault` mutators, as a backstop to the call graph. ----------
+    //
+    // Every one of these ends in `Vault::save` — build the hashed index over
+    // the whole collection, postcard-encode every item, seal the blob, write a
+    // temp file, `fsync` it, rename, `fsync` the directory — and the four that
+    // derive (`unlock`, `unlock_with_key`, `verify_password`, `change_key`)
+    // allocate an Argon2 arena as well. That is exactly the work `CLAUDE.md`
+    // forbids under the state mutex and sanctions under a collection's lock
+    // only inside `block_in_place`.
+    //
+    // This list was deleted in favour of "coverage is the call graph's now,
+    // not a list's". The graph is the better instrument and it does not reach
+    // this: `Vault::save` is `self.save_with(write_atomic)`, and `save_with`
+    // publishes through `publish(&path, &bytes)` — a *parameter*, not a path,
+    // so the edge to `write_atomic`'s `write_all`/`sync_all`/`rename` is a
+    // higher-order one that a signature-only view cannot draw. The graph
+    // reaches `Vault::update_item` and stops one call short of the `fsync`.
+    //
+    // So the two instruments are kept, and they are not the same instrument
+    // twice. The graph is primary — it is what reaches `change_password`'s
+    // second Argon2 arena and anything a future edit writes. The list is a
+    // backstop with one job: a rename cannot silently drop coverage, because a
+    // renamed mutator that is no longer on it still has to reach the `fsync`
+    // through the graph, and one that the graph cannot reach still has to be
+    // on it. `the_scan_catches_a_vault_write_at_a_real_call_site` is the case
+    // that fails if either half goes.
+    //
+    // `save` itself is kept even though it is private to `vault::store` — the
+    // reason the old list's `save` was dead was that `src/vault/` was outside
+    // the parsed set, and it no longer is. `self.save()` inside a `Vault`
+    // method now fires whenever the graph enters that method holding a lock,
+    // which is precisely the higher-order gap above.
+    "insert_item",
+    "update_item",
+    "delete_item",
+    "delete_items",
+    "import_items",
+    "set_label",
+    "change_password",
+    "change_key",
+    "unlock",
+    "unlock_with_key",
+    "verify_password",
+    "verify_key",
+    "delete_file",
+    "save",
 ];
-
 /// The same, as the last segment of a called path: `remove_file(p)`,
 /// `std::fs::rename(a, b)`, `fs::create_dir_all(d)`.
 const BLOCKING_FNS: &[&str] = &[
@@ -1212,6 +1566,27 @@ const BLOCKING_FNS: &[&str] = &[
     // derives: `unlock`, `verify_password`, `change_password`, `create`,
     // `open`.
     "derive_key",
+];
+
+/// Method calls that yield the same payload they are called on, so a type
+/// travels through them: `Option`/`Result` unwrapping, cloning, borrowing.
+/// Peeling these is not following a call edge — [`TypeMap::payload`] has
+/// already collapsed `Option<Arc<Mutex<Vault>>>` to `Vault`, and these are the
+/// expressions that do the collapsing at runtime.
+const PASSTHROUGH: &[&str] = &[
+    "clone",
+    "cloned",
+    "to_owned",
+    "unwrap",
+    "expect",
+    "ok_or",
+    "ok_or_else",
+    "unwrap_or_else",
+    "unwrap_or_default",
+    "as_ref",
+    "as_mut",
+    "borrow",
+    "borrow_mut",
 ];
 
 /// The sanctioned escape hatch — for a collection's lock only.
@@ -1253,6 +1628,12 @@ struct FnDef {
     /// inside the closure `Service::set_alias` hands to `update_aliases`)
     /// resolves to nothing at all.
     callback_params: Vec<Option<Vec<Option<String>>>>,
+    /// The payload type this function returns, when it names one:
+    /// `ServiceState::vault(&self, …) -> Option<VaultRef>` yields `Vault`.
+    /// This is what carries a type across a call, and it is how the local in
+    /// `let vault = self.vault().await.ok_or_else(…)?` — the shape every
+    /// `src/dbus/` write actually uses — comes to be a `Vault` at all.
+    ret_ty: Option<String>,
     /// Why this function's whole body is a guard region, if it is.
     seed: Option<(Guard, String)>,
     /// Whether that region comes from a `&self`/`&mut self` receiver rather
@@ -1265,28 +1646,151 @@ struct FnDef {
     block: syn::Block,
 }
 
+/// Wrappers a value is *behind* rather than *is*. Peeling them is what turns
+/// `Option<VaultRef>` — and `VaultRef` is itself `Arc<Mutex<Vault>>` — into
+/// `Vault`, which is the whole reason the guard binding in
+/// `let mut vault = vault.lock().await` can be typed at all.
+const WRAPPERS: &[&str] = &[
+    "Option",
+    "Result",
+    "Arc",
+    "Rc",
+    "Box",
+    "Pin",
+    "Mutex",
+    "RwLock",
+    "RefCell",
+    "Cell",
+    "MutexGuard",
+    "OwnedMutexGuard",
+    "RwLockReadGuard",
+    "RwLockWriteGuard",
+    "Zeroizing",
+];
+
+/// The type names the scan knows: `type` aliases and struct fields, from the
+/// scanned files themselves.
+///
+/// `syn` does no inference, so this is the whole of the scan's type knowledge
+/// — and it is enough for the shape that matters, because the daemon writes
+/// every one of these down. `Shared` and `VaultRef` are aliases in
+/// `src/dbus/state.rs`; `Item { state: Shared, … }` is a struct there; and
+/// `ServiceState::vault(&self, …) -> Option<VaultRef>` is a signature. Follow
+/// those three and `let mut vault = vault.lock().await` types as `Vault` and
+/// `let st = self.state.lock().await` as `ServiceState`, which is what the
+/// guard-binding rule and the state/collection classification both need.
+#[derive(Default)]
+struct TypeMap {
+    aliases: HashMap<String, syn::Type>,
+    /// `(struct name, field name) -> declared type`.
+    fields: HashMap<(String, String), syn::Type>,
+}
+
+impl TypeMap {
+    /// The named type a value of this type ultimately *is*, after peeling
+    /// references and [`WRAPPERS`] and resolving aliases.
+    fn payload(&self, ty: &syn::Type) -> Option<String> {
+        self.payload_at(ty, 0)
+    }
+
+    fn payload_at(&self, ty: &syn::Type, depth: usize) -> Option<String> {
+        if depth > 12 {
+            return None;
+        }
+        match ty {
+            syn::Type::Reference(r) => self.payload_at(&r.elem, depth + 1),
+            syn::Type::Paren(p) => self.payload_at(&p.elem, depth + 1),
+            syn::Type::Group(g) => self.payload_at(&g.elem, depth + 1),
+            syn::Type::Path(p) => {
+                let seg = p.path.segments.last()?;
+                let name = seg.ident.to_string();
+                if WRAPPERS.contains(&name.as_str())
+                    && let syn::PathArguments::AngleBracketed(a) = &seg.arguments
+                    && let Some(inner) = a.args.iter().find_map(|g| match g {
+                        syn::GenericArgument::Type(t) => Some(t),
+                        _ => None,
+                    })
+                {
+                    return self.payload_at(inner, depth + 1);
+                }
+                if let Some(aliased) = self.aliases.get(&name) {
+                    return self.payload_at(&aliased.clone(), depth + 1);
+                }
+                Some(name)
+            }
+            _ => None,
+        }
+    }
+
+    fn field(&self, on: &str, field: &str) -> Option<String> {
+        let ty = self.fields.get(&(on.to_string(), field.to_string()))?;
+        self.payload(&ty.clone())
+    }
+}
+
+fn collect_types(items: &[syn::Item], out: &mut TypeMap) {
+    for item in items {
+        match item {
+            syn::Item::Type(t) => {
+                out.aliases.insert(t.ident.to_string(), (*t.ty).clone());
+            }
+            syn::Item::Struct(s) => {
+                for f in &s.fields {
+                    if let Some(id) = &f.ident {
+                        out.fields
+                            .insert((s.ident.to_string(), id.to_string()), f.ty.clone());
+                    }
+                }
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    collect_types(inner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct Registry {
     defs: Vec<FnDef>,
     by_name: HashMap<String, Vec<usize>>,
+    types: TypeMap,
 }
 
 impl Registry {
     fn build(files: &[(String, String)]) -> Registry {
+        let parsed: Vec<(&String, syn::File)> = files
+            .iter()
+            .map(|(name, text)| {
+                let f = syn::parse_file(text).unwrap_or_else(|e| {
+                    panic!(
+                        "{name} did not parse as Rust, so the scan below would be reading \
+                         something other than this daemon: {e}"
+                    )
+                });
+                (name, f)
+            })
+            .collect();
+        // Types first: a signature in the first file may name an alias
+        // declared in the last one.
+        let mut types = TypeMap::default();
+        for (_, f) in &parsed {
+            collect_types(&f.items, &mut types);
+        }
         let mut defs = Vec::new();
-        for (name, text) in files {
-            let parsed = syn::parse_file(text).unwrap_or_else(|e| {
-                panic!(
-                    "{name} did not parse as Rust, so the scan below would be reading \
-                     something other than this daemon: {e}"
-                )
-            });
-            collect_items(name, &parsed.items, false, &mut defs);
+        for (name, f) in &parsed {
+            collect_items(name, &f.items, false, &types, &mut defs);
         }
         let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, d) in defs.iter().enumerate() {
             by_name.entry(d.name.clone()).or_default().push(i);
         }
-        Registry { defs, by_name }
+        Registry {
+            defs,
+            by_name,
+            types,
+        }
     }
 
     /// Candidate definitions for a call.
@@ -1342,7 +1846,13 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-fn collect_items(file: &str, items: &[syn::Item], in_test: bool, out: &mut Vec<FnDef>) {
+fn collect_items(
+    file: &str,
+    items: &[syn::Item],
+    in_test: bool,
+    types: &TypeMap,
+    out: &mut Vec<FnDef>,
+) {
     for item in items {
         match item {
             syn::Item::Fn(f) => push_fn(
@@ -1351,11 +1861,12 @@ fn collect_items(file: &str, items: &[syn::Item], in_test: bool, out: &mut Vec<F
                 &f.sig,
                 &f.block,
                 in_test || is_cfg_test(&f.attrs),
+                types,
                 out,
             ),
             syn::Item::Mod(m) => {
                 if let Some((_, inner)) = &m.content {
-                    collect_items(file, inner, in_test || is_cfg_test(&m.attrs), out);
+                    collect_items(file, inner, in_test || is_cfg_test(&m.attrs), types, out);
                 }
             }
             syn::Item::Impl(i) => {
@@ -1363,7 +1874,7 @@ fn collect_items(file: &str, items: &[syn::Item], in_test: bool, out: &mut Vec<F
                 let t = in_test || is_cfg_test(&i.attrs);
                 for ii in &i.items {
                     if let syn::ImplItem::Fn(m) = ii {
-                        push_fn(file, ty.as_deref(), &m.sig, &m.block, t, out);
+                        push_fn(file, ty.as_deref(), &m.sig, &m.block, t, types, out);
                     }
                 }
             }
@@ -1373,7 +1884,7 @@ fn collect_items(file: &str, items: &[syn::Item], in_test: bool, out: &mut Vec<F
                     if let syn::TraitItem::Fn(m) = ti
                         && let Some(body) = &m.default
                     {
-                        push_fn(file, None, &m.sig, body, tt, out);
+                        push_fn(file, None, &m.sig, body, tt, types, out);
                     }
                 }
             }
@@ -1388,6 +1899,7 @@ fn push_fn(
     sig: &syn::Signature,
     block: &syn::Block,
     in_test: bool,
+    types: &TypeMap,
     out: &mut Vec<FnDef>,
 ) {
     let name = sig.ident.to_string();
@@ -1418,10 +1930,16 @@ fn push_fn(
             syn::FnArg::Typed(pt) => {
                 params.push(pat_name(&pt.pat).unwrap_or_else(|| "_".to_string()));
                 // A guard over the state answers method calls as the state.
+                // The *payload* type, not the outermost one: a `&VaultRef`
+                // is a `Vault` behind an `Arc<Mutex<…>>`, and typing it as
+                // `Arc` would resolve nothing. `&Shared` becomes
+                // `ServiceState` for the same reason — which says what the
+                // lock is *over*, and is not the same claim as holding it;
+                // `is_state_ref` below is still what decides the seed.
                 param_types.push(if is_state_ref(&pt.ty) {
                     Some("ServiceState".to_string())
                 } else {
-                    type_name(&pt.ty)
+                    types.payload(&pt.ty).or_else(|| type_name(&pt.ty))
                 });
                 callback_params.push(callback_arg_types(&pt.ty));
                 if seed.is_none() && is_state_ref(&pt.ty) {
@@ -1441,6 +1959,13 @@ fn push_fn(
         Some(t) => format!("{t}::{name}"),
         None => name.clone(),
     };
+    let ret_ty = match &sig.output {
+        syn::ReturnType::Type(_, ty) => types.payload(ty).map(|t| match t.as_str() {
+            "Self" => self_ty.unwrap_or("Self").to_string(),
+            _ => t,
+        }),
+        syn::ReturnType::Default => None,
+    };
     out.push(FnDef {
         display,
         name,
@@ -1451,6 +1976,7 @@ fn push_fn(
         params,
         param_types,
         callback_params,
+        ret_ty,
         seed,
         receiver_seed,
         in_test,
@@ -1566,27 +2092,39 @@ fn strip_try(e: &syn::Expr) -> &syn::Expr {
     }
 }
 
-/// `recv.lock().await` and friends, and which lock it is.
-fn acquisition(e: &syn::Expr) -> Option<Guard> {
+/// The receiver of `recv.lock().await` and friends, if this expression is an
+/// acquisition. The receiver is what says *which* lock it is, and — once it
+/// has a type — what the binding the guard is bound to holds.
+fn acquisition_recv(e: &syn::Expr) -> Option<&syn::Expr> {
     let syn::Expr::Await(a) = strip_try(e) else {
         return None;
     };
     await_acquisition(a)
 }
 
-fn await_acquisition(a: &syn::ExprAwait) -> Option<Guard> {
+fn await_acquisition(a: &syn::ExprAwait) -> Option<&syn::Expr> {
     let syn::Expr::MethodCall(m) = strip_try(&a.base) else {
         return None;
     };
-    (ACQUIRE.contains(&m.method.to_string().as_str()) && m.args.is_empty())
-        .then(|| receiver_kind(&m.receiver))
+    (ACQUIRE.contains(&m.method.to_string().as_str()) && m.args.is_empty()).then_some(&*m.receiver)
 }
 
-/// Which mutex a receiver names. Only an expression that plainly ends in the
-/// daemon's state is treated as the state lock; everything else is a
-/// collection lock. The asymmetry is deliberate: mistaking a vault's lock for
-/// the state's would flag `block_in_place(|| v.save())`, which `CLAUDE.md`
-/// *requires*, at every save site in the tree.
+/// Which lock an acquisition takes, with no type information: used where
+/// there is no walk to ask — [`count_guard_bindings`] and [`scrutinee_locks`],
+/// neither of which cares which lock it is.
+fn acquisition(e: &syn::Expr) -> Option<Guard> {
+    acquisition_recv(e).map(receiver_kind)
+}
+
+/// Which mutex a receiver names, by *name* — the fallback for a receiver whose
+/// type the scan cannot see. This used to be the only answer, and it was a
+/// hole: `receiver_kind` decided `Guard::State` from the binding name, so a
+/// state lock reached under any other name classified as a collection lock and
+/// was thereby *permitted* `block_in_place`, which is itself an offence under
+/// the state guard. Naming is now the last resort; [`Walk::guard_of`] asks the
+/// type first. The asymmetry is still deliberate in this direction: mistaking
+/// a vault's lock for the state's would flag `block_in_place(|| v.save())`,
+/// which `CLAUDE.md` *requires*, at every save site in the tree.
 fn receiver_kind(e: &syn::Expr) -> Guard {
     fn tail(e: &syn::Expr) -> Option<String> {
         match e {
@@ -1629,6 +2167,36 @@ fn scrutinee_locks(e: &syn::Expr) -> bool {
     let mut f = Find(false);
     f.visit_expr(e);
     f.0
+}
+
+/// Whether an `if`/`while` condition is a `let` **chain** whose temporaries a
+/// lock outlives.
+///
+/// `visit_expr_if` and `visit_expr_while` used to match a bare `Expr::Let` and
+/// nothing else, so `if let Some(x) = a.lock().await.f() && cond` — which
+/// parses as an `Expr::Binary` with the `let` on one side — walked straight
+/// past the scrutinee rule. The tree uses let-chains freely, so that is the
+/// shape a future edit is most likely to take.
+///
+/// A `let` anywhere in the condition is what makes the whole condition's
+/// temporaries live to the end of the construct, so once one is present the
+/// *whole* condition is the scrutinee — both `let` initialisers and the plain
+/// operands beside them. A condition with no `let` in it is not one of these:
+/// its temporaries are dropped before the body runs, which is why a plain
+/// `if guard.lock().await.is_locked() {}` is not reported here.
+fn let_chain_locks(cond: &syn::Expr) -> bool {
+    struct HasLet(bool);
+    impl<'ast> Visit<'ast> for HasLet {
+        fn visit_expr_let(&mut self, l: &'ast syn::ExprLet) {
+            self.0 = true;
+            visit::visit_expr_let(self, l);
+        }
+        // A closure body in the condition is its own scope.
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    }
+    let mut has = HasLet(false);
+    has.visit_expr(cond);
+    has.0 && scrutinee_locks(cond)
 }
 
 fn call_path(f: &syn::Expr) -> Option<Vec<String>> {
@@ -1759,13 +2327,22 @@ impl<'a> Walk<'a> {
         self.out.calls.push((call, entry, line));
     }
 
-    /// The receiver's type, when it is knowable and useful for resolving a
-    /// method call: `self` inside an `impl`, a binding that is a state guard,
-    /// a local whose initialiser names its type, a closure parameter typed
-    /// from the callee's signature, or a parameter of this function.
-    fn prefer_ty(&self, recv: &syn::Expr) -> Option<String> {
+    /// The type of an expression, as far as signatures, struct fields and
+    /// `type` aliases can say — which is the whole of what `syn` offers,
+    /// since it infers nothing.
+    ///
+    /// This is what resolves a method call on a receiver, and it is the piece
+    /// the scan was missing. It used to type only `self`, a parameter, a
+    /// state-guard binding, and a local whose initialiser was literally
+    /// `Type::assoc(…)`. Production writes none of those at a vault write
+    /// site: `let vault = self.vault().await.ok_or_else(…)?;` then
+    /// `let mut vault = vault.lock().await;`. Following the *return* type of
+    /// `Item::vault` (`Option<VaultRef>`, so `Vault`) and then the
+    /// acquisition's receiver is what makes that second binding a `Vault` and
+    /// the edge into `src/vault/store.rs` exist at all.
+    fn expr_ty(&self, e: &syn::Expr) -> Option<String> {
         let me = &self.reg.defs[self.me];
-        match recv {
+        match e {
             syn::Expr::Path(p) if p.path.is_ident("self") => me.self_ty.clone(),
             syn::Expr::Path(p) => {
                 let id = p.path.get_ident()?.to_string();
@@ -1782,10 +2359,80 @@ impl<'a> Walk<'a> {
                 let i = me.params.iter().position(|n| *n == id)?;
                 me.param_types.get(i).cloned().flatten()
             }
-            syn::Expr::Reference(r) => self.prefer_ty(&r.expr),
-            syn::Expr::Paren(p) => self.prefer_ty(&p.expr),
-            syn::Expr::Group(g) => self.prefer_ty(&g.expr),
+            syn::Expr::Field(f) => {
+                let base = self.expr_ty(&f.base)?;
+                let syn::Member::Named(n) = &f.member else {
+                    return None;
+                };
+                self.reg.types.field(&base, &n.to_string())
+            }
+            syn::Expr::MethodCall(m) => {
+                let name = m.method.to_string();
+                // A wrapper peeled, not a call followed: `Option`/`Result`
+                // unwrapping and the guard-producing calls all yield the
+                // payload, which [`TypeMap::payload`] has already collapsed
+                // the receiver's type to.
+                if PASSTHROUGH.contains(&name.as_str())
+                    || (ACQUIRE.contains(&name.as_str()) && m.args.is_empty())
+                {
+                    return self.expr_ty(&m.receiver);
+                }
+                let call = Call {
+                    name,
+                    method: true,
+                    on: self.expr_ty(&m.receiver),
+                };
+                self.reg
+                    .resolve(&call)
+                    .iter()
+                    .find_map(|&j| self.reg.defs[j].ret_ty.clone())
+            }
+            syn::Expr::Call(c) => {
+                let segs = call_path(&c.func)?;
+                let on = segs
+                    .get(segs.len().wrapping_sub(2))
+                    .filter(|s| s.starts_with(char::is_uppercase))
+                    .cloned();
+                let call = Call {
+                    name: segs.last()?.clone(),
+                    method: false,
+                    on: on.clone(),
+                };
+                self.reg
+                    .resolve(&call)
+                    .iter()
+                    .find_map(|&j| self.reg.defs[j].ret_ty.clone())
+                    .or(on)
+            }
+            syn::Expr::Await(a) => self.expr_ty(&a.base),
+            syn::Expr::Try(t) => self.expr_ty(&t.expr),
+            syn::Expr::Reference(r) => self.expr_ty(&r.expr),
+            syn::Expr::Unary(u) => self.expr_ty(&u.expr),
+            syn::Expr::Paren(p) => self.expr_ty(&p.expr),
+            syn::Expr::Group(g) => self.expr_ty(&g.expr),
             _ => None,
+        }
+    }
+
+    /// Which lock an acquisition takes: the receiver's *type* where the scan
+    /// has one, and only otherwise its name.
+    ///
+    /// The name-only answer was a hole with a direction: a state lock reached
+    /// through a binding not called `state`/`st`/`shared` classified as a
+    /// collection lock, and a collection lock is the one that *permits*
+    /// `block_in_place` and blocking work inside it. Over-flagging is safe
+    /// here and exempting is not, so the two answers are unioned rather than
+    /// ranked: either the type or the name saying "state" makes it the state
+    /// guard. The name alone still has to answer where the type is invisible
+    /// — a synthetic case carries no `type Shared = …` for the alias table to
+    /// resolve, and neither does a file that names its lock through something
+    /// the scan cannot follow.
+    fn guard_of(&self, recv: &syn::Expr) -> Guard {
+        let by_type = self.expr_ty(recv).as_deref() == Some("ServiceState");
+        if by_type || receiver_kind(recv) == Guard::State {
+            Guard::State
+        } else {
+            Guard::Collection
         }
     }
 
@@ -1864,19 +2511,30 @@ impl<'ast> Visit<'ast> for Walk<'_> {
         if let Some((_, diverge)) = &init.diverge {
             self.visit_expr(diverge);
         }
-        if acquisition(&init.expr).is_none()
-            && let Some(name) = pat_name(&l.pat)
-            && let syn::Expr::Call(c) = strip_try(&init.expr)
-            && let Some(segs) = call_path(&c.func)
-            && segs.len() >= 2
-            && let Some(ty) = segs
-                .get(segs.len() - 2)
-                .filter(|s| s.starts_with(char::is_uppercase))
-        {
-            let depth = self.depth;
-            self.locals.push((name, ty.clone(), depth));
+        let acquired = acquisition_recv(&init.expr).map(|recv| (self.guard_of(recv), recv));
+        // Every local the scan can type is typed, acquisition or not. A guard
+        // binding is typed from what it is a guard *over* — that is the whole
+        // fix: `visit_local` used to type a local only when the initialiser
+        // was `Type::assoc(…)`, and deliberately typed nothing when the
+        // initialiser was an acquisition, so `let mut vault = vault.lock()
+        // .await` — the receiver every write in `src/dbus/` goes through —
+        // left `vault` untyped, `Registry::resolve` dropped the edge, and
+        // nothing was ever followed into `src/vault/`. The three synthetic
+        // offenders that stood in for the real thing passed only because they
+        // were written `let mut owned = Vault::open(p)?;`, a shape that
+        // appears nowhere in `src/dbus/`.
+        if let Some(name) = pat_name(&l.pat) {
+            let ty = match acquired {
+                Some((Guard::State, _)) => Some("ServiceState".to_string()),
+                Some((Guard::Collection, recv)) => self.expr_ty(recv),
+                None => self.expr_ty(&init.expr),
+            };
+            if let Some(ty) = ty {
+                let depth = self.depth;
+                self.locals.push((name, ty, depth));
+            }
         }
-        if let Some(kind) = acquisition(&init.expr) {
+        if let Some((kind, _)) = acquired {
             let name = pat_name(&l.pat);
             let label = match &name {
                 Some(n) => format!("`{n}` ({})", kind.what()),
@@ -1893,14 +2551,39 @@ impl<'ast> Visit<'ast> for Walk<'_> {
     }
 
     fn visit_expr_await(&mut self, a: &'ast syn::ExprAwait) {
-        if await_acquisition(a).is_some() {
-            let label = self.innermost().map(|h| h.label.clone());
-            if let Some(label) = label {
-                self.report(
-                    a.await_token.span(),
-                    format!("takes a lock while {label} is still held"),
-                );
-            }
+        let held = self.innermost().map(|h| (h.kind, h.label.clone()));
+        match (await_acquisition(a).is_some(), held) {
+            (true, Some((_, label))) => self.report(
+                a.await_token.span(),
+                format!("takes a lock while {label} is still held"),
+            ),
+            // The `.await` half of the first rule, which had no check at all.
+            // `CLAUDE.md`: "Not an `.await` that can block, and not a
+            // synchronous blocking call either" — only the synchronous half
+            // was enforced, so a pinentry Assuan round trip, a
+            // `SignalEmitter::…().await`, an `object_server().at(…).await`, a
+            // `JoinHandle` await and a control-socket read were all invisible
+            // under the state guard. None of them is bounded by a constant and
+            // every one of them parks the global mutex for its duration.
+            //
+            // Scoped to the state guard on purpose: under a *collection's*
+            // lock an `.await` is ordinary — that lock is one collection's,
+            // nothing else wants it, and `CLAUDE.md` sanctions holding it
+            // across the save. The acquisition that opens a region is not an
+            // offence against itself; it is reported, if at all, by the arm
+            // above.
+            (false, Some((Guard::State, label))) => self.report(
+                a.await_token.span(),
+                format!(
+                    "`.await`s while {label} is held. `CLAUDE.md`: nothing slow or \
+                     blocking may happen under the state mutex, and that is not an \
+                     `.await` that can block either — the guard is held across the \
+                     suspension, so every other bus call, control request and \
+                     housekeeping task waits on whatever this is waiting for. Clone \
+                     what is needed out of the state, drop the guard, and await after"
+                ),
+            ),
+            _ => {}
         }
         visit::visit_expr_await(self, a);
     }
@@ -1917,9 +2600,7 @@ impl<'ast> Visit<'ast> for Walk<'_> {
     }
 
     fn visit_expr_if(&mut self, e: &'ast syn::ExprIf) {
-        if let syn::Expr::Let(l) = &*e.cond
-            && scrutinee_locks(&l.expr)
-        {
+        if let_chain_locks(&e.cond) {
             self.report(
                 e.if_token.span(),
                 "takes a lock in an `if let` scrutinee, which holds the guard across the \
@@ -1931,9 +2612,7 @@ impl<'ast> Visit<'ast> for Walk<'_> {
     }
 
     fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
-        if let syn::Expr::Let(l) = &*e.cond
-            && scrutinee_locks(&l.expr)
-        {
+        if let_chain_locks(&e.cond) {
             self.report(
                 e.while_token.span(),
                 "takes a lock in a `while let` scrutinee, which holds the guard across \
@@ -2069,7 +2748,7 @@ impl<'ast> Visit<'ast> for Walk<'_> {
         let call = Call {
             name: name.clone(),
             method: true,
-            on: self.prefer_ty(&m.receiver),
+            on: self.expr_ty(&m.receiver),
         };
         // `.lock()`/`.read()` are the acquisition itself, reported at the
         // `.await`; they are not calls into this crate.

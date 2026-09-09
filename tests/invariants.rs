@@ -245,6 +245,27 @@ fn every_header_field_is_authenticated() {
     let bytes = std::fs::read(&path).unwrap();
     let file = VaultFile::decode(&bytes).unwrap();
 
+    // The table below is only "every field" for as long as something ties it
+    // to the struct. This destructure is that tie: it names every field of
+    // `format::Header` with no `..`, so adding one is a compile error here —
+    // `E0027`, missing field — and not a green run over an uncovered field.
+    //
+    // **Every binding named here must appear as a row in `mutate` below**,
+    // and `kdf` appears as three rows: its costs are separate fields in the
+    // postcard encoding, so a partial associated data would leave the two
+    // that are not `t_cost` writable.
+    let format::Header {
+        version: _,
+        label: _,
+        created: _,
+        modified: _,
+        kdf: _,
+        salt: _,
+        index_salt: _,
+        nonce: _,
+        index: _,
+    } = &file.header;
+
     let mutate: Vec<(&str, HeaderMutation, CaughtBy)> = vec![
         (
             "label",

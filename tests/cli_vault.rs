@@ -561,21 +561,42 @@ fn a_collection_warning_from_the_control_socket_is_escaped() {
     }
 }
 
-/// `sm daemon` that cannot start for a reason other than the bus name already
-/// being owned is exit 1, and says what failed. Only the name clash is exit 3.
+/// `sm daemon` that cannot start for a *local* reason — here a vault
+/// directory it cannot read, refused by the scan that runs before the bus is
+/// ever touched — is exit 1, and says what failed.
+///
+/// This used to induce the failure with an unreachable bus address and assert
+/// 1 for it, on the belief that only the name clash is 3. That contradicted
+/// the README, which lists exit 3 as "daemon or bus unreachable, or
+/// `XDG_RUNTIME_DIR` unset", and made `sm daemon` the one command that
+/// disagreed with `vault_cmds::control` and `client::method_error_to_cli`
+/// about an unreachable bus. Those two cases are exit 3 and are asserted in
+/// `tests/daemon.rs`; what is left for 1 is everything that is not a
+/// transport failure.
 #[test]
-fn daemon_reports_a_start_failure_that_is_not_a_name_clash() {
+#[cfg(unix)]
+fn daemon_reports_a_local_start_failure_as_exit_1() {
     let home = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
     let vault_dir = write_fast_config(home.path());
-    std::fs::create_dir_all(&vault_dir).unwrap();
+    // A regular file where the vault directory belongs, so the startup scan
+    // fails with `DaemonError::Io` before the connection and the bus address
+    // plays no part in the verdict.
+    //
+    // A mode-000 directory does *not* work here, and the reason is worth
+    // keeping: `scan_vault_dir` goes through `ensure_vault_dir`, which repairs
+    // a directory's mode as well as setting it at creation, so it chmods 000
+    // back to 0700, the scan succeeds, and the daemon reaches the bus — which
+    // is exit 3, the very code this test exists to distinguish from.
+    if let Some(parent) = vault_dir.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&vault_dir, b"not a directory").unwrap();
 
     bare_sm(home.path(), runtime.path())
         .arg("daemon")
         .arg("--foreground")
         .assert()
-        // Not 3: 3 is reserved for "another daemon already owns the name",
-        // which a script may treat as "one is already running".
         .code(1)
         .stderr(predicate::str::contains("secret-manager:"));
 }

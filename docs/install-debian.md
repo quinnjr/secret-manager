@@ -42,6 +42,16 @@ normal user and only `sudo` the install step.
 
 Only one service may own `org.freedesktop.secrets` on the session bus.
 
+**Move your secrets across before you turn the old one off.** Disabling a
+provider does not migrate anything, and the steps below leave the old files
+in place but unread. `sm import --from gnome-keyring --inventory` prints
+what is in the source from its cleartext headers alone — no password, no
+daemon — and `sm import --from gnome-keyring --dry-run` runs the whole
+extraction and every check and writes nothing. Both report, per item,
+whether the application that wrote it will still find it; see "Commands" in
+`README.md` for what the three outcomes mean, and use `--from kwallet` for
+the KWallet section below.
+
 ```sh
 systemctl --user mask gnome-keyring-daemon.service
 ```
@@ -98,6 +108,12 @@ before agreeing.
 This section — `ksecretd`'s behaviour, the file paths, the PAM stack
 contents — was reasoned from Debian's packaging, not checked on a live KDE
 session; see `docs/vagrant.md`.
+
+Import the wallet before disabling it: `sm import --from kwallet --dry-run`
+(see "Commands" in `README.md`). A native KWallet entry has no attributes,
+so it is preserved and findable with `sm list` and `sm get`, but no
+libsecret client that did not write it will look it up — the dry run says
+how many of yours are in that case.
 
 KWallet claims `org.freedesktop.secrets` through `ksecretd`, and it does so
 at runtime — it will hold the name even when the system activation file

@@ -182,18 +182,63 @@ and `src/kdf.rs` — the real Rust grammar, not a lexer — which builds the cal
 graph and asks of every statement whether it can run with a lock held.
 `src/vault/` is in the set because the blocking work is: every `Vault` mutator
 ends in `save`'s `write_all`/`sync_all`/`rename`, and `unlock`,
-`verify_password`, `change_password` and `create` run Argon2 as well. It used
-to be outside, with a hand-maintained list of five `Vault` method names
-standing in for it — which had already gone stale, missing `change_password`
-while naming a `save` that is private to `vault::store` and could never fire.
-Coverage is the call graph's now, not a list's, and `crypto::derive_key` is
-named blocking so `CLAUDE.md`'s Argon2 rule below has a rule in the scan. It refuses a second
-acquisition, and blocking work: an `fsync` stops the same tasks a bad `.await`
-would, and phrasing the rule for awaits alone is what let the original bug
-through. **Because it follows calls to a fixed point, no rule here is
-defeatable by moving the offending line one `fn` deeper** — which is how
+`verify_password`, `change_password` and `create` run Argon2 as well. It
+refuses a second acquisition, blocking work, and — under the state guard — an
+`.await`: an `fsync` stops the same tasks a bad `.await` would, and phrasing
+the rule for awaits alone is what let the original bug through, while checking
+only the synchronous half left a pinentry round trip, a signal emission and a
+`JoinHandle` await invisible under the global mutex. `crypto::derive_key` is
+named blocking so the Argon2 rule above has a rule in the scan.
+**Because it follows calls to a fixed point, no rule here is defeatable by
+moving the offending line one `fn` deeper** — which is how
 `unique_collection_id` hid, its whole body a one-line delegation to something
 that looped over `symlink_metadata`.
+
+**Coverage is the graph's *and* a list's, and the two are not the same
+instrument.** This file used to say "coverage is the call graph's now, not a
+list's", and that sentence is what made a hole plausible: the `Vault` mutators
+were deleted from `BLOCKING_METHODS` on the strength of it. The graph is the
+better instrument in principle and it does not reach the daemon's own write
+path. `Vault::save` is `self.save_with(write_atomic)`, and `save_with`
+publishes through `publish(&path, &bytes)` — a *parameter*, not a path — so the
+edge to the `write_all`/`sync_all`/`rename` is higher-order and a
+signature-only view cannot draw it. The graph reaches `Vault::update_item` and
+stops one call short of the `fsync`. So the mutators are named again, as a
+backstop: the graph stays primary and is what reaches whatever a future edit
+writes, and the list means a rename cannot silently drop coverage. `save` is on
+it too — it was dead on the old list only because `src/vault/` was unparsed,
+and it no longer is.
+
+Guard bindings are **typed**, from what the acquisition is a lock over. This is
+the fix for the hole that motivated the rest. Production writes every vault
+mutation through a guard receiver —
+
+```rust
+let vault = self.vault().await.ok_or_else(…)?;
+let mut vault = vault.lock().await;
+block_in_place(|| vault.update_item(&self.id, f))
+```
+
+— and the scan used to refuse to type a binding whose initialiser was an
+acquisition, so `vault` had no type, every method call on it resolved to
+nothing, and *nothing was ever followed into `src/vault/` from `src/dbus/`*.
+Deleting that `block_in_place` from `src/dbus/item.rs` — a whole-vault
+re-encrypt and two `fsync`s, on the async worker — left the whole file green,
+four of four. The synthetic offenders passed only because they were written
+`let mut owned = Vault::open(p)?;`, a receiver typed by its initialiser and a
+shape that appears nowhere in `src/dbus/`. Every rule here therefore has its
+offender written in the shape production uses, not the shape that was
+convenient to type; that distinction is the whole lesson.
+
+Which of the two locks an acquisition takes is answered by the receiver's
+**type** where the scan has one — `type` aliases, struct fields and return
+types are all it has, and they are enough, because `Shared`, `VaultRef`,
+`Item { state: Shared }` and `ServiceState::vault(…) -> Option<VaultRef>` are
+all written down — and only otherwise by its name. Naming alone was a hole with
+a direction: a state lock reached through a binding not called
+`state`/`st`/`shared` classified as a *collection* lock, and a collection lock
+is the one that permits `block_in_place`. Over-flagging is safe here and
+exempting is not, so the two answers are unioned rather than ranked.
 
 The two locks are not interchangeable and the scan does not conflate them.
 Under a **collection's** lock, `state::block_in_place` is the sanctioned
@@ -205,8 +250,10 @@ place blocking work may not go.
 A guard region starts where the state is genuinely held: a `let`-bound
 acquisition, for as long as its binding lives; a `match`/`while let`/`if
 let`/`for` scrutinee that locks, which is refused outright because a scrutinee
-is not a terminating scope; the whole body of a helper whose signature takes
-`&ServiceState`, `&mut ServiceState` or the guard itself, which can only have
+is not a terminating scope — **including a let-chain**, `if let Some(x) =
+a.lock().await.f() && cond`, which parses as a binary expression and used to
+escape a rule that matched only a bare `let`; the whole body of a helper whose
+signature takes `&ServiceState`, `&mut ServiceState` or the guard itself, which can only have
 been called with the state held; and the body of a closure passed to a callee
 that runs it under the guard — `update_aliases` invokes its `edit` argument
 with the state held, so the closure written at the call site is as much inside
@@ -237,6 +284,19 @@ ever gain is one that already holds the guard, so the fix is deletion, not a
 carefully placed call — and it is what both `unique_collection_id` and
 `save_aliases` were before they were deleted, each kept alive by its own unit
 tests.
+
+**What the scan still does not do.** It has no type inference; it knows only
+the types that signatures, struct fields and `type` aliases write down, so a
+receiver typed by inference alone resolves to nothing and the call is not
+followed. It cannot follow a **higher-order** call — a function passed as a
+value and invoked through a parameter, which is exactly why `Vault::save`'s
+publish step needs the name list. It reads a macro body as text, not as
+grammar. It treats an `.await` under a *collection's* lock as ordinary, which
+is what the rules above sanction but means a genuinely slow await there is not
+reported. It says nothing about how long a bounded piece of work takes, only
+about what kind it is. And it is still a source scan: it proves a property of
+the tree as written, and the runtime half of this file exists because that is
+not the same as a property of an execution.
 
 Run `cargo fmt` before trusting a failure from any of this — it reads
 formatted source.

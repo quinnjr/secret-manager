@@ -62,11 +62,29 @@ pub const SYNTHESISED_ATTRIBUTES: [&str; 3] =
 /// path**, which is the only path that synthesises anything. See
 /// [`SYNTHESISED_ATTRIBUTES`].
 ///
-/// The source is a parameter and not an assumption: `kwallet:` is a
-/// user-writable namespace, so a gnome-keyring item may genuinely carry an
-/// attribute named `kwallet:folder` — unlikely, but it would be a real,
+/// The source is a parameter so that the discount stops at the KWallet path:
+/// `kwallet:` is a user-writable namespace, so a gnome-keyring item may
+/// genuinely carry an attribute named `kwallet:folder` — unlikely, but a real,
 /// searchable attribute that nothing here wrote, and discounting it would
 /// misreport the item as [`Outcome::PreservedOnly`].
+///
+/// That argument does not extend to the source it excludes, and this function
+/// deliberately does not pretend otherwise. A *KWallet* item can carry a real
+/// `kwallet:key` too — one written into the sidecar by hand — and
+/// `kwallet::map_entry` records that as an attribute conflict rather than
+/// overwriting it, so the name survives into the map as user data. This
+/// function discounts it anyway, and such an item is reported
+/// [`Outcome::PreservedOnly`] when a client could in principle have searched
+/// on it. The classification is by name, not by provenance, because the map
+/// that reaches [`Outcome::classify`] no longer records which of its keys this
+/// importer inserted.
+///
+/// The error is one-directional: it can only under-promise. An item is called
+/// "no libsecret client will find it" when the truth is "probably none will",
+/// never the reverse, so no user is told a migration went better than it did.
+/// Making it exact means threading "did we insert this key?" out of
+/// `kwallet::map_entry` and into the classifier, which is the honest fix and
+/// not one a doc comment can perform.
 pub fn is_synthesised_attribute(source: Source, key: &str) -> bool {
     source == Source::KWallet && SYNTHESISED_ATTRIBUTES.contains(&key)
 }
@@ -321,15 +339,13 @@ impl From<CapViolation> for Refusal {
 /// with a half-populated vault and no way to tell which half. Check first,
 /// write second; refuse items, not runs.
 ///
-/// Three callers exist and two policies are written down. `gnome::extract`
-/// (around the `cap_violation` call) and `kwallet::extract` both do what this
-/// doc says: the item goes to `refused` and the walk continues. `cli::import`
-/// then runs a second pre-check over `extraction.items` that treats any
-/// violation as fatal and writes nothing — and because both extractors have
-/// already removed every violating item from `items`, that list is always
-/// empty and the abort is unreachable. The abort is the policy to delete, not
-/// the one to spread: it contradicts this doc, and as written it is dead code
-/// carrying a comment that describes behaviour the product does not have.
+/// Two callers exist, one per source, and both do what this doc says: the
+/// violating item goes to the refused list and the walk continues.
+/// `gnome::drain_batch` reaches it through [`SourceItem::cap_violation`];
+/// `kwallet::walk` calls it directly on the mapped entry. `cli::import` does
+/// **not** re-check — by the time it sees `extraction.items` every violating
+/// item has already been removed from that list — so there is one policy here,
+/// written down once, and no second gate that could contradict it.
 pub fn check_caps(
     label: &str,
     attributes: &BTreeMap<String, String>,
@@ -405,9 +421,31 @@ impl fmt::Display for Refusal {
 
 /// The attribute *names* of an item, and nothing else.
 ///
-/// The only way to build one is from a map whose values are dropped on the
+/// [`AttributeKeys::of`] builds one from a map whose values are dropped on the
 /// way in, so no code path can put an attribute value into a report by
 /// accident. That is the whole point of the newtype.
+///
+/// Two other doors exist and neither is a hole in *that* guarantee, because
+/// what the newtype protects is the report this process writes, not the
+/// contents of a file someone hands back to it.
+///
+/// - [`AttributeKeys::from_names`] takes arbitrary strings, so
+///   `AttributeKeys::from_names(attributes.values().cloned())` compiles and
+///   fills a report with `server=`/`user=` *values*. It is `pub(crate)`, which
+///   reduces "no code path can do this by accident" to a claim about code in
+///   this repository — a claim review can actually settle.
+/// - `#[derive(Deserialize)]` with `#[serde(transparent)]` on a `pub` type is
+///   a **public** constructor from any JSON array of strings, reachable by any
+///   downstream crate with no `unsafe` and no crate-private call. It exists so
+///   a report can be read back and its tally checked, and the strings it
+///   admits are whatever the file on disk holds. So a deserialized
+///   `AttributeKeys` carries only the guarantee that *whoever wrote the file*
+///   put names in it; nothing this crate emits ever takes that route.
+///
+/// The structural fix for both is a distinct `AttributeName` type that only a
+/// parser can mint, with the `Deserialize` going through it; until that
+/// exists, [`AttributeKeys::of`] is the only constructor whose input shape
+/// makes a value impossible.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AttributeKeys(BTreeSet<String>);
@@ -422,15 +460,14 @@ impl AttributeKeys {
     /// index, which stores key names and hashed values, hands us exactly
     /// this.
     ///
-    /// `pub(crate)` on purpose. This is the one hole in the guarantee the
-    /// type doc makes: it takes any strings at all, so
+    /// `pub(crate)` on purpose: it takes any strings at all, so
     /// `AttributeKeys::from_names(attributes.values().cloned())` compiles and
     /// fills a report with `server=`/`user=` *values*. Keeping it inside the
     /// crate reduces "no code path can do this by accident" to a claim about
     /// code in this repository, which is a claim review can actually settle.
-    /// The structural fix is a distinct `AttributeName` type that only a
-    /// parser can mint; until that exists, this stays crate-private and
-    /// [`AttributeKeys::of`] is the only public constructor.
+    /// See the type's own doc for the other constructor — the derived,
+    /// `pub`-by-inheritance `Deserialize` — and why it is not the same kind of
+    /// hole.
     pub(crate) fn from_names<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -476,8 +513,30 @@ pub struct ItemReport {
     /// A source item type with no target: our daemon exposes no `Type`
     /// property, so `NETWORK_PASSWORD` and friends flatten and the report
     /// says which items lost one.
+    ///
+    /// Only a type this build *recognises*, because it is the on-disk
+    /// format's numbering and there is no number for a string we do not know.
+    /// A type the source named and this build cannot place goes in
+    /// [`ItemReport::unknown_item_type`] instead — never here, and never in
+    /// the `None` that means "nothing was lost".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_item_type: Option<u32>,
+    /// The item carried a `Type` this build does not recognise, verbatim
+    /// except for sanitisation.
+    ///
+    /// A type string is not an attribute value and not a secret: it is a
+    /// well-known constant the source daemon chose from, `xdg:schema`'s
+    /// cousin, and printing it is the whole point — a future gnome-keyring
+    /// type that flattened is a thing the reader of a migration report must be
+    /// able to name. It is peer text on its way to a terminal all the same, so
+    /// whoever sets it puts it through `display_label` first.
+    ///
+    /// Distinct from [`ItemReport::lost_item_type`] because the two say
+    /// different things. `lost_item_type: None` means *nothing was lost*;
+    /// folding an unrecognised type into it would report a flattened type as
+    /// no type at all, which is the one thing a migration report may not do.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown_item_type: Option<String>,
     /// The item carried a per-application access list the Secret Service has
     /// no equivalent for. "Only `/usr/bin/foo` may read this" becomes
     /// "anything on the session bus may read this" — a security downgrade at
@@ -499,6 +558,7 @@ impl ItemReport {
             refusals: Vec::new(),
             secret_len: item.secret.len(),
             lost_item_type: None,
+            unknown_item_type: None,
             acl_downgrade: false,
         }
     }
@@ -515,6 +575,7 @@ impl ItemReport {
             refusals: vec![refusal],
             secret_len: 0,
             lost_item_type: None,
+            unknown_item_type: None,
             acl_downgrade: false,
         }
     }
@@ -528,9 +589,10 @@ impl ItemReport {
 ///
 /// The counters are only ever moved by [`Tally::record_outcome`] and
 /// [`Tally::record_refused`], which is what keeps a tally and the items it
-/// summarises in step. (They are still `pub` fields: `src/cli/import.rs`
-/// reads them by name when it prints the summary, so sealing them is a change
-/// to a file this lane does not own.)
+/// summarises in step. The fields are private and the accessors below are the
+/// only way out, so a call site cannot reach past `record_outcome` to bump a
+/// counter directly; `src/cli/import.rs` prints the summary through those
+/// accessors.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tally {
     fully_portable: usize,
@@ -545,7 +607,8 @@ impl Tally {
         self.fully_portable + self.attributes_preserved + self.preserved_only
     }
 
-    /// Every item the walk produced, written or not.
+    /// Items written carrying a non-empty `xdg:schema`. See
+    /// [`Outcome::FullyPortable`].
     pub fn fully_portable(&self) -> usize {
         self.fully_portable
     }
@@ -562,6 +625,7 @@ impl Tally {
         self.refused
     }
 
+    /// Every item the walk produced, written or not.
     pub fn seen(&self) -> usize {
         self.imported() + self.refused
     }

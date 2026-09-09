@@ -7,7 +7,7 @@ use super::prop_string;
 use super::registry;
 use super::require_sender;
 use super::session::{SecretStruct, Session};
-use super::state::{self, PathTarget, SessionEntry, Shared};
+use super::state::{self, PathTarget, SessionEntry, Shared, VaultRef};
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
 use std::collections::{BTreeMap, HashMap};
@@ -121,6 +121,37 @@ fn push_unique(ids: &mut Vec<String>, id: String) {
     if !ids.contains(&id) {
         ids.push(id);
     }
+}
+
+/// Bucket `elements` by collection id, keeping each element's index.
+///
+/// The point is one vault-lock acquisition per *distinct collection* in a
+/// batch instead of one per element: `Unlock` and `Lock` accept up to
+/// [`MAX_LOCK_OBJECTS`] paths, which at the cap is 1024 acquisitions of a
+/// lock there may be one of. Buckets come back in first-appearance order and
+/// each holds its indices in the request's own order, so a caller can
+/// reassemble a reply that is indistinguishable from the per-element walk.
+///
+/// The grouping itself is a hashed index rather than a linear scan per
+/// element — the `contains`-in-a-loop shape `CollectionAdmin::delete_items`
+/// replaced with a set.
+fn group_by_collection<T>(
+    elements: &[T],
+    key: impl Fn(&T) -> &String,
+) -> Vec<(String, Vec<usize>)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut at: HashMap<&String, usize> = HashMap::new();
+    for (i, e) in elements.iter().enumerate() {
+        let cid = key(e);
+        match at.get(cid) {
+            Some(&slot) => groups[slot].1.push(i),
+            None => {
+                at.insert(cid, groups.len());
+                groups.push((cid.clone(), vec![i]));
+            }
+        }
+    }
+    groups
 }
 
 #[interface(name = "org.freedesktop.Secret.Service")]
@@ -250,14 +281,25 @@ impl Service {
             let cipher = SessionCipher::clone(st.cipher(session.as_str(), &sender)?);
             st.touch();
             let mut wanted: Wanted = Vec::new();
+            // Grouping is a hashed index, not a linear scan of `wanted` per
+            // item: at `MAX_GET_SECRETS_ITEMS` items in as many distinct
+            // collections the `find` was quadratic, the same
+            // `contains`-in-a-loop shape `CollectionAdmin::delete_items`
+            // replaced with a set. The index maps a collection id to its slot
+            // in `wanted`, so the reply still groups in first-appearance
+            // order.
+            let mut group: HashMap<String, usize> = HashMap::new();
             for path in items {
                 let Some(PathTarget::Item { id, vault, item }) = st.resolve_path(path.as_str())
                 else {
                     continue;
                 };
-                match wanted.iter_mut().find(|(cid, _, _)| *cid == id) {
-                    Some((_, paths, _)) => paths.push((path, item)),
-                    None => wanted.push((id, vec![(path, item)], vault)),
+                match group.get(&id) {
+                    Some(&at) => wanted[at].1.push((path, item)),
+                    None => {
+                        group.insert(id.clone(), wanted.len());
+                        wanted.push((id, vec![(path, item)], vault));
+                    }
                 }
             }
             (cipher, wanted)
@@ -376,42 +418,98 @@ impl Service {
         #[zbus(object_server)] server: &ObjectServer,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
         check_object_count(objects.len())?;
+        // Answered before the resolution loop, not after it: a caller with no
+        // sender, or one already at [`MAX_PROMPTS_PER_OWNER`], is refused
+        // without first paying up to `MAX_LOCK_OBJECTS` lock acquisitions for
+        // a prompt it can never be given. That is the shape HIGH 4 corrected
+        // on `open_session`. The check is repeated under the guard that
+        // inserts the owner entry below, because only there is it atomic with
+        // the insert.
+        let owner = require_sender(&header)?;
+        self.state.lock().await.check_prompt_quota(&owner)?;
+        // Resolve every path under ONE state acquisition and answer the lock
+        // state with that guard released, one vault acquisition per *distinct
+        // collection* rather than one of each per element — the shape
+        // `CollectionAdmin::delete_items` documents. The two locks are never
+        // held together: the `Arc`s are cloned out and the guard dropped
+        // before any vault is touched (see `state::VaultRef`).
+        struct Pending {
+            path: OwnedObjectPath,
+            cid: String,
+            vault: Option<VaultRef>,
+            item: Option<String>,
+        }
+        let pending: Vec<Pending> = {
+            let st = self.state.lock().await;
+            objects
+                .into_iter()
+                .filter_map(|path| match st.resolve_path(path.as_str()) {
+                    // A broken collection (no entry in `collections`; see
+                    // `state::ServiceState::broken`) has no vault and is
+                    // always locked.
+                    Some(PathTarget::Broken { id }) => Some(Pending {
+                        path,
+                        cid: id,
+                        vault: None,
+                        item: None,
+                    }),
+                    Some(PathTarget::Collection { id, vault }) => Some(Pending {
+                        path,
+                        cid: id,
+                        vault: Some(vault),
+                        item: None,
+                    }),
+                    Some(PathTarget::Item { id, vault, item }) => Some(Pending {
+                        path,
+                        cid: id,
+                        vault: Some(vault),
+                        item: Some(item),
+                    }),
+                    None => None,
+                })
+                .collect()
+        };
+        // `None` drops the element from the reply entirely; `Some(locked)` is
+        // its answer. Verdicts are per element, so grouping cannot reorder
+        // the reply: it is reassembled in the request's own order below.
+        let mut verdict: Vec<Option<bool>> = vec![None; pending.len()];
+        for (_, idxs) in group_by_collection(&pending, |p| &p.cid) {
+            let Some(vault) = pending[idxs[0]].vault.clone() else {
+                for i in idxs {
+                    verdict[i] = Some(true);
+                }
+                continue;
+            };
+            let vault = vault.lock().await;
+            let is_locked = vault.is_locked();
+            for i in idxs {
+                // An item path that names no item resolves to nothing, as it
+                // did when the item index was reachable from the state lock
+                // itself.
+                if let Some(iid) = &pending[i].item
+                    && !vault.has_item(iid)
+                {
+                    continue;
+                }
+                verdict[i] = Some(is_locked);
+            }
+        }
         let mut unlocked = Vec::new();
         let mut collections: Vec<String> = Vec::new();
         let mut requested = Vec::new();
-        for path in objects {
-            let Some(target) = self.state.lock().await.resolve_path(path.as_str()) else {
-                continue;
-            };
-            // A broken collection (no entry in `collections`; see
-            // `state::ServiceState::broken`) is always locked.
-            let is_locked = match &target {
-                PathTarget::Broken { .. } => true,
-                PathTarget::Collection { vault, .. } => vault.lock().await.is_locked(),
-                PathTarget::Item { vault, item, .. } => {
-                    let v = vault.lock().await;
-                    // An item path that names no item resolves to nothing, as
-                    // it did when the item index was reachable from the state
-                    // lock itself.
-                    if !v.has_item(item) {
-                        continue;
-                    }
-                    v.is_locked()
-                }
-            };
-            let cid = target.id().to_string();
+        for (p, verdict) in pending.into_iter().zip(verdict) {
+            let Some(is_locked) = verdict else { continue };
             if !is_locked {
-                unlocked.push(path);
+                unlocked.push(p.path);
                 continue;
             }
-            push_unique(&mut collections, cid);
-            requested.push(path);
+            push_unique(&mut collections, p.cid);
+            requested.push(p.path);
         }
         if collections.is_empty() {
             return Ok((unlocked, paths::root()));
         }
         let mut st = self.state.lock().await;
-        let owner = require_sender(&header)?;
         st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
         st.prompt_owners.insert(prompt_path.to_string(), owner);
@@ -444,32 +542,70 @@ impl Service {
         #[zbus(connection)] conn: &Connection,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
         check_object_count(objects.len())?;
+        // The same shape `unlock` uses: resolve every path under ONE state
+        // acquisition, then take each *distinct collection's* lock once
+        // instead of once per element — up to `MAX_LOCK_OBJECTS` of each per
+        // message before. The state guard is dropped before any vault is
+        // locked; the two are never held together (see `state::VaultRef`).
+        struct Pending {
+            path: OwnedObjectPath,
+            cid: String,
+            vault: VaultRef,
+            item: Option<String>,
+        }
+        let pending: Vec<Pending> = {
+            let st = self.state.lock().await;
+            objects
+                .into_iter()
+                .filter_map(|path| match st.resolve_path(path.as_str()) {
+                    // A broken collection has no vault to lock and is left
+                    // out of the reply, exactly as when `collections.get_mut`
+                    // missed it.
+                    Some(PathTarget::Collection { id, vault }) => Some(Pending {
+                        path,
+                        cid: id,
+                        vault,
+                        item: None,
+                    }),
+                    Some(PathTarget::Item { id, vault, item }) => Some(Pending {
+                        path,
+                        cid: id,
+                        vault,
+                        item: Some(item),
+                    }),
+                    Some(PathTarget::Broken { .. }) | None => None,
+                })
+                .collect()
+        };
         let (locked, changed) = {
-            let mut locked = Vec::new();
+            let mut answered: Vec<bool> = vec![false; pending.len()];
             let mut changed: Vec<String> = Vec::new();
-            for path in objects {
-                let Some(target) = self.state.lock().await.resolve_path(path.as_str()) else {
-                    continue;
-                };
-                // A broken collection has no vault to lock and is left out of
-                // the reply, exactly as when `collections.get_mut` missed it.
-                let (cid, vault, item) = match target {
-                    PathTarget::Broken { .. } => continue,
-                    PathTarget::Collection { id, vault } => (id, vault, None),
-                    PathTarget::Item { id, vault, item } => (id, vault, Some(item)),
-                };
+            for (cid, idxs) in group_by_collection(&pending, |p| &p.cid) {
+                let vault = pending[idxs[0]].vault.clone();
                 let mut vault = vault.lock().await;
-                if let Some(iid) = item
-                    && !vault.has_item(&iid)
-                {
-                    continue;
+                let mut any = false;
+                for i in idxs {
+                    if let Some(iid) = &pending[i].item
+                        && !vault.has_item(iid)
+                    {
+                        continue;
+                    }
+                    answered[i] = true;
+                    any = true;
                 }
-                if !vault.is_locked() {
+                // A collection named only by paths that resolve to nothing is
+                // not locked, exactly as before: the per-element walk reached
+                // `vault.lock()` only past the existence check.
+                if any && !vault.is_locked() {
                     vault.lock();
                     push_unique(&mut changed, cid);
                 }
-                locked.push(path);
             }
+            let locked: Vec<OwnedObjectPath> = pending
+                .into_iter()
+                .zip(answered)
+                .filter_map(|(p, keep)| keep.then_some(p.path))
+                .collect();
             (locked, changed)
         };
         for cid in changed {

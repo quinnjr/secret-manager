@@ -355,20 +355,42 @@ impl Client {
                 Value::from(attrs_map),
             ),
         ]);
-        let (item, _prompt) = proxy
+        let (item, prompt) = proxy
             .create_item(props, &self.encrypt(secret, "text/plain"), true)
             .await
             .map_err(map_zbus)?;
+        // Our own daemon always answers `/` here, but `CreateItem` is
+        // specified to be allowed to return a prompt instead of an item, and
+        // the provider on the other end need not be ours — a foreign
+        // implementation, or the same-uid impostor the README accepts as
+        // possible. Discarding the prompt made `sm set` print nothing, store
+        // nothing, and exit 0. `unlock` drives its prompt; so does this.
+        if prompt.as_str() != "/" {
+            let result = self.perform_prompt(&prompt).await?;
+            return OwnedObjectPath::try_from(result)
+                .map_err(|e| CliError::Failed(format!("bad CreateItem result: {e}")));
+        }
+        if item.as_str() == "/" {
+            return Err(CliError::Failed(
+                "the secret service returned neither an item nor a prompt for CreateItem".into(),
+            ));
+        }
         Ok(item)
     }
 
     pub async fn delete_item(&self, item: &OwnedObjectPath) -> Result<(), CliError> {
-        self.item_proxy(item)
+        // As with `store` above: `Item.Delete` may answer with a prompt, and
+        // a discarded one is a delete that never happened reported as success.
+        let prompt = self
+            .item_proxy(item)
             .await?
             .delete()
             .await
-            .map(|_| ())
-            .map_err(map_zbus)
+            .map_err(map_zbus)?;
+        if prompt.as_str() != "/" {
+            self.perform_prompt(&prompt).await?;
+        }
+        Ok(())
     }
 
     /// Delete every item in `items` from `collection` in one atomic call, via

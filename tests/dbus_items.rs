@@ -174,6 +174,13 @@ async fn create_search_get_set_delete_with_signals() {
             .is_empty()
     );
 
+    // A `replace = true` create that hits an existing item is a *change*, not
+    // a creation: `ItemChanged` names the item, and no `ItemCreated` follows
+    // it. Both streams are live across the call, and the `ItemCreated` one is
+    // read after `ItemChanged` has arrived — the two signals are emitted on
+    // the same connection in order, so had the wrong one been sent it would
+    // already be queued.
+    let mut created_again = coll.receive_item_created().await.unwrap();
     let (again, _) = coll
         .create_item(
             props("replaced", &[("app", "git"), ("user", "jane")]),
@@ -185,6 +192,17 @@ async fn create_search_get_set_delete_with_signals() {
     assert_eq!(again, item_path);
     assert_eq!(coll.items().await.unwrap().len(), 1);
     assert_eq!(it.label().await.unwrap(), "replaced");
+    let replace_signal = tokio::time::timeout(Duration::from_secs(5), changed.next())
+        .await
+        .expect("a replace emits ItemChanged")
+        .unwrap();
+    assert_eq!(replace_signal.args().unwrap().item, item_path);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), created_again.next())
+            .await
+            .is_err(),
+        "a replace must not emit ItemCreated"
+    );
 
     let mut deleted = coll.receive_item_deleted().await.unwrap();
     assert_eq!(it.delete().await.unwrap().as_str(), "/");
@@ -200,6 +218,83 @@ async fn create_search_get_set_delete_with_signals() {
         .await,
         "item object removed"
     );
+}
+
+/// `replace = true` matches on the *exact* attribute set, as
+/// `Collection::create_item` documents. The spec's "an item with the same
+/// attributes" also reads as `SearchItems`' superset rule, under which a
+/// create carrying one attribute would overwrite every item that has it — so
+/// this pins which reading is implemented, in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replace_matches_exact_attributes_only() {
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+
+    let (original, _) = coll
+        .create_item(
+            props("original", &[("app", "git"), ("user", "joe")]),
+            &plain_secret(&session, b"tok"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    // A strict subset: every attribute given is on the existing item, and
+    // `SearchItems` finds it, but the sets are not equal.
+    assert_eq!(
+        coll.search_items(HashMap::from([("app", "git")]))
+            .await
+            .unwrap(),
+        vec![original.clone()],
+        "the subset does match the existing item for search"
+    );
+    let (subset, _) = coll
+        .create_item(
+            props("subset", &[("app", "git")]),
+            &plain_secret(&session, b"other"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_ne!(subset, original, "a subset creates a new item");
+
+    // A superset, for the same reason from the other side.
+    let (superset, _) = coll
+        .create_item(
+            props("superset", &[("app", "git"), ("user", "joe"), ("h", "x")]),
+            &plain_secret(&session, b"third"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_ne!(superset, original);
+    assert_ne!(superset, subset);
+    assert_eq!(coll.items().await.unwrap().len(), 3);
+
+    // The original is untouched by either.
+    let it = item(&conn, original.clone()).await;
+    assert_eq!(it.label().await.unwrap(), "original");
+    assert_eq!(
+        it.get_secret(&session).await.unwrap().value.as_slice(),
+        b"tok"
+    );
+
+    // The exact set does replace, in place.
+    let (same, _) = coll
+        .create_item(
+            props("replaced", &[("app", "git"), ("user", "joe")]),
+            &plain_secret(&session, b"tok2"),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(same, original);
+    assert_eq!(coll.items().await.unwrap().len(), 3);
+    assert_eq!(it.label().await.unwrap(), "replaced");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

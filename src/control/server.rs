@@ -1,4 +1,7 @@
-use crate::protocol::{MAX_FRAME, Request, Response, Zeroizing, decode_frame, encode_frame};
+use crate::protocol::{
+    MAX_FRAME, PROTOCOL_VERSION, ProtocolError, Request, Response, Zeroizing, decode_frame,
+    encode_frame,
+};
 use std::fs::Permissions;
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
@@ -68,7 +71,16 @@ impl ControlServer {
         let dir = path
             .parent()
             .ok_or_else(|| std::io::Error::other("socket path has no parent"))?;
-        tokio::fs::create_dir_all(dir).await?;
+        // Mode at creation, not a chmod afterwards: `create_dir_all` uses
+        // 0777 & ~umask, and another uid that wins the window between the two
+        // keeps a descriptor to the directory the control socket lives in.
+        // The `set_permissions` that follows is the repair path for a
+        // directory that already existed with looser bits.
+        tokio::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .await?;
         tokio::fs::set_permissions(dir, Permissions::from_mode(0o700)).await?;
         // Whoever is listening here, it is not another daemon.
         //
@@ -252,7 +264,27 @@ async fn handle_connection(
             Ok(response) => response,
             Err(_) => Response::Error("the daemon took too long to answer".into()),
         },
-        Err(e) => Response::Error(format!("malformed request: {e}")),
+        Err(e) => {
+            // A version mismatch is the one decode failure whose answer
+            // cannot reach the peer that caused it: the reply below is framed
+            // at `PROTOCOL_VERSION`, which is by definition the version the
+            // peer just refused, so it fails the peer's own `decode_frame`
+            // and the sentence in it is never read. No reply encoding can be
+            // understood here — that is what a version mismatch means — so
+            // the diagnostic goes to the log, where the operator can see it
+            // regardless. The reply is still sent, because dropping the
+            // connection would surface at the peer as an unexplained EOF
+            // rather than as a decode error naming the version.
+            if let ProtocolError::UnsupportedVersion(v) = e {
+                tracing::warn!(
+                    "refusing a control request at protocol version {v}; this daemon speaks \
+                     {PROTOCOL_VERSION}. The peer cannot read this refusal: the response is \
+                     framed at {PROTOCOL_VERSION} too. The client and the daemon are from \
+                     different builds."
+                );
+            }
+            Response::Error(format!("malformed request: {e}"))
+        }
     };
     // A response too large to frame must still be diagnosable: send an error
     // the peer can read rather than dropping the connection, which would

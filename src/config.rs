@@ -92,11 +92,16 @@ impl Default for PromptConfig {
 }
 
 impl Default for KdfConfig {
+    /// One number per cost, not two that can drift: the shipped Argon2
+    /// parameters are stated once, in `KdfParams::default`, and this is the
+    /// same three numbers read back out. `defaults_match_spec` asserts the
+    /// two agree as well as asserting the literals the spec names.
     fn default() -> Self {
+        let p = crate::vault::crypto::KdfParams::default();
         Self {
-            m_cost_kib: 65536,
-            t_cost: 3,
-            p_cost: 1,
+            m_cost_kib: p.m_cost_kib,
+            t_cost: p.t_cost,
+            p_cost: p.p_cost,
         }
     }
 }
@@ -229,6 +234,14 @@ mod tests {
         assert_eq!(c.kdf.m_cost_kib, 65536);
         assert_eq!(c.kdf.t_cost, 3);
         assert_eq!(c.kdf.p_cost, 1);
+        // The literals above are the spec's; these are the vault layer's own
+        // defaults, and the two must be the same three numbers. `KdfConfig`
+        // is defined from `KdfParams` so they cannot drift, and this fails if
+        // that definition is ever unwound back into a second set of literals.
+        assert_eq!(
+            crate::vault::crypto::KdfParams::from(c.kdf),
+            crate::vault::crypto::KdfParams::default()
+        );
         assert_eq!(c.prompt.pinentry, "pinentry");
         assert_eq!(c.vault.auto_lock_after, Duration::from_secs(15 * 60));
         assert!(!c.vault.lock_memory);

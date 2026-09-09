@@ -2603,3 +2603,56 @@ async fn the_alias_cap_holds_on_the_create_collection_path() {
         .await
         .unwrap();
 }
+
+/// `Prompt(window_id)` is accepted and deliberately ignored — see the decision
+/// recorded on `dbus::prompt::Prompt::prompt`. Every other prompt test in this
+/// file passes `""`, so this is the one place the argument is exercised with a
+/// value: an unlock driven with a non-empty handle still succeeds, and nothing
+/// derived from the handle reaches the pinentry.
+///
+/// The value is shaped like a real X11 window id with an Assuan injection
+/// glued to it. If the handle were ever forwarded as `OPTION parent-wid=`,
+/// this is the input that must not reach the dialog unescaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_window_id_is_accepted_and_ignored() {
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let coll = collection(&conn, fx.default_collection()).await;
+    assert!(coll.locked().await.unwrap());
+
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy
+        .prompt("41943045\nOPTION parent-wid=99\nGETINFO version")
+        .await
+        .unwrap();
+    let sig = tokio::time::timeout(Duration::from_secs(10), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(!args.dismissed, "a window id must not dismiss the prompt");
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap()).unwrap(),
+        vec![fx.default_collection()]
+    );
+    assert!(!coll.locked().await.unwrap());
+
+    let log = fx.pinentry_log();
+    assert!(log.contains("GETPIN"), "the dialog was raised");
+    assert!(
+        !log.contains("parent-wid"),
+        "the window id is not forwarded: {log}"
+    );
+    assert!(
+        !log.contains("41943045") && !log.contains("GETINFO"),
+        "nothing derived from the window id reaches the dialog: {log}"
+    );
+}

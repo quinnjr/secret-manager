@@ -50,7 +50,9 @@ fn merge_unlocked(
 }
 
 /// Search, unlocking what is locked. A dismissed prompt is tolerated when
-/// something already matched (`sm get`, `sm list`, `sm ssh`).
+/// something already matched (`sm get`, `sm ssh`). `sm list` is not a caller:
+/// it never unlocks and prompts for nothing, so it walks the collections
+/// itself.
 pub(crate) async fn find(
     client: &Client,
     query: &BTreeMap<String, String>,
@@ -322,33 +324,45 @@ mod tests {
 pub async fn get(attrs: Vec<String>, label: Option<String>) -> Result<(), CliError> {
     let query = parse_attrs(&attrs)?;
     let client = Client::connect().await?;
-    let mut best: Option<ItemInfo> = None;
-    let mut matches = 0usize;
-    for path in find(&client, &query).await? {
-        let info = client.item_info(&path).await?;
-        if label.as_deref().is_some_and(|l| l != info.label) {
-            continue;
+    let found = find(&client, &query).await?;
+    // The `GetAll` per match below is issued only to rank on `modified` and
+    // to filter on `--label`. With a single match and no `--label` there is
+    // nothing to rank and nothing to filter, and the path it would settle on
+    // is the one already in hand — so the round trip is skipped and the
+    // common `sm get` is two calls rather than three.
+    let path = match (found.as_slice(), label.as_deref()) {
+        ([only], None) => only.clone(),
+        _ => {
+            let mut best: Option<ItemInfo> = None;
+            let mut matches = 0usize;
+            for path in &found {
+                let info = client.item_info(path).await?;
+                if label.as_deref().is_some_and(|l| l != info.label) {
+                    continue;
+                }
+                matches += 1;
+                if best.as_ref().is_none_or(|b| info.modified > b.modified) {
+                    best = Some(info);
+                }
+            }
+            let Some(info) = best else {
+                return Err(CliError::NotFound("no matching secret".into()));
+            };
+            // `SearchItems` is subset matching, so an item carrying the queried
+            // attributes *plus* its own also matches; any process on the session bus
+            // can create one and win on `modified`. Keep secret-tool's "newest wins"
+            // behaviour and exit code, but never do it silently.
+            if matches > 1 {
+                eprintln!(
+                    "warning: {matches} items match; using the most recently modified (\"{}\"). \
+                     Pass --label to disambiguate.",
+                    escape_control(&info.label)
+                );
+            }
+            info.path
         }
-        matches += 1;
-        if best.as_ref().is_none_or(|b| info.modified > b.modified) {
-            best = Some(info);
-        }
-    }
-    let Some(info) = best else {
-        return Err(CliError::NotFound("no matching secret".into()));
     };
-    // `SearchItems` is subset matching, so an item carrying the queried
-    // attributes *plus* its own also matches; any process on the session bus
-    // can create one and win on `modified`. Keep secret-tool's "newest wins"
-    // behaviour and exit code, but never do it silently.
-    if matches > 1 {
-        eprintln!(
-            "warning: {matches} items match; using the most recently modified (\"{}\"). \
-             Pass --label to disambiguate.",
-            escape_control(&info.label)
-        );
-    }
-    let secret = client.get_secret(&info.path).await?;
+    let secret = client.get_secret(&path).await?;
     let mut out = std::io::stdout().lock();
     out.write_all(&secret)?;
     out.flush()?;

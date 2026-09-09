@@ -190,13 +190,20 @@ pub async fn notify_collection_changed(conn: &Connection, id: &str) {
 }
 
 async fn emit_locked_changed(conn: &Connection, path: zbus::zvariant::OwnedObjectPath) {
-    if let Ok(iface) = conn.object_server().interface::<_, Collection>(path).await
-        && let Err(e) = iface
-            .get()
-            .await
-            .locked_changed(iface.signal_emitter())
-            .await
-    {
+    let Ok(iface) = conn.object_server().interface::<_, Collection>(path).await else {
+        return;
+    };
+    // `iface.get()` is a read lock like any other, so it is taken as a
+    // statement temporary — dropped at the semicolon — and never as a
+    // `let`-chain scrutinee, which would hold it across the whole `if let`
+    // construct. `tests/dbus_locking.rs` refuses a lock in a scrutinee
+    // outright, because a scrutinee is not a terminating scope.
+    let sent = iface
+        .get()
+        .await
+        .locked_changed(iface.signal_emitter())
+        .await;
+    if let Err(e) = sent {
         tracing::warn!("emitting Locked PropertiesChanged: {e}");
     }
 }

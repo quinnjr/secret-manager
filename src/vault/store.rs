@@ -99,6 +99,10 @@ enum ItemDelta {
     Replaced { index: usize, prior: Box<Item> },
     /// The item at `index` was removed; undo by reinserting `prior` there.
     Removed { index: usize, prior: Box<Item> },
+    /// Several items were removed in one batch, paired with the index each
+    /// sat at *before* the batch, in ascending order of that index; undo by
+    /// reinserting them in that same order. See [`Vault::delete_items`].
+    RemovedMany(Vec<(usize, Box<Item>)>),
 }
 
 /// One item to import, carrying its original timestamps.
@@ -137,8 +141,13 @@ enum ItemDelta {
 /// preserved and letting a caller choose one invites collisions.
 ///
 /// `#[non_exhaustive]`, so a later field is not a breaking change for a
-/// struct-literal construction outside this crate. Build one with
-/// [`ImportItem::new`] and assign the rest.
+/// struct-literal construction outside this crate. It restrains nothing
+/// *inside* it, though, and every construction there is - the CLI's
+/// `sm import` and this module's tests - so adding a field means visiting
+/// them. There is deliberately no all-fields constructor standing in for
+/// that: one was written to make the addition "keep compiling somewhere",
+/// gained no caller, and so protected exactly nothing while reading as
+/// though it did.
 #[non_exhaustive]
 pub struct ImportItem {
     pub label: String,
@@ -147,30 +156,6 @@ pub struct ImportItem {
     pub content_type: String,
     pub created: u64,
     pub modified: u64,
-}
-
-impl ImportItem {
-    /// An import item with every field given. The constructor exists so that
-    /// adding a field to this type stays a non-breaking change: it is the one
-    /// construction that keeps compiling, and `#[non_exhaustive]` makes it
-    /// the only one available outside the crate.
-    pub fn new(
-        label: String,
-        attributes: BTreeMap<String, String>,
-        secret: Zeroizing<Vec<u8>>,
-        content_type: String,
-        created: u64,
-        modified: u64,
-    ) -> Self {
-        ImportItem {
-            label,
-            attributes,
-            secret,
-            content_type,
-            created,
-            modified,
-        }
-    }
 }
 
 // Hand-written: the secret is redacted, and so are attribute *values*, which
@@ -353,7 +338,8 @@ impl Vault {
         password: &[u8],
         kdf: KdfParams,
     ) -> Result<Vault, VaultError> {
-        ensure_vault_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        ensure_vault_dir(parent).map_err(|e| io_err(parent, e))?;
         let mut vault = Self::build(path, label, password, kdf)?;
         vault.save_with(publish_new)?;
         Ok(vault)
@@ -723,12 +709,6 @@ impl Vault {
         }
     }
 
-    fn restore_items(&mut self, items: Vec<Item>) {
-        if let State::Unlocked { items: cur, .. } = &mut self.state {
-            *cur = items;
-        }
-    }
-
     /// Undo an append-only batch for [`Vault::save_or_restore`]: drop
     /// everything past `len`. See [`Vault::import_items`], the only caller -
     /// `save` neither reorders nor resizes the list, so the items below `len`
@@ -739,15 +719,16 @@ impl Vault {
         }
     }
 
-    /// Undo one single-item mutation, for [`Vault::save_or_restore`].
+    /// Undo one item-list mutation, for [`Vault::save_or_restore`].
     ///
-    /// The whole-vector snapshot [`Vault::restore_items`] takes is a deep
-    /// clone of every item *including every secret*, paid on the success path
-    /// too, purely as rollback insurance for a write that almost always
-    /// succeeds. For the paths that touch exactly one item the delta is all
-    /// that is needed, and it restores the same state: `save` never reorders
-    /// or resizes the item list, so the index recorded here still names the
-    /// same slot when this runs.
+    /// The alternative — snapshotting the whole vector — is a deep clone of
+    /// every item *including every secret*, paid on the success path too,
+    /// purely as rollback insurance for a write that almost always succeeds.
+    /// A delta restores the same state and clones only what the call is
+    /// about to change: `save` never reorders or resizes the item list, so
+    /// the indices recorded here still name the same slots when this runs.
+    /// No writer takes the whole-vector snapshot any more; `delete_items`,
+    /// the last one that did, records [`ItemDelta::RemovedMany`] instead.
     fn restore_delta(&mut self, delta: ItemDelta) {
         let State::Unlocked { items, .. } = &mut self.state else {
             return;
@@ -764,6 +745,18 @@ impl Vault {
             ItemDelta::Removed { index, prior } => {
                 if index <= items.len() {
                     items.insert(index, *prior);
+                }
+            }
+            ItemDelta::RemovedMany(removed) => {
+                // Ascending, which is the order they were collected in and
+                // the only order that works: an item's recorded index is an
+                // index into the *original* list, so it is correct again
+                // exactly once everything that sat before it is back in
+                // place.
+                for (index, prior) in removed {
+                    if index <= items.len() {
+                        items.insert(index, *prior);
+                    }
                 }
             }
         }
@@ -919,9 +912,9 @@ impl Vault {
     ///
     /// Every id is checked *before* anything is removed, so an unknown one is
     /// refused with the vault untouched and unwritten. The removal itself is
-    /// one `retain` followed by one `save_or_restore`, so a failed write rolls
-    /// the whole batch back in memory exactly as `delete_item` rolls back one.
-    /// Duplicate ids are harmless.
+    /// one indexed pass followed by one `save_or_restore`, so a failed write
+    /// rolls the whole batch back in memory exactly as `delete_item` rolls
+    /// back one. Duplicate ids are harmless.
     ///
     /// An empty batch is a no-op and does not rewrite the file.
     /// Both the validation and the removal go through one set built from the
@@ -929,26 +922,50 @@ impl Vault {
     /// `O(items x ids)` string comparisons a pair of linear scans would make -
     /// ~10^8 comparisons at the 1024-id cap against a large collection, all of
     /// it under the caller's state lock.
+    ///
+    /// Rollback records only the items actually removed, paired with where
+    /// each sat, and puts them back by reinsertion - see
+    /// [`ItemDelta::RemovedMany`]. The whole-vector snapshot this used to take
+    /// was a deep clone of every item including every secret, taken *before*
+    /// the batch was even validated and paid on the success path too: at the
+    /// 1024-id cap against a large collection that duplicated the entire
+    /// decrypted collection in memory to insure a write that almost always
+    /// succeeds.
     pub fn delete_items(&mut self, ids: &[String]) -> Result<(), VaultError> {
-        let items_before = self.items()?.to_vec();
-        let present: std::collections::HashSet<&str> =
-            items_before.iter().map(|i| i.id.as_str()).collect();
-        // Every id is checked before anything is removed, in the order given,
-        // so the reported id is the same one the linear scan reported.
-        for id in ids {
-            if !present.contains(id.as_str()) {
-                return Err(VaultError::NoSuchItem(id.clone()));
+        {
+            let present: std::collections::HashSet<&str> =
+                self.items()?.iter().map(|i| i.id.as_str()).collect();
+            // Every id is checked before anything is removed, in the order
+            // given, so the reported id is the same one the linear scan
+            // reported.
+            for id in ids {
+                if !present.contains(id.as_str()) {
+                    return Err(VaultError::NoSuchItem(id.clone()));
+                }
             }
         }
         if ids.is_empty() {
             return Ok(());
         }
         let doomed: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
-        {
+        let delta = {
             let items = self.items_mut()?;
-            items.retain(|i| !doomed.contains(i.id.as_str()));
-        }
-        self.save_or_restore(items_before, Self::restore_items)
+            // One pass, moving each item either into the surviving list or
+            // into the delta: nothing is cloned, and the index recorded is
+            // the one the item held in the list this pass consumed.
+            let mut kept = Vec::with_capacity(items.len());
+            let mut removed: Vec<(usize, Box<Item>)> = Vec::new();
+            for (index, item) in std::mem::take(items).into_iter().enumerate() {
+                if doomed.contains(item.id.as_str()) {
+                    removed.push((index, Box::new(item)));
+                } else {
+                    kept.push(item);
+                }
+            }
+            *items = kept;
+            ItemDelta::RemovedMany(removed)
+        };
+        self.save_or_restore(delta, Self::restore_delta)
     }
 
     /// Insert many items with their original timestamps, in a single save:
@@ -971,10 +988,10 @@ impl Vault {
     /// and O(N^2) bytes written - hundreds of megabytes for a few hundred
     /// kilobytes of secrets.
     ///
-    /// Rollback needs no snapshot of the item list: this only ever appends, so
-    /// truncating back to the length recorded before the extend restores the
-    /// exact prior state, and unlike [`Vault::restore_items`] it does not
-    /// clone every secret in the collection on the success path too.
+    /// Rollback needs no snapshot of the item list at all: this only ever
+    /// appends, so truncating back to the length recorded before the extend
+    /// restores the exact prior state, without cloning even the items the
+    /// batch removes - which is the most any delta can save.
     ///
     /// Timestamps are taken verbatim from each [`ImportItem`]; ids are
     /// assigned here, one fresh uuid v4 per item. See [`ImportItem`] for what
@@ -1089,10 +1106,27 @@ impl Vault {
         // catch anything that appeared in between.
         //
         // The zero threshold can unlink a temp belonging to a save running
-        // *right now* in another process, which makes that save's rename fail
-        // with ENOENT. That save then rolls back and reports an error, which
-        // is the acceptable side of the trade: the alternative is a silently
-        // un-revoked copy of the old vault.
+        // *right now*, which makes that save's rename fail with ENOENT. That
+        // save then rolls back and reports an error, which is the acceptable
+        // side of the trade: the alternative is a silently un-revoked copy of
+        // the old vault.
+        //
+        // The collateral is wider than "another process", though, and the
+        // scope is worth stating exactly: `sweep_dir_now` sweeps the whole
+        // vault *directory*, and the temp-name shape it matches is every
+        // collection's, not this one's. Every collection in this daemon lives
+        // in that directory behind its own lock, so rotating one collection's
+        // key can unlink the live temp of a concurrent save of a *different*
+        // collection in this same process. Nothing is lost - that save rolls
+        // back in memory and its file is untouched - but the failure the user
+        // sees is on a collection they were not rotating.
+        //
+        // The revocation argument only concerns copies of *this* vault, so
+        // restricting the sweep to this vault's own stem would keep it and
+        // remove the collateral outright. That is a change to which files get
+        // unlinked, not to what is written down, so it is recorded here
+        // rather than made in passing; see `is_write_atomic_temp_name` for
+        // the shape currently matched.
         self.sweep_dir_now();
         let was_locked = self.is_locked();
         if was_locked {
@@ -1322,14 +1356,38 @@ fn sweep_temp_files(dir: &Path, min_age: Duration) -> usize {
 ///
 /// `create_dir_all` uses 0777 & ~umask (typically 0755) and only then gets
 /// chmodded, so another uid winning that window can open a descriptor and go
-/// on listing collection names afterwards. The `set_permissions` below stays
-/// as the repair path for a directory that already existed with looser bits.
-fn ensure_vault_dir(dir: &Path) -> Result<(), VaultError> {
+/// on listing collection names afterwards. **The mode has to be set at
+/// creation, by `DirBuilder::mode`, and cannot be a chmod afterwards** - that
+/// is the entire point of this function, and it is why it exists rather than
+/// each caller writing `create_dir_all` plus a `set_permissions`. The
+/// `set_permissions` below is not that chmod: it is the repair path for a
+/// directory that already existed with looser bits.
+///
+/// `pub(crate)` because it is the *only* definition of "create the vault
+/// directory": every writer that can be the first to create it must call
+/// this and not grow its own copy of the four lines. The alias writer in
+/// `dbus::state` is the second such writer. Two copies of a rule this small
+/// is exactly the shape the `escape_control` tables and the six cap
+/// predicates had before they drifted.
+///
+/// Returns `io::Result` rather than [`VaultError`]: the callers here add
+/// their own path context with [`io_err`], and the daemon's alias writer is
+/// already on `io::Result`, so a shared definition that imposed a vault
+/// error type on both would just be converted back at each end.
+///
+/// **Deliberately idempotent, and deliberately on the save path.** Every
+/// [`write_temp`] calls it, so the cost is a `mkdir` that returns `EEXIST`
+/// and an unconditional `chmod` per save - two syscalls beside two `fsync`s,
+/// which is nothing - and the benefit is that a directory loosened at
+/// runtime, by anything at all, is tightened again by the next write rather
+/// than staying open until the daemon restarts. Hoisting it to startup would
+/// trade that for the two syscalls. It is not a one-time initialisation and
+/// must not be turned into one.
+pub(crate) fn ensure_vault_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)
-        .map_err(|e| io_err(dir, e))?;
+        .create(dir)?;
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     Ok(())
 }
@@ -1339,7 +1397,7 @@ fn ensure_vault_dir(dir: &Path) -> Result<(), VaultError> {
 /// the temp path for the caller to publish.
 fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, VaultError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    ensure_vault_dir(dir)?;
+    ensure_vault_dir(dir).map_err(|e| io_err(dir, e))?;
     let stem = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -2124,7 +2182,7 @@ mod tests {
     fn delete_items_is_atomic() {
         let (_d, path) = tmp();
         let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
-        let ids: Vec<String> = ["a", "b", "c"]
+        let ids: Vec<String> = ["a", "b", "c", "d"]
             .iter()
             .map(|n| {
                 v.insert_item(n, BTreeMap::new(), b"s".to_vec(), "text/plain", false)
@@ -2146,19 +2204,24 @@ mod tests {
         v.delete_items(&[]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // A save that cannot be written rolls the whole batch back in memory.
+        // A save that cannot be written rolls the whole batch back in memory,
+        // *in order*. The removed ids are deliberately not adjacent and do
+        // not start the list: rollback reinserts each item at the index it
+        // held before the batch, which is only correct in ascending order of
+        // that index, and a batch of one or a contiguous run from the front
+        // cannot tell the two orders apart.
         let block = block_writes(&path);
-        assert!(v.delete_items(&[ids[0].clone(), ids[1].clone()]).is_err());
+        assert!(v.delete_items(&[ids[0].clone(), ids[2].clone()]).is_err());
         assert_eq!(v.item_ids(), ids, "a failed save must roll the batch back");
         unblock(block);
 
         // The happy path: one save, all of them gone, duplicates harmless.
         v.delete_items(&[ids[0].clone(), ids[1].clone(), ids[0].clone()])
             .unwrap();
-        assert_eq!(v.item_ids(), vec![ids[2].clone()]);
+        assert_eq!(v.item_ids(), vec![ids[2].clone(), ids[3].clone()]);
         let mut reopened = Vault::open(&path).unwrap();
         reopened.unlock(b"pw").unwrap();
-        assert_eq!(reopened.item_ids(), vec![ids[2].clone()]);
+        assert_eq!(reopened.item_ids(), vec![ids[2].clone(), ids[3].clone()]);
     }
 
     fn import(label: &str, secret: &[u8], created: u64, modified: u64) -> ImportItem {

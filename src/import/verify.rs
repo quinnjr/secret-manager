@@ -31,7 +31,7 @@ use super::formats::{Md5Hash, WalletInventory};
 use super::{AttributeKeys, ItemReport, Outcome, SourceItem, Tally};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 /// A per-item fingerprint. Derived from the secret but never invertible to
@@ -281,7 +281,16 @@ pub struct CountCheck {
     /// then *not made*, which is reported rather than counted as a pass.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header_item_count: Option<usize>,
-    /// Items the walk produced, written or refused.
+    /// Every item the walk **accounted for**: written, refused, or skipped.
+    ///
+    /// All three, because the number this is compared against is the count in
+    /// the source's own header, and the header counts items in the file
+    /// regardless of what we then decided about them. An item refused for a
+    /// cap violation was in the file; so was one skipped because its secret
+    /// would not decrypt. Omitting either category would report a count
+    /// mismatch for an item nothing is wrong with — the check would fire on
+    /// our own decisions instead of on a shortfall — which is the opposite of
+    /// what it is for.
     pub walked: usize,
 }
 
@@ -338,8 +347,29 @@ pub struct HashMiss {
 /// folder or entry the extractor did not record) are not checked: there is no
 /// hash to look up, and inventing one would report a miss for an item the
 /// index never claimed to hold.
+///
+/// # Why the index is transposed first
+///
+/// [`WalletInventory::contains_entry`] is a linear scan of every folder and,
+/// within a matching folder, of every entry hash. That is right for one
+/// lookup and wrong for this loop, which does one per imported item: the
+/// product is quadratic in input the parser accepts from a hostile file —
+/// `MAX_ENTRIES` entries against an index of the same order — and a `.kwl`
+/// that parses cleanly could hold this function for hours without a single
+/// byte being decrypted. So the pairs are hoisted into a set once, and the
+/// per-item work becomes one hash lookup. `contains_entry` stays as it is for
+/// the single-shot callers it suits.
 pub fn check_wallet_hash_table(inventory: &WalletInventory, items: &[SourceItem]) -> Vec<HashMiss> {
     let mut out = Vec::new();
+    let index: HashSet<(Md5Hash, Md5Hash)> = inventory
+        .folders
+        .iter()
+        .flat_map(|f| {
+            f.entry_hashes
+                .iter()
+                .map(move |entry| (f.folder_hash, *entry))
+        })
+        .collect();
     for item in items {
         let (Some(folder), Some(entry)) = (
             item.provenance.folder.as_deref(),
@@ -349,7 +379,7 @@ pub fn check_wallet_hash_table(inventory: &WalletInventory, items: &[SourceItem]
         };
         let folder_hash = md5(folder.as_bytes());
         let entry_hash = md5(entry.as_bytes());
-        if !inventory.contains_entry(&folder_hash, &entry_hash) {
+        if !index.contains(&(folder_hash, entry_hash)) {
             out.push(HashMiss {
                 folder_hash: hex(&folder_hash),
                 entry_hash: hex(&entry_hash),
@@ -637,7 +667,11 @@ impl ProbeSummary {
 /// one key set therefore share a verdict: the pessimistic direction, which is
 /// the correct one for a promise.
 pub fn tally_with_probes(items: &[ItemReport], probes: &[ProbeResult]) -> Tally {
-    let failed: Vec<&AttributeKeys> = probes
+    // A set, not a list. The lookup below runs once per item and the failed
+    // probes are drawn from the same items, so a linear scan here is a
+    // whole-`BTreeSet` comparison per (item, failed probe) pair — quadratic in
+    // the report, in the one place a large import is guaranteed to be large.
+    let failed: BTreeSet<&AttributeKeys> = probes
         .iter()
         .filter(|p| p.found.is_some() && !p.passed())
         .map(|p| &p.attribute_keys)
@@ -648,7 +682,7 @@ pub fn tally_with_probes(items: &[ItemReport], probes: &[ProbeResult]) -> Tally 
             tally.record_refused();
             continue;
         }
-        let downgraded = failed.iter().any(|keys| **keys == item.attribute_keys);
+        let downgraded = failed.contains(&item.attribute_keys);
         // Counted through `Tally`'s own recording API rather than by touching
         // its counters: this function and `ImportReport::push` are the two
         // places a tally is built, and they must agree about what each

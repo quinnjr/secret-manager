@@ -452,7 +452,10 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
     }
     if !walked.unresolved_sidecar_rows.is_empty() {
         notes.push(format!(
-            "{} sidecar rows named an entry the walk never found",
+            "{} sidecar rows were not applied to any entry. That is not the same as \
+             stale: a row also lands here when its folder's entryList was refused, and \
+             when its key is ambiguous — those are the keys listed above, and the entry \
+             they name does exist",
             walked.unresolved_sidecar_rows.len()
         ));
     }
@@ -615,12 +618,29 @@ fn files_with_extension(dir: &Path, extension: &str) -> Result<Vec<PathBuf>, Cli
     Ok(out)
 }
 
-/// Read a source file, bounding the read before making it: these are foreign
+/// Read a source file, bounding the read *as* it is made: these are foreign
 /// files and their length fields are attacker-controlled.
+///
+/// One open, one bounded read, exactly as `kwallet::Sidecar::load` does.
+/// Sizing a `metadata(path)` and then re-opening the path bounds nothing —
+/// the file can grow, or become a different file, between the two syscalls,
+/// and the second open resolves the path again. So the `stat` is taken on the
+/// open handle and is only an early refusal; the [`std::io::Read::take`] is
+/// the guarantee.
 fn read_source(path: &Path) -> Result<Vec<u8>, CliError> {
-    let meta = std::fs::metadata(path).map_err(|e| header_io(path, e))?;
-    formats::check_source_size(meta.len()).map_err(|e| header_error(path, &e))?;
-    std::fs::read(path).map_err(|e| header_io(path, e))
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| header_io(path, e))?;
+    let len = file.metadata().map_err(|e| header_io(path, e))?.len();
+    formats::check_source_size(len).map_err(|e| header_error(path, &e))?;
+    // One byte past the limit, so a file that grew after the `stat` is
+    // refused rather than silently truncated into a parse error that blames
+    // the format.
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(formats::MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| header_io(path, e))?;
+    formats::check_source_size(bytes.len() as u64).map_err(|e| header_error(path, &e))?;
+    Ok(bytes)
 }
 
 fn header_io(path: &Path, e: std::io::Error) -> CliError {
@@ -909,6 +929,27 @@ fn probe_plan(items: &[SourceItem]) -> Vec<verify::ProbeQuery> {
             .count();
     }
     plan
+}
+
+/// Write `--report`, and treat a failure as a warning rather than an abort.
+///
+/// The report is a diagnostic artifact; it is never the thing the command is
+/// for. Both call sites sit between the last check and the effects that
+/// finish — or unwind — the import, so propagating an unwritable directory,
+/// a full disk or a temp-name collision from here would leave the run half
+/// done: on the failure path the freshly created vault would stay on disk,
+/// contradicting the error's own promise that it "has been removed again"
+/// and blocking the next run with the "collection already exists" refusal
+/// against a file this run made; on the success path it would exit 1 with
+/// the collection loaded by the daemon and `--set-default` silently skipped.
+/// A report nobody could write is worth a line on stderr, not either of
+/// those.
+fn write_report_or_warn(path: &Path, file: &ReportFile<'_>) {
+    let shown = escape_control(&path.display().to_string());
+    match write_report(path, file) {
+        Ok(()) => println!("\nReport written to {shown}"),
+        Err(e) => eprintln!("\nwarning: the report could not be written to {shown}: {e}"),
+    }
 }
 
 fn write_report(path: &Path, file: &ReportFile<'_>) -> Result<(), CliError> {
@@ -1216,18 +1257,14 @@ mod pipeline {
             );
             print_report(&file, &id, &report_file, destination_exists);
             if let Some(path) = &args.report {
-                write_report(path, &report_file)?;
-                println!(
-                    "\nReport written to {}",
-                    escape_control(&path.display().to_string())
-                );
+                write_report_or_warn(path, &report_file);
             }
             let e = CliError::Failed(format!(
                 "verification did not pass; the lines above name every check that failed. \
                  Nothing was published: the `default` alias was not moved, no daemon was \
                  told to load anything, {} and the source files were not touched.",
                 if args.dry_run {
-                    "nothing was written,"
+                    "no vault was written,"
                 } else {
                     "the collection this run created has been removed again,"
                 }
@@ -1273,11 +1310,7 @@ mod pipeline {
         print_report(&file, &id, &report_file, destination_exists);
 
         if let Some(path) = &args.report {
-            write_report(path, &report_file)?;
-            println!(
-                "\nReport written to {}",
-                escape_control(&path.display().to_string())
-            );
+            write_report_or_warn(path, &report_file);
         }
 
         if !verification.passed() {
@@ -1290,9 +1323,9 @@ mod pipeline {
                 "the collection was written correctly but a libsecret client could not find \
                  every item in it; the lines above name each attribute set that did not come \
                  back. {} is on disk and a running daemon has loaded it, the `default` alias \
-                 was not moved, and the source files were not touched. Either check it by \
-                 hand with `sm list --collection {}`, or remove that file and restart the \
-                 daemon before importing again.",
+                 was not moved, and the source files were not touched. Either unlock it with \
+                 `sm unlock --collection {}` and check it by hand with `sm list`, or remove \
+                 that file and restart the daemon before importing again.",
                 escape_control(&vault_path.display().to_string()),
                 escape_control(&id)
             )));
@@ -1691,6 +1724,59 @@ fn verify_import(
 /// One argument rather than ten: six of the ten were `&str` and slices, where
 /// swapping two of them type-checks by luck, and every one of them was a field
 /// of the [`ReportFile`] this function is printing.
+/// The two item-type paragraphs of the printed report, rendered rather than
+/// printed so a test can assert on them without capturing stdout.
+///
+/// They are two paragraphs and not one on purpose. `lost_item_type` is a
+/// number from the on-disk format's own numbering, and there is no number for
+/// a type string this build cannot place; folding the unrecognised case into
+/// it would set `lost_item_type: None`, which is the value that means
+/// *nothing was lost* — a flattened type reported as no type at all.
+fn item_type_paragraphs(items: &[ItemReport]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let lost: Vec<&ItemReport> = items
+        .iter()
+        .filter(|i| i.lost_item_type.is_some())
+        .collect();
+    if !lost.is_empty() {
+        let _ = write!(
+            out,
+            "\n{} items had a source item type with no target here; it was dropped:\n",
+            lost.len()
+        );
+        for item in lost {
+            let _ = writeln!(
+                out,
+                "  {} (type {})",
+                escape_control(&item.label),
+                item.lost_item_type.unwrap_or_default()
+            );
+        }
+    }
+    let unknown: Vec<&ItemReport> = items
+        .iter()
+        .filter(|i| i.unknown_item_type.is_some())
+        .collect();
+    if !unknown.is_empty() {
+        let _ = write!(
+            out,
+            "\n{} items carried a source item type this build does not recognise; it has no \
+             target here either, and was dropped:\n",
+            unknown.len()
+        );
+        for item in unknown {
+            let _ = writeln!(
+                out,
+                "  {} (type {})",
+                escape_control(&item.label),
+                escape_control(item.unknown_item_type.as_deref().unwrap_or_default())
+            );
+        }
+    }
+    out
+}
+
 fn print_report(file: &SourceFile, id: &str, r: &ReportFile<'_>, destination_exists: bool) {
     let source = r.source;
     let label = r.collection;
@@ -1713,7 +1799,7 @@ fn print_report(file: &SourceFile, id: &str, r: &ReportFile<'_>, destination_exi
         escape_control(id)
     );
     if dry_run {
-        println!("  nothing was written");
+        println!("  no vault was written");
     }
 
     println!("\nOutcome, per the three-way split:");
@@ -1778,24 +1864,7 @@ fn print_report(file: &SourceFile, id: &str, r: &ReportFile<'_>, destination_exi
         }
     }
 
-    let lost_types: Vec<&ItemReport> = r
-        .items
-        .iter()
-        .filter(|i| i.lost_item_type.is_some())
-        .collect();
-    if !lost_types.is_empty() {
-        println!(
-            "\n{} items had a source item type with no target here; it was dropped:",
-            lost_types.len()
-        );
-        for item in lost_types {
-            println!(
-                "  {} (type {})",
-                escape_control(&item.label),
-                item.lost_item_type.unwrap_or_default()
-            );
-        }
-    }
+    print!("{}", item_type_paragraphs(r.items));
     if r.empty_folders > 0 {
         println!(
             "\n{} source folders held no entries. A collection of items has nowhere to put \
@@ -1828,7 +1897,7 @@ fn print_report(file: &SourceFile, id: &str, r: &ReportFile<'_>, destination_exi
                 );
             }
         }
-        None => println!("  fingerprints         not compared: nothing was written"),
+        None => println!("  fingerprints         not compared: no vault was written"),
     }
     if let Some(n) = verification.hash_table_checked {
         if verification.hash_table_misses.is_empty() {
@@ -1968,6 +2037,41 @@ mod tests {
             modified: 1_699_387_319,
             provenance: Provenance::kwallet("kdewallet", "Passwords", "an entry name"),
         }
+    }
+
+    /// An item type this build does not recognise gets its own paragraph.
+    ///
+    /// The case used to be invisible: an unrecognised `Item.Type` produced
+    /// `lost_item_type: None`, which is the value that means nothing was
+    /// lost, and the printed report said nothing at all. This asserts the
+    /// paragraph, and that it is separate from the numbered one — a report
+    /// that merged them would name the type twice or not at all.
+    #[test]
+    fn an_unrecognised_item_type_gets_its_own_paragraph() {
+        let mut numbered = ItemReport::imported(&hostile_item());
+        numbered.label = "A network password".to_string();
+        numbered.lost_item_type = Some(1);
+        let mut unknown = ItemReport::imported(&hostile_item());
+        unknown.label = "A future thing".to_string();
+        unknown.unknown_item_type = Some("org.gnome.keyring.NewType".to_string());
+        let plain = ItemReport::imported(&hostile_item());
+
+        let out = item_type_paragraphs(&[numbered, unknown, plain]);
+        assert!(
+            out.contains("1 items had a source item type with no target"),
+            "{out}"
+        );
+        assert!(out.contains("A network password (type 1)"), "{out}");
+        assert!(
+            out.contains("1 items carried a source item type this build does not recognise"),
+            "{out}"
+        );
+        assert!(
+            out.contains("A future thing (type org.gnome.keyring.NewType)"),
+            "{out}"
+        );
+        // The item with neither is in neither paragraph.
+        assert!(!out.contains("A migrated login"), "{out}");
     }
 
     fn wallet_source_file() -> SourceFile {

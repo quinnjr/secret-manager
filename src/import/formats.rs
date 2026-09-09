@@ -553,6 +553,14 @@ impl WalletInventory {
     /// hashes for every imported item and assert membership, proving no name
     /// was mangled using only hashes. Computing MD5 is a later agent's
     /// problem; comparing it is this type's.
+    ///
+    /// A **linear scan** of every folder and, within a matching folder, of
+    /// every entry hash. That is right for a single lookup and wrong inside a
+    /// loop over imported items, where it is quadratic in a count the parser
+    /// takes from a hostile file. `verify::check_wallet_hash_table` is that
+    /// loop and transposes the index into a set once instead; anything else
+    /// that needs more than a handful of lookups should do the same rather
+    /// than call this repeatedly.
     pub fn contains_entry(&self, folder_hash: &Md5Hash, entry_hash: &Md5Hash) -> bool {
         self.folders
             .iter()

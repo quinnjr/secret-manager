@@ -346,7 +346,13 @@ pub fn load_aliases(dir: &Path) -> std::io::Result<BTreeMap<String, String>> {
 /// `std::io::Error`, not a copy of it.
 pub fn save_aliases_to(dir: &Path, aliases: &BTreeMap<String, String>) -> std::io::Result<()> {
     use std::io::Write;
-    std::fs::create_dir_all(dir)?;
+    // Not `create_dir_all`: that creates at 0777 & ~umask and can only be
+    // chmodded afterwards, and another uid winning that window keeps a
+    // descriptor. `ensure_vault_dir` sets the mode at creation. This writer
+    // reaches the directory second in practice — every caller creates a vault
+    // first — but "in practice" is a caller ordering, not a guarantee, and
+    // this is the other writer into the same directory.
+    crate::vault::store::ensure_vault_dir(dir)?;
     let text = toml::to_string(&AliasFile {
         aliases: aliases.clone(),
     })
@@ -434,6 +440,18 @@ const ALIAS_UPDATE_ATTEMPTS: usize = 8;
 /// work the write needs is cloned out, the guard is dropped, the blocking
 /// half runs in [`block_in_place`], and only the (allocation-only) commit
 /// happens back under the lock.
+///
+/// Both halves that *do* run under the guard are allocation-only, and that is
+/// the whole claim — neither is free. The edit half clones the alias table
+/// twice per attempt: once as `base`, the table the compare-and-swap below
+/// remembers, and once as `next`, the copy the caller's closure edits. At
+/// [`MAX_ALIASES`](super::service::MAX_ALIASES) entries of at most
+/// [`MAX_ALIAS_NAME`](super::service::MAX_ALIAS_NAME) bytes that is a couple
+/// of hundred short strings, bounded by a cap and not by anything a client
+/// supplies, repeated at most [`ALIAS_UPDATE_ATTEMPTS`] times — which is why
+/// it stays here rather than being cloned out and diffed back. What matters
+/// is the rule it does not break: it is bounded work with no syscall in it,
+/// so nothing under this guard can block.
 ///
 /// **The write happens before the in-memory commit, deliberately.** The other
 /// order leaves the daemon disagreeing with its own file whenever the write
@@ -552,7 +570,12 @@ pub fn scan_vault_dir(
     index_attributes: bool,
     already_loaded: &std::collections::BTreeSet<String>,
 ) -> std::io::Result<VaultScan> {
-    std::fs::create_dir_all(dir)?;
+    // The daemon's startup path reaches this before any vault exists, so this
+    // is often the call that *creates* the vault directory. `create_dir_all`
+    // would create it 0777 & ~umask with nothing to tighten it until the first
+    // write — a window covering the whole of a fresh daemon's life until its
+    // first save.
+    crate::vault::store::ensure_vault_dir(dir)?;
     let mut scan = VaultScan {
         opened: Vec::new(),
         broken: Vec::new(),
@@ -963,6 +986,30 @@ impl ServiceState {
 
 #[cfg(test)]
 mod tests {
+    /// The daemon's startup scan often *creates* the vault directory — it runs
+    /// before any vault exists on a fresh install — so it is one of the two
+    /// writers that must set the mode at creation rather than chmod after.
+    ///
+    /// This went unnoticed because the other writer, `write_temp`, repairs the
+    /// mode on every save: the directory is only loose between a fresh
+    /// daemon's start and its first write, which no test reached.
+    #[test]
+    fn the_startup_scan_creates_the_vault_directory_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("vaults");
+        assert!(!dir.exists(), "the scan must be the thing that creates it");
+
+        super::scan_vault_dir(&dir, true, &Default::default()).unwrap();
+
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "the startup scan created the vault directory {mode:o}, not 0700; \
+             another uid can list collection names until the first save repairs it"
+        );
+    }
+
     use super::*;
 
     fn state(dir: &Path) -> ServiceState {

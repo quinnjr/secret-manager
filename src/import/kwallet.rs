@@ -958,8 +958,14 @@ impl<'a> Reader<'a> {
 /// Nothing stops a libsecret client from having written an attribute literally
 /// named `kwallet:folder`. Overwriting it would change the lookup for an
 /// attribute we did not write — the same identity argument as above, one key
-/// at a time — so the insert is `or_insert` and each collision is counted
+/// at a time — so the insert is `or_insert` and the collision is counted
 /// through `conflicts` rather than resolved silently.
+///
+/// `conflicts` counts **entries**, not names: an entry whose row carries all
+/// three `kwallet:*` names increments it once, because the CLI reports it as a
+/// number of sidecar rows and one row that collides three times is still one
+/// row. Every colliding name in that row is left alone all the same — the
+/// counter is what is aggregated, never what is decided on.
 pub(crate) fn map_entry(
     wallet: &str,
     folder: &str,
@@ -972,6 +978,7 @@ pub(crate) fn map_entry(
     let mut attributes = sidecar.map(|s| s.attributes.clone()).unwrap_or_default();
 
     if !attributes.contains_key(XDG_SCHEMA) {
+        let mut collided = false;
         for (name, value) in [
             (ATTR_FOLDER, folder.to_string()),
             (ATTR_KEY, entry.to_string()),
@@ -981,8 +988,13 @@ pub(crate) fn map_entry(
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     slot.insert(value);
                 }
-                std::collections::btree_map::Entry::Occupied(_) => *conflicts += 1,
+                std::collections::btree_map::Entry::Occupied(_) => collided = true,
             }
+        }
+        // One entry, one count. Three collisions in one sidecar row are one
+        // row that collided, and the row is what the report names.
+        if collided {
+            *conflicts += 1;
         }
     }
 
@@ -1362,8 +1374,25 @@ pub struct Extraction {
     /// [`super::Outcome::PreservedOnly`] — not an error, but a fact the
     /// report must carry.
     pub entries_without_sidecar: usize,
-    /// Sidecar rows whose key no entry in the wallet composed. Stale rows
-    /// `ksecretd` left behind, or rows for a folder the walk could not read.
+    /// Sidecar rows the walk did not apply to any entry.
+    ///
+    /// Three conditions land here and they are not the same condition:
+    ///
+    /// - a **stale** row, whose key no entry in the wallet composes at all —
+    ///   `ksecretd` left it behind when the entry was deleted;
+    /// - a row for a folder `entryList` refused, which is not stale and would
+    ///   have resolved had the folder been readable (see
+    ///   [`Extraction::unreadable_folders`]);
+    /// - an **ambiguous** row, whose key *two* entries compose and which was
+    ///   therefore deliberately used by neither — see
+    ///   [`Extraction::ambiguous_sidecar_keys`], where the same key is also
+    ///   listed, and which is the field that says why.
+    ///
+    /// So this list means "unapplied", not "orphaned": a reader who takes
+    /// every entry in it as a row pointing at an entry that does not exist
+    /// will go looking for a deleted entry that is in fact still there. The
+    /// two lists are meant to be read together, and a key in both is the
+    /// ambiguous case, not two problems.
     pub unresolved_sidecar_rows: Vec<String>,
     /// Sidecar keys that **more than one** `(folder, entry)` pair composes,
     /// and which were therefore used by none of them.
@@ -1381,7 +1410,17 @@ pub struct Extraction {
     /// See [`Extraction::unexpected_sidecar_rows`], which is the number worth
     /// showing a user.
     pub skipped_sidecar_rows: usize,
-    /// Sidecar fields that were present but unusable, summed over all rows.
+    /// Sidecar fields that were present but unusable, summed over the rows
+    /// that were **applied to an entry**.
+    ///
+    /// Not over every row in the file. A row the walk did not apply — stale,
+    /// or ambiguous between two entries — contributed nothing to any item, so
+    /// its malformed fields cost the migration nothing and counting them here
+    /// would inflate a number whose whole meaning is "this many fields of
+    /// items you imported were dropped". Those rows are reported as themselves
+    /// by [`Extraction::unresolved_sidecar_rows`] and
+    /// [`Extraction::ambiguous_sidecar_keys`]; the parser does measure their
+    /// malformed fields, and this sum deliberately discards that.
     pub malformed_sidecar_fields: usize,
     /// Entries whose declared type was `Password`, whose `readPassword`
     /// failed, and which `readEntry` then **recovered**. Counted on success
@@ -1401,6 +1440,10 @@ pub struct Extraction {
     /// `kwallet:folder`, `kwallet:key` or `kwallet:type`. The sidecar's value
     /// was kept — overwriting an attribute we did not write changes a lookup
     /// — and the collision is counted rather than resolved silently.
+    ///
+    /// One **entry** per unit, however many of the three names collided in it.
+    /// The CLI prints this as a number of sidecar rows, and a row carrying all
+    /// three names is one row, not three.
     pub attribute_conflicts: usize,
     /// Folders `entryList` refused. Their entries are unreachable and their
     /// sidecar rows will show up in `unresolved_sidecar_rows`.
@@ -2759,6 +2802,37 @@ mod tests {
 
         assert_eq!(out.items[0].attributes[ATTR_FOLDER], "theirs");
         assert_eq!(out.attribute_conflicts, 1);
+    }
+
+    /// The counter counts **entries**, not colliding names.
+    ///
+    /// The CLI renders it as "N sidecar rows already carried an attribute
+    /// named kwallet:folder, kwallet:key or kwallet:type". One row carrying
+    /// all three is one row; counting each name multiplied a single row into
+    /// three and the user went looking for two rows that do not exist. Every
+    /// colliding name is still left alone — that is asserted here too, so the
+    /// counting change cannot be mistaken for permission to overwrite one.
+    #[tokio::test]
+    async fn one_row_that_collides_three_times_is_one_conflict() {
+        let fake = FakeWallet::default()
+            .folder("Passwords", &["router"])
+            .password("Passwords", "router", "v");
+        let sidecar = parse(
+            r#"{"Passwords/router": {"attributes": {"kwallet:folder": "theirs",
+                                                    "kwallet:key": "their key",
+                                                    "kwallet:type": "their type"}}}"#,
+        );
+
+        let out = walked(&fake, &sidecar).await;
+
+        let attributes = &out.items[0].attributes;
+        assert_eq!(attributes[ATTR_FOLDER], "theirs");
+        assert_eq!(attributes[ATTR_KEY], "their key");
+        assert_eq!(attributes[ATTR_TYPE], "their type");
+        assert_eq!(
+            out.attribute_conflicts, 1,
+            "three colliding names in one sidecar row are one row that collided"
+        );
     }
 
     /// A sidecar in an unexpected shape parses "successfully" with no entries

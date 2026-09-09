@@ -102,7 +102,11 @@ const ITEM_TYPE_PK_STORAGE: u32 = 5;
 /// speak in the file format's numbering, so the two halves of a report say
 /// the same thing about the same item whether it was reached through the
 /// parser or through the bus. `None` for a type string this build does not
-/// know, which is reported as an unknown type rather than guessed at.
+/// know — never a guess at the nearest number. `None` is not a report, and
+/// the caller may not treat it as one: [`ExtractedItem::report`] turns it into
+/// [`ItemReport::unknown_item_type`], carrying the string, because
+/// [`ItemReport::lost_item_type`] has no room for a type that has no number
+/// and its own `None` already means "nothing was lost".
 pub fn item_type_code(item_type: &str) -> Option<u32> {
     match item_type {
         TYPE_GENERIC => Some(ITEM_TYPE_GENERIC_SECRET),
@@ -649,11 +653,6 @@ impl KeyringSnapshot {
 /// The directory gnome-keyring reads under `XDG_DATA_HOME`.
 pub const KEYRINGS_SUBDIR: &str = "keyrings";
 
-/// A running gnome-keyring on a session bus nobody else can see.
-///
-/// Dropping it kills both children. [`PrivateKeyring::shutdown`] is the
-/// ordinary path and waits for them; `Drop` is the backstop for a panic or an
-/// early return, which is why both exist.
 /// The head of a child's stderr, collected by a task so the pipe never fills.
 ///
 /// A `gnome-keyring-daemon` that refuses the password says so on stderr and
@@ -708,6 +707,15 @@ impl StderrTail {
     }
 }
 
+/// A running gnome-keyring on a session bus nobody else can see.
+///
+/// Both children are killed on every exit path, and there is no `Drop` impl on
+/// this struct doing it: each child is a [`Reaped`], spawned with
+/// `kill_on_drop(true)`, so dropping this — on a panic or an early return —
+/// drops the two `Child`s and signals them. [`PrivateKeyring::shutdown`] is
+/// the ordinary path and additionally *waits*, so by the time it returns the
+/// processes are gone rather than merely signalled. That is the difference
+/// between the two, and it is why both exist.
 pub struct PrivateKeyring {
     bus: Reaped,
     keyring: Reaped,
@@ -1092,14 +1100,22 @@ impl ExtractedItem {
     /// is between flagging all of them and flagging none. Every item that
     /// moves does lose whatever ACL it had, and the direction that
     /// under-reports a security downgrade is the wrong one.
+    /// A type this build does not recognise is reported as *itself*, not as
+    /// `lost_item_type: None`. `item_type_code` answers `None` for both "there
+    /// was nothing to lose" and "a type string arrived that this build cannot
+    /// place", and collapsing the two is how a gnome-keyring type added after
+    /// this was written would flatten with the report saying nothing at all.
     pub fn report(&self) -> ItemReport {
         let mut report = ItemReport::imported(&self.item);
         report.acl_downgrade = true;
-        report.lost_item_type = self
-            .item_type
-            .as_deref()
-            .filter(|t| *t != TYPE_GENERIC)
-            .and_then(item_type_code);
+        if let Some(item_type) = self.item_type.as_deref().filter(|t| *t != TYPE_GENERIC) {
+            match item_type_code(item_type) {
+                Some(code) => report.lost_item_type = Some(code),
+                // Peer text on its way to a terminal and to the report file,
+                // so it is sanitised here, at the one place that sets it.
+                None => report.unknown_item_type = Some(display_label(item_type)),
+            }
+        }
         report
     }
 }
@@ -1138,23 +1154,31 @@ pub struct Extraction {
     /// unreadable item type, and inventing neither is why this list exists.
     pub skipped: Vec<SkippedEntry>,
     pub collections: Vec<CollectionSummary>,
-    /// The label of the collection `ReadAlias("default")` names.
-    pub default_collection: Option<String>,
-    /// `dh-ietf1024-sha256-aes128-cbc-pkcs7`, or `plain` with a reason.
-    pub algorithm: &'static str,
-    /// Why DH was not used, when it was not. Present in the report so a
-    /// plaintext-on-the-bus run is never silent.
+    /// Why DH was not used, when it was not. `Some` for exactly the runs whose
+    /// transport was `plain`, because [`open_session`] fills it in on every
+    /// path that returns [`ALGORITHM_PLAIN`] — the caller asking for it as
+    /// much as the source refusing DH. So this is the whole of what a reader
+    /// needs to know about the transport, and it is the one the CLI prints.
+    ///
+    /// An `algorithm: &'static str` sat beside this and said the same thing
+    /// less usefully: `plain` here is `Some(reason)`, `dh` is `None`, and
+    /// nothing outside a test ever read the second copy. A field a report is
+    /// never built from is not a record of anything.
     pub plain_fallback_reason: Option<String>,
     /// No item exposed `Item.Type`, so the chained-item refusal could not be
     /// evaluated on this source. A refusal that cannot fire is worse than
     /// none, because it looks like protection; the caller must say so.
     ///
-    /// Set only when no item answered the property with a type. An item whose
-    /// type read *failed* does not clear this flag and does not need to: it is
-    /// refused outright, so the refusal did fire for it. This is the backstop
-    /// for a provider that has no `Type` property at all, and it was never a
-    /// backstop for a single flaky read — which is why that case is refused
-    /// per item rather than left to this flag.
+    /// Set only when the property was *consulted* for at least one item and
+    /// no item answered it with a type. An item whose type read failed does
+    /// not clear this flag and does not need to: it is refused outright, so
+    /// the refusal did fire for it. An item that never reached the type read
+    /// at all — one refused earlier, for unreadable attributes — does not set
+    /// it either, because nothing was asked about that item and a walk that
+    /// asked nothing has established nothing. This is the backstop for a
+    /// provider that has no `Type` property, and it was never a backstop for a
+    /// single flaky read — which is why that case is refused per item rather
+    /// than left to this flag.
     pub item_type_unavailable: bool,
 }
 
@@ -1271,7 +1295,7 @@ pub async fn extract(
 ) -> Result<Extraction, GnomeError> {
     let service: ServiceProxy<'static> = proxy_default(conn, "Service").await?;
 
-    let (session, cipher, algorithm, plain_fallback_reason) =
+    let (session, cipher, plain_fallback_reason) =
         open_session(&service, options.prefer_dh).await?;
 
     let mut out = Extraction {
@@ -1279,8 +1303,6 @@ pub async fn extract(
         refused: Vec::new(),
         skipped: Vec::new(),
         collections: Vec::new(),
-        default_collection: None,
-        algorithm,
         plain_fallback_reason,
         item_type_unavailable: false,
     };
@@ -1289,11 +1311,6 @@ pub async fn extract(
     // function: the session holds the transport key, and closing it only on
     // the success path left one open on the source daemon for every failure.
     let walked = async {
-        let default_path = call("Service.ReadAlias", service.read_alias("default"))
-            .await
-            .ok()
-            .filter(|p| p.as_str() != NO_PROMPT);
-
         let mut saw_type = false;
         let mut saw_item = false;
         // Every container name the walk saw, filtered or not, so a filter that
@@ -1374,10 +1391,6 @@ pub async fn extract(
                 }
             }
 
-            if default_path.as_ref().is_some_and(|d| *d == path) {
-                out.default_collection = Some(container.clone());
-            }
-
             // A collection whose item list cannot be read is *not* made a
             // per-collection skip: unlike an item, it has no report to carry the
             // shortfall, so continuing here would drop an unknown number of items
@@ -1399,14 +1412,24 @@ pub async fn extract(
             // bytes never cross the bus at all.
             let mut candidates = Vec::new();
             for item_path in items {
-                saw_item = true;
                 let meta = match read_metadata(conn, &item_path, &container).await? {
                     Metadata::Read(meta) => *meta,
                     Metadata::Refused(report) => {
+                        // Refused before the `Type` read was reached — an
+                        // unreadable attribute map returns above it — so this
+                        // item establishes nothing either way about whether
+                        // the provider has the property. Counting it as one
+                        // that was asked is what made a collection whose every
+                        // item failed its attribute read report "this provider
+                        // exposes no item type" when nothing was ever asked.
                         out.refused.push(*report);
                         continue;
                     }
                 };
+                // Set only once the property has actually been consulted, so
+                // `item_type_unavailable` below means "asked, and nothing
+                // answered" rather than "never asked".
+                saw_item = true;
                 match &meta.item_type {
                     ItemType::Known(t) => {
                         saw_type = true;
@@ -1501,7 +1524,7 @@ pub async fn extract(
 async fn open_session(
     service: &ServiceProxy<'_>,
     prefer_dh: bool,
-) -> Result<(OwnedObjectPath, SessionCipher, &'static str, Option<String>), GnomeError> {
+) -> Result<(OwnedObjectPath, SessionCipher, Option<String>), GnomeError> {
     if prefer_dh {
         let pair = KeyPair::generate();
         let opened = tokio::time::timeout(
@@ -1522,7 +1545,7 @@ async fn open_session(
                     SessionCipher::from_dh(&pair, &peer).map_err(|e| GnomeError::NoSession {
                         message: e.to_string(),
                     })?;
-                return Ok((path, cipher, ALGORITHM_DH, None));
+                return Ok((path, cipher, None));
             }
             Err(e) => {
                 // The peer chose this text and it is printed verbatim by
@@ -1538,7 +1561,7 @@ async fn open_session(
                     service.open_session(ALGORITHM_PLAIN, &Value::from("")),
                 )
                 .await?;
-                return Ok((path, SessionCipher::plain(), ALGORITHM_PLAIN, Some(reason)));
+                return Ok((path, SessionCipher::plain(), Some(reason)));
             }
         }
     }
@@ -1550,7 +1573,6 @@ async fn open_session(
     Ok((
         path,
         SessionCipher::plain(),
-        ALGORITHM_PLAIN,
         Some("the caller asked for plain".into()),
     ))
 }
@@ -2186,14 +2208,47 @@ mod tests {
         ] {
             let report = extracted(Some(name), &[]).report();
             assert_eq!(report.lost_item_type, Some(code), "{name}");
+            assert_eq!(report.unknown_item_type, None, "{name}");
         }
-        assert_eq!(extracted(None, &[]).report().lost_item_type, None);
+        // No type at all: nothing was lost, and neither field is set.
+        let absent = extracted(None, &[]).report();
+        assert_eq!(absent.lost_item_type, None);
+        assert_eq!(absent.unknown_item_type, None);
+    }
+
+    /// A type string this build does not know is a type that flattened, and
+    /// the report has to say so by name.
+    ///
+    /// This is the case `lost_item_type` cannot express: it speaks the on-disk
+    /// format's numbering and there is no number for a string we have never
+    /// seen, so `item_type_code` answers `None` — which is the same value that
+    /// means "this item had no type to lose". Folding the two together is how
+    /// a gnome-keyring type added after this was written flattens in silence,
+    /// with the report claiming nothing happened.
+    #[test]
+    fn a_type_this_build_does_not_know_is_reported_as_unknown_and_not_as_nothing() {
+        let report = extracted(Some("org.gnome.keyring.Unheard"), &[]).report();
         assert_eq!(
-            extracted(Some("org.gnome.keyring.Unheard"), &[])
-                .report()
-                .lost_item_type,
-            None
+            report.lost_item_type, None,
+            "an unknown type has no number and must not be given the nearest one"
         );
+        assert_eq!(
+            report.unknown_item_type.as_deref(),
+            Some("org.gnome.keyring.Unheard"),
+            "the type flattened and the report says nothing about it"
+        );
+    }
+
+    /// The type string is peer text on its way to a terminal and to the report
+    /// file, so it goes through `display_label` like every other.
+    #[test]
+    fn an_unknown_type_is_sanitised_before_it_reaches_the_report() {
+        let report = extracted(Some("org.gnome.\r\nkeyring.Evil\u{7}"), &[]).report();
+        let shown = report.unknown_item_type.expect("an unknown type");
+        assert!(!shown.contains('\r'), "{shown:?}");
+        assert!(!shown.contains('\n'), "{shown:?}");
+        assert!(!shown.contains('\u{7}'), "{shown:?}");
+        assert!(shown.contains("keyring.Evil"), "{shown:?}");
     }
 
     /// gnome-keyring's per-item ACLs live in the encrypted half, which is
@@ -3030,6 +3085,86 @@ mod tests {
         );
     }
 
+    /// **A question nobody asked has no answer.**
+    ///
+    /// `item_type_unavailable` says "this provider exposes no `Item.Type`",
+    /// and the CLI turns it into "check by hand that no imported item is an
+    /// unlock credential". An item refused for unreadable attributes returns
+    /// from `read_metadata` *above* the `Type` read, so it never consulted the
+    /// property at all — and a walk whose every item was refused that way
+    /// consulted it zero times. Marking the item seen before the read is what
+    /// made such a walk print a claim about a property nothing had asked
+    /// about.
+    #[tokio::test]
+    async fn a_walk_that_never_reached_a_type_read_claims_nothing_about_the_property() {
+        let bus = match private_bus() {
+            Ok(bus) => bus,
+            Err(reason) => {
+                println!("SKIPPED: {reason}");
+                return;
+            }
+        };
+        let fetched: Fetched = Arc::new(Mutex::new(Vec::new()));
+        let _server = Builder::address(bus.address.as_str())
+            .unwrap()
+            .name(SECRETS_BUS_NAME)
+            .unwrap()
+            .serve_at(
+                "/org/freedesktop/secrets",
+                TypeService {
+                    fetched: fetched.clone(),
+                    collections: vec![FAKE_COLLECTION],
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_COLLECTION,
+                FakeCollection {
+                    items: vec![FAKE_ATTRLESS_ITEM],
+                    label: "Test",
+                },
+            )
+            .unwrap()
+            .serve_at(
+                FAKE_ATTRLESS_ITEM,
+                FakeItem {
+                    path: FAKE_ATTRLESS_ITEM,
+                    // The property is there and would answer; the walk never
+                    // gets that far, which is the point.
+                    label: "Attributes Cannot Be Read",
+                    item_type: Some(TYPE_GENERIC),
+                    attributes_fail: true,
+                    fetched: fetched.clone(),
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let client = Builder::address(bus.address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let options = ExtractOptions {
+            prefer_dh: false,
+            ..ExtractOptions::default()
+        };
+        let extraction = tokio::time::timeout(Duration::from_secs(30), extract(&client, &options))
+            .await
+            .expect("the walk blocked forever")
+            .expect("the walk itself failed");
+
+        assert!(extraction.items.is_empty(), "{:?}", extraction.items);
+        assert_eq!(extraction.refused.len(), 1, "{:?}", extraction.refused);
+        assert!(
+            !extraction.item_type_unavailable,
+            "the walk consulted Item.Type for no item, so it may not report that the \
+             provider has none"
+        );
+    }
+
     /// **The refusal must not fail open on the one input the foreign daemon
     /// controls.** A `Type` read that *errors* is not a provider without the
     /// property: nothing was established, so the item may be an unlock
@@ -3388,13 +3523,12 @@ mod tests {
             "the in-memory session collection was not skipped: {:?}",
             extraction.collections
         );
-        assert!(
-            extraction.algorithm == ALGORITHM_DH || extraction.algorithm == ALGORITHM_PLAIN,
-            "{}",
-            extraction.algorithm
-        );
-        if extraction.algorithm == ALGORITHM_PLAIN {
-            assert!(extraction.plain_fallback_reason.is_some());
+        // A plain transport is never silent: whichever way `open_session`
+        // reached it, the reason is there for the CLI to print. This walk asks
+        // for DH, so the expected shape is `None` — but a source that refuses
+        // DH is a legitimate outcome here and must carry its reason.
+        if let Some(reason) = &extraction.plain_fallback_reason {
+            assert!(!reason.is_empty(), "a plain run with no reason given");
         }
         // The property is there, so the refusal is a check that can actually
         // fire. If it were absent the extraction must say so rather than

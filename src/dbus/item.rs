@@ -180,12 +180,20 @@ impl Item {
         Ok(())
     }
 
+    /// Whether this item can be read.
+    ///
+    /// Routed through [`Item::with_item`], not through `Vault::is_locked`
+    /// alone, so an item that no longer exists reads as locked. Between a
+    /// delete and the `object_server` unexport that follows it, the object is
+    /// still on the bus with nothing behind it; answering `is_locked` for its
+    /// *collection* made a deleted item in an unlocked collection report
+    /// `Locked = false` while `Label` and `Attributes` — which both go
+    /// through `with_item` — answered empty. "Unlocked but blank" is not a
+    /// state this interface has; "locked" is what every other property
+    /// already says in that window.
     #[zbus(property)]
     async fn locked(&self) -> bool {
-        match self.vault().await {
-            Some(v) => v.lock().await.is_locked(),
-            None => true,
-        }
+        self.with_item(|_| false).await.unwrap_or(true)
     }
 
     #[zbus(property)]

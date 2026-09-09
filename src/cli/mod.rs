@@ -279,7 +279,12 @@ async fn daemon() -> Result<(), CliError> {
     let daemon = Daemon::start(DaemonOptions::new(config))
         .await
         .map_err(|e| match e {
-            DaemonError::NameTaken => CliError::Unreachable(e.to_string()),
+            // Exit 3 is "daemon or bus unreachable, or `XDG_RUNTIME_DIR`
+            // unset" — the same contract the client commands honour through
+            // `client::method_error_to_cli` and `vault_cmds::control`.
+            DaemonError::NameTaken | DaemonError::NoRuntimeDir | DaemonError::ZBus(_) => {
+                CliError::Unreachable(e.to_string())
+            }
             other => CliError::Failed(other.to_string()),
         })?;
     daemon.run_until_shutdown().await;

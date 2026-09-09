@@ -264,6 +264,35 @@ impl Collection {
             .collect())
     }
 
+    /// Create an item, or overwrite one when `replace` is set.
+    ///
+    /// **What `replace` matches.** The freedesktop spec says only that
+    /// `replace` overwrites "an item with the same attributes", which admits
+    /// two readings: the *exact same* attribute set, or any item whose
+    /// attributes are a superset of the ones given (the rule `SearchItems`
+    /// uses). This implementation takes the first: an item is replaced only
+    /// when its attribute map is equal to the one supplied, key for key and
+    /// value for value. A strict subset, a superset, or one differing value
+    /// creates a new item instead.
+    ///
+    /// Exact equality is the safer of the two readings, and the asymmetry is
+    /// deliberate. Under the search reading, `CreateItem` with the single
+    /// attribute `{service: mail}` and `replace = true` would silently
+    /// destroy every distinct account item carrying that attribute — a
+    /// destructive act the client did not ask for and cannot undo, since the
+    /// prior secret is gone. Under this reading the worst outcome is a
+    /// duplicate item, which the client can see and delete. It is also what a
+    /// `secret-tool store` round-trip expects: the same command run twice
+    /// updates its own item rather than creating a second.
+    ///
+    /// At most **one** item is replaced — the first in the vault's own item
+    /// order — so a collection that already holds duplicates (written by an
+    /// older build, an import, or another implementation) is narrowed by one
+    /// per call rather than collapsed in a single write.
+    ///
+    /// A replace answers `ItemChanged` on the collection and reuses the
+    /// existing item's path and `Created` timestamp; a create answers
+    /// `ItemCreated` with a fresh path.
     #[zbus(out_args("item", "prompt"))]
     async fn create_item(
         &self,

@@ -424,7 +424,24 @@ Attribute keys, values, labels and content types are Rust `String`. A source
 attribute containing non-UTF-8 bytes **cannot be represented**. Lossy
 conversion is not acceptable here: it changes the attribute, and a changed
 attribute is a silently broken lookup, which is the exact failure this whole
-document is organised around. Such items are refused and listed.
+document is organised around. So the rule is refuse, never convert.
+
+**As implemented, the condition is unreachable, and no refusal is written.**
+Both live routes validate UTF-8 upstream of the importer: gnome-keyring is
+read over D-Bus, whose marshaller validates `s` and `a{ss}` before we see
+them, and the KWallet route reads a JSON sidecar, whose parser rejects
+invalid UTF-8 outright. `import::SourceItem` therefore takes `String`
+attributes and there is no path that could construct a non-UTF-8 one — a
+refusal variant for it existed briefly, had no construction site, and was
+removed as dead code rather than left standing as a claim the tree does not
+support.
+
+The rule above still governs any route that does not have that upstream
+guarantee. **A future route that reads raw attribute bytes — a direct
+`.keyring` or `.kwl` attribute parser, a file format with no encoding
+contract — must add the refusal, and the item's line in the report, in the
+same commit as the code that constructs it.** Adding the route first and the
+refusal later is precisely the lossy conversion this section forbids.
 
 Secrets are `Vec<u8>` and may hold arbitrary bytes including NUL, so binary
 values need no special handling — provided they never go through `sm set`,
@@ -576,8 +593,15 @@ What is new:
   error rather than block.
 - **Fidelity properties**, in the style of `tests/invariants.rs`: attributes
   survive a round trip byte-for-byte for arbitrary UTF-8 keys and values; a
-  non-UTF-8 attribute is refused rather than converted; a secret ending in
-  `0x0a` survives; timestamps land exactly.
+  secret ending in `0x0a` survives; timestamps land exactly.
+
+  There is deliberately **no test that a non-UTF-8 attribute is refused**.
+  See *Encoding*: on both implemented routes the bytes are UTF-8 validated
+  before the importer sees them, so such an item has no construction site and
+  the test would have to fabricate a state the code cannot reach — which
+  proves nothing about the refusal and rots the moment the type changes. The
+  test is owed by the first route that can produce the condition, and lands
+  in the same commit as it.
 - **Cap enforcement**, asserting `import_items` rejects each of the six
   limits — because that is the one place where the offline path could
   silently produce items the D-Bus API could not.
