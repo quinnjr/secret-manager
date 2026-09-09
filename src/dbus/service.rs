@@ -418,15 +418,25 @@ impl Service {
         #[zbus(object_server)] server: &ObjectServer,
     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
         check_object_count(objects.len())?;
-        // Answered before the resolution loop, not after it: a caller with no
-        // sender, or one already at [`MAX_PROMPTS_PER_OWNER`], is refused
-        // without first paying up to `MAX_LOCK_OBJECTS` lock acquisitions for
-        // a prompt it can never be given. That is the shape HIGH 4 corrected
-        // on `open_session`. The check is repeated under the guard that
-        // inserts the owner entry below, because only there is it atomic with
-        // the insert.
+        // A caller with no sender is refused outright, before the resolution
+        // loop: it can never be given a prompt, so paying up to
+        // `MAX_LOCK_OBJECTS` lock acquisitions for it is waste.
+        //
+        // The quota is *computed* here for the same reason — it is one cheap
+        // read under a guard this method takes anyway — but deliberately not
+        // returned yet. `open_session` may fail fast on it because it always
+        // creates a session; `Unlock` often creates no prompt at all, and
+        // libsecret calls it unconditionally before every read. Refusing a
+        // caller at quota when every named object is already unlocked would
+        // cost it the ability to read collections that are not locked, on the
+        // strength of prompts that clear only on completion, dismissal or the
+        // owner's departure. So the verdict is held until past the
+        // `collections.is_empty()` return below, which is where the old
+        // per-element code first reached it. It is taken again under the
+        // guard that inserts the owner entry, because only there is it atomic
+        // with the insert.
         let owner = require_sender(&header)?;
-        self.state.lock().await.check_prompt_quota(&owner)?;
+        let quota = self.state.lock().await.check_prompt_quota(&owner);
         // Resolve every path under ONE state acquisition and answer the lock
         // state with that guard released, one vault acquisition per *distinct
         // collection* rather than one of each per element — the shape
@@ -509,6 +519,7 @@ impl Service {
         if collections.is_empty() {
             return Ok((unlocked, paths::root()));
         }
+        quota?;
         let mut st = self.state.lock().await;
         st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
@@ -608,6 +619,15 @@ impl Service {
                 .collect();
             (locked, changed)
         };
+        // Recorded rather than restored: `changed` is in order of each
+        // collection's *first appearance* among the request's paths, where the
+        // per-element walk emitted at the first path that actually locked it —
+        // the first *valid* element. The two differ only when a collection's
+        // earlier paths resolve to nothing, and only in the relative order of
+        // `PropertiesChanged` signals for distinct collections. The spec
+        // orders neither, each signal names its own object, and a client that
+        // depended on the old order would already have been broken by a
+        // caller reordering its own argument list.
         for cid in changed {
             registry::notify_collection_changed(conn, &cid).await;
         }

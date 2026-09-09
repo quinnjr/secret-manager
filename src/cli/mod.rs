@@ -273,20 +273,31 @@ pub fn argv_with_dispatch(args: impl IntoIterator<Item = OsString>) -> Vec<OsStr
     out
 }
 
+/// Map a startup failure to the CLI's exit-code contract.
+///
+/// Exit 3 is "daemon or bus unreachable, or `XDG_RUNTIME_DIR` unset" — the
+/// same contract the client commands honour through
+/// `client::method_error_to_cli` and `vault_cmds::control` — and a supervisor
+/// reads it as "one is already running". So only the *transport-shaped*
+/// failures earn it. `DaemonError::Export` is a bus we reached and objects we
+/// then failed to serve: that daemon is broken, not redundant, and must read
+/// as an ordinary failure so it is restarted rather than assumed duplicated.
+fn daemon_start_error(e: crate::daemon::DaemonError) -> CliError {
+    use crate::daemon::DaemonError;
+    match e {
+        DaemonError::NameTaken | DaemonError::NoRuntimeDir | DaemonError::ZBus(_) => {
+            CliError::Unreachable(e.to_string())
+        }
+        other => CliError::Failed(other.to_string()),
+    }
+}
+
 async fn daemon() -> Result<(), CliError> {
-    use crate::daemon::{Daemon, DaemonError, DaemonOptions};
+    use crate::daemon::{Daemon, DaemonOptions};
     let config = load_config()?;
     let daemon = Daemon::start(DaemonOptions::new(config))
         .await
-        .map_err(|e| match e {
-            // Exit 3 is "daemon or bus unreachable, or `XDG_RUNTIME_DIR`
-            // unset" — the same contract the client commands honour through
-            // `client::method_error_to_cli` and `vault_cmds::control`.
-            DaemonError::NameTaken | DaemonError::NoRuntimeDir | DaemonError::ZBus(_) => {
-                CliError::Unreachable(e.to_string())
-            }
-            other => CliError::Failed(other.to_string()),
-        })?;
+        .map_err(daemon_start_error)?;
     daemon.run_until_shutdown().await;
     Ok(())
 }
@@ -294,6 +305,28 @@ async fn daemon() -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exit 3 means "unreachable", which a supervisor reads as "another
+    /// daemon already owns the name". A daemon that reached the bus and then
+    /// failed to export its own objects is neither, so it must not claim 3 —
+    /// otherwise the supervisor leaves a service that serves nothing running.
+    #[test]
+    fn export_failure_is_not_reported_as_unreachable() {
+        use crate::daemon::DaemonError;
+        let unreachable = daemon_start_error(DaemonError::ZBus(zbus::Error::InvalidReply));
+        assert_eq!(unreachable.exit_code(), 3, "a transport failure is exit 3");
+        assert_eq!(
+            daemon_start_error(DaemonError::NameTaken).exit_code(),
+            3,
+            "a taken bus name is exit 3"
+        );
+        let export = daemon_start_error(DaemonError::Export(zbus::Error::InvalidReply));
+        assert_eq!(
+            export.exit_code(),
+            1,
+            "an object-export failure must not read as 'one is already running'"
+        );
+    }
 
     #[test]
     fn askpass_symlink_dispatches_to_ssh_askpass() {

@@ -969,14 +969,30 @@ mod tests {
 
     /// The cap is `>`, not `>=`: an item of exactly the limit is one the
     /// D-Bus API would have accepted, and refusing it would strand data.
+    ///
+    /// All six caps at once, which is the claim the comment makes. Two of
+    /// them — the secret and the attribute *key* — used to be left at their
+    /// baseline size here while the doc comment spoke for all six, so a
+    /// `>=` in either would have passed this test.
     #[test]
     fn an_item_at_exactly_the_cap_is_accepted() {
         let mut it = item(&[]);
+        it.secret = Zeroizing::new(vec![0u8; MAX_ITEM_SECRET]);
         it.label = "x".repeat(MAX_ITEM_LABEL);
         it.content_type = "x".repeat(MAX_ITEM_CONTENT_TYPE);
+        // Every key is exactly `MAX_ATTRIBUTE_KEY` long and still distinct:
+        // a zero-padded index, so the count cap is at its limit too and no
+        // two keys collide into a shorter map.
         it.attributes = (0..MAX_ITEM_ATTRIBUTES)
-            .map(|n| (format!("k{n}"), "v".repeat(MAX_ATTRIBUTE_VALUE)))
+            .map(|n| {
+                (
+                    format!("{n:0>width$}", width = MAX_ATTRIBUTE_KEY),
+                    "v".repeat(MAX_ATTRIBUTE_VALUE),
+                )
+            })
             .collect();
+        assert_eq!(it.attributes.len(), MAX_ITEM_ATTRIBUTES);
+        assert!(it.attributes.keys().all(|k| k.len() == MAX_ATTRIBUTE_KEY));
         assert_eq!(it.cap_violation(), None);
     }
 
@@ -1138,7 +1154,10 @@ mod tests {
             (Cap::Secret, "secret"),
             (Cap::Label, "label"),
             (Cap::AttributeCount, "attribute-count"),
-            (Cap::AttributeKey, "attribute-key"),
+            // Deliberately not the kebab-case of the variant: the JSON is
+            // user-facing and every message spells this cap "attribute
+            // name". Pinned in `vault::format::Cap`.
+            (Cap::AttributeKey, "attribute-name"),
             (Cap::AttributeValue, "attribute-value"),
             (Cap::ContentType, "content-type"),
         ] {

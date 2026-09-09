@@ -2,12 +2,13 @@
 #
 # The Debian instructions were written from packaging and reasoning rather
 # than from a Debian box; this exists so they are checked rather than
-# believed. `vagrant up` follows the documented steps verbatim and then
-# proves the result works: a daemon on a session bus, a vault, a secret
+# believed. `make vagrant-verify` follows the documented steps verbatim and
+# then proves the result works: a daemon on a session bus, a vault, a secret
 # stored and read back, `secret-tool` interop, and the PAM module where the
 # docs say it lands.
 #
-#   vagrant up                    # provision and verify
+#   make vagrant-verify           # provision and verify; see Makefile for why
+#                                 # this and not a bare `vagrant up`
 #   vagrant provision --provision-with verify   # re-run just the checks
 #   vagrant ssh                   # poke at it
 #   vagrant destroy -f            # done

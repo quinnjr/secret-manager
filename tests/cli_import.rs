@@ -40,6 +40,51 @@ fn keyring_dir(root: &Path) -> PathBuf {
     dir
 }
 
+/// The golden keyring's own display name, which is also its file stem above.
+const GOLDEN_NAME: &str = "Sample keyring";
+
+/// A second keyring in `dir`, byte-identical to the golden one except for its
+/// display name.
+///
+/// Copying the golden file under another *file* name is not enough: the name
+/// the walk is asked for is the keyring's **display name**, which lives in the
+/// header, so two copies are one container under two file names and no
+/// assertion can tell which of them the pipeline chose. Only the name changes
+/// here — the item count, the item table and the ciphertext are the golden
+/// file's own, which is what keeps the independent count a real check.
+///
+/// The name must be the same length as the one it replaces: it is a
+/// length-prefixed string and every later offset in the file, including the
+/// ciphertext length the parser bounds against what the file holds, is
+/// measured from where it ends.
+fn keyring_named(dir: &Path, name: &str) -> PathBuf {
+    let golden = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import/sample.keyring"),
+    )
+    .unwrap();
+    assert_eq!(
+        name.len(),
+        GOLDEN_NAME.len(),
+        "a differently sized name would move every offset after it"
+    );
+    // 16 bytes of magic, then major/minor/crypto/hash, then the u32 length.
+    let at = 20;
+    assert_eq!(
+        golden[at..at + 4],
+        (GOLDEN_NAME.len() as u32).to_be_bytes(),
+        "the golden keyring's name is not where this helper patches it"
+    );
+    assert_eq!(
+        &golden[at + 4..at + 4 + GOLDEN_NAME.len()],
+        GOLDEN_NAME.as_bytes()
+    );
+    let mut bytes = golden.clone();
+    bytes[at + 4..at + 4 + name.len()].copy_from_slice(name.as_bytes());
+    let path = dir.join(format!("{name}.keyring"));
+    std::fs::write(&path, &bytes).unwrap();
+    path
+}
+
 fn attrs(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
@@ -90,19 +135,37 @@ fn sample_refusal() -> ItemReport {
     )
 }
 
+/// A source that holds **one named container** and answers for that one only.
+///
+/// The name is the point. This used to ignore the container it was asked for
+/// and hand back the same items whatever the pipeline had located, so every
+/// assertion about "the keyring the walk covered" was an assertion about a
+/// constant: reverting `ExtractOptions::only_container` to `None` left all
+/// seventeen tests green — including the one named for the scope of the
+/// independent count, the test for the exact bug this branch introduced and
+/// then fixed. A fake that refuses a container it does not hold is what makes
+/// "which keyring did the pipeline ask for" something the suite can be wrong
+/// about.
 struct Fake {
+    container: String,
     items: Vec<SourceItem>,
     refusals: Vec<ItemReport>,
     skipped: Vec<NotMigrated>,
 }
 
 impl Fake {
-    fn sample() -> Self {
+    fn of(container: &str, items: Vec<SourceItem>, refusals: Vec<ItemReport>) -> Self {
         Self {
-            items: sample_items(),
-            refusals: vec![sample_refusal()],
+            container: container.to_string(),
+            items,
+            refusals,
             skipped: Vec::new(),
         }
+    }
+
+    /// The golden keyring's own container, items and refusal.
+    fn sample() -> Self {
+        Self::of("Sample keyring", sample_items(), vec![sample_refusal()])
     }
 }
 
@@ -114,6 +177,15 @@ impl Extractor for Fake {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Extraction, CliError>> + 'a>>
     {
         Box::pin(async move {
+            // A real extractor walks the keyring it is named — `only_container`
+            // is exactly this argument, and a name matching no collection is
+            // `GnomeError::NoSuchCollection`, not an empty success. So is this.
+            if container != self.container {
+                return Err(CliError::NotFound(format!(
+                    "this source holds no container named '{container}'; it holds '{}'",
+                    self.container
+                )));
+            }
             let mut extraction = Extraction::new(container);
             extraction.items = self
                 .items
@@ -353,11 +425,12 @@ async fn a_cap_violation_refuses_one_item_and_not_the_run() {
     let vaults = tempfile::tempdir().unwrap();
     let env = env_for(root.path(), vaults.path());
 
-    let fake = Fake {
-        items: sample_items(),
+    let fake = Fake::of(
+        "Sample keyring",
+        sample_items(),
         // The golden keyring declares three items; this is the third, and the
         // extractor has already declined it.
-        refusals: vec![ItemReport::refused(
+        vec![ItemReport::refused(
             Provenance::gnome("Sample keyring", 9),
             "An enormous note",
             Refusal::CapViolation {
@@ -366,8 +439,7 @@ async fn a_cap_violation_refuses_one_item_and_not_the_run() {
                 limit: MAX_ITEM_SECRET,
             },
         )],
-        skipped: Vec::new(),
-    };
+    );
 
     let report_path = root.path().join("cap.json");
     let mut a = args(false);
@@ -511,13 +583,9 @@ async fn a_walk_that_missed_an_item_fails_the_run() {
     let root = tempfile::tempdir().unwrap();
     let vaults = tempfile::tempdir().unwrap();
     let env = env_for(root.path(), vaults.path());
-    let fake = Fake {
-        items: sample_items(),
-        // The golden keyring declares three items; without the refusal only
-        // two are accounted for.
-        refusals: Vec::new(),
-        skipped: Vec::new(),
-    };
+    // The golden keyring declares three items; without the refusal only two
+    // are accounted for.
+    let fake = Fake::of("Sample keyring", sample_items(), Vec::new());
     let report_path = root.path().join("count.json");
     let mut a = args(true);
     a.report = Some(report_path.clone());
@@ -549,13 +617,10 @@ async fn the_independent_count_is_scoped_to_the_keyring_that_is_walked() {
     let root = tempfile::tempdir().unwrap();
     let vaults = tempfile::tempdir().unwrap();
     let env = env_for(root.path(), vaults.path());
-    // A second keyring beside the first, and a `default` naming which of them
-    // the destination is labelled after. The walk never enters it.
-    std::fs::copy(
-        env.source_dir.join("Sample keyring.keyring"),
-        env.source_dir.join("Other keyring.keyring"),
-    )
-    .unwrap();
+    // A second keyring beside the first — a different container, not another
+    // copy of the same one — and a `default` naming which of them the
+    // destination is labelled after. The walk never enters the other.
+    keyring_named(&env.source_dir, "Second keyring");
     std::fs::write(env.source_dir.join("default"), "Sample keyring\n").unwrap();
 
     let report_path = root.path().join("two-keyrings.json");
@@ -572,6 +637,72 @@ async fn the_independent_count_is_scoped_to_the_keyring_that_is_walked() {
     );
     // And the destination is still labelled after the keyring `default` names.
     assert_eq!(parsed["collection"], serde_json::json!("Sample keyring"));
+}
+
+/// And the other way round: with `default` naming the *second* keyring, both
+/// the label and the walked count follow that one.
+///
+/// This is the half the test above could not establish on its own. `Fake` used
+/// to hand back the same items whatever container it was asked for, so a
+/// pipeline that walked the wrong keyring — or every keyring — produced
+/// exactly the same report, and the assertion "the count is scoped to the
+/// keyring that is walked" held for a source that has only one answer. Here
+/// the two keyrings hold different items, and asking for the wrong one is an
+/// error rather than a different-looking success.
+#[tokio::test]
+async fn the_walk_and_the_label_follow_the_keyring_the_default_file_names() {
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    keyring_named(&env.source_dir, "Second keyring");
+    std::fs::write(env.source_dir.join("default"), "Second keyring\n").unwrap();
+
+    // The second keyring's own three items, none of them the first's. Its
+    // header is the golden one's, so three walked is three declared.
+    let fake = Fake::of(
+        "Second keyring",
+        vec![
+            item(
+                1,
+                "A second-keyring login",
+                &[("server", "b.example")],
+                b"1",
+            ),
+            item(2, "A second-keyring token", &[("account", "someone")], b"2"),
+            item(3, "A second-keyring note", &[("note", "yes")], b"3"),
+        ],
+        Vec::new(),
+    );
+
+    let report_path = root.path().join("second.json");
+    let mut a = args(true);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect("the walk must be asked for the keyring `default` names");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    // The label follows the file `default` names...
+    assert_eq!(parsed["collection"], serde_json::json!("Second keyring"));
+    // ...and so does the count: that file's own header against that file's
+    // own walk.
+    assert_eq!(
+        parsed["verification"]["count"],
+        serde_json::json!({ "header_item_count": 3, "walked": 3 })
+    );
+    // And the items in the report are the ones that keyring holds.
+    let labels: Vec<String> = parsed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["label"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        labels.iter().all(|l| l.starts_with("A second-keyring")),
+        "{labels:?}"
+    );
+    assert!(!labels.iter().any(|l| l == "GitHub token"), "{labels:?}");
 }
 
 // --------------------------------------------------------------------------
@@ -695,11 +826,7 @@ async fn a_failed_verification_removes_the_collection_even_when_the_report_canno
     let vaults = tempfile::tempdir().unwrap();
     let env = env_for(root.path(), vaults.path());
     // Three declared in the header, two walked: the count check fails.
-    let fake = Fake {
-        items: sample_items(),
-        refusals: Vec::new(),
-        skipped: Vec::new(),
-    };
+    let fake = Fake::of("Sample keyring", sample_items(), Vec::new());
     // The parent does not exist, so the report's `O_EXCL` create fails.
     let report_path = root.path().join("no-such-dir").join("report.json");
     let mut a = args(false);
@@ -792,9 +919,7 @@ async fn import_never_merges_into_an_existing_collection() {
 ///
 /// Here it runs against a real `secret-manager` on the fixture's private bus,
 /// and every probe has to come back found.
-// A real daemon on the fixture's bus answers on other threads; the control
-// socket call the import makes is blocking, so this needs more than one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn the_lookup_probe_runs_against_our_own_daemon_and_finds_every_item() {
     let fixture = Fixture::start().await;
     let root = tempfile::tempdir().unwrap();
@@ -831,16 +956,15 @@ async fn the_lookup_probe_runs_against_our_own_daemon_and_finds_every_item() {
 /// smaller probe expected 1 and found 2 — and a byte-perfect import failed
 /// verification, with every item sharing that key set downgraded on the way
 /// out.
-// A real daemon on the fixture's bus answers on other threads; the control
-// socket call the import makes is blocking, so this needs more than one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn a_probe_expects_what_subset_matching_actually_returns() {
     let fixture = Fixture::start().await;
     let root = tempfile::tempdir().unwrap();
     let env = env_against(&fixture, root.path());
 
-    let fake = Fake {
-        items: vec![
+    let fake = Fake::of(
+        "Sample keyring",
+        vec![
             item(
                 2,
                 "router",
@@ -860,9 +984,8 @@ async fn a_probe_expects_what_subset_matching_actually_returns() {
                 b"b",
             ),
         ],
-        refusals: vec![sample_refusal()],
-        skipped: Vec::new(),
-    };
+        vec![sample_refusal()],
+    );
 
     let report_path = root.path().join("subset.json");
     let mut a = args(false);
@@ -889,9 +1012,7 @@ async fn a_probe_expects_what_subset_matching_actually_returns() {
 /// pass" left `default` pointing at the new collection, the daemon holding it,
 /// and the file on disk — which then made the retry fail on the "already
 /// exists" refusal, naming a file that same run had created.
-// A real daemon on the fixture's bus answers on other threads; the control
-// socket call the import makes is blocking, so this needs more than one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn a_failed_verification_moves_no_alias_and_leaves_no_collection() {
     use secret_manager::protocol::{Request, Response, call};
 
@@ -902,18 +1023,28 @@ async fn a_failed_verification_moves_no_alias_and_leaves_no_collection() {
 
     // Two items walked against the golden keyring's declared three: the count
     // check fails, after a perfectly good write.
-    let fake = Fake {
-        items: sample_items(),
-        refusals: Vec::new(),
-        skipped: Vec::new(),
-    };
+    let fake = Fake::of("Sample keyring", sample_items(), Vec::new());
+    let report_path = root.path().join("unpublished.json");
     let mut a = args(false);
     a.set_default = true;
+    a.report = Some(report_path.clone());
     let err = secret_manager::cli::import::run_with(a, &fake, &env)
         .await
         .expect_err("2 walked against 3 in the header is a failure");
     let message = err.to_string();
     assert!(message.contains("Nothing was published"), "{message}");
+    assert!(message.contains("has been removed again"), "{message}");
+
+    // The report agrees with the message printed beside it. This was the one
+    // place the artifact a user pastes into a bug contradicted the run: it
+    // said `written: true` for a collection the error above correctly
+    // describes as removed again, three lines before it was unlinked. And it
+    // is not a dry run — a vault really was created — so the two questions are
+    // two fields.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(parsed["written"], serde_json::json!(false));
+    assert_eq!(parsed["dry_run"], serde_json::json!(false));
 
     // The collection this run created is gone, so the next attempt is not
     // refused against it.
@@ -946,4 +1077,184 @@ async fn a_failed_verification_moves_no_alias_and_leaves_no_collection() {
     secret_manager::cli::import::run_with(args(false), &Fake::sample(), &env)
         .await
         .expect("the retry must not be blocked by the failed run's own file");
+}
+
+/// Two `.keyring` files and no `default` is exit **1**, not exit 2.
+///
+/// Exit 2 is the code that means "a different invocation of `sm` is the
+/// remedy", and there is none: `--collection` names the *destination*, and
+/// nothing on this command names the source container. The user has to move a
+/// file aside or write a `default` file, which is not something a flag can do.
+#[tokio::test]
+async fn two_candidate_keyrings_and_no_default_is_a_failure_not_a_usage_error() {
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    keyring_named(&env.source_dir, "Second keyring");
+    // No `default` file: the choice is genuinely ambiguous.
+    assert!(!env.source_dir.join("default").exists());
+
+    let err = secret_manager::cli::import::run_with(args(true), &Fake::sample(), &env)
+        .await
+        .expect_err("two keyrings and no default cannot be resolved");
+    let message = err.to_string();
+    assert!(message.contains("2 .keyring files"), "{message}");
+    assert!(message.contains("Sample keyring.keyring"), "{message}");
+    assert_eq!(
+        err.exit_code(),
+        1,
+        "no different invocation of `sm` fixes this: {message}"
+    );
+}
+
+/// The pid-identity check, which nothing exercised.
+///
+/// `probe_target` establishes that the process owning `org.freedesktop.secrets`
+/// on the session bus is the same process that answers our control socket —
+/// the same kernel, asked twice — because the alternative is what shipped: the
+/// probe questioned gnome-keyring, matched its item paths through a prefix
+/// that collides for a keyring named `login`, and reported PASS while proving
+/// nothing. Replacing the whole function with a bare session connection left
+/// the suite green.
+///
+/// Here the bus is the fixture's, whose name is held by the in-process daemon,
+/// and the control socket is the *dbus-daemon's* own listening socket, so
+/// `SO_PEERCRED` names a different process. Every probe must come back not
+/// issued — unproved, never a pass and never a failure — and the run must
+/// still succeed, because an unprovable check is not a failed one.
+#[tokio::test]
+async fn a_probe_is_not_issued_when_the_bus_name_is_not_our_control_socket_peer() {
+    let fixture = Fixture::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut env = env_against(&fixture, root.path());
+    let bus_socket = fixture
+        .bus
+        .address
+        .strip_prefix("unix:path=")
+        .expect("the fixture bus is a unix socket")
+        .split(',')
+        .next()
+        .unwrap()
+        .to_string();
+    env.daemon = DaemonTarget::At {
+        bus_address: fixture.bus.address.clone(),
+        control_socket: PathBuf::from(bus_socket),
+    };
+
+    let report_path = root.path().join("identity.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+        .await
+        .expect("a probe that cannot be shown to be ours is unproved, not failed");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(
+        parsed["verification"]["probes"],
+        serde_json::json!({ "passed": 0, "failed": 0, "not_issued": 2 }),
+        "the probe questioned a provider it had not identified: {parsed}"
+    );
+}
+
+/// The one failure that deliberately leaves a vault on disk.
+///
+/// Every other failure here fails offline, before anything is published, and
+/// unlinks. This branch is the opposite policy and it had never run: the bytes
+/// are right, the daemon has been told to load the collection, and a probe
+/// still cannot find the items — so taking the file away would remove a good
+/// collection from a daemon that holds it in memory. It also rests on
+/// `verification` being *mutated* between the two `passed()` calls: without
+/// the probe results being written back, the second call would agree with the
+/// first and the run would exit 0.
+///
+/// The daemon here watches its own vault directory and this import writes to
+/// another one, which is an ordinary misconfiguration and reaches the branch
+/// honestly: the write, the reopen, the fingerprints and the count all pass,
+/// the `Reload` finds nothing new, and every probe comes back empty.
+#[tokio::test]
+async fn a_probe_that_finds_nothing_keeps_the_collection_and_fails_the_run() {
+    let fixture = Fixture::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let mut env = env_against(&fixture, root.path());
+    env.config.vault.dir = vaults.path().to_path_buf();
+
+    let report_path = root.path().join("unfindable.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    a.set_default = true;
+    let err = secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+        .await
+        .expect_err("a collection no libsecret client can search is not a finished import");
+    let message = err.to_string();
+    assert!(message.contains("could not find every item"), "{message}");
+    assert_eq!(err.exit_code(), 1);
+
+    // The one failure that keeps what it wrote, and says so.
+    assert!(
+        vaults.path().join("sample_keyring.vault").exists(),
+        "a good file was taken away from a daemon that may hold it: {:?}",
+        files_in(vaults.path())
+    );
+    assert!(message.contains("is on disk"), "{message}");
+    // The alias is the effect a user notices, and it does not move over a
+    // failed migration.
+    assert!(
+        !vaults.path().join("aliases.toml").exists(),
+        "`default` moved to a collection this run calls broken"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    // The report describes a collection that is there.
+    assert_eq!(parsed["written"], serde_json::json!(true));
+    assert_eq!(parsed["dry_run"], serde_json::json!(false));
+    assert_eq!(
+        parsed["verification"]["probes"],
+        serde_json::json!({ "passed": 0, "failed": 2, "not_issued": 0 }),
+        "{parsed}"
+    );
+    // And the probe's verdict reached the items and the tally: what the
+    // attributes promised is not what the daemon returned.
+    assert_eq!(
+        parsed["tally_before_probe"]["fully_portable"],
+        serde_json::json!(1)
+    );
+    assert_eq!(parsed["tally"]["fully_portable"], serde_json::json!(0));
+    assert_eq!(
+        parsed["tally"]["attributes_preserved"],
+        serde_json::json!(2)
+    );
+}
+
+/// Whether a locked collection can answer an attribute search is a property of
+/// the **header this run wrote**, not of this CLI's `[vault] locked_search`.
+///
+/// The config the CLI loaded is not the config the running daemon has, and it
+/// is not what shaped the header either — `Vault::create` writes the index and
+/// this command never passes the setting to it. Gating the probe on the config
+/// therefore left a byte-perfect import reporting its discoverability unproved
+/// on a machine whose header carries every hash.
+#[tokio::test]
+async fn the_probe_is_gated_on_the_header_that_was_written_not_on_the_cli_config() {
+    let fixture = Fixture::start().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut env = env_against(&fixture, root.path());
+    env.config.vault.locked_search = false;
+
+    let report_path = root.path().join("gate.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+        .await
+        .expect("a faithful import passes its probe whatever this CLI's config says");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(
+        parsed["verification"]["probes"],
+        serde_json::json!({ "passed": 2, "failed": 0, "not_issued": 0 }),
+        "the probe was skipped over a setting that shaped nothing: {parsed}"
+    );
 }

@@ -124,19 +124,39 @@ pub const MAX_ITEM_CONTENT_TYPE: usize = 256;
 ///
 /// The *constants* had already been hoisted here so there is one number per
 /// cap; the *predicates* had not, and there were three hand-maintained copies
-/// of "which caps, measured how, in what order" — the D-Bus entry points in
+/// of "which caps, and measured how" — the D-Bus entry points in
 /// `dbus::collection`, `Vault::import_items`'s re-application of them, and
-/// `import::check_caps`'s pre-flight. Three copies of an ordering is the
-/// worst kind to let drift: the symptom of a disagreement is a pre-check that
+/// `import::check_caps`'s pre-flight. Three copies of a limit is the worst
+/// kind to let drift: the symptom of a disagreement is a pre-check that
 /// passes an item `import_items` then refuses halfway through a migration.
 /// So the predicate lives here too, and each layer maps [`CapViolation`] into
 /// its own error type rather than re-deciding what "too large" means.
+///
+/// **The order is not shared, and this refactor did not make it so.** What is
+/// shared — and what has to be — is the set of caps, each predicate and each
+/// limit. [`check_caps`] fixes an order for its own callers; `CreateItem` in
+/// `dbus::collection` checks label, content type, attributes and only then
+/// the secret, deliberately, so an over-large label is refused before the
+/// client's secret session value is decrypted. An item over two caps at once
+/// is therefore named by a different one of the two on that path than on
+/// this one. That is a difference in which message a doomed request gets,
+/// never in which requests are refused.
+///
+/// **These variant names are a wire format.** `Cap` is serialized, kebab-
+/// cased, into `sm import`'s `report.json` through
+/// `import::Refusal::CapViolation`, so a rename here changes a file other
+/// programs read — and each name must say what [`Cap::as_str`] says, since
+/// the two describe the same refusal to the same person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Cap {
     Secret,
     Label,
     AttributeCount,
+    /// Serialized as `attribute-name`, not the kebab-case of the variant:
+    /// the JSON is user-facing and every error message spells this cap
+    /// "attribute name". See the wire-format note above.
+    #[serde(rename = "attribute-name")]
     AttributeKey,
     AttributeValue,
     ContentType,
@@ -204,9 +224,14 @@ pub struct CapViolation {
 
 /// The first of the six per-item caps this item violates, or `None`.
 ///
-/// The order is fixed here and nowhere else: secret, label, content type,
-/// attribute count, then the attribute pairs in `BTreeMap` order, name before
-/// value. Every caller reports the same cap for the same item.
+/// The order is fixed here: secret, label, content type, attribute count,
+/// then the attribute pairs in `BTreeMap` order, name before value. Every
+/// caller *of this function* reports the same cap for the same item.
+///
+/// It is not the only order in the tree. `CreateItem` in `dbus::collection`
+/// does not go through here and checks cheap-before-decrypt instead, so an
+/// item over both the secret and the label cap is reported as `label` there
+/// and as `secret` here — see [`Cap`].
 pub fn check_caps(
     label: &str,
     attributes: &BTreeMap<String, String>,

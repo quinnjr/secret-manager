@@ -609,9 +609,15 @@ proptest! {
         let n = (bytes.len() as f64 * cut) as usize;
         prop_assume!(n < bytes.len());
         keyring_never_panics(&bytes[..n]);
-        // A prefix of an honest file cannot itself be a complete honest file:
-        // the ciphertext length is the last field, so something is missing.
-        if spec.is_honest() && spec.ciphertext.is_empty() {
+        // A *strict* prefix of an honest file is never itself a parse. The
+        // conjunct used to be `&& spec.ciphertext.is_empty()`, which
+        // discarded exactly the cases where the cut lands in the trailing
+        // region — which is where the `ciphertext length` guard lives, so the
+        // one assertion in this test skipped the arm it was best placed to
+        // reach. It is unnecessary: with a non-empty ciphertext, a cut inside
+        // it leaves a file whose declared length exceeds what remains, and a
+        // cut before it removes a structural field.
+        if spec.is_honest() {
             prop_assert!(parse_keyring_header(&bytes[..n]).is_err());
         }
     }
@@ -715,7 +721,18 @@ struct Reach {
 }
 
 impl Reach {
+    /// Assert a floor, and *report the observation either way*.
+    ///
+    /// The number printed here is the one the next person should retune a
+    /// floor from. A floor set from a guess rather than a measurement is the
+    /// failure mode this whole file is about: `unsupported_version` sat at
+    /// 128 against an observed ~1100, so an order-of-magnitude regression in
+    /// the arm it names would not have moved it.
     fn require(&self, name: &str, got: usize, floor: usize) {
+        println!(
+            "reach: {got:>5} / {} cases reached {name} (floor {floor})",
+            self.cases
+        );
         assert!(
             got >= floor,
             "the generator reached {name} in only {got} of {} cases, under the floor of \
@@ -727,8 +744,20 @@ impl Reach {
     }
 }
 
-/// True for an error that can only be raised from inside `parse_keyring_item`.
-fn from_item_parser(e: &HeaderError) -> bool {
+/// True for an error that can only be raised from *inside the attribute
+/// loop* — an attribute was actually being decoded when the file was
+/// refused.
+///
+/// This is deliberately narrower than [`from_item_parser`], and the two used
+/// to be one predicate that incremented both counters. That made the
+/// `attribute_loop` floor satisfiable by files that never entered the loop:
+/// `Truncated { field: "item id" | "item type" | "attribute count" }` fails
+/// before the count is even read, and `ImpossibleLength { field: "attribute
+/// count" }` fails on the guard *preceding* the loop. The floor that is
+/// supposed to guarantee `AttrSpec` does anything could therefore be met
+/// entirely by files that died at "item id" — the same defect this file was
+/// rewritten to eliminate, one level in.
+fn from_attribute_loop(e: &HeaderError) -> bool {
     matches!(
         e,
         HeaderError::UnknownAttributeType { .. }
@@ -737,18 +766,30 @@ fn from_item_parser(e: &HeaderError) -> bool {
                 field: "attribute name"
             }
             | HeaderError::Truncated {
-                field: "item id"
-                    | "item type"
-                    | "attribute count"
-                    | "attribute name"
-                    | "attribute type"
-                    | "attribute value"
+                field: "attribute name" | "attribute type" | "attribute value"
             }
             | HeaderError::ImpossibleLength {
-                field: "attribute count" | "attribute name" | "attribute value",
+                field: "attribute name" | "attribute value",
                 ..
             }
     )
+}
+
+/// True for an error that can only be raised from inside
+/// `parse_keyring_item` — the item loop ran, whether or not it got as far as
+/// an attribute. Every attribute-loop error is one of these; the extra
+/// variants are the four fields read before the loop is entered.
+fn from_item_parser(e: &HeaderError) -> bool {
+    from_attribute_loop(e)
+        || matches!(
+            e,
+            HeaderError::Truncated {
+                field: "item id" | "item type" | "attribute count"
+            } | HeaderError::ImpossibleLength {
+                field: "attribute count",
+                ..
+            }
+        )
 }
 
 /// The test that makes the rest of this file mean something.
@@ -794,8 +835,13 @@ fn the_generators_reach_every_shape_the_parsers_can_produce() {
                 }
             }
             Err(e) => {
+                // Each counter gets its own witness. An error raised before
+                // the attribute count is read says the item loop ran and
+                // nothing more.
                 if from_item_parser(&e) {
                     r.item_loop += 1;
+                }
+                if from_attribute_loop(&e) {
                     r.attribute_loop += 1;
                 }
                 match e {
@@ -811,30 +857,49 @@ fn the_generators_reach_every_shape_the_parsers_can_produce() {
         }
     }
 
+    // A real invariant rather than a floor: an attribute cannot be decoded
+    // by a case that never entered the item loop, so this can only be
+    // violated by the two counters drifting apart the way they had.
+    assert!(
+        r.attribute_loop <= r.item_loop,
+        "the attribute loop was counted {} times against {} item-loop cases: {r:#?}",
+        r.attribute_loop,
+        r.item_loop
+    );
+
     // Floors, not exact counts: the generator may be retuned, but it may not
-    // stop reaching any of these.
-    r.require("a successful parse", r.parsed, 512);
-    r.require("an honest, fully-checked file", r.honest, 256);
-    r.require("parse_keyring_item", r.item_loop, 512);
-    r.require("the attribute loop", r.attribute_loop, 256);
+    // stop reaching any of these. Every number below was set against a run of
+    // this test — `require` prints what it observed — and the observation is
+    // in the comment beside it. Three of them used to sit so far under the
+    // arm they name that it could have collapsed by an order of magnitude
+    // without failing: the version gate at 128 against 1115, the NULL name
+    // at 16 against 132, the impossible length at 128 against 1277.
+    r.require("a successful parse", r.parsed, 512); // observed 751
+    r.require("an honest, fully-checked file", r.honest, 256); // 300
+    r.require("parse_keyring_item", r.item_loop, 512); // 1126
+    r.require("the attribute loop", r.attribute_loop, 256); // 797
     // The two value encodings are only counted on a *successful* parse that
     // carries items, which is the strictest way to say the arm really ran, so
     // these floors are lower than the share of cases that encode one.
-    r.require("a hashed string attribute value", r.string_values, 32);
-    r.require("a uint32 attribute value", r.uint32_values, 32);
+    r.require("a hashed string attribute value", r.string_values, 32); // 60
+    r.require("a uint32 attribute value", r.uint32_values, 32); // 67
+    // 233 observed.
     r.require(
         "the unknown-attribute-type refusal",
         r.unknown_attribute_type,
         32,
     );
-    r.require("the NULL attribute name refusal", r.null_name, 16);
-    r.require("the non-UTF-8 refusal", r.non_utf8, 32);
-    r.require("the impossible-length refusal", r.impossible_length, 128);
-    // Truncation is rare here because the generator writes complete files;
-    // `truncating_a_generated_keyring_anywhere_is_an_error` is where it is
-    // exercised on purpose. One case is enough to say the path is live.
-    r.require("the truncation error", r.truncated, 1);
-    r.require("the version gate", r.unsupported_version, 128);
+    r.require("the NULL attribute name refusal", r.null_name, 64); // 132
+    r.require("the non-UTF-8 refusal", r.non_utf8, 32); // 584
+    r.require("the impossible-length refusal", r.impossible_length, 512); // 1277
+    // Truncation is rare here *by construction*: the generator writes
+    // complete files, so only a declared length overshooting the bytes
+    // actually written produces one. Four cases in 4096 — this floor cannot
+    // detect much and does not pretend to; it says the path is live, and
+    // `truncating_a_generated_keyring_anywhere_is_an_error` is where
+    // truncation is exercised on purpose.
+    r.require("the truncation error", r.truncated, 2); // 4
+    r.require("the version gate", r.unsupported_version, 512); // 1115
 }
 
 /// The same, for the wallet generator and the entry-hash loop, which had no
@@ -871,12 +936,13 @@ fn the_wallet_generator_reaches_the_entry_hash_loop() {
         }
     }
 
-    r.require("a successful parse", r.parsed, 512);
-    r.require("an honest, fully-checked file", r.honest, 256);
-    r.require("the folder loop", r.item_loop, 512);
-    r.require("the entry-hash loop", r.attribute_loop, 256);
-    r.require("the impossible-length refusal", r.impossible_length, 64);
-    r.require("the version gate", r.unsupported_version, 64);
+    // Observed beside each, as above.
+    r.require("a successful parse", r.parsed, 512); // observed 1696
+    r.require("an honest, fully-checked file", r.honest, 512); // 1140
+    r.require("the folder loop", r.item_loop, 512); // 1131
+    r.require("the entry-hash loop", r.attribute_loop, 256); // 997
+    r.require("the impossible-length refusal", r.impossible_length, 512); // 1227
+    r.require("the version gate", r.unsupported_version, 512); // 1119
 }
 
 /// Where the golden wallet's cleartext index ends. Truncating *after* it

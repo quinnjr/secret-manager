@@ -1,7 +1,7 @@
 mod common;
 
 use common::Fixture;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use secret_manager::dbus::proxies::{CollectionProxy, ItemProxy, ServiceProxy};
 use secret_manager::dbus::session::SecretStruct;
 use secret_manager::session::dh::KeyPair;
@@ -197,10 +197,13 @@ async fn create_search_get_set_delete_with_signals() {
         .expect("a replace emits ItemChanged")
         .unwrap();
     assert_eq!(replace_signal.args().unwrap().item, item_path);
+    // No timeout: the ordering argument above is the whole proof. `ItemChanged`
+    // has been received, both signals travel the same connection in emission
+    // order, so an `ItemCreated` for this call would already be queued and
+    // ready. Polling once answers that exactly, where half a second of waiting
+    // answered it only probabilistically — and charged every run for it.
     assert!(
-        tokio::time::timeout(Duration::from_millis(500), created_again.next())
-            .await
-            .is_err(),
+        created_again.next().now_or_never().is_none(),
         "a replace must not emit ItemCreated"
     );
 

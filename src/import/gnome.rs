@@ -52,6 +52,7 @@ use crate::dbus::prompt::display_label;
 use crate::dbus::proxies::{CollectionProxy, ItemProxy, PromptProxy, ServiceProxy, SessionProxy};
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
+use crate::vault::format::escape_control;
 use futures_util::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -384,6 +385,41 @@ pub const MAX_ITEMS_PER_COLLECTION: usize = 100_000;
 /// or PIN is incorrect" — which is why the *head* is kept and the tail
 /// dropped.
 pub const STDERR_CAPTURE_LIMIT: usize = 4096;
+/// How much escaped peer text an error message carries. Bytes, not characters,
+/// and applied *after* escaping, so the bound is on what is printed.
+const ERROR_TEXT_LIMIT: usize = 512;
+
+/// Peer text on its way into an **error message**, sanitised without being
+/// truncated into uselessness.
+///
+/// [`display_label`] is the *dialog-label* sanitiser: it collapses whitespace
+/// and cuts at 64 characters, which is the right rule for a label and the
+/// wrong one for prose. gnome-keyring's first stderr line is an ~85-character
+/// capabilities warning, so a 64-character cut is *guaranteed* to drop "The
+/// password or PIN is incorrect" — the one thing [`STDERR_CAPTURE_LIMIT`]'s
+/// 4 KiB exists to preserve — and the same cut took the cause back out of
+/// [`GnomeError::KeyringNeverReady`] and out of the batch cause threaded into
+/// a per-item failure.
+///
+/// [`escape_control`] satisfies the `CLAUDE.md` rule that peer text is
+/// sanitised before a log or a dialog — every control character and invisible
+/// formatter becomes `\xNN` — and leaves the sentence intact. The cap that
+/// remains is [`ERROR_TEXT_LIMIT`], on a character boundary, which is a bound
+/// on how much of our output a hostile peer can choose and not a rule about
+/// labels.
+fn error_text(text: &str) -> String {
+    let escaped = escape_control(text);
+    if escaped.len() <= ERROR_TEXT_LIMIT {
+        return escaped;
+    }
+    let mut cut = ERROR_TEXT_LIMIT;
+    while !escaped.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = escaped[..cut].to_string();
+    out.push('\u{2026}');
+    out
+}
 
 /// Every way this module can fail, each one named so a report can say which.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -644,7 +680,8 @@ impl KeyringSnapshot {
         Ok(KeyringSnapshot { dir })
     }
 
-    /// The value to pass as [`ExtractOptions::data_home`].
+    /// The directory to hand [`extract_over_private_bus`] or
+    /// [`PrivateKeyring::start`] as the child's `XDG_DATA_HOME`.
     pub fn data_home(&self) -> &Path {
         self.dir.path()
     }
@@ -689,12 +726,14 @@ impl StderrTail {
     }
 
     /// What the daemon said, sanitised: it is peer text on its way to a
-    /// terminal, so it goes through [`display_label`] like every other.
-    /// `None` when it said nothing.
+    /// terminal, so it goes through [`error_text`] — escaped, not truncated at
+    /// a label's 64 characters, because the cause is usually on the *second*
+    /// line and a label cut would take exactly it. `None` when it said
+    /// nothing.
     fn text(&self) -> Option<String> {
         let held = self.0.lock().ok()?;
         let trimmed = held.trim();
-        (!trimmed.is_empty()).then(|| display_label(trimmed))
+        (!trimmed.is_empty()).then(|| error_text(trimmed))
     }
 
     /// `detail` for an error, combining what the daemon said with whatever
@@ -744,13 +783,18 @@ impl PrivateKeyring {
     /// and that is `Zeroizing`.
     ///
     /// `data_home` overrides `XDG_DATA_HOME` for the child, which is how
-    /// gnome-keyring finds `keyrings/`. `None` means the user's own, which is
-    /// what a migration wants; a path means that directory and nothing else,
-    /// which is what reading a backup — or a test — wants. It is set on the
+    /// gnome-keyring finds `keyrings/`. It is **required**, and it must not be
+    /// the user's own: this child is not a reader. `gnome-keyring-daemon
+    /// --unlock` rewrites the keyrings it opens and creates a `login.keyring`
+    /// where there is none, so pointed at the real directory it writes to the
+    /// very files a migration — and a `--dry-run` above all — exists to leave
+    /// alone. A migration passes [`KeyringSnapshot::data_home`]; a test passes
+    /// a directory of its own. There is no value here that means "the user's
+    /// own", which is why the parameter is not an `Option`. It is set on the
     /// child alone, so the process running the import is unaffected.
     pub async fn start(
         password: &Zeroizing<Vec<u8>>,
-        data_home: Option<&Path>,
+        data_home: &Path,
     ) -> Result<PrivateKeyring, GnomeError> {
         let control_dir = PrivateDir::create().map_err(|e| GnomeError::Spawn {
             program: "control directory".into(),
@@ -802,10 +846,8 @@ impl PrivateKeyring {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(home) = data_home {
-            started.env("XDG_DATA_HOME", home);
-        }
+            .kill_on_drop(true)
+            .env("XDG_DATA_HOME", data_home);
 
         let mut child = started.spawn().map_err(|e| GnomeError::Spawn {
             program: GNOME_KEYRING_PROGRAM.into(),
@@ -920,7 +962,7 @@ impl PrivateKeyring {
             if tokio::time::Instant::now() >= deadline {
                 return Err(GnomeError::KeyringNeverReady {
                     waited: STARTUP_TIMEOUT,
-                    detail: self.stderr.detail(&display_label(&last_error)),
+                    detail: self.stderr.detail(&error_text(&last_error)),
                 });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1073,10 +1115,24 @@ pub struct CollectionSummary {
     pub locked: bool,
     pub created: u64,
     pub modified: u64,
-    pub item_count: usize,
+    /// How many items the collection holds, or `None` when the walk never got
+    /// to look.
+    ///
+    /// `Option` rather than a count with a zero in it, because "nobody looked"
+    /// and "there are none" are different facts and only one of them is worth
+    /// printing. A collection skipped for an unanswerable prompt is skipped
+    /// *before* `Collection.Items` is read, and as a `usize` this field then
+    /// said `0` — so the note built from it read "holds 0 items … so none of
+    /// them were read" for a keyring holding forty, which is the silent
+    /// shortfall [`CollectionSummary::unanswerable_prompt`] exists to rule
+    /// out. A caller printing `None` must say the number is unknown; the
+    /// independent count from the cleartext header is where the real total
+    /// comes from in that case.
+    pub item_count: Option<usize>,
     /// The collection could not be unlocked because its prompt cannot be
     /// answered. Its items are absent from the extraction, and that is a
-    /// reported error rather than a silent shortfall.
+    /// reported error rather than a silent shortfall — which is also why
+    /// [`CollectionSummary::item_count`] is `None` here rather than `0`.
     pub unanswerable_prompt: bool,
 }
 
@@ -1120,9 +1176,11 @@ impl ExtractedItem {
     }
 }
 
-/// One item the walk could not carry, and why. Label and reason only: both go
-/// through [`display_label`] on the way in, because both are peer text on
-/// their way to a terminal and to the report file.
+/// One item the walk could not carry, and why. Label and reason only: both are
+/// peer text on their way to a terminal and to the report file, so both are
+/// sanitised on the way in — the label through [`display_label`], which is a
+/// label; the reason through [`error_text`], because a reason cut at 64
+/// characters is a reason nobody can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedEntry {
     pub label: String,
@@ -1213,6 +1271,13 @@ impl Extraction {
 }
 
 /// Options a caller can vary; every field has a defensible default.
+///
+/// The child's `XDG_DATA_HOME` is deliberately *not* one of them. It was, and
+/// its default was the user's own directory — so the ergonomic call,
+/// `extract_over_private_bus(&pw, &ExtractOptions::default())`, pointed a
+/// daemon that writes at the files the import exists to leave alone. It is now
+/// a [`KeyringSnapshot`] argument of [`extract_over_private_bus`], which no
+/// `..Default::default()` can reach past.
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
     /// How long to wait on an unlock prompt before naming it unanswerable.
@@ -1220,9 +1285,6 @@ pub struct ExtractOptions {
     /// Try `dh-ietf1024-sha256-aes128-cbc-pkcs7` first. Off only for a source
     /// known not to implement it; the fallback is automatic either way.
     pub prefer_dh: bool,
-    /// `XDG_DATA_HOME` for the private gnome-keyring, or `None` for the
-    /// user's own. See [`PrivateKeyring::start`].
-    pub data_home: Option<PathBuf>,
     /// Walk **only** the collection with this container name, or every
     /// collection when `None`.
     ///
@@ -1250,7 +1312,6 @@ impl Default for ExtractOptions {
         ExtractOptions {
             prompt_timeout: PROMPT_TIMEOUT,
             prefer_dh: true,
-            data_home: None,
             only_container: None,
         }
     }
@@ -1258,11 +1319,17 @@ impl Default for ExtractOptions {
 
 /// Starts a private bus and a private gnome-keyring, walks it, and shuts both
 /// down — on the error path too.
+///
+/// The `snapshot` is what the private daemon is given as `XDG_DATA_HOME`, and
+/// it is an argument rather than an option because there is no safe default
+/// for it: the child writes to whatever directory it is pointed at. See
+/// [`KeyringSnapshot`].
 pub async fn extract_over_private_bus(
     password: &Zeroizing<Vec<u8>>,
+    snapshot: &KeyringSnapshot,
     options: &ExtractOptions,
 ) -> Result<Extraction, GnomeError> {
-    let mut keyring = PrivateKeyring::start(password, options.data_home.as_deref()).await?;
+    let mut keyring = PrivateKeyring::start(password, snapshot.data_home()).await?;
     let result = async {
         let conn = Builder::address(keyring.address())
             .map_err(|e| GnomeError::Bus {
@@ -1367,7 +1434,7 @@ pub async fn extract(
                 modified: call("Collection.Modified", collection.modified())
                     .await
                     .unwrap_or(0),
-                item_count: 0,
+                item_count: None,
                 unanswerable_prompt: false,
             };
 
@@ -1404,7 +1471,7 @@ pub async fn extract(
                     limit: MAX_ITEMS_PER_COLLECTION,
                 });
             }
-            summary.item_count = items.len();
+            summary.item_count = Some(items.len());
             out.collections.push(summary);
 
             // Two passes. The first reads *about* every item; the second fetches
@@ -1452,7 +1519,7 @@ pub async fn extract(
                     // not read is false, so carrying it would import an unlock
                     // credential on the strength of a failed read, and the read
                     // that failed is one the foreign daemon controls.
-                    ItemType::Unreadable(_) => {
+                    ItemType::Unreadable => {
                         out.refused.push(ItemReport::refused(
                             meta.provenance,
                             meta.label,
@@ -1554,7 +1621,7 @@ async fn open_session(
                 // there is no unsanitised copy for a caller to reach.
                 let reason = format!(
                     "the source refused {ALGORITHM_DH}: {}",
-                    display_label(&e.to_string())
+                    error_text(&e.to_string())
                 );
                 let (_, path) = call(
                     "Service.OpenSession(plain)",
@@ -1650,7 +1717,14 @@ enum ItemType {
     /// implement the property at all. Our own daemon answers this way.
     Unsupported,
     /// The read failed or timed out. Nothing was established.
-    Unreadable(String),
+    ///
+    /// It carries no reason: the one caller turns it straight into
+    /// [`Refusal::UnreadableItemType`], which has no room for one. A payload
+    /// nothing reads is a payload nobody sanitises — one of the two
+    /// construction sites was passing a raw `zbus` error string, the only
+    /// unsanitised peer text in this module, waiting for whoever first decided
+    /// to print it.
+    Unreadable,
 }
 
 impl ItemType {
@@ -1676,8 +1750,7 @@ impl ItemType {
             {
                 ItemType::Unsupported
             }
-            Ok(Err(e)) => ItemType::Unreadable(display_label(&e.to_string())),
-            Err(_) => ItemType::Unreadable(format!("it did not answer within {CALL_TIMEOUT:?}")),
+            Ok(Err(_)) | Err(_) => ItemType::Unreadable,
         }
     }
 }
@@ -1688,8 +1761,10 @@ impl ItemType {
 /// our own daemon implements and which has no `Type`; extending them for a
 /// property only one foreign provider has would put a call in the CLI's path
 /// that our daemon answers with `UnknownProperty`. So the spec proxies are
-/// reused for all seven standard calls and this one non-standard property gets
-/// its own two-line proxy, whose absence is tolerated.
+/// reused for every standard call the walk makes — eighteen of them, across
+/// the `Service`, `Collection`, `Item`, `Prompt` and `Session` proxies — and
+/// this one non-standard property gets its own two-line proxy, whose absence
+/// is tolerated.
 #[zbus::proxy(
     interface = "org.freedesktop.Secret.Item",
     default_service = "org.freedesktop.secrets"
@@ -1740,7 +1815,7 @@ async fn read_metadata(
     // an unlock credential.
     let item_type = match proxy_at::<GnomeItemProxy<'static>>(conn, "Item.Type", path).await {
         Ok(proxy) => ItemType::classify(tokio::time::timeout(CALL_TIMEOUT, proxy.type_()).await),
-        Err(e) => ItemType::Unreadable(e.to_string()),
+        Err(_) => ItemType::Unreadable,
     };
 
     Ok(Metadata::Read(Box::new(ItemMetadata {
@@ -1795,7 +1870,7 @@ async fn fetch_secrets(
                 HashMap::new(),
                 Some(format!(
                     "Service.GetSecrets failed: {}",
-                    display_label(&e.to_string())
+                    error_text(&e.to_string())
                 )),
             ),
             Err(_) => (
@@ -1822,10 +1897,14 @@ async fn fetch_secrets(
     )
     .await;
 
-    // `SecretStruct::value` is a plain `Vec<u8>` and, on a `plain` session,
-    // it is the plaintext — a whole collection's worth of it held at once.
-    // Whatever is left in the map on any path out of here is wiped by hand,
-    // because the type does not wipe itself.
+    // `SecretStruct::value` is the plaintext on a `plain` session — a whole
+    // collection's worth of it held at once. The type does wipe itself:
+    // `value` is `Zeroizing` and its `Debug` redacts. What it cannot do is
+    // wipe *early*, and that is what this is for: the map outlives the last
+    // item that needed it, so whatever is left in it on any path out of here
+    // — the `?` paths included — is wiped here rather than whenever the
+    // `HashMap` happens to drop. `parameters` is a plain `Vec<u8>` and is
+    // wiped for the same reason.
     for secret in batch.values_mut() {
         secret.value.zeroize();
         secret.parameters.zeroize();
@@ -1877,7 +1956,7 @@ async fn drain_batch(
                 e: GnomeError| {
         skipped.push(SkippedEntry {
             label: display_label(label),
-            reason: display_label(&e.to_string()),
+            reason: error_text(&e.to_string()),
         });
         if first_failure.is_none() {
             *first_failure = Some(e);
@@ -2173,21 +2252,27 @@ mod tests {
         }
     }
 
-    /// The mapping is near-total: attributes byte-for-byte, timestamps
-    /// carried, nothing invented. An item with no `xdg:schema` gets no
-    /// synthesised one — two of 28 items on the author's machine have none,
-    /// and inventing one produces an item that looks migrated and is
-    /// unreachable.
+    /// The mapping is near-total and invents nothing. An item with no
+    /// `xdg:schema` gets no synthesised one — two of 28 items on the author's
+    /// machine have none, and inventing one produces an item that looks
+    /// migrated and is unreachable.
+    ///
+    /// Every assertion here is on [`ExtractedItem::report`]'s output, not on
+    /// the fields `extracted` set two lines above: `assert_eq!(e.item.created,
+    /// …)` on a value the test's own helper wrote is a test of the helper, and
+    /// it stayed green through any change to the code it was supposed to be
+    /// pinning.
     #[test]
     fn the_mapping_copies_and_invents_nothing() {
         let e = extracted(Some(TYPE_GENERIC), &[("server", "example.com")]);
         let report = e.report();
-        assert_eq!(
-            e.item.attributes,
-            BTreeMap::from([("server".to_string(), "example.com".to_string())])
-        );
-        assert_eq!(e.item.created, 1_788_893_013);
-        assert_eq!(e.item.modified, 1_788_893_014);
+        // Exactly the source's keys: none dropped, and no `xdg:schema`
+        // conjured for an item that had none.
+        assert_eq!(report.attribute_keys.iter().collect::<Vec<_>>(), ["server"]);
+        assert_eq!(report.label, "Test Item");
+        assert_eq!(report.content_type, "text/plain");
+        assert_eq!(report.secret_len, b"s3cr3t".len());
+        assert_eq!(report.provenance, e.item.provenance);
         assert_eq!(
             report.outcome,
             Some(super::super::Outcome::AttributesPreserved)
@@ -2195,6 +2280,7 @@ mod tests {
         assert!(report.refusals.is_empty());
         // Generic is the type our daemon *does* represent, so nothing is lost.
         assert_eq!(report.lost_item_type, None);
+        assert_eq!(report.unknown_item_type, None);
     }
 
     /// Item types other than generic have no target, so they flatten — and the
@@ -2249,6 +2335,37 @@ mod tests {
         assert!(!shown.contains('\n'), "{shown:?}");
         assert!(!shown.contains('\u{7}'), "{shown:?}");
         assert!(shown.contains("keyring.Evil"), "{shown:?}");
+    }
+
+    /// Error prose is sanitised without being truncated into uselessness.
+    ///
+    /// The finding this pins: `display_label`'s 64-character cut, applied to
+    /// [`StderrTail`] and to D-Bus error strings, threw away the cause the
+    /// message exists to carry. gnome-keyring's first stderr line is an
+    /// ~85-character capabilities warning, so "The password or PIN is
+    /// incorrect" — the one thing [`STDERR_CAPTURE_LIMIT`]'s 4 KiB is for —
+    /// was *guaranteed* to be past the cut.
+    #[test]
+    fn error_prose_keeps_its_cause_and_is_still_escaped_and_bounded() {
+        let stderr = "gnome-keyring-daemon: insufficient process capabilities, insecure \
+                      memory might get used\n\
+                      gnome-keyring-daemon: The password or PIN is incorrect";
+        assert!(stderr.find('\n').unwrap() > 64, "the premise of this test");
+        let shown = error_text(stderr);
+        assert!(
+            shown.contains("The password or PIN is incorrect"),
+            "the cause was cut off: {shown:?}"
+        );
+        // Sanitised all the same: nothing that can move a cursor survives.
+        assert!(!shown.contains('\n'), "{shown:?}");
+        assert!(shown.contains("\\x0a"), "{shown:?}");
+
+        // And still bounded: a peer does not choose how much of our output it
+        // fills. The cap is on the escaped bytes, so an escape cannot smuggle
+        // four bytes out of one.
+        let capped = error_text(&"\u{7}".repeat(4096));
+        assert!(capped.ends_with('\u{2026}'), "{capped:?}");
+        assert_eq!(capped.len(), ERROR_TEXT_LIMIT + '\u{2026}'.len_utf8());
     }
 
     /// gnome-keyring's per-item ACLs live in the encrypted half, which is
@@ -3363,7 +3480,7 @@ mod tests {
 
         let snapshot = KeyringSnapshot::create(&keyrings).expect("the snapshot is made");
         let password = Zeroizing::new(b"sm-import-snapshot-test".to_vec());
-        match PrivateKeyring::start(&password, Some(snapshot.data_home())).await {
+        match PrivateKeyring::start(&password, snapshot.data_home()).await {
             Ok(mut keyring) => keyring.shutdown().await,
             Err(e) => {
                 println!("SKIPPED: could not start a private gnome-keyring: {e}");
@@ -3384,22 +3501,25 @@ mod tests {
         assert_eq!(std::fs::read(keyrings.join("default")).unwrap(), before);
     }
 
-    /// `false`, with a printed reason, when this machine cannot run the live
-    /// extraction. A skip that says why is the only honest alternative to
+    /// `false`, with a printed reason, when one of `programs` is not on this
+    /// machine. A skip that says why is the only honest alternative to
     /// coverage; a silent pass is the failure mode the whole suite exists to
     /// avoid.
-    fn live_prerequisites() -> bool {
+    ///
+    /// Presence is "ran `--version` and exited zero". `status().is_err()`
+    /// alone accepts a binary that ran and failed, which is a broken tool
+    /// reported as a present one — so every live test asks the question here
+    /// rather than writing its own weaker version of it.
+    fn programs_present(programs: &[&str]) -> bool {
         let mut missing = Vec::new();
-        for program in ["dbus-daemon", GNOME_KEYRING_PROGRAM] {
-            // `is_err()` alone accepts a binary that ran and exited
-            // non-zero, which is a broken tool reported as a present one.
+        for program in programs {
             let ran = StdCommand::new(program)
                 .arg("--version")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
             if !matches!(ran, Ok(status) if status.success()) {
-                missing.push(program);
+                missing.push(*program);
             }
         }
         if missing.is_empty() {
@@ -3412,6 +3532,12 @@ mod tests {
         false
     }
 
+    /// `false`, with a printed reason, when this machine cannot run the live
+    /// extraction.
+    fn live_prerequisites() -> bool {
+        programs_present(&["dbus-daemon", GNOME_KEYRING_PROGRAM])
+    }
+
     /// The synthetic tests above pin the *decision*; this pins the two command
     /// invocations that feed it. A `busctl` whose output format moved, or a
     /// `ps` invoked with the wrong flag, would leave every synthetic test green
@@ -3420,17 +3546,8 @@ mod tests {
     /// source is stale.
     #[tokio::test]
     async fn the_real_bus_owner_check_runs_against_the_real_tools() {
-        for program in ["busctl", "ps"] {
-            if StdCommand::new(program)
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_err()
-            {
-                println!("SKIPPED: {program} is not installed");
-                return;
-            }
+        if !programs_present(&["busctl", "ps"]) {
+            return;
         }
         let owner = secrets_bus_owner().await.expect("the check itself failed");
         match &owner {
@@ -3455,13 +3572,19 @@ mod tests {
                     owner.is_gnome_keyring(),
                     program_name(command) == Some(GNOME_KEYRING_PROGRAM)
                 );
-                // The two providers that need no warning are gnome-keyring
-                // itself and us.
-                assert_eq!(
-                    owner.foreign_provider_warning().is_none(),
-                    owner.is_gnome_keyring() || owner.is_secret_manager()
-                );
             }
+        }
+        // Not `warning.is_none() == is_gnome_keyring() || is_secret_manager()`,
+        // which is `foreign_provider_warning`'s own guard clause restated: it
+        // passes however wrong the guard is, and it sat inside the `Process`
+        // arm, which does not run at all on a machine where nothing owns the
+        // name. What a live run can pin instead is that the sentence is built
+        // from what the real `ps` said, rather than from a constant.
+        if let Some(warning) = owner.foreign_provider_warning() {
+            assert!(
+                warning.contains(&owner.describe()),
+                "the warning does not name the owner it is about: {warning:?}"
+            );
         }
         // Whatever the answer, it renders without panicking and names the bus.
         assert!(owner.describe().contains(SECRETS_BUS_NAME));
@@ -3483,7 +3606,7 @@ mod tests {
         }
         let data_home = tempfile::tempdir().expect("a writable temp directory");
         let password = Zeroizing::new(b"sm-import-live-test".to_vec());
-        let mut keyring = match PrivateKeyring::start(&password, Some(data_home.path())).await {
+        let mut keyring = match PrivateKeyring::start(&password, data_home.path()).await {
             Ok(k) => k,
             Err(e) => {
                 println!("SKIPPED: could not start a private gnome-keyring: {e}");

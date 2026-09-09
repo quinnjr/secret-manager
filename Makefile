@@ -38,6 +38,14 @@ test:
 	# wire-format changes. Type-check it here so a change to a shared type
 	# cannot silently disable the fuzz layer.
 	$(CARGO) $(FUZZ_NIGHTLY) check --manifest-path fuzz/Cargo.toml --all-targets
+	# A type-check is not a run. `fuzz/src/lib.rs` carries self-tests whose
+	# whole subject is a generator disagreeing with its own oracle — the
+	# `parses()`/`decodes()` predicates the targets assert on, and the
+	# allocation bound they measure against. Nothing else executes them, so
+	# without this line they are checks that have never checked anything, and
+	# a generator bug surfaces instead as a libFuzzer artifact that reads
+	# like a parser bug.
+	$(CARGO) $(FUZZ_NIGHTLY) test --manifest-path fuzz/Cargo.toml --lib
 	# The PAM feature is a library-only build: the integration tests pull the
 	# crate back in with its default features, which the mutual-exclusion
 	# guard in src/lib.rs correctly rejects.

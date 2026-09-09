@@ -33,8 +33,8 @@ for `dbus-run-session`.
 
 `vagrant/build.sh` builds as the normal user and `sudo`s only the install
 step, as `docs/install-common.md` instructs, then checks the toolchain is
-actually new enough rather than trusting the package name, and reports where
-every installed file landed.
+actually new enough rather than trusting the package name, and fails if any
+documented install path did not land.
 
 `vagrant/verify.sh` proves the result works:
 
@@ -54,7 +54,8 @@ every installed file landed.
   `vagrant ssh` leaves a working box.
 
 Every check prints `ok` or `FAIL` and the script exits non-zero if any
-failed, so `vagrant up` is itself the test run.
+failed, so `make vagrant-verify` is itself the test run — see the Makefile
+for why a bare `vagrant up` is not.
 
 The box gets a private network and no forwarded ports beyond SSH: the daemon
 is a session-bus service and nothing here should be reachable from outside

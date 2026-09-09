@@ -18,6 +18,13 @@ use zeroize::Zeroizing;
 /// the definition is what makes that true for all of them at once rather than
 /// at whichever call site last remembered to wipe by hand.
 ///
+/// What it covers is *this struct's* copy, and only that. On a `plain`
+/// session the same bytes are also serialised into the zbus message body and
+/// handed to the kernel's socket buffer, and neither of those is `Zeroizing`;
+/// a `plain` secret therefore still leaves copies this type cannot reach. The
+/// answer to that is the `dh-ietf1024-sha256-aes128-cbc-pkcs7` session, where
+/// what reaches the wire is ciphertext — not a wider `Zeroizing`.
+///
 /// `parameters` is deliberately *not* `Zeroizing`. It is empty on a `plain`
 /// session and the AES-CBC IV on a `dh-ietf1024-sha256-aes128-cbc-pkcs7` one
 /// (`SessionCipher::encrypt`); an IV is public by construction and travels

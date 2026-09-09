@@ -235,11 +235,17 @@ impl<'a> Cursor<'a> {
         Ok(declared as usize)
     }
 
-    /// gnome-keyring's length prefix. `0xffffffff` is its NULL marker — not
-    /// a length — so it is answered with `None` rather than run through
-    /// [`Self::count`], which would (rightly) refuse four billion bytes as
-    /// impossible. Every length prefix in the format carries this marker, so
-    /// every reader of one goes through here.
+    /// gnome-keyring's length prefix for a **string** — a keyring name, an
+    /// attribute name, a hashed attribute value. `0xffffffff` is the NULL
+    /// marker for those, not a length, so it is answered with `None` rather
+    /// than run through [`Self::count`], which would (rightly) refuse four
+    /// billion bytes as impossible. Every *string* length prefix in the
+    /// format carries the marker, so every reader of one goes through here.
+    ///
+    /// The ciphertext length is deliberately not one of them: it is a plain
+    /// count, read with [`Self::u32`] and [`Self::count`], because there is
+    /// no NULL ciphertext and a declared `0xffffffff` there is a file
+    /// claiming four gigabytes of encrypted half — a refusal, not a `None`.
     fn opt_len(&mut self, field: &'static str) -> Result<Option<usize>, HeaderError> {
         let len = self.u32(field)?;
         if len == u32::MAX {
@@ -403,6 +409,12 @@ pub fn parse_keyring_header(bytes: &[u8]) -> Result<KeyringInventory, HeaderErro
     // The encrypted half is length-prefixed. Its length is read so that a
     // file claiming more ciphertext than it holds is refused here rather than
     // by whatever reads it next; the bytes themselves are never touched.
+    //
+    // A plain `u32` plus `count`, not `opt_len`: this is the one length in
+    // the format that is not a string prefix, so it carries no NULL marker,
+    // and `0xffffffff` here means a file declaring four gigabytes of
+    // ciphertext it does not hold. That must be an `ImpossibleLength`, which
+    // is exactly what `opt_len` would turn into a `None`.
     let declared_len = c.u32("ciphertext length")?;
     let ciphertext_len = c.count(declared_len, 1, "ciphertext length")?;
     let ciphertext_offset = c.pos;

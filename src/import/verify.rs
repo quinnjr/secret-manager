@@ -888,7 +888,21 @@ impl Verification {
         if self.fingerprints_compared.is_none() {
             out.push("no destination was written, so no fingerprint was compared".to_string());
         }
-        if self.probes.not_issued > 0 {
+        // No probe at all is not "every probe passed". `probe_plan` skips an
+        // item with no attributes — `SearchItems({})` matches every item in
+        // every collection, so a probe for it would pass for reasons that have
+        // nothing to do with this import — so a source whose items are all
+        // attribute-less produces an empty plan, and an empty plan makes
+        // `passed == failed == not_issued == 0`. Without this line such a run
+        // proves discoverability for nothing, reports nothing unproved, and
+        // earns the decommission recommendation, which is the one conclusion
+        // an unprobed run may not reach.
+        if self.probes.total() == 0 {
+            out.push(
+                "no attribute set was probed, so no lookup was proved against a running daemon"
+                    .to_string(),
+            );
+        } else if self.probes.not_issued > 0 {
             out.push(format!(
                 "{} of {} lookup probes were not issued, so discoverability is unproved",
                 self.probes.not_issued,
@@ -1357,5 +1371,54 @@ mod tests {
         let json = serde_json::to_string(&v).unwrap();
         let back: Verification = serde_json::from_str(&json).unwrap();
         assert_eq!(back, v);
+    }
+
+    /// A run that probed **nothing** has not proved discoverability.
+    ///
+    /// `probe_plan` skips an item with no attributes, so a source whose items
+    /// are all attribute-less plans no probe at all, and every counter is
+    /// zero: `not_issued > 0` is false, `probes.failed == 0` is true, and the
+    /// run reported nothing unproved and earned the "decommission the old
+    /// provider" recommendation on the strength of a check that never
+    /// happened. Zero probes is the emptiest possible evidence, not the
+    /// strongest.
+    #[test]
+    fn a_run_that_probed_nothing_at_all_is_unproved() {
+        let no_attributes = [item(&[], b"a"), item(&[], b"b")];
+        let plan = probe_plan(&no_attributes);
+        assert!(plan.is_empty(), "an attribute-less item must not be probed");
+
+        let v = Verification {
+            count: CountCheck::new(Some(2), 2),
+            fingerprint_mismatches: Vec::new(),
+            fingerprints_compared: Some(2),
+            hash_table_misses: Vec::new(),
+            hash_table_checked: None,
+            probes: ProbeSummary::of(&[]),
+            failed_probes: Vec::new(),
+            source_lengths: Histogram::of_lengths([1, 1]),
+            destination_lengths: Some(Histogram::of_lengths([1, 1])),
+            length_differences: Vec::new(),
+        };
+        // Every check it made agreed — and it made no lookup check at all.
+        assert!(v.passed());
+        let unproved = v.unproved();
+        assert_eq!(unproved.len(), 1, "{unproved:?}");
+        assert!(
+            unproved[0].contains("no attribute set was probed"),
+            "{unproved:?}"
+        );
+
+        // And the ordinary case is unchanged: probes that were issued and
+        // passed leave nothing unproved.
+        let probed = Verification {
+            probes: ProbeSummary {
+                passed: 1,
+                failed: 0,
+                not_issued: 0,
+            },
+            ..v.clone()
+        };
+        assert!(probed.unproved().is_empty(), "{:?}", probed.unproved());
     }
 }

@@ -198,9 +198,12 @@ fn absurd_header_length_is_rejected_without_allocating() {
 /// * `salt` changes the derived key, so the failure comes from decryption
 ///   with the wrong key, not from the tag.
 /// * `version` is refused by the parser before any key is derived, so
-///   `Vault::open` never returns. That is a *stronger* outcome, but it is a
-///   different mechanism, so the field's AEAD coverage is asserted separately
-///   and directly against `crypto::open`.
+///   `Vault::open` never returns.
+///
+/// Both are *stronger* outcomes, but both are a different mechanism, so both
+/// fields' AEAD coverage is asserted separately and directly against
+/// `crypto::open`. Without that, removing either from the associated data
+/// would leave this test green.
 ///
 /// `nonce` matters more than it looks: it is passed to `crypto::open`
 /// separately as well as living in the associated data, so an encoder that
@@ -246,104 +249,132 @@ fn every_header_field_is_authenticated() {
     let file = VaultFile::decode(&bytes).unwrap();
 
     // The table below is only "every field" for as long as something ties it
-    // to the struct. This destructure is that tie: it names every field of
-    // `format::Header` with no `..`, so adding one is a compile error here —
-    // `E0027`, missing field — and not a green run over an uncovered field.
+    // to the struct. This destructure is that tie, and it binds a *name* per
+    // field rather than a `_` on purpose. `_` tied only field existence:
+    // adding a field to `format::Header` was a compile error here (`E0027`,
+    // missing field), but writing `foo: _` answered it and the run stayed
+    // green over a field no row covers. Every binding below is consumed by
+    // the row that covers it, through `row!`, so an uncovered field is an
+    // unused binding — `unused_variables`, an error under the clippy gate.
     //
-    // **Every binding named here must appear as a row in `mutate` below**,
-    // and `kdf` appears as three rows: its costs are separate fields in the
+    // `kdf` is consumed by three rows: its costs are separate fields in the
     // postcard encoding, so a partial associated data would leave the two
     // that are not `t_cost` writable.
     let format::Header {
-        version: _,
-        label: _,
-        created: _,
-        modified: _,
-        kdf: _,
-        salt: _,
-        index_salt: _,
-        nonce: _,
-        index: _,
+        version,
+        label,
+        created,
+        modified,
+        // Not `kdf`: that name is the `KdfParams` this vault was created
+        // with, and it is used again below.
+        kdf: kdf_field,
+        salt,
+        index_salt,
+        nonce,
+        index,
     } = &file.header;
 
+    // One row of the table. The first argument is the binding from the
+    // destructure above that the row covers; consuming it there is the whole
+    // mechanism described above.
+    macro_rules! row {
+        ($field:expr, $name:expr, $f:expr, $caught:expr) => {{
+            let _ = $field;
+            ($name, Box::new($f) as HeaderMutation, $caught)
+        }};
+    }
+
     let mutate: Vec<(&str, HeaderMutation, CaughtBy)> = vec![
-        (
+        row!(
+            label,
             "label",
-            Box::new(|h: &mut format::Header| h.label = "evil".into()),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.label = "evil".into(),
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            created,
             "created",
-            Box::new(|h: &mut format::Header| h.created ^= 1),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.created ^= 1,
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            modified,
             "modified",
-            Box::new(|h: &mut format::Header| h.modified ^= 1),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.modified ^= 1,
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            index_salt,
             "index_salt",
-            Box::new(|h: &mut format::Header| h.index_salt[0] ^= 1),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.index_salt[0] ^= 1,
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            index,
             "index id",
-            Box::new(|h: &mut format::Header| {
+            |h: &mut format::Header| {
                 if let Some(e) = h.index.first_mut() {
                     e.id = "zzz".into();
                 }
-            }),
-            CaughtBy::Crypto,
+            },
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            index,
             "index hash",
-            Box::new(|h: &mut format::Header| {
+            |h: &mut format::Header| {
                 if let Some(e) = h.index.first_mut()
                     && let Some(x) = e.attr_hashes.first_mut()
                 {
                     x[0] ^= 1;
                 }
-            }),
-            CaughtBy::Crypto,
+            },
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            kdf_field,
             "kdf t_cost",
-            Box::new(|h: &mut format::Header| h.kdf.t_cost += 1),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.kdf.t_cost += 1,
+            CaughtBy::Crypto
         ),
         // The other two costs were covered only through `t_cost`, which
         // proves nothing about them: they are separate fields in the postcard
         // encoding and a partial AAD would leave them writable.
-        (
+        row!(
+            kdf_field,
             "kdf m_cost_kib",
-            Box::new(|h: &mut format::Header| h.kdf.m_cost_kib += 8),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.kdf.m_cost_kib += 8,
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            kdf_field,
             "kdf p_cost",
-            Box::new(|h: &mut format::Header| h.kdf.p_cost += 1),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.kdf.p_cost += 1,
+            CaughtBy::Crypto
         ),
         // The nonce is handed to `crypto::open` separately, so this row would
         // stay green even without the AAD — see the direct check below, which
         // is the one that pins its AAD coverage.
-        (
+        row!(
+            nonce,
             "nonce",
-            Box::new(|h: &mut format::Header| h.nonce[0] ^= 1),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.nonce[0] ^= 1,
+            CaughtBy::Crypto
         ),
         // The salt is detected by deriving a different key rather than by the
-        // tag, but it is still a header field and still must not be flippable.
-        (
+        // tag, so this row too would stay green without the AAD — the direct
+        // check below is what pins its coverage.
+        row!(
+            salt,
             "salt",
-            Box::new(|h: &mut format::Header| h.salt[0] ^= 1),
-            CaughtBy::Crypto,
+            |h: &mut format::Header| h.salt[0] ^= 1,
+            CaughtBy::Crypto
         ),
-        (
+        row!(
+            version,
             "version",
-            Box::new(|h: &mut format::Header| h.version ^= 1),
-            CaughtBy::Parser,
+            |h: &mut format::Header| h.version ^= 1,
+            CaughtBy::Parser
         ),
     ];
     for (name, f, caught_by) in mutate {
@@ -369,12 +400,13 @@ fn every_header_field_is_authenticated() {
         }
     }
 
-    // `version` and `nonce`, checked directly against the AEAD rather than
-    // through `Vault`, because their `CaughtBy` above is satisfied by a
-    // mechanism other than the associated data. This is what makes the test's
-    // name true for them: the *only* thing that changes is a header field, the
-    // key and the nonce argument are the originals, and the tag must still
-    // refuse it.
+    // `version`, `nonce` and `salt`, checked directly against the AEAD rather
+    // than through `Vault`, because their `CaughtBy` above is satisfied by a
+    // mechanism other than the associated data — the parser for `version`, the
+    // separate nonce argument for `nonce`, a different derived key for `salt`.
+    // This is what makes the test's name true for them: the *only* thing that
+    // changes is a header field, the key and the nonce argument are the
+    // originals, and the tag must still refuse it.
     let key = crypto::derive_key(b"pw", &file.header.salt, kdf).unwrap();
     assert!(
         crypto::open(&key, &file.header.nonce, &file.aad, &file.ciphertext).is_ok(),
@@ -386,6 +418,7 @@ fn every_header_field_is_authenticated() {
             Box::new(|h: &mut format::Header| h.version ^= 1) as HeaderMutation,
         ),
         ("nonce", Box::new(|h: &mut format::Header| h.nonce[0] ^= 1)),
+        ("salt", Box::new(|h: &mut format::Header| h.salt[0] ^= 1)),
     ] {
         let mut h = file.header.clone();
         f(&mut h);

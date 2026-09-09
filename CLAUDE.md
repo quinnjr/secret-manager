@@ -285,18 +285,46 @@ carefully placed call — and it is what both `unique_collection_id` and
 `save_aliases` were before they were deleted, each kept alive by its own unit
 tests.
 
+A guard nobody binds is still a guard. `vault.lock().await.item_ids()` — an
+acquisition consumed as a **temporary** — is how `src/dbus/` reaches a vault
+about twenty-five times (`collection.rs`, `prompt.rs`, `registry.rs`,
+`state.rs`), and for a while it opened no region at all: a guard was pushed
+only by a `let` binding or a signature seed, so the blocking check and the
+call-graph edge both saw nothing held and both early-returned. A mutator
+written that way — `vault.lock().await.update_item(id, f)` — was reported by
+neither instrument, and neither was
+`state.lock().await.vault(id).unwrap().lock().await`, which holds both locks in
+one statement. A temporary's region is now the statement that produced it,
+which is Rust's own rule, and the receiver of a method call is visited before
+the call so that the acquisition's own `.await` is not read as a second lock.
+The near-miss matters as much as the offender here: the cheap read that shape
+is normally used for must stay clean, or the scan is unusable. The `.await` is
+also what tells an acquisition from an ordinary call: `Vault::lock` shares its
+name with the acquisitions and so was skipped everywhere, permanently
+unfollowable from any caller; `recv.lock().await` is the acquisition and a bare
+`v.lock()` is a call like any other.
+
 **What the scan still does not do.** It has no type inference; it knows only
 the types that signatures, struct fields and `type` aliases write down, so a
 receiver typed by inference alone resolves to nothing and the call is not
-followed. It cannot follow a **higher-order** call — a function passed as a
-value and invoked through a parameter, which is exactly why `Vault::save`'s
-publish step needs the name list. It reads a macro body as text, not as
-grammar. It treats an `.await` under a *collection's* lock as ordinary, which
-is what the rules above sanction but means a genuinely slow await there is not
-reported. It says nothing about how long a bounded piece of work takes, only
-about what kind it is. And it is still a source scan: it proves a property of
-the tree as written, and the runtime half of this file exists because that is
-not the same as a property of an execution.
+followed — and *only* initialisers, signatures, fields and aliases are read, so
+a type written in a `let` annotation (`let v: Vault = …`) is never seen at all.
+It cannot follow a **higher-order** call — a function passed as a value and
+invoked through a parameter, which is exactly why `Vault::save`'s publish step
+needs the name list. It reads a macro body as text, not as grammar, and only
+partly: the token text of a macro invocation is matched against the acquisition
+names and `BLOCKING_FNS`, **not** against `BLOCKING_METHODS` and not against the
+`.await`-under-the-state-guard rule, so a vault mutator or an await written
+inside a `select!` — `src/daemon.rs` has one — is invisible there. (String and
+char literals are skipped before that matching, so a log line naming a syscall
+is not a finding; that direction was a false positive, and a rule that reports
+source which does not exist is as bad as one that reports nothing.) It treats an
+`.await` under a *collection's* lock as ordinary, which is what the rules above
+sanction but means a genuinely slow await there is not reported. It says nothing
+about how long a bounded piece of work takes, only about what kind it is. And it
+is still a source scan: it proves a property of the tree as written, and the
+runtime half of this file exists because that is not the same as a property of
+an execution.
 
 Run `cargo fmt` before trusting a failure from any of this — it reads
 formatted source.

@@ -234,10 +234,17 @@ mod tests {
         assert_eq!(c.kdf.m_cost_kib, 65536);
         assert_eq!(c.kdf.t_cost, 3);
         assert_eq!(c.kdf.p_cost, 1);
-        // The literals above are the spec's; these are the vault layer's own
-        // defaults, and the two must be the same three numbers. `KdfConfig`
-        // is defined from `KdfParams` so they cannot drift, and this fails if
-        // that definition is ever unwound back into a second set of literals.
+        // The literals above are the spec's, and they are what catches a
+        // drift in the shipped parameters: `KdfConfig::default` is *defined*
+        // from `KdfParams::default`, so asserting the two agree cannot catch
+        // a change to those three numbers - both sides move together.
+        //
+        // What it does catch is the conversion between the two types: this is
+        // the round trip `KdfParams -> KdfConfig -> KdfParams`, and a `From`
+        // impl that dropped a cost or transposed `t_cost` and `p_cost` fails
+        // here while every assertion above still passes. It would also fail
+        // if `KdfConfig::default` were unwound back into literals that
+        // disagree with the vault layer's.
         assert_eq!(
             crate::vault::crypto::KdfParams::from(c.kdf),
             crate::vault::crypto::KdfParams::default()

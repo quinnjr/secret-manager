@@ -70,16 +70,22 @@ fuzz_target!(|data: &[u8]| {
 
     // The dumb case first: arbitrary bytes, which is what a truncated write
     // or an entirely wrong file actually looks like.
+    // The peak is snapshotted *before* `check_self_consistent`, which
+    // allocates a `BTreeMap` cloning every attribute name. Sampling after it
+    // would make the assertion's subject "the parser plus this helper"
+    // rather than the parser — the structured path below gets this right,
+    // and all three paths must.
     smfuzz::reset_peak();
-    if let Ok(inv) = parse_keyring_header(data) {
+    let parsed = parse_keyring_header(data);
+    let peak = smfuzz::peak();
+    assert!(
+        peak <= smfuzz::decode_alloc_bound(data.len()),
+        "parsing {} raw bytes allocated {peak}",
+        data.len(),
+    );
+    if let Ok(inv) = parsed {
         check_self_consistent(&inv, data);
     }
-    assert!(
-        smfuzz::peak() <= smfuzz::decode_alloc_bound(data.len()),
-        "parsing {} raw bytes allocated {}",
-        data.len(),
-        smfuzz::peak()
-    );
 
     // The structured case.
     let Ok(spec) = smfuzz::KeyringBytes::arbitrary(&mut u) else {
@@ -151,10 +157,15 @@ fuzz_target!(|data: &[u8]| {
     // interrupted write is the commonest malformation there is.
     if let Ok(cut) = u.int_in_range(0..=bytes.len().saturating_sub(1)) {
         smfuzz::reset_peak();
-        if let Ok(inv) = parse_keyring_header(&bytes[..cut]) {
+        let parsed = parse_keyring_header(&bytes[..cut]);
+        let peak = smfuzz::peak();
+        assert!(
+            peak <= smfuzz::decode_alloc_bound(cut),
+            "parsing a {cut}-byte prefix allocated {peak}"
+        );
+        if let Ok(inv) = parsed {
             check_self_consistent(&inv, &bytes[..cut]);
         }
-        assert!(smfuzz::peak() <= smfuzz::decode_alloc_bound(cut));
     }
 
     // The `default` file rides along: it is read from the same directory, by

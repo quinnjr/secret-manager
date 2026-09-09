@@ -339,21 +339,33 @@ fn no_source_file_acquires_a_lock_while_holding_one() {
     // `state_params >= 3` against exactly three call sites, so re-inlining
     // any one of them would have failed with a message blaming the matcher
     // for something the matcher had got right.
+    //
+    // Every one of them counts **production** definitions only. They used to
+    // filter `reg.defs` without `!d.in_test` while `entry_points` correctly
+    // skipped test roots, so a refactor that moved production code out from
+    // under the scan could have left every floor satisfied by
+    // `src/dbus/state.rs`'s own `#[cfg(test)]` fixtures — which build states
+    // and lock vaults by hand — with the assertion message asserting the
+    // opposite of what it had measured. Filtering them cost 156 of 418
+    // "functions" and 3 of 68 guard bindings; the seeds were production-only
+    // already, which is luck rather than design. Current readings, from which
+    // these floors are derived: 262 functions, 65 guard bindings, 18 seeds,
+    // 15 receiver seeds, 68 guarded functions, 792 guarded call sites.
     assert!(
-        found.functions >= 120,
+        found.functions >= 200,
         "the scan parsed only {} functions out of {} files, so it is not looking \
          at what it thinks it is",
         found.functions,
         files.len()
     );
     assert!(
-        found.guard_bindings >= 40,
+        found.guard_bindings >= 45,
         "the scan recognised only {} `let`-bound guards, so the acquisition \
          rule has stopped matching the tree",
         found.guard_bindings
     );
     assert!(
-        found.seeds >= 12,
+        found.seeds >= 14,
         "the scan recognised only {} functions whose signature puts their whole \
          body under the state guard — a `&ServiceState`/`MutexGuard` parameter \
          or a `&self` receiver on `ServiceState` — so that rule is no longer \
@@ -376,7 +388,7 @@ fn no_source_file_acquires_a_lock_while_holding_one() {
     // and every rule above is back to being defeatable by one `fn` boundary,
     // which is the failure mode that motivated the rewrite.
     assert!(
-        found.guarded_fns >= 25 && found.guarded_calls >= 200,
+        found.guarded_fns >= 45 && found.guarded_calls >= 500,
         "the scan reached only {} functions and {} call sites with a lock held, \
          so the call graph is not being walked and every rule here is one \
          delegation away from proving nothing",
@@ -1034,6 +1046,59 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
             "async fn f() {\n    let mut vault = vault.lock().await;\n    \
              vault.import_items(batch)?;\n}\n",
         ),
+        // ---- The guard nobody binds. -------------------------------------
+        //
+        // A guard pushed onto `held` came only from `visit_local` or a
+        // signature seed, so an acquisition consumed as a **temporary**
+        // opened no region at all: `innermost()` was `None`, and both the
+        // blocking check in `visit_expr_method_call` and `note_call`
+        // early-return on that. The name list and the call graph went blind
+        // together, and `src/dbus/` writes this shape about twenty-five times
+        // — `collection.rs:173,380,427`, `prompt.rs:450`, `registry.rs:31`,
+        // `state.rs:681`. Every callee there is cheap today, so there was no
+        // live bug; there was also no protection.
+        (
+            "a `Vault` mutator on a temporary collection guard",
+            "type VaultRef = Arc<Mutex<Vault>>;\nstruct Item {\n    coll: VaultRef,\n}\n\
+             impl Item {\n    async fn update(&self, id: &str) -> Result<()> {\n        \
+             self.coll.lock().await.update_item(id, f)\n    }\n}\n",
+        ),
+        (
+            // The graph half of the same hole, with nothing on any list:
+            // reported only because the temporary opens a region *and* the
+            // receiver is typed through it, so the edge into `Vault::rewrite`
+            // is drawn and walked with the lock held.
+            "a graph-only blocking `Vault` method on a temporary collection guard",
+            "type VaultRef = Arc<Mutex<Vault>>;\nstruct Item {\n    coll: VaultRef,\n}\n\
+             impl Item {\n    async fn update(&self) -> Result<()> {\n        \
+             self.coll.lock().await.rewrite()\n    }\n}\n\
+             impl Vault {\n    fn rewrite(&mut self) -> Result<()> {\n        \
+             file.sync_all()\n    }\n}\n",
+        ),
+        (
+            // Rule two, defeated by the same hole. Both guards here are
+            // temporaries and both are live at once — the state guard lives to
+            // the end of the statement, and the collection lock is taken
+            // inside it. The state half of this shape was covered only by
+            // accident, because `vault` resolves to a `&self` method on
+            // `ServiceState` and those are seeded; the collection half — the
+            // one place `block_in_place` is mandatory — was invisible.
+            "two locks in one statement, both taken as temporaries",
+            "async fn f(id: &str) {\n    \
+             state.lock().await.vault(id).unwrap().lock().await.is_locked();\n}\n",
+        ),
+        // ---- `Vault::lock`, which was permanently unfollowable. ----------
+        // Its name collides with `ACQUIRE`, so `note_call` was skipped for
+        // every method called `lock` and no edge was ever drawn into it from
+        // anywhere. It is cheap today and on no list. The `.await` is what
+        // tells the two apart: an acquisition is always `recv.lock().await`.
+        (
+            "a blocking `Vault::lock` called bare, under the state guard",
+            "async fn f(state: &Shared, p: &Path) {\n    let st = state.lock().await;\n    \
+             let mut v = Vault::open(p)?;\n    v.lock();\n}\n\
+             impl Vault {\n    fn lock(&mut self) {\n        \
+             std::fs::create_dir_all(&self.dir).ok();\n    }\n}\n",
+        ),
         // ---- The `.await` half of rule one. ------------------------------
         // `CLAUDE.md`: "Not an `.await` that can block, and not a synchronous
         // blocking call either." Only the synchronous half was ever checked,
@@ -1143,9 +1208,51 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
              g.arc()\n    };\n    let v = a.lock().await;\n}\n",
         ),
         (
-            "a temporary, which is not a guard",
+            // A temporary guard *is* a region now, but Rust ends it with the
+            // statement that produced it, so the lock on the next line is
+            // taken with nothing held. This case used to be named "a
+            // temporary, which is not a guard" and passed because temporaries
+            // were modelled as nothing at all; it passes now because the
+            // region is modelled and has ended.
+            "a second lock after a temporary guard's statement has ended",
             "async fn f() {\n    self.state.lock().await.touch();\n    \
              let v = vault.lock().await;\n}\n",
+        ),
+        (
+            // The near-miss that decides whether any of this is usable. This
+            // is what `src/dbus/` writes about twenty-five times —
+            // `collection.rs:380`, `registry.rs:31`, `state.rs:681` — and
+            // every callee is a map read. Flagging it would make the scan
+            // useless, so the temporary must open a region the graph walks
+            // *through* rather than one it reports on sight.
+            "a cheap read on a temporary collection guard",
+            "type VaultRef = Arc<Mutex<Vault>>;\nstruct Item {\n    coll: VaultRef,\n}\n\
+             impl Item {\n    async fn ids(&self) -> Vec<String> {\n        \
+             self.coll.lock().await.item_ids()\n    }\n}\n\
+             impl Vault {\n    fn item_ids(&self) -> Vec<String> {\n        \
+             self.index.iter().map(|e| e.id.clone()).collect()\n    }\n}\n",
+        ),
+        (
+            // The near-miss for `Vault::lock`: the acquisition is not a call
+            // to a method named `lock`, even where the receiver is typed and a
+            // `Vault::lock` definition is right there to resolve to.
+            //
+            // Honest about what it pins: reverting the fix does **not** make
+            // this case fail, and it cannot, because an acquisition is only
+            // ever reached with nothing held — anywhere a guard *is* held, a
+            // second acquisition is already reported as one. So the edge, if
+            // it were drawn, would be drawn unguarded and cost nothing. This
+            // case is the shape a future edit would break first; the real
+            // check on the over-flagging direction is
+            // `no_source_file_acquires_a_lock_while_holding_one`, where 65
+            // acquisitions meet the real `Vault::lock`.
+            "the acquisition `.lock().await`, beside a real `Vault::lock`",
+            "type VaultRef = Arc<Mutex<Vault>>;\nstruct Item {\n    coll: VaultRef,\n}\n\
+             impl Item {\n    async fn ids(&self) -> Vec<String> {\n        \
+             let v = self.coll.lock().await;\n        v.item_ids()\n    }\n}\n\
+             impl Vault {\n    fn lock(&mut self) {\n        \
+             std::fs::create_dir_all(&self.dir).ok();\n    }\n    \
+             fn item_ids(&self) -> Vec<String> {\n        Vec::new()\n    }\n}\n",
         ),
         (
             "blocking I/O with no lock held at all",
@@ -1382,6 +1489,32 @@ fn the_scan_reports_the_source_it_claims_to_reject() {
             "an `if let` chain whose scrutinees take no lock",
             "async fn f() {\n    if let Some(v) = self.lookup(id)\n        \
              && v.is_ready()\n    {\n        v.save();\n    }\n}\n",
+        ),
+        // ---- The macro rule's near-misses, which it had none of. ---------
+        // `visit_macro` matched its patterns against the whole token text,
+        // string literals included, and the whitespace stripping made it
+        // worse. There was an offender for the rule and the nearest clean case
+        // deliberately used a *function call* rather than a macro, so the
+        // coverage was illusory: nothing in this file would have failed if the
+        // rule had started reporting every log line that mentions a syscall.
+        (
+            "a blocking name inside a string literal in a macro under a guard",
+            "async fn f() {\n    let g = self.state.lock().await;\n    \
+             tracing::debug!(\"about to sync_all() the vault\");\n}\n",
+        ),
+        (
+            "an acquisition inside a string literal in a macro under a guard",
+            "async fn f() {\n    let g = self.state.lock().await;\n    \
+             tracing::warn!(\"callers must take vault.lock().await first\");\n}\n",
+        ),
+        (
+            // The other half, and the reason the whitespace stripping made the
+            // rule worse rather than merely imprecise: it joined words that
+            // are not adjacent in the source, so a literal that does not
+            // contain `sync_all(` at all matched once the spaces were gone.
+            "words in a macro's string literal that only touch once whitespace is stripped",
+            "async fn f() {\n    let g = self.state.lock().await;\n    \
+             tracing::debug!(\"about to sync _all() the vault\");\n}\n",
         ),
         (
             // The point of this case is that the closure's blocking body runs
@@ -2103,10 +2236,25 @@ fn acquisition_recv(e: &syn::Expr) -> Option<&syn::Expr> {
 }
 
 fn await_acquisition(a: &syn::ExprAwait) -> Option<&syn::Expr> {
+    await_acquisition_call(a).map(|m| &*m.receiver)
+}
+
+/// The `.lock()`/`.read()`/… call an acquisition is made of, not merely its
+/// receiver.
+///
+/// The distinction is what makes `Vault::lock` followable. Its name collides
+/// with [`ACQUIRE`], and while the acquisition was recognised only by name the
+/// scan skipped `note_call` for *every* method called `lock`, so no edge was
+/// ever drawn into that method from anywhere — it was permanently invisible,
+/// cheap today and on no list. An acquisition is always `recv.lock().await`;
+/// a bare `v.lock()` is an ordinary call. Knowing which node is the
+/// acquisition's own lets [`Walk::visit_expr_await`] skip that one node and
+/// treat every other `lock` as the call it is.
+fn await_acquisition_call(a: &syn::ExprAwait) -> Option<&syn::ExprMethodCall> {
     let syn::Expr::MethodCall(m) = strip_try(&a.base) else {
         return None;
     };
-    (ACQUIRE.contains(&m.method.to_string().as_str()) && m.args.is_empty()).then_some(&*m.receiver)
+    (ACQUIRE.contains(&m.method.to_string().as_str()) && m.args.is_empty()).then_some(m)
 }
 
 /// Which lock an acquisition takes, with no type information: used where
@@ -2226,6 +2374,15 @@ struct Held {
     kind: Guard,
     label: String,
     depth: usize,
+    /// A guard produced as a **temporary**, by an acquisition nobody binds:
+    /// `vault.lock().await.update_item(id, f)`. Rust keeps such a temporary
+    /// alive to the end of the enclosing statement, so that is the region,
+    /// and [`Walk::drop_temporaries`] is what ends it. Modelling it is the
+    /// difference between watching the shape `src/dbus/` actually writes and
+    /// watching nothing at all: a temporary was pushed onto `held` by nothing,
+    /// so `innermost()` was `None` and both the blocking check and `note_call`
+    /// early-returned — the name list and the call graph blind together.
+    temporary: bool,
 }
 
 /// A call site, as far as a signature-only view can describe it.
@@ -2284,6 +2441,30 @@ impl<'a> Walk<'a> {
             .iter()
             .find(|h| h.kind == Guard::State)
             .or_else(|| self.held.last())
+    }
+
+    /// End every temporary guard region opened above `base`.
+    ///
+    /// A temporary guard lives to the end of the statement that produced it —
+    /// that is Rust's rule, not an approximation of one — so a statement is
+    /// where its region ends. The `base` index is what keeps a temporary
+    /// opened by an *enclosing* expression alive across a nested statement:
+    /// `foo(v.lock().await.id(), { … })` holds the guard inside the block too.
+    fn drop_temporaries(&mut self, base: usize) {
+        let mut i = 0;
+        self.held.retain(|h| {
+            let keep = i < base || !h.temporary;
+            i += 1;
+            keep
+        });
+    }
+
+    /// Visit an expression whose temporaries are dropped before anything that
+    /// follows it runs — an `if`/`while` condition with no `let` in it.
+    fn visit_temp_scoped(&mut self, e: &syn::Expr) {
+        let base = self.held.len();
+        Visit::visit_expr(self, e);
+        self.drop_temporaries(base);
     }
 
     fn report(&mut self, span: Span, why: String) {
@@ -2461,6 +2642,7 @@ impl<'a> Walk<'a> {
                         kind,
                         label: label.clone(),
                         depth: self.depth,
+                        temporary: false,
                     });
                     // The closure's parameters, typed from the callee's
                     // declared callback signature — `syn` infers nothing, and
@@ -2505,6 +2687,34 @@ impl<'ast> Visit<'ast> for Walk<'_> {
         self.depth -= 1;
     }
 
+    /// A statement is where a temporary guard's region ends. See
+    /// [`Held::temporary`].
+    fn visit_stmt(&mut self, s: &'ast syn::Stmt) {
+        let base = self.held.len();
+        visit::visit_stmt(self, s);
+        self.drop_temporaries(base);
+    }
+
+    /// So is a `match` arm. `state::is_unlocked_path` writes one arm
+    /// `!vault.lock().await.is_locked()` and the next `let v = vault.lock()
+    /// .await;`, and the two arms are alternatives — treating the first arm's
+    /// temporary as live in the second reported a second acquisition that
+    /// cannot happen.
+    fn visit_arm(&mut self, a: &'ast syn::Arm) {
+        let base = self.held.len();
+        if let Some((_, cond)) = &a.guard {
+            self.visit_expr(cond);
+        }
+        self.visit_expr(&a.body);
+        self.drop_temporaries(base);
+    }
+
+    /// And so is a closure body written as a bare expression, for the same
+    /// reason: it is not a statement, so nothing else would end the region.
+    fn visit_expr_closure(&mut self, c: &'ast syn::ExprClosure) {
+        self.visit_temp_scoped(&c.body);
+    }
+
     fn visit_local(&mut self, l: &'ast syn::Local) {
         let Some(init) = &l.init else { return };
         self.visit_expr(&init.expr);
@@ -2546,13 +2756,31 @@ impl<'ast> Visit<'ast> for Walk<'_> {
                 kind,
                 label,
                 depth,
+                temporary: false,
             });
         }
     }
 
     fn visit_expr_await(&mut self, a: &'ast syn::ExprAwait) {
+        let acq = await_acquisition_call(a);
+        // Descend *first*. Two acquisitions can live in one expression —
+        // `state.lock().await.vault(id).unwrap().lock().await.is_locked()`
+        // holds both locks at once — and the inner one is the deeper node, so
+        // a check made before descending saw nothing held and reported
+        // nothing. Only the state half of that shape was ever covered, and
+        // only by accident, because `vault` resolves to a `&self` method on
+        // `ServiceState` and those are seeded; the *collection* half — the one
+        // place `block_in_place` is mandatory — was invisible.
+        match acq {
+            // The acquisition's own `.lock()` is not a call into this crate:
+            // it is this node. Visiting only its receiver leaves every other
+            // `lock` a call, which is what makes `Vault::lock` followable at
+            // all — see [`await_acquisition_call`].
+            Some(m) => self.visit_expr(&m.receiver),
+            None => visit::visit_expr_await(self, a),
+        }
         let held = self.innermost().map(|h| (h.kind, h.label.clone()));
-        match (await_acquisition(a).is_some(), held) {
+        match (acq.is_some(), held) {
             (true, Some((_, label))) => self.report(
                 a.await_token.span(),
                 format!("takes a lock while {label} is still held"),
@@ -2585,7 +2813,22 @@ impl<'ast> Visit<'ast> for Walk<'_> {
             ),
             _ => {}
         }
-        visit::visit_expr_await(self, a);
+        // The guard this acquisition produces. A `let` binding gets its own,
+        // named, region from `visit_local`; this one is the *temporary*, and
+        // it is the whole point — `vault.lock().await.update_item(id, f)` is
+        // how `src/dbus/` writes a vault call about twenty-five times, and
+        // until now it opened no region at all.
+        if let Some(m) = acq {
+            let kind = self.guard_of(&m.receiver);
+            let depth = self.depth;
+            self.held.push(Held {
+                name: None,
+                kind,
+                label: format!("{} taken as a temporary", kind.what()),
+                depth,
+                temporary: true,
+            });
+        }
     }
 
     fn visit_expr_match(&mut self, m: &'ast syn::ExprMatch) {
@@ -2608,7 +2851,14 @@ impl<'ast> Visit<'ast> for Walk<'_> {
                     .to_string(),
             );
         }
-        visit::visit_expr_if(self, e);
+        // A condition with no `let` in it drops its temporaries before the
+        // body runs, so a guard taken there is not held across the branches.
+        // (A let-chain does hold it — and is refused outright, just above.)
+        self.visit_temp_scoped(&e.cond);
+        self.visit_block(&e.then_branch);
+        if let Some((_, alt)) = &e.else_branch {
+            self.visit_expr(alt);
+        }
     }
 
     fn visit_expr_while(&mut self, e: &'ast syn::ExprWhile) {
@@ -2620,7 +2870,8 @@ impl<'ast> Visit<'ast> for Walk<'_> {
                     .to_string(),
             );
         }
-        visit::visit_expr_while(self, e);
+        self.visit_temp_scoped(&e.cond);
+        self.visit_block(&e.body);
     }
 
     fn visit_expr_for_loop(&mut self, e: &'ast syn::ExprForLoop) {
@@ -2742,6 +2993,17 @@ impl<'ast> Visit<'ast> for Walk<'_> {
             self.held = saved;
             return;
         }
+        // The **receiver first**, and this order is the fix. An acquisition
+        // consumed as a temporary — `vault.lock().await.update_item(id, f)` —
+        // opens its region while the receiver is visited, so by the time the
+        // call on it is examined the guard is held. Checking the call before
+        // descending was the hole: `innermost()` answered `None`, and both
+        // `blocking` and `note_call` early-return on that, so the shape
+        // `src/dbus/` actually writes was invisible to the name list and to
+        // the call graph at once. Visiting the receiver first is also what
+        // keeps the acquisition's own `.await` from reading as a *second*
+        // lock: the region opens after that check, not before it.
+        self.visit_expr(&m.receiver);
         if BLOCKING_METHODS.contains(&name.as_str()) {
             self.blocking(m.method.span(), &name);
         }
@@ -2750,12 +3012,11 @@ impl<'ast> Visit<'ast> for Walk<'_> {
             method: true,
             on: self.expr_ty(&m.receiver),
         };
-        // `.lock()`/`.read()` are the acquisition itself, reported at the
-        // `.await`; they are not calls into this crate.
-        if !ACQUIRE.contains(&name.as_str()) {
-            self.note_call(call.clone(), line);
-        }
-        self.visit_expr(&m.receiver);
+        // Every method call is an edge, `lock` included. The acquisition's own
+        // `.lock()` never reaches here — `visit_expr_await` visits just its
+        // receiver — so excluding [`ACQUIRE`] by name is no longer needed, and
+        // it used to make `Vault::lock` permanently unreachable.
+        self.note_call(call.clone(), line);
         self.visit_args(&call, 1, &args);
     }
 
@@ -2767,12 +3028,7 @@ impl<'ast> Visit<'ast> for Walk<'_> {
         if self.held.is_empty() {
             return;
         }
-        let text: String = m
-            .tokens
-            .to_string()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
+        let text = macro_code(&m.tokens);
         for a in ACQUIRE {
             if text.contains(&format!(".{a}().await")) {
                 self.report(
@@ -2787,6 +3043,46 @@ impl<'ast> Visit<'ast> for Walk<'_> {
             }
         }
     }
+}
+
+/// A macro invocation's tokens as text, **with literals dropped**.
+///
+/// The macro rule is the one place this scan still matches characters, and it
+/// used to match them against the whole token text — string literals included,
+/// with whitespace stripped, so `tracing::debug!("about to sync_all() the
+/// vault")` under a guard read as an `fsync` and a literal mentioning
+/// `.lock().await` read as an acquisition. Findings against source that does
+/// not exist are the failure mode this file exists to avoid, and there was an
+/// offender for the macro rule but no near-miss, so nothing said so.
+///
+/// Delimiters are kept, because the patterns matched against this are written
+/// with them — `.lock().await`, `sync_all(` — and groups are recursed into,
+/// because a literal nested inside one is still a literal. A `char` literal is
+/// one too, which is incidentally how `'}'` stops being a brace.
+fn macro_code(tokens: &proc_macro2::TokenStream) -> String {
+    fn go(ts: proc_macro2::TokenStream, out: &mut String) {
+        for t in ts {
+            match t {
+                proc_macro2::TokenTree::Literal(_) => {}
+                proc_macro2::TokenTree::Group(g) => {
+                    let (open, close) = match g.delimiter() {
+                        proc_macro2::Delimiter::Parenthesis => ("(", ")"),
+                        proc_macro2::Delimiter::Brace => ("{", "}"),
+                        proc_macro2::Delimiter::Bracket => ("[", "]"),
+                        proc_macro2::Delimiter::None => ("", ""),
+                    };
+                    out.push_str(open);
+                    go(g.stream(), out);
+                    out.push_str(close);
+                }
+                other => out.push_str(&other.to_string()),
+            }
+        }
+    }
+    let mut s = String::new();
+    go(tokens.clone(), &mut s);
+    s.retain(|c| !c.is_whitespace());
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -2855,6 +3151,7 @@ fn run_pass(
                     kind,
                     label: format!("{} (held by the caller)", kind.what()),
                     depth: 0,
+                    temporary: false,
                 }],
                 None => Vec::new(),
             },
@@ -3055,11 +3352,26 @@ fn scan_files(files: &[(String, String)]) -> Scan {
             return Scan {
                 offences: list,
                 guard_bindings,
-                seeds: reg.defs.iter().filter(|d| d.seed.is_some()).count(),
-                receiver_seeds: reg.defs.iter().filter(|d| d.receiver_seed).count(),
+                // Production only. `entry_points` already refuses to root a
+                // walk in a `#[cfg(test)]` body, and a floor these counted
+                // could be satisfied entirely by `src/dbus/state.rs`'s test
+                // fixtures — which lock vaults by hand and call `Vault::unlock`
+                // on them — while the production code the floor is about had
+                // moved out from under the scan. The assertion message would
+                // then be asserting the opposite of what it checked.
+                seeds: reg
+                    .defs
+                    .iter()
+                    .filter(|d| !d.in_test && d.seed.is_some())
+                    .count(),
+                receiver_seeds: reg
+                    .defs
+                    .iter()
+                    .filter(|d| !d.in_test && d.receiver_seed)
+                    .count(),
                 guarded_fns: pass.guarded.len(),
                 guarded_calls: pass.guarded_calls.len(),
-                functions: reg.defs.len(),
+                functions: reg.defs.iter().filter(|d| !d.in_test).count(),
             };
         }
         facts = pass.facts;
@@ -3080,6 +3392,11 @@ fn count_guard_bindings(reg: &Registry) -> usize {
     }
     let mut c = Count(0);
     for d in &reg.defs {
+        // Production only, for the reason the other canaries are: a guard a
+        // test fixture binds is not the daemon binding one.
+        if d.in_test {
+            continue;
+        }
         c.visit_block(&d.block);
     }
     c.0

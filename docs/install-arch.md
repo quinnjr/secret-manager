@@ -53,11 +53,17 @@ cp /usr/share/dbus-1/services/org.freedesktop.secrets.service ~/.local/share/dbu
 `/etc/xdg/autostart/gnome-keyring-secrets.desktop` launches
 `gnome-keyring-daemon --components=secrets` from a plain desktop session even
 with the unit masked, and it will take the bus name before secret-manager
-does. Shadow it with a per-user override — same filename, `Hidden=true`:
+does. Shadow it with a per-user override — same filename, `Hidden=true`.
+This truncates any override already at this path — check first if you have
+one:
 
 ```sh
 mkdir -p ~/.config/autostart
-cat > ~/.config/autostart/gnome-keyring-secrets.desktop <<'EOF'
+if [ -e ~/.config/autostart/gnome-keyring-secrets.desktop ]; then
+    echo "~/.config/autostart/gnome-keyring-secrets.desktop already exists;" >&2
+    echo "not overwriting — edit it by hand to add Hidden=true instead." >&2
+else
+    cat > ~/.config/autostart/gnome-keyring-secrets.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
 Name=GNOME Keyring: Secret Service (disabled)
@@ -65,6 +71,7 @@ Exec=/usr/bin/gnome-keyring-daemon --start --foreground --components=secrets
 Hidden=true
 X-GNOME-Autostart-enabled=false
 EOF
+fi
 ```
 
 To keep PKCS#11 while disabling secrets, leave

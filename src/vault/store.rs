@@ -772,6 +772,11 @@ impl Vault {
         content_type: &str,
         replace: bool,
     ) -> Result<(String, bool), VaultError> {
+        // Refuse a locked vault before validating, so the error a caller sees
+        // first is the one it can actually do something about. This is the
+        // order `Vault::import_items` argues for explicitly, and the two are
+        // documented as mirror images: they must not disagree about it.
+        self.items()?;
         check_item_caps(label, &attributes, secret.len(), content_type)?;
         self.insert_item_unchecked(label, attributes, secret, content_type, replace)
     }
@@ -1209,9 +1214,11 @@ impl Vault {
         // would carry a fresh nonce/index while the on-disk ciphertext (and
         // our cached `aad`/`ciphertext`) still describe the old one, and a
         // later lock()+unlock() would fail decryption permanently.
-        // Fallibly, and before any mutation: `save` runs while the daemon
-        // holds its state mutex, where a panic on an unavailable RNG would
-        // poison it for every other caller.
+        // Fallibly, and before any mutation: `save` runs under the
+        // collection's own lock - never the daemon's state mutex, which
+        // `CLAUDE.md` forbids holding across a save and the lock scan
+        // enforces - where a panic on an unavailable RNG would poison that
+        // lock for every other caller of this collection.
         let nonce = crypto::try_random_bytes::<NONCE_LEN>()?;
         let saved_header = self.header.clone();
         self.header.modified = now();
@@ -1363,6 +1370,25 @@ fn sweep_temp_files(dir: &Path, min_age: Duration) -> usize {
 /// `set_permissions` below is not that chmod: it is the repair path for a
 /// directory that already existed with looser bits.
 ///
+/// It is a *set*, not a tightening. A directory an operator had deliberately
+/// narrowed to 0000 is widened back to 0700 by the next save - that is the
+/// behaviour change that broke a test when this became unconditional, and it
+/// is the intended one: 0700 is the mode this program needs to reach its own
+/// vaults, so a directory it cannot open is not a safer state but a broken
+/// one. What it never does is loosen past 0700.
+///
+/// **The chmod's failure is reported, not propagated.** Returning it would
+/// fail every save on a filesystem with no Unix mode to set at all - vfat, a
+/// FUSE mount - where the vault is still perfectly writable. Dropping it
+/// silently was the other half of the mistake: a directory left at 0777 that
+/// cannot be tightened is the uid boundary down, and it went by with no log
+/// line. So the mode is read back on failure and a directory that is still
+/// group- or world-accessible is named, with the mode it actually has.
+/// `Vault::index_warning` is the precedent for degradation that is reported
+/// rather than fatal; there is no `Vault` here to hang one on - this is a
+/// free function on the save path, shared with the daemon's alias writer -
+/// so the report is the log line.
+///
 /// `pub(crate)` because it is the *only* definition of "create the vault
 /// directory": every writer that can be the first to create it must call
 /// this and not grow its own copy of the four lines. The alias writer in
@@ -1388,7 +1414,22 @@ pub(crate) fn ensure_vault_dir(dir: &Path) -> std::io::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+        // Only the bits that matter: a filesystem that cannot represent a
+        // mode at all reports one we cannot fix and must not warn about on
+        // every save, while a real 0777 left behind by a failed chmod is
+        // exactly what has to be visible.
+        let mode = std::fs::metadata(dir)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0);
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "{}: cannot tighten the vault directory to 0700; it is still mode {mode:04o} \
+                 and reachable by another user",
+                dir.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2216,8 +2257,20 @@ mod tests {
         unblock(block);
 
         // The happy path: one save, all of them gone, duplicates harmless.
+        //
+        // The count is the only reachable form of the "single save" claim in
+        // the doc: every save renames its temp file away, so a per-id loop
+        // leaves the directory and the item list looking exactly as one save
+        // does. See `import_items_takes_a_large_batch_in_one_go`, which makes
+        // the same argument for the other batch method.
+        let saves_before = v.saves_for_tests();
         v.delete_items(&[ids[0].clone(), ids[1].clone(), ids[0].clone()])
             .unwrap();
+        assert_eq!(
+            v.saves_for_tests() - saves_before,
+            1,
+            "two ids cost more than one save: the batch was written id by id"
+        );
         assert_eq!(v.item_ids(), vec![ids[2].clone(), ids[3].clone()]);
         let mut reopened = Vault::open(&path).unwrap();
         reopened.unlock(b"pw").unwrap();
@@ -3378,6 +3431,21 @@ mod tests {
             .insert_item("y", BTreeMap::new(), b"t".to_vec(), "text/plain", false)
             .unwrap_err();
         assert!(matches!(err, VaultError::Locked), "{err:?}");
+        // An item that is *also* over a cap still reports the lock. The cap
+        // check runs after it, exactly as `Vault::import_items` documents for
+        // itself: the error a caller sees first should be the one it can do
+        // something about. The two are documented as mirror images and must
+        // not disagree about which refusal comes first.
+        let err = v
+            .insert_item(
+                &"y".repeat(format::MAX_ITEM_LABEL + 1),
+                BTreeMap::new(),
+                b"t".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
         let err = v.update_item(&id, |i| i.label = "no".into()).unwrap_err();
         assert!(matches!(err, VaultError::Locked), "{err:?}");
         let err = v.delete_item(&id).unwrap_err();
@@ -3947,11 +4015,18 @@ mod tests {
             "{err:?}"
         );
 
-        // A full batch with duplicates removes exactly those ids, in one save.
+        // A full batch with duplicates removes exactly those ids, in one
+        // save - asserted, not just claimed: a per-id loop would cost 512.
         let mut batch: Vec<String> = ids[..512].to_vec();
         batch.extend_from_slice(&ids[..512]);
         assert_eq!(batch.len(), 1024);
+        let saves_before = v.saves_for_tests();
         v.delete_items(&batch).unwrap();
+        assert_eq!(
+            v.saves_for_tests() - saves_before,
+            1,
+            "a 1024-id batch cost more than one save"
+        );
         assert_eq!(v.item_ids(), ids[512..]);
         let mut reopened = Vault::open(&path).unwrap();
         reopened.unlock(b"pw").unwrap();

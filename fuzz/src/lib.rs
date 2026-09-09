@@ -327,6 +327,20 @@ mod tests {
     #[global_allocator]
     static ALLOC: PeakAlloc = PeakAlloc;
 
+    /// A cheap deterministic byte source. `Unstructured` turns it into every
+    /// arm of a generator, and the same seed gives the same case on every
+    /// run, so a failure here is reproducible without a corpus.
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        (0..n as u32)
+            .map(|i| {
+                (seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(i as u64)
+                    >> 33) as u8
+            })
+            .collect()
+    }
+
     fn good_header() -> Header {
         Header {
             version: format::VERSION,
@@ -455,11 +469,7 @@ mod tests {
     fn the_declared_allocation_bound_holds_for_real_inputs() {
         let mut worst = 0f64;
         for seed in 0u64..4096 {
-            // A cheap deterministic byte source; `Unstructured` turns it into
-            // every arm of the generator.
-            let raw: Vec<u8> = (0..256u32)
-                .map(|i| (seed.wrapping_mul(6364136223846793005).wrapping_add(i as u64) >> 33) as u8)
-                .collect();
+            let raw = lcg_bytes(seed, 256);
             let mut u = Unstructured::new(&raw);
             let Ok(v) = VaultBytes::arbitrary(&mut u) else {
                 continue;
@@ -501,6 +511,168 @@ mod tests {
             format::MAX_HEADER
         );
         assert!(p < format::MAX_HEADER, "allocated {p} from the prefix alone");
+    }
+
+    // ----------------------------------------------------------------------
+    // The import generators, which had no self-tests at all
+    // ----------------------------------------------------------------------
+    //
+    // `VaultBytes` has had these two since the day its `Corrupt` arm was
+    // found to be decoding nothing. `KeyringBytes` and `WalletBytes` assert
+    // the same two things in their targets and had nothing checking the
+    // *generators* — so a `parses()` that disagreed with its own encoder
+    // would have surfaced as a libFuzzer artifact reading like a parser bug.
+
+    /// The bound `import_keyring_header` asserts must hold on every shape the
+    /// generator emits, and an input honest in every respect must parse to
+    /// exactly the fields it was built from.
+    #[test]
+    fn the_keyring_generator_agrees_with_the_parser() {
+        let mut honest = 0;
+        let mut with_items = 0;
+        for seed in 0u64..4096 {
+            let raw = lcg_bytes(seed, 512);
+            let mut u = Unstructured::new(&raw);
+            let Ok(spec) = KeyringBytes::arbitrary(&mut u) else {
+                continue;
+            };
+            let bytes = spec.to_bytes();
+
+            reset_peak();
+            let parsed = import_formats::parse_keyring_header(&bytes);
+            let p = peak();
+            assert!(
+                p <= decode_alloc_bound(bytes.len()),
+                "parsing {} bytes allocated {p}, over the bound {}; a declared count \
+                 drove an allocation",
+                bytes.len(),
+                decode_alloc_bound(bytes.len())
+            );
+
+            if !spec.parses() {
+                continue;
+            }
+            honest += 1;
+            let inv = parsed.unwrap_or_else(|e| panic!("an honest keyring was refused: {e}"));
+            // The same oracle the target asserts, field for field: a parser
+            // reading the right number of items out of the wrong offsets
+            // still satisfies every bound above.
+            assert_eq!(inv.display_name, spec.honest_display_name().unwrap());
+            assert_eq!(inv.created, KEYRING_CREATED);
+            assert_eq!(inv.modified, 0);
+            assert_eq!(inv.flags, 0);
+            assert_eq!(inv.lock_timeout, 0);
+            assert_eq!(inv.hash_iterations, spec.hash_iterations);
+            assert_eq!(inv.salt, KEYRING_SALT);
+            assert_eq!(inv.item_count(), spec.items.len());
+            assert_eq!(inv.ciphertext_len, spec.ciphertext.len());
+            assert_eq!(inv.ciphertext_offset + inv.ciphertext_len, bytes.len());
+            if !spec.items.is_empty() {
+                with_items += 1;
+            }
+            for (got, want) in inv.items.iter().zip(&spec.items) {
+                assert_eq!(got.id, want.id);
+                assert_eq!(got.item_type, want.item_type);
+                let names: std::collections::BTreeSet<String> =
+                    got.attribute_keys.iter().map(str::to_string).collect();
+                assert_eq!(names, want.names());
+                assert_eq!(got.is_unlock_credential(), matches!(want.item_type, 3 | 4));
+            }
+        }
+        // Without these the test passes on a `parses()` that is never true,
+        // which is the vacuous form of exactly the same bug. The floors are
+        // set from a measurement — 1743 honest of 4096 draws, 1410 of them
+        // carrying an item — with enough room for a retune and not enough to
+        // sit through an order-of-magnitude regression.
+        assert!(honest >= 1024, "only {honest} honest keyrings in 4096 draws");
+        assert!(
+            with_items >= 512,
+            "only {with_items} honest keyrings carried an item, so the oracle \
+             never checked the item loop"
+        );
+    }
+
+    /// The same two properties for the wallet index, whose nested folder and
+    /// entry loops are the ones a trusted `folderCount` would blow up.
+    #[test]
+    fn the_wallet_generator_agrees_with_the_parser() {
+        let mut honest = 0;
+        let mut with_entries = 0;
+        for seed in 0u64..4096 {
+            let raw = lcg_bytes(seed, 512);
+            let mut u = Unstructured::new(&raw);
+            let Ok(spec) = WalletBytes::arbitrary(&mut u) else {
+                continue;
+            };
+            let bytes = spec.to_bytes();
+
+            reset_peak();
+            let parsed = import_formats::parse_wallet_header(&bytes);
+            let p = peak();
+            assert!(
+                p <= decode_alloc_bound(bytes.len()),
+                "parsing {} bytes allocated {p}, over the bound {}; a declared folder \
+                 or entry count drove an allocation",
+                bytes.len(),
+                decode_alloc_bound(bytes.len())
+            );
+
+            if !spec.parses() {
+                continue;
+            }
+            honest += 1;
+            let inv = parsed.unwrap_or_else(|e| panic!("an honest wallet index was refused: {e}"));
+            assert_eq!((inv.cipher, inv.hash), (3, 2));
+            assert_eq!(inv.folder_count(), spec.folders.len());
+            let entries: usize = spec.folders.iter().map(|f| f.entries.len()).sum();
+            assert_eq!(inv.entry_count(), entries);
+            if entries > 0 {
+                with_entries += 1;
+            }
+            // Arithmetic, not a guess: the parser stops at the index end and
+            // never looks at the encrypted half.
+            assert_eq!(inv.ciphertext_offset, spec.index_end());
+            for (got, want) in inv.folders.iter().zip(&spec.folders) {
+                assert_eq!(got.folder_hash, want.hash);
+                assert_eq!(got.entry_hashes, want.entries);
+                assert_eq!(got.is_empty(), want.entries.is_empty());
+                for e in &want.entries {
+                    assert!(inv.contains_entry(&want.hash, e));
+                }
+            }
+        }
+        // Measured: 2179 honest of 4096 draws, 1244 of them with an entry.
+        assert!(honest >= 1024, "only {honest} honest wallets in 4096 draws");
+        assert!(
+            with_entries >= 512,
+            "only {with_entries} honest wallets carried an entry, so the oracle \
+             never checked the entry-hash loop"
+        );
+    }
+
+    /// The named seeds must exercise the arm they are named for. This one was
+    /// byte-identical to `seed-empty` — it declared *zero* items — so the one
+    /// seed whose job is to put libFuzzer a mutation away from the item-count
+    /// guard seeded the same input as its neighbour.
+    #[test]
+    fn the_absurd_item_count_seed_hits_the_item_count_guard() {
+        let seed = include_bytes!("../corpus/import_keyring_header/seed-absurd-item-count");
+        let empty = include_bytes!("../corpus/import_keyring_header/seed-empty");
+        assert_ne!(
+            seed.as_slice(),
+            empty.as_slice(),
+            "the seed is byte-identical to seed-empty again"
+        );
+        match import_formats::parse_keyring_header(seed) {
+            Err(import_formats::HeaderError::ImpossibleLength { field, declared }) => {
+                assert_eq!(field, "item count");
+                assert_eq!(declared, u64::from(u32::MAX));
+            }
+            other => panic!("expected an item-count refusal, got {other:?}"),
+        }
+        // And `seed-empty` still parses, so the pair really is a contrast.
+        let inv = import_formats::parse_keyring_header(empty).expect("seed-empty must parse");
+        assert_eq!(inv.item_count(), 0);
     }
 }
 

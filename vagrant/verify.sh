@@ -4,20 +4,14 @@
 # least likely to have tested for us.
 #
 # Every check prints ok/FAIL and the script exits non-zero if any failed, so
-# `vagrant up` is itself the test run.
+# `make vagrant-verify` is itself the test run — see the Makefile for why a
+# bare `vagrant up` is not.
 set -u
 
 # This script uninstalls, then reinstalls, whatever `secret-manager` build
-# happens to be on the machine it runs on. That is fine inside the Vagrant
-# box the Vagrantfile names "secret-manager-debian" and nowhere else — run
-# it on a developer's own machine and it uninstalls and reinstalls their
-# live install from an arbitrary build. Refuse outside the box.
-if [ "$(hostname)" != "secret-manager-debian" ]; then
-    echo "FAIL    refusing to run outside the secret-manager-debian Vagrant box" >&2
-    echo "        (hostname is '$(hostname)'; this script uninstalls and" >&2
-    echo "        reinstalls secret-manager and must not touch a real machine)" >&2
-    exit 1
-fi
+# happens to be on the machine it runs on. See vagrant/guard.sh for why that
+# is confined to the Vagrant box.
+. "$(dirname "$0")/guard.sh"
 
 cd "$HOME/secret-manager" || { echo "FAIL    cd to \$HOME/secret-manager" >&2; exit 1; }
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -95,7 +89,14 @@ back="$(sm get k=v)"
 sm list >/dev/null
 sm status >/dev/null
 sm lock
-sm status | grep -qi lock
+# Format-independent: a locked vault must not answer `sm get`, whatever
+# `sm status`'s wording happens to be (a naive `grep -qi lock` matches the
+# *unlocked* line too, so it would pass whether or not `sm lock` did
+# anything).
+if sm get app=vagrant user=tester >/dev/null 2>&1; then
+    echo "sm lock: secret still readable after lock"
+    exit 1
+fi
 
 echo "INNER-OK"
 INNER
@@ -108,6 +109,13 @@ else
     fail "session test"
     printf '%s\n' "$out" | sed 's/^/        /'
 fi
+
+echo "NOTE    the session test above left a scripted pinentry configured at"
+echo "        \$HOME/.config/secret-manager/config.toml, pointed at"
+echo "        \$HOME/bin/fake-pinentry, which answers every passphrase"
+echo "        prompt with 'vagrant-test-passphrase' and no terminal or"
+echo "        display. Anything you observe by hand on this box about real"
+echo "        prompting behaviour is wrong until you remove both paths."
 
 echo "== sm import, which needs neither a source nor a daemon =="
 check "sm import --help"                 "sm import --help"
@@ -124,6 +132,10 @@ sudo make uninstall >/dev/null 2>&1
 check "binary gone after uninstall"      "[ ! -e /usr/bin/secret-manager ]"
 check "sm symlink gone after uninstall"  "[ ! -e /usr/bin/sm ]"
 check "PAM module gone after uninstall"  "[ ! -e '$PAMSO' ]"
+check "systemd unit gone after uninstall" \
+      "[ ! -e /usr/lib/systemd/user/secret-manager.service ]"
+check "D-Bus activation file gone after uninstall" \
+      "[ ! -e /usr/share/dbus-1/services/org.freedesktop.secrets.service ]"
 
 echo "== reinstall, so \`vagrant ssh\` leaves a working box to poke at =="
 if install_out="$(sudo make install 2>&1)"; then

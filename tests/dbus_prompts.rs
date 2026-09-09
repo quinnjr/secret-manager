@@ -1124,6 +1124,70 @@ async fn outstanding_prompts_are_capped_per_client() {
     );
 }
 
+/// The quota is a cap on *prompts*, so it may only refuse a call that would
+/// create one. `Unlock` of a collection that is already unlocked creates none:
+/// it answers from the resolution loop and returns `/`.
+///
+/// This is the case the cap must not eat. libsecret calls `Unlock`
+/// unconditionally before a read, and a prompt entry clears only on
+/// completion, dismissal or the owner's departure — so a client that leaks
+/// prompts would otherwise lose the ability to read collections that are not
+/// locked at all, which is every read it makes for the rest of its life.
+///
+/// The budget is filled with `CreateCollection` prompts precisely so the
+/// collection under test can be genuinely unlocked first; the existing quota
+/// tests all unlock a locked collection, which is why the regression this
+/// guards was invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_quota_unlock_of_an_unlocked_collection_still_succeeds() {
+    use secret_manager::dbus::state::MAX_PROMPTS_PER_OWNER;
+
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let (dismissed, _) = perform(&conn, &prompt).await;
+    assert!(!dismissed, "the fixture pinentry must answer the unlock");
+    let coll = collection(&conn, fx.default_collection()).await;
+    assert!(!coll.locked().await.unwrap());
+
+    for i in 0..MAX_PROMPTS_PER_OWNER {
+        let props = HashMap::from([(
+            "org.freedesktop.Secret.Collection.Label",
+            Value::from(format!("quota filler {i}")),
+        )]);
+        let (_, prompt) = service.create_collection(props, "").await.unwrap();
+        assert!(
+            prompt
+                .as_str()
+                .starts_with("/org/freedesktop/secrets/prompt/"),
+            "filler {i} allocated no prompt: {prompt}"
+        );
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER,
+        "the budget must be full for this test to mean anything"
+    );
+
+    let (unlocked, prompt) = service
+        .unlock(&[fx.default_collection()])
+        .await
+        .expect("an Unlock that creates no prompt must not be refused for want of prompt budget");
+    assert_eq!(unlocked, vec![fx.default_collection()]);
+    assert_eq!(
+        prompt.as_str(),
+        "/",
+        "nothing was locked, so nothing prompts"
+    );
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER,
+        "a successful no-op Unlock registers no prompt owner"
+    );
+}
+
 /// `CreateCollection`'s alias validation is a separate code path from
 /// `SetAlias`'s, and it is the one that keeps a client-chosen name out of
 /// `paths::alias` (whose `expect` assumes a valid object-path segment) and out

@@ -62,16 +62,20 @@ fuzz_target!(|data: &[u8]| {
 
     // Arbitrary bytes: a wrong file, a truncated write, a `.kwl` from a
     // version this build does not read.
+    // Snapshotted before `check_self_consistent` runs: the assertion is about
+    // the parser, and a helper that walks the inventory allocates too. The
+    // structured path below already did this; all three paths must.
     smfuzz::reset_peak();
-    if let Ok(inv) = parse_wallet_header(data) {
+    let parsed = parse_wallet_header(data);
+    let peak = smfuzz::peak();
+    assert!(
+        peak <= smfuzz::decode_alloc_bound(data.len()),
+        "parsing {} raw bytes allocated {peak}",
+        data.len(),
+    );
+    if let Ok(inv) = parsed {
         check_self_consistent(&inv, data);
     }
-    assert!(
-        smfuzz::peak() <= smfuzz::decode_alloc_bound(data.len()),
-        "parsing {} raw bytes allocated {}",
-        data.len(),
-        smfuzz::peak()
-    );
 
     let Ok(spec) = smfuzz::WalletBytes::arbitrary(&mut u) else {
         return;
@@ -136,9 +140,14 @@ fuzz_target!(|data: &[u8]| {
     // self-consistent inventory — never a panic.
     if let Ok(cut) = u.int_in_range(0..=bytes.len().saturating_sub(1)) {
         smfuzz::reset_peak();
-        if let Ok(inv) = parse_wallet_header(&bytes[..cut]) {
+        let parsed = parse_wallet_header(&bytes[..cut]);
+        let peak = smfuzz::peak();
+        assert!(
+            peak <= smfuzz::decode_alloc_bound(cut),
+            "parsing a {cut}-byte prefix allocated {peak}"
+        );
+        if let Ok(inv) = parsed {
             check_self_consistent(&inv, &bytes[..cut]);
         }
-        assert!(smfuzz::peak() <= smfuzz::decode_alloc_bound(cut));
     }
 });

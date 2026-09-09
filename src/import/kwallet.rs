@@ -61,9 +61,6 @@ use zeroize::{Zeroize, Zeroizing};
 /// may be answered by an older daemon on a mixed system.
 pub(crate) const SERVICE: &str = "org.kde.kwalletd6";
 
-/// The one object that exports `org.kde.KWallet`.
-pub const OBJECT_PATH: &str = "/modules/kwalletd6";
-
 /// The application id every call carries.
 ///
 /// This becomes **persistent state** in the wallet's per-application access
@@ -92,7 +89,13 @@ pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
 /// access prompt ("allow secret-manager-import to read this wallet?") is
 /// raised inside a `readPassword`/`readEntry`, not at open. An unbounded read
 /// therefore reproduces exactly the hang [`open_wallet`] exists to prevent.
-/// Every call is bounded; a read that expires costs one entry, not the import.
+/// Every call is bounded — including the proxy constructors and the `AddMatch`
+/// behind `receive_wallet_async_opened`, which are bus round trips too — and a
+/// read that expires costs one entry, not the import.
+///
+/// This is also why the live test at the bottom of this file walks only a
+/// wallet that is *already open*: being open rules out the unlock dialog,
+/// which a test may not raise. It does not rule out this one.
 pub(crate) const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long the `close` at the end of [`extract`] may take. Shorter than
@@ -125,6 +128,20 @@ pub(crate) const MAX_MAP_ENTRIES: usize = 4096;
 /// The largest number of entries one walk will produce, across all folders.
 /// A wallet larger than this is not a wallet, it is a denial of service.
 pub(crate) const MAX_ENTRIES: usize = 200_000;
+
+/// The largest total of secret bytes one walk will hold, across all entries.
+///
+/// [`MAX_ENTRIES`] alone bounds nothing that matters here: an entry's secret
+/// may be up to `vault::format::MAX_ITEM_SECRET` (1 MiB), so 200,000 of them
+/// is ~200 GiB resident and the walk dies to the OOM killer with the wallet
+/// still held open by [`APP_ID`] — the one lasting side effect this module
+/// promises not to leave. A count limits how many things are read; only a
+/// byte budget limits how much memory reading them takes.
+///
+/// 256 MiB is four orders of magnitude above the measured wallet (66 entries,
+/// a few KiB each) and still a bound. Exceeding it aborts the walk, so the
+/// close in [`extract`] still runs.
+pub(crate) const MAX_SECRET_BYTES: usize = 256 << 20;
 
 /// Attribute recording the KWallet folder. See
 /// [`the `kwallet:` prefix`](self#the-kwallet-prefix-is-added-only-where-it-is-free).
@@ -335,6 +352,13 @@ pub enum KWalletError {
     },
     #[error("the walk produced more than {limit} entries, which is not a wallet")]
     TooManyEntries { limit: usize },
+    /// The walk's secrets exceeded [`MAX_SECRET_BYTES`] in total. Separate
+    /// from [`KWalletError::TooManyEntries`] because the two bound different
+    /// things: a wallet of ten entries can still be larger than memory.
+    #[error(
+        "the walk's entries hold more than {limit} bytes of secrets in total, which is not a wallet"
+    )]
+    TooManySecretBytes { limit: usize },
     #[error(transparent)]
     Sidecar(#[from] SidecarError),
     #[error("KWallet D-Bus call failed: {0}")]
@@ -390,6 +414,7 @@ impl fmt::Debug for SidecarEntry {
 pub struct Sidecar {
     entries: BTreeMap<String, SidecarEntry>,
     skipped_rows: usize,
+    duplicate_keys: Vec<String>,
 }
 
 impl Sidecar {
@@ -409,6 +434,19 @@ impl Sidecar {
     /// between — so the [`std::io::Read::take`] is the guarantee and the
     /// `metadata` call is only an early refusal.
     pub fn load(path: &Path) -> Result<Self, SidecarError> {
+        Self::load_with_limit(path, MAX_SIDECAR_BYTES)
+    }
+
+    /// [`Sidecar::load`] with the limit as a parameter.
+    ///
+    /// The parameter exists so the `take` re-check below is *reachable in a
+    /// test*. With the limit fixed, every file a test can write has an honest
+    /// `metadata` and the `metadata` refusal fires first — so deleting the
+    /// re-check left the suite green, and the guarantee this function claims
+    /// had no coverage at all. With a limit the caller chooses, a file whose
+    /// `metadata` under-reports its length (every file in `/proc`) exercises
+    /// the second check and nothing else.
+    fn load_with_limit(path: &Path, limit: u64) -> Result<Self, SidecarError> {
         let io = |source| SidecarError::Io {
             path: path.to_path_buf(),
             source,
@@ -419,25 +457,23 @@ impl Sidecar {
             Err(source) => return Err(io(source)),
         };
         let len = file.metadata().map_err(io)?.len();
-        if len > MAX_SIDECAR_BYTES {
+        if len > limit {
             return Err(SidecarError::TooLarge {
                 path: path.to_path_buf(),
                 len,
-                limit: MAX_SIDECAR_BYTES,
+                limit,
             });
         }
         // One byte past the limit, so a file that grew between the `stat` and
         // the read is caught rather than silently truncated into a parse
         // error that blames the JSON.
         let mut text = String::with_capacity(len as usize);
-        file.take(MAX_SIDECAR_BYTES + 1)
-            .read_to_string(&mut text)
-            .map_err(io)?;
-        if text.len() as u64 > MAX_SIDECAR_BYTES {
+        file.take(limit + 1).read_to_string(&mut text).map_err(io)?;
+        if text.len() as u64 > limit {
             return Err(SidecarError::TooLarge {
                 path: path.to_path_buf(),
                 len: text.len() as u64,
-                limit: MAX_SIDECAR_BYTES,
+                limit,
             });
         }
         Self::parse(&text, path)
@@ -449,13 +485,25 @@ impl Sidecar {
     /// the real file also carries wallet-level `$fdo_created` and
     /// `$fdo_modified` as bare strings at the root. Those are not entries and
     /// are not an error; they are counted in [`Sidecar::skipped_rows`].
+    /// A repeated key is **counted**, not silently resolved. JSON has no rule
+    /// against one, `serde_json` keeps the last and says nothing, and the
+    /// dropped row is an entry's whole attribute map — so a file with one
+    /// imports an item under attributes that came from the row that happened
+    /// to be second. Last-wins is kept, because that is what every other
+    /// reader of this file does and changing it would invent a different
+    /// answer; what changes is that the file no longer lies about it. See
+    /// [`Sidecar::duplicate_keys`].
     pub(crate) fn parse(text: &str, path: &Path) -> Result<Self, SidecarError> {
-        let root: serde_json::Value =
+        let root: SidecarRoot =
             serde_json::from_str(text).map_err(|source| SidecarError::Json {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let serde_json::Value::Object(rows) = root else {
+        let SidecarRoot::Object {
+            rows,
+            duplicate_keys,
+        } = root
+        else {
             return Err(SidecarError::NotAnObject {
                 path: path.to_path_buf(),
             });
@@ -480,6 +528,7 @@ impl Sidecar {
         Ok(Self {
             entries,
             skipped_rows,
+            duplicate_keys,
         })
     }
 
@@ -506,6 +555,93 @@ impl Sidecar {
     /// The row keys, so a caller can diff them against what the walk resolved.
     pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
+    }
+
+    /// Keys the file declared **more than once**. Each one is a row whose
+    /// attribute map was discarded in favour of a later row with the same key,
+    /// which the walk cannot detect afterwards because only the survivor is
+    /// there to see. Carried through to
+    /// [`Extraction::duplicate_sidecar_keys`].
+    pub(crate) fn duplicate_keys(&self) -> &[String] {
+        &self.duplicate_keys
+    }
+}
+
+/// The sidecar's root value, parsed in one pass so a repeated key is visible.
+///
+/// `serde_json::Value` cannot express this: its object is a map, so by the
+/// time the root is a `Value` the earlier of two identical keys is already
+/// gone. A non-object root is a variant here rather than an error so
+/// [`SidecarError::NotAnObject`] stays the message the user sees for it.
+enum SidecarRoot {
+    Object {
+        rows: serde_json::Map<String, serde_json::Value>,
+        duplicate_keys: Vec<String>,
+    },
+    NotAnObject,
+}
+
+impl<'de> serde::Deserialize<'de> for SidecarRoot {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+
+        struct RootVisitor;
+
+        impl<'de> Visitor<'de> for RootVisitor {
+            type Value = SidecarRoot;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a KWallet attribute sidecar object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                // No row cap here: `Sidecar::parse` applies `MAX_SIDECAR_ROWS`
+                // and its error names the limit, which a `de::Error::custom`
+                // from inside the visitor would flatten into a JSON syntax
+                // error blaming the file's shape. The bound that keeps this
+                // finite in the meantime is `MAX_SIDECAR_BYTES` on the read.
+                let mut rows = serde_json::Map::new();
+                let mut duplicate_keys = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
+                    if rows.insert(key.clone(), value).is_some() {
+                        duplicate_keys.push(key);
+                    }
+                }
+                Ok(SidecarRoot::Object {
+                    rows,
+                    duplicate_keys,
+                })
+            }
+
+            // Every other shape is "not an object". A sequence's elements are
+            // drained rather than left, so the error is about the root and not
+            // about trailing input.
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(SidecarRoot::NotAnObject)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(SidecarRoot::NotAnObject)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(SidecarRoot::NotAnObject)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(SidecarRoot::NotAnObject)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(SidecarRoot::NotAnObject)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(SidecarRoot::NotAnObject)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(SidecarRoot::NotAnObject)
+            }
+        }
+
+        de.deserialize_any(RootVisitor)
     }
 }
 
@@ -678,7 +814,9 @@ pub(crate) fn decode_qmap(bytes: &[u8]) -> Result<MapPairs, MapDecodeError> {
     // `pairs` wipes itself on drop, so every `?` below — not only the happy
     // path — wipes the plaintext decoded so far. Malformed input is exactly
     // when that matters: it is the one case where the values are abandoned
-    // mid-map.
+    // mid-map. That only holds for plaintext `pairs` actually *owns*, which
+    // is why the loop below pushes each string before it can fail rather than
+    // holding it in a local across a `?`.
     let mut pairs = MapPairs(Vec::with_capacity(count));
     // Digests, never the keys themselves: a `BTreeSet<String>` of map keys is
     // a second, un-zeroized copy of half the plaintext, dropped to the
@@ -692,7 +830,15 @@ pub(crate) fn decode_qmap(bytes: &[u8]) -> Result<MapPairs, MapDecodeError> {
     let mut saw_empty_key = false;
     for _ in 0..count {
         let (key, key_was_null) = r.qstring("map key")?;
+        // Pushed before the value is read, not after both are. A `String`
+        // local is wiped by nobody: an early return between the two reads —
+        // a malformed value, a duplicate key — drops decoded plaintext to the
+        // allocator un-wiped, which is the one thing `MapPairs` exists to make
+        // impossible. Inside `pairs` it is owned by the `Drop` that wipes.
+        pairs.0.push((key, String::new()));
         let (value, _) = r.qstring("map value")?;
+        let (key, slot) = pairs.0.last_mut().expect("just pushed");
+        *slot = value;
         if key.is_empty() {
             if key_was_null {
                 saw_null_key = true;
@@ -700,7 +846,7 @@ pub(crate) fn decode_qmap(bytes: &[u8]) -> Result<MapPairs, MapDecodeError> {
                 saw_empty_key = true;
             }
         }
-        if !seen.insert(digest(&key)) {
+        if !seen.insert(digest(key)) {
             if saw_null_key && saw_empty_key {
                 return Err(MapDecodeError::Unrepresentable {
                     what: "the map has both a null and an empty string as keys, and Rust's \
@@ -709,7 +855,6 @@ pub(crate) fn decode_qmap(bytes: &[u8]) -> Result<MapPairs, MapDecodeError> {
             }
             return Err(MapDecodeError::DuplicateKey);
         }
-        pairs.0.push((key, value));
     }
     if r.remaining() != 0 {
         return Err(MapDecodeError::TrailingBytes {
@@ -816,6 +961,46 @@ pub(crate) fn qmap_to_canonical_json(
 pub(crate) fn read_map_secret(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, MapDecodeError> {
     let pairs = decode_qmap(bytes)?;
     qmap_to_canonical_json(&pairs)
+}
+
+/// Decodes the bytes `readEntry` returns for a `Password` entry: a
+/// `QDataStream`-serialised `QString`.
+///
+/// # `readPassword` and `readEntry` do not return the same bytes
+///
+/// This is the whole reason this function exists. `readPassword` is declared
+/// `s` on the wire and `readEntry` is declared `ay`, and the difference is not
+/// a wrapper: `KWallet::Wallet::writePassword` does
+/// `QDataStream ds(&a, QIODevice::WriteOnly); ds << value;` and stores *that*,
+/// so what is in the wallet is a `quint32` byte length followed by big-endian
+/// UTF-16 — and `readPassword` is kwalletd deserialising it for us, while
+/// `readEntry` hands back the stored blob.
+///
+/// So the fallback used to store `00 00 00 0E 00 68 00 75 …` where the user
+/// had written `hunter2`, label it `text/plain`, count it as a *recovery*, and
+/// leave the user believing their wallet was safe to decommission. Deleting
+/// the fallback would have been correct too — refusing one entry beats
+/// corrupting it — but the bytes are a format this module already decodes, so
+/// decoding them recovers the entry honestly, and anything that is not that
+/// format is refused exactly the way an undecodable map is.
+///
+/// The buffer must be consumed **exactly**: a `QString` is the whole of what
+/// `writePassword` writes, so trailing bytes mean these are not a serialised
+/// password and a prefix of them is not the secret.
+pub(crate) fn decode_qstring_password(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, MapDecodeError> {
+    let mut r = Reader::new(bytes);
+    let (mut decoded, _was_null) = r.qstring("password")?;
+    if r.remaining() != 0 {
+        let trailing = r.remaining();
+        // The password is plaintext and this path abandons it, so it is wiped
+        // here rather than dropped to the allocator: the same rule
+        // `MapPairs`'s `Drop` enforces for a map.
+        decoded.zeroize();
+        return Err(MapDecodeError::TrailingBytes { trailing });
+    }
+    // `into_bytes` reuses the `String`'s allocation, so the conversion leaves
+    // no second, un-wiped copy behind.
+    Ok(Zeroizing::new(std::mem::take(&mut decoded).into_bytes()))
 }
 
 /// A bounds-checked cursor. Every read names the field it was reading so a
@@ -1140,7 +1325,15 @@ pub(crate) fn has_display() -> bool {
 
 /// True if `org.kde.kwalletd6` has an owner on this bus.
 pub(crate) async fn service_is_running(conn: &zbus::Connection) -> Result<bool, KWalletError> {
-    let dbus = zbus::fdo::DBusProxy::new(conn).await?;
+    // Constructing a proxy is not free of the bus: zbus may introspect and
+    // will register match rules, so "every call is bounded" has to include the
+    // constructors or it is a claim about most of them.
+    let dbus = bounded(
+        "DBusProxy::new",
+        DEFAULT_CALL_TIMEOUT,
+        zbus::fdo::DBusProxy::new(conn),
+    )
+    .await?;
     let name = zbus::names::BusName::try_from(SERVICE).map_err(zbus::Error::from)?;
     match tokio::time::timeout(DEFAULT_CALL_TIMEOUT, dbus.name_has_owner(name)).await {
         Ok(r) => Ok(r?),
@@ -1196,21 +1389,35 @@ pub(crate) async fn open_wallet(
 ) -> Result<WalletHandle, KWalletError> {
     use futures_util::StreamExt;
 
-    let proxy = KWalletProxy::new(conn).await?;
+    let proxy = bounded(
+        "KWalletProxy::new",
+        DEFAULT_CALL_TIMEOUT,
+        KWalletProxy::new(conn),
+    )
+    .await?;
 
     // If it is already open there is no dialog to worry about. If it is not,
     // and nothing can draw one, say so now rather than after two minutes of
     // silence: this is the SSH case, and a clear refusal is the entire point.
-    let already_open = bounded("isOpen", DEFAULT_CALL_TIMEOUT, proxy.is_open(wallet))
-        .await
-        .unwrap_or(false);
+    // Deliberately not `unwrap_or(false)`: a failed `isOpen` says nothing
+    // about the wallet, and treating it as "closed" makes the *next* line
+    // report `NoDisplay` — a diagnosis about the user's session — for what is
+    // really a broken call to kwalletd. A call that failed is an error.
+    let already_open = bounded("isOpen", DEFAULT_CALL_TIMEOUT, proxy.is_open(wallet)).await?;
     if !already_open && !has_display() {
         return Err(KWalletError::NoDisplay {
             wallet: wallet.to_string(),
         });
     }
 
-    let mut opened = proxy.receive_wallet_async_opened().await?;
+    // `receive_*` sends `AddMatch` to the bus daemon, so it is a call like any
+    // other and is bounded like one.
+    let mut opened = bounded(
+        "AddMatch(walletAsyncOpened)",
+        DEFAULT_CALL_TIMEOUT,
+        proxy.receive_wallet_async_opened(),
+    )
+    .await?;
 
     let tid = bounded(
         "openAsync",
@@ -1322,7 +1529,30 @@ pub enum SkipReason {
     /// Every read this module knows how to try failed.
     #[error("KWallet would not hand over the entry: {0}")]
     Unreadable(String),
-    /// `entryType` failed, so the entry's type is not known.
+    /// `readEntry` recovered bytes for a `Password` entry that are not a
+    /// `QDataStream`-serialised `QString`, so they are not the password.
+    ///
+    /// Separate from [`SkipReason::MapUndecodable`] because it names a
+    /// different format and a different branch, and the branch is the point:
+    /// this is the fallback that used to skip the decoder entirely and store
+    /// a serialised `QString` as if it were the secret. See
+    /// [`decode_qstring_password`].
+    #[error("the password value could not be decoded: {0}")]
+    PasswordUndecodable(MapDecodeError),
+    /// A read answered successfully with no bytes at all.
+    ///
+    /// Refused rather than imported as a zero-length secret. No KWallet
+    /// writer stores an entry with nothing in it that this module can tell
+    /// apart from a failed read, and a migration that silently writes an
+    /// empty secret and reports success is the one direction that cannot be
+    /// undone. Whether kwalletd *also* uses an empty reply as its per-entry
+    /// error channel — rather than raising a D-Bus error — is recollection
+    /// and was not verifiable here; the refusal is correct either way, which
+    /// is why it does not rest on the answer.
+    #[error("KWallet answered {call} with no bytes, so nothing was established about the entry")]
+    EmptyRead { call: &'static str },
+    /// `entryType` failed, or reported a type no KWallet writer produces, so
+    /// the entry's type is not known.
     ///
     /// This is a refusal and not a default. Falling back to
     /// [`EntryType::Unknown`] routes the entry to `readEntry`, whose bytes for
@@ -1331,6 +1561,16 @@ pub enum SkipReason {
     /// counted as imported. That is the exact outcome `decode_qmap` refuses,
     /// reached by a path the decoder never sees, and a false success on a
     /// secret cannot be undone later.
+    ///
+    /// A reported type of `0` ([`EntryType::Unknown`]) lands here too, for the
+    /// same reason and not because the call failed: `writePassword`,
+    /// `writeEntry` and `writeMap` produce 1, 2 and 3, so nothing that can
+    /// write a wallet produces a `0` entry. (kwalletd is additionally
+    /// remembered to return `0` for every failed lookup — unknown handle,
+    /// missing folder, unauthorised application — rather than raising a D-Bus
+    /// error, which would make the in-band `0` the *common* case; only the
+    /// client library is installed here, so that half is unverified. The
+    /// refusal does not depend on it.)
     #[error("KWallet would not report the entry's type, so it cannot be read safely: {0}")]
     TypeUnavailable(String),
 }
@@ -1410,6 +1650,14 @@ pub struct Extraction {
     /// See [`Extraction::unexpected_sidecar_rows`], which is the number worth
     /// showing a user.
     pub skipped_sidecar_rows: usize,
+    /// Keys the sidecar file declared **more than once**.
+    ///
+    /// Each is a row that was discarded in favour of a later row with the same
+    /// key — an entry's whole attribute map, dropped. Nothing downstream can
+    /// notice, because only the surviving row reaches the walk, so this is the
+    /// only place the condition is visible at all. Nonzero means the file is
+    /// not the shape `ksecretd` writes.
+    pub duplicate_sidecar_keys: Vec<String>,
     /// Sidecar fields that were present but unusable, summed over the rows
     /// that were **applied to an entry**.
     ///
@@ -1423,10 +1671,14 @@ pub struct Extraction {
     /// malformed fields, and this sum deliberately discards that.
     pub malformed_sidecar_fields: usize,
     /// Entries whose declared type was `Password`, whose `readPassword`
-    /// failed, and which `readEntry` then **recovered**. Counted on success
-    /// only: an entry both reads failed for is in `skipped`, and counting it
-    /// here as well would make this number, and the sentence the CLI prints
-    /// about it, false.
+    /// failed, and whose `readEntry` bytes then **decoded** to the password.
+    /// Counted on success only: an entry both reads failed for, or whose
+    /// fallback bytes were not a serialised `QString`, is in `skipped`, and
+    /// counting it here as well would make this number, and the sentence the
+    /// CLI prints about it, false. Before [`decode_qstring_password`] existed
+    /// this counted entries whose *serialised* `QString` had just been stored
+    /// as the secret — so the number said "recovered" about the entries it had
+    /// corrupted.
     ///
     /// The count exists because the type numbering is a claim about another
     /// project's enum, and a nonzero value here is the evidence that it is
@@ -1641,7 +1893,12 @@ pub async fn extract(
     if !service_is_running(conn).await? {
         return Err(KWalletError::ServiceUnavailable);
     }
-    let proxy = KWalletProxy::new(conn).await?;
+    let proxy = bounded(
+        "KWalletProxy::new",
+        DEFAULT_CALL_TIMEOUT,
+        KWalletProxy::new(conn),
+    )
+    .await?;
     let wallets = bounded("wallets", DEFAULT_CALL_TIMEOUT, proxy.wallets()).await?;
     if !wallets.iter().any(|w| w == wallet) {
         return Err(KWalletError::NoSuchWallet {
@@ -1685,6 +1942,7 @@ async fn walk<R: WalletReader>(
 ) -> Result<Extraction, KWalletError> {
     let mut out = Extraction {
         skipped_sidecar_rows: sidecar.skipped_rows(),
+        duplicate_sidecar_keys: sidecar.duplicate_keys().to_vec(),
         ..Default::default()
     };
 
@@ -1729,6 +1987,10 @@ async fn walk<R: WalletReader>(
 
     // -- pass two: read ----------------------------------------------------
     let mut resolved: BTreeSet<String> = BTreeSet::new();
+    // Beside `MAX_ENTRIES`, not instead of it: the count bounds how many
+    // secrets are read and this bounds how large they may be together. See
+    // `MAX_SECRET_BYTES`.
+    let mut secret_bytes = 0usize;
     for Listing { folder, entries } in listings {
         for entry in entries {
             let key = sidecar_key(&folder, &entry);
@@ -1743,8 +2005,6 @@ async fn walk<R: WalletReader>(
             } else {
                 out.entries_without_sidecar += 1;
             }
-            out.malformed_sidecar_fields += row.map_or(0, |r| r.malformed_fields);
-
             let provenance = Provenance::kwallet(wallet, &folder, &entry);
 
             // A failed `entryType` is a refusal, not a default. Treating it as
@@ -1754,6 +2014,29 @@ async fn walk<R: WalletReader>(
             // counted as imported. A false success on a secret is permanent,
             // and this is the one path the decoder's refusal never sees.
             let entry_type = match reader.entry_type(&folder, &entry).await {
+                // `0` is `EntryType::Unknown`, which no KWallet writer
+                // produces: `writePassword`, `writeEntry` and `writeMap` store
+                // 1, 2 and 3. So a `0` here is not a type, and routing it to
+                // `readEntry` stores an undecoded blob under whatever the
+                // sidecar's content type claims — the same false success a
+                // failed `entryType` would cause, reached in band. (kwalletd is
+                // additionally remembered to answer `0` for every failed lookup
+                // rather than raising a D-Bus error, which would make this the
+                // common path and not the odd one; only the client library is
+                // installed here, so that half is unverified. The refusal is
+                // right under either reading, which is why it does not wait on
+                // the answer.)
+                Ok(code) if EntryType::from_code(code) == EntryType::Unknown => {
+                    out.skipped.push(SkippedEntry {
+                        provenance,
+                        label: entry,
+                        reason: SkipReason::TypeUnavailable(
+                            "entryType reported 0 (Unknown), which no KWallet writer stores"
+                                .to_string(),
+                        ),
+                    });
+                    continue;
+                }
                 Ok(code) => EntryType::from_code(code),
                 Err(e) => {
                     out.skipped.push(SkippedEntry {
@@ -1776,6 +2059,20 @@ async fn walk<R: WalletReader>(
                     continue;
                 }
             };
+            // Checked as soon as the bytes exist, so the walk cannot be made
+            // to hold more than the budget even by one enormous entry.
+            secret_bytes = secret_bytes.saturating_add(secret.len());
+            if secret_bytes > MAX_SECRET_BYTES {
+                return Err(KWalletError::TooManySecretBytes {
+                    limit: MAX_SECRET_BYTES,
+                });
+            }
+
+            // Counted only now: a row whose entry the guards above skipped was
+            // applied to nothing, so its malformed fields cost the migration
+            // nothing, and adding them here would inflate a number that means
+            // "this many fields of items you imported were dropped".
+            out.malformed_sidecar_fields += row.map_or(0, |r| r.malformed_fields);
 
             let item = map_entry(
                 wallet,
@@ -1819,16 +2116,40 @@ async fn walk<R: WalletReader>(
 /// `KWallet::Wallet::EntryType` from KWallet's own public header, but it is
 /// still another project's enum reached over a wire that reports it as a bare
 /// integer. So a `Password` whose `readPassword` fails falls back to
-/// `readEntry` — the raw bytes are the same bytes — and the fallback is
-/// *counted* when it works, so a wrong assumption shows up as a number in the
-/// report rather than as a pile of missing items. An entry both reads failed
-/// for is not a fallback: it is a skip, and counting it as both would make the
-/// number mean nothing.
+/// `readEntry`, and the fallback is *counted* when it works, so a wrong
+/// assumption shows up as a number in the report rather than as a pile of
+/// missing items. An entry both reads failed for is not a fallback: it is a
+/// skip, and counting it as both would make the number mean nothing.
+///
+/// # The fallback bytes are decoded, not copied
+///
+/// This doc used to say the two reads return "the same bytes". They do not:
+/// `readPassword` is `s` and `readEntry` is `ay`, because kwalletd
+/// deserialises the stored `QDataStream` `QString` for the first and hands
+/// back the stored blob for the second. Copying the blob through stored
+/// `00 00 00 0E 00 68 00 75 …` for `hunter2`, labelled `text/plain`, counted
+/// as a *recovery*, and reported to the user as safe to decommission — the
+/// exact failure [`SkipReason::MapUndecodable`] exists to prevent, on the one
+/// branch that skipped the decoder. The fallback now goes through
+/// [`decode_qstring_password`] and refuses anything that is not a serialised
+/// `QString`.
 ///
 /// A `Map`'s *read* falls back the same way and is counted the same way; its
 /// **decode** is what gets no fallback. Its bytes are not the secret, the
 /// decoded map is, and an undecodable map is refused with a reason rather than
 /// written as an opaque blob that no one will ever recognise.
+///
+/// # An empty reply is not a secret
+///
+/// Every branch refuses a read that succeeded with no bytes. No supported
+/// KWallet writer produces an entry this module could tell apart from a failed
+/// read, so importing a zero-length secret and counting it as a success is the
+/// one outcome here that cannot be undone. (kwalletd is additionally
+/// remembered to signal a per-entry failure with an empty `QString`/
+/// `QByteArray` rather than a D-Bus error; only the client library is
+/// installed here, so that half is unverified and the refusal does not rest on
+/// it.) The `Map` branch was previously protected only by accident —
+/// `decode_qmap(b"")` is `Truncated` — which is why the gap was invisible.
 async fn read_secret<R: WalletReader>(
     reader: &R,
     folder: &str,
@@ -1837,44 +2158,74 @@ async fn read_secret<R: WalletReader>(
     out: &mut Extraction,
 ) -> Result<Zeroizing<Vec<u8>>, SkipReason> {
     match entry_type {
-        EntryType::Password => match reader.read_password(folder, entry).await {
-            // The `String` is moved out of the `Zeroizing` wrapper and its
-            // buffer reused, so the conversion leaves no un-zeroized copy.
-            Ok(mut s) => Ok(Zeroizing::new(std::mem::take(&mut *s).into_bytes())),
-            Err(first) => {
-                let recovered = reader.read_entry(folder, entry).await.map_err(|second| {
-                    SkipReason::Unreadable(format!(
-                        "readPassword failed ({first}) and readEntry failed ({second})"
-                    ))
-                })?;
-                // Counted here and not before the attempt: a fallback that did
-                // not recover anything is a skip, not a recovery.
-                out.password_read_fallbacks += 1;
-                Ok(recovered)
+        EntryType::Password => {
+            let first = match reader.read_password(folder, entry).await {
+                // The `String` is moved out of the `Zeroizing` wrapper and its
+                // buffer reused, so the conversion leaves no un-zeroized copy.
+                Ok(mut s) if !s.is_empty() => {
+                    return Ok(Zeroizing::new(std::mem::take(&mut *s).into_bytes()));
+                }
+                // An empty answer establishes nothing, so it is treated as a
+                // failed read and the fallback decides — not as a password
+                // that happens to be "".
+                Ok(_) => "readPassword answered with an empty string".to_string(),
+                Err(e) => e.to_string(),
+            };
+            let raw = reader.read_entry(folder, entry).await.map_err(|second| {
+                SkipReason::Unreadable(format!(
+                    "readPassword failed ({first}) and readEntry failed ({second})"
+                ))
+            })?;
+            if raw.is_empty() {
+                return Err(SkipReason::EmptyRead { call: "readEntry" });
             }
-        },
+            // `readEntry` hands back the *stored* blob, which for a password
+            // is a serialised `QString` and not the password. Decoded, or
+            // refused: storing the blob is the corruption this branch used to
+            // commit.
+            let recovered =
+                decode_qstring_password(&raw).map_err(SkipReason::PasswordUndecodable)?;
+            // Counted here and not before the attempt: a fallback that did not
+            // recover the password is a skip, not a recovery.
+            out.password_read_fallbacks += 1;
+            Ok(recovered)
+        }
         EntryType::Map => {
             let raw = match reader.read_map(folder, entry).await {
-                Ok(v) => v,
-                Err(e) => {
-                    // `readEntry` returns the identical bytes for a map entry,
-                    // so it is a legitimate retry for a refused `readMap` —
-                    // and the decode below is what actually decides.
+                Ok(v) if !v.is_empty() => v,
+                first => {
+                    let first = match first {
+                        Ok(_) => "readMap answered with no bytes".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    // `readEntry` returns the identical bytes for a map entry
+                    // — both are `ay` and both are the stored blob — so it is
+                    // a legitimate retry for a refused `readMap`, and the
+                    // decode below is what actually decides.
                     let recovered = reader.read_entry(folder, entry).await.map_err(|second| {
                         SkipReason::Unreadable(format!(
-                            "readMap failed ({e}) and readEntry failed ({second})"
+                            "readMap failed ({first}) and readEntry failed ({second})"
                         ))
                     })?;
+                    if recovered.is_empty() {
+                        return Err(SkipReason::EmptyRead { call: "readEntry" });
+                    }
                     out.map_read_fallbacks += 1;
                     recovered
                 }
             };
             Ok(read_map_secret(&raw)?)
         }
-        EntryType::Stream | EntryType::Unknown | EntryType::Other(_) => reader
-            .read_entry(folder, entry)
-            .await
-            .map_err(|e| SkipReason::Unreadable(e.to_string())),
+        EntryType::Stream | EntryType::Unknown | EntryType::Other(_) => {
+            let raw = reader
+                .read_entry(folder, entry)
+                .await
+                .map_err(|e| SkipReason::Unreadable(e.to_string()))?;
+            if raw.is_empty() {
+                return Err(SkipReason::EmptyRead { call: "readEntry" });
+            }
+            Ok(raw)
+        }
     }
 }
 
@@ -1904,6 +2255,19 @@ mod tests {
 
     fn secret() -> Zeroizing<Vec<u8>> {
         Zeroizing::new(b"hunter2".to_vec())
+    }
+
+    /// Serialises `s` exactly as `QDataStream << QString` does, which is what
+    /// `KWallet::Wallet::writePassword` stores and therefore what `readEntry`
+    /// hands back for a `Password` entry: a big-endian `quint32` **byte**
+    /// length, then UTF-16BE.
+    fn qstring_bytes(s: &str) -> Vec<u8> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let mut out = ((units.len() * 2) as u32).to_be_bytes().to_vec();
+        for u in units {
+            out.extend_from_slice(&u.to_be_bytes());
+        }
+        out
     }
 
     /// Serialises `pairs` exactly as `QDataStream << QMap<QString, QString>`
@@ -2298,6 +2662,58 @@ mod tests {
         }
     }
 
+    /// The `take` is the guarantee and the `metadata` check is only an early
+    /// refusal — so the `take` needs a case where `metadata` does not fire.
+    /// Every file a test can *write* has an honest length, which is why
+    /// deleting this re-check left the suite green; a `/proc` file reports a
+    /// length of zero and has content, which is exactly the shape the
+    /// re-check exists for.
+    #[test]
+    fn a_file_whose_metadata_understates_its_length_is_still_bounded() {
+        let path = Path::new("/proc/self/maps");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            0,
+            "this test needs a file whose metadata understates its length"
+        );
+        match Sidecar::load_with_limit(path, 64).unwrap_err() {
+            SidecarError::TooLarge { len, limit, .. } => {
+                assert_eq!(len, 65, "the read was not stopped one byte past the limit");
+                assert_eq!(limit, 64);
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    /// A repeated key silently loses a whole row — an entry's entire attribute
+    /// map — because `serde_json` keeps the last and says nothing. Last-wins
+    /// is kept, since every other reader of the file does the same; what is
+    /// not kept is the silence.
+    #[test]
+    fn a_duplicate_sidecar_key_is_reported_rather_than_silently_resolved() {
+        let s = parse(
+            r#"{"f/e": {"attributes": {"server": "first"}},
+                "f/e": {"attributes": {"server": "second"}}}"#,
+        );
+        assert_eq!(s.duplicate_keys(), ["f/e"]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.get("f/e").unwrap().attributes["server"], "second");
+    }
+
+    /// And the walk carries it out to the caller, which is the only place the
+    /// condition is visible at all: only the surviving row ever reaches it.
+    #[tokio::test]
+    async fn duplicate_sidecar_keys_reach_the_extraction() {
+        let fake = FakeWallet::default()
+            .folder("f", &["e"])
+            .password("f", "e", "v");
+        let sidecar = parse(r#"{"f/e": {"attributes": {}}, "f/e": {"attributes": {}}}"#);
+
+        let out = walked(&fake, &sidecar).await;
+
+        assert_eq!(out.duplicate_sidecar_keys, ["f/e"]);
+    }
+
     /// A wallet `ksecretd` never touched has no sidecar. Its entries have no
     /// attributes, which is a state the mapping already handles; it is not an
     /// error.
@@ -2625,31 +3041,40 @@ mod tests {
     /// the secret, given the sidecar's `application/json` content type, and
     /// counted as imported: a false success on a secret, reached by the one
     /// path the decoder's refusal never sees.
+    ///
+    /// Both shapes of failure are driven, and the second is the one that
+    /// matters. This test used to drive only `Err(…)` — a *transport* error,
+    /// which an `i`-returning method cannot produce for a missing entry — so
+    /// the refusal was real here and unreachable in production: a live daemon
+    /// reports the failure in band as `0`, which is `EntryType::Unknown`,
+    /// which dispatched straight to `readEntry`.
     #[tokio::test]
     async fn a_refused_entry_type_is_skipped_rather_than_read_as_raw_bytes() {
         let blob = qmap_bytes(&[("user", "joseph"), ("password", "hunter2")]);
-        let fake = FakeWallet::default()
-            .folder("Secret Service", &["credential"])
-            .entry_type("Secret Service", "credential", Err("no such entry"))
-            .read_entry("Secret Service", "credential", Ok(blob.clone()));
-        let sidecar =
-            parse(r#"{"Secret Service/credential": {"$fdo_mime_type": "application/json"}}"#);
+        for reported in [Err("no such entry"), Ok(EntryType::Unknown.code())] {
+            let fake = FakeWallet::default()
+                .folder("Secret Service", &["credential"])
+                .entry_type("Secret Service", "credential", reported)
+                .read_entry("Secret Service", "credential", Ok(blob.clone()));
+            let sidecar =
+                parse(r#"{"Secret Service/credential": {"$fdo_mime_type": "application/json"}}"#);
 
-        let out = walked(&fake, &sidecar).await;
+            let out = walked(&fake, &sidecar).await;
 
-        assert!(
-            out.items.is_empty(),
-            "the entry was imported: {:?}",
-            out.items
-        );
-        assert_eq!(out.skipped.len(), 1);
-        assert!(
-            matches!(out.skipped[0].reason, SkipReason::TypeUnavailable(_)),
-            "{:?}",
-            out.skipped[0].reason
-        );
-        // And in particular the raw stream never became a secret.
-        assert!(!out.items.iter().any(|i| *i.secret == blob));
+            assert!(
+                out.items.is_empty(),
+                "the entry was imported ({reported:?}): {:?}",
+                out.items
+            );
+            assert_eq!(out.skipped.len(), 1, "{reported:?}");
+            assert!(
+                matches!(out.skipped[0].reason, SkipReason::TypeUnavailable(_)),
+                "{:?}",
+                out.skipped[0].reason
+            );
+            // And in particular the raw stream never became a secret.
+            assert!(!out.items.iter().any(|i| *i.secret == blob));
+        }
     }
 
     /// A sidecar key two `(folder, entry)` pairs compose belongs to neither.
@@ -2723,16 +3148,25 @@ mod tests {
         assert_eq!(out.items.len(), 1);
     }
 
-    /// The fallback counter names what `readEntry` *recovered*. An entry both
-    /// reads failed for is a skip; counting it here as well would make the
-    /// number — and the sentence the CLI prints about it — false.
+    /// The fallback counter names what `readEntry` *recovered*, and what it
+    /// recovered has to be the password.
+    ///
+    /// `read_entry` is fed the **wire form** — `readEntry` is `ay` and returns
+    /// the stored `QDataStream` `QString`, not the plain UTF-8 bytes an
+    /// earlier version of this test invented — and the recovered secret's
+    /// bytes are asserted. With plain `b"hunter2"` and no assertion on the
+    /// stored bytes, this test passed while the fallback wrote
+    /// `00 00 00 0E 00 68 00 75 …` into the vault, labelled it `text/plain`,
+    /// and counted it as a recovery. The sibling
+    /// `a_map_read_falls_back_and_is_counted` did assert its bytes; the
+    /// asymmetry was the whole of the defect.
     #[tokio::test]
-    async fn a_password_fallback_is_counted_only_when_it_recovers() {
+    async fn a_password_fallback_recovers_the_password_and_is_counted() {
         let fake = FakeWallet::default()
             .folder("f", &["recovered", "lost"])
             .entry_type("f", "recovered", Ok(EntryType::Password.code()))
             .read_password("f", "recovered", Err("not a password"))
-            .read_entry("f", "recovered", Ok(b"hunter2".to_vec()))
+            .read_entry("f", "recovered", Ok(qstring_bytes("hunter2")))
             .entry_type("f", "lost", Ok(EntryType::Password.code()))
             .read_password("f", "lost", Err("not a password"))
             .read_entry("f", "lost", Err("denied"));
@@ -2740,10 +3174,151 @@ mod tests {
         let out = walked(&fake, &Sidecar::empty()).await;
 
         assert_eq!(out.items.len(), 1);
+        assert_eq!(
+            &*out.items[0].secret, b"hunter2",
+            "the fallback stored something that is not the password"
+        );
         assert_eq!(out.skipped.len(), 1);
         assert_eq!(
             out.password_read_fallbacks, 1,
             "an entry that was skipped was counted as a recovery"
+        );
+    }
+
+    /// Fallback bytes that are not a serialised `QString` are refused, not
+    /// stored. There is no shape of `readEntry` reply that becomes a secret
+    /// without going through the decoder.
+    #[tokio::test]
+    async fn a_password_fallback_refuses_bytes_that_are_not_a_qstring() {
+        // Plain UTF-8, which is what the old test fed and what the old code
+        // would have stored verbatim: as a `QString` it declares 0x68756e74
+        // bytes and truncates immediately.
+        for blob in [
+            b"hunter2".to_vec(),
+            // A well-formed `QString` with one byte glued on the end: a prefix
+            // of a password is not a password.
+            {
+                let mut b = qstring_bytes("hunter2");
+                b.push(0);
+                b
+            },
+        ] {
+            let fake = FakeWallet::default()
+                .folder("f", &["p"])
+                .entry_type("f", "p", Ok(EntryType::Password.code()))
+                .read_password("f", "p", Err("not a password"))
+                .read_entry("f", "p", Ok(blob.clone()));
+
+            let out = walked(&fake, &Sidecar::empty()).await;
+
+            assert!(out.items.is_empty(), "stored {blob:?}");
+            assert_eq!(out.password_read_fallbacks, 0, "counted as a recovery");
+            assert!(
+                matches!(out.skipped[0].reason, SkipReason::PasswordUndecodable(_)),
+                "{:?}",
+                out.skipped[0].reason
+            );
+        }
+    }
+
+    /// A `readPassword` that works is not touched by any of this: its reply is
+    /// already the deserialised string.
+    #[tokio::test]
+    async fn a_successful_read_password_is_the_secret_verbatim() {
+        let fake = FakeWallet::default()
+            .folder("f", &["p"])
+            .password("f", "p", "hunter2");
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert_eq!(&*out.items[0].secret, b"hunter2");
+        assert_eq!(out.password_read_fallbacks, 0);
+    }
+
+    /// An empty reply is not a zero-length secret.
+    ///
+    /// No supported KWallet writer produces an entry this module could tell
+    /// apart from a failed read, and kwalletd is remembered to report a
+    /// per-entry failure this way rather than by raising a D-Bus error.
+    /// Importing it and reporting success is the direction that cannot be
+    /// undone. The `Map` branch was protected only by accident —
+    /// `decode_qmap(b"")` is `Truncated` — so only the other two were live.
+    #[tokio::test]
+    async fn an_empty_reply_is_refused_rather_than_imported_as_an_empty_secret() {
+        let fake = FakeWallet::default()
+            .folder("f", &["password", "stream", "map"])
+            .entry_type("f", "password", Ok(EntryType::Password.code()))
+            .read_password("f", "password", Ok(""))
+            .read_entry("f", "password", Ok(Vec::new()))
+            .entry_type("f", "stream", Ok(EntryType::Stream.code()))
+            .read_entry("f", "stream", Ok(Vec::new()))
+            .entry_type("f", "map", Ok(EntryType::Map.code()))
+            .read_map("f", "map", Ok(Vec::new()))
+            .read_entry("f", "map", Ok(Vec::new()));
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        assert_eq!(out.skipped.len(), 3);
+        assert_eq!(
+            out.password_read_fallbacks, 0,
+            "an empty reply was counted as a recovery"
+        );
+        assert_eq!(out.map_read_fallbacks, 0);
+        for skipped in &out.skipped {
+            assert!(
+                matches!(
+                    skipped.reason,
+                    SkipReason::EmptyRead { .. } | SkipReason::Unreadable(_)
+                ),
+                "{:?}",
+                skipped.reason
+            );
+        }
+    }
+
+    /// A walk is bounded by bytes as well as by entries. `MAX_ENTRIES` alone
+    /// permits ~200 GiB resident, at which point the process dies with the
+    /// wallet still held open by `APP_ID`.
+    #[tokio::test]
+    async fn the_walk_refuses_to_hold_more_than_the_byte_budget() {
+        let big = vec![b'x'; 8 << 20];
+        let names: Vec<String> = (0..40).map(|n| format!("e{n}")).collect();
+        let mut fake = FakeWallet::default()
+            .folder("f", &names.iter().map(String::as_str).collect::<Vec<_>>());
+        for name in &names {
+            fake = fake
+                .entry_type("f", name, Ok(EntryType::Stream.code()))
+                .read_entry("f", name, Ok(big.clone()));
+        }
+
+        let e = walk(&fake, "kdewallet", &Sidecar::empty())
+            .await
+            .expect_err("the walk held 320 MiB of secrets and said nothing");
+        assert!(
+            matches!(e, KWalletError::TooManySecretBytes { limit } if limit == MAX_SECRET_BYTES),
+            "{e:?}"
+        );
+    }
+
+    /// A row whose entry never became an item contributed nothing to any item,
+    /// so its malformed fields are not counted against the import. The doc
+    /// said this before the code did.
+    #[tokio::test]
+    async fn malformed_fields_of_a_skipped_entrys_row_are_not_counted() {
+        let fake = FakeWallet::default().folder("f", &["gone"]).entry_type(
+            "f",
+            "gone",
+            Err("no such entry"),
+        );
+        let sidecar = parse(r#"{"f/gone": {"$fdo_created": "not a number"}}"#);
+
+        let out = walked(&fake, &sidecar).await;
+
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(
+            out.malformed_sidecar_fields, 0,
+            "a row for an entry that was skipped was counted against the import"
         );
     }
 
@@ -2942,8 +3517,12 @@ mod tests {
     /// Set, every step is required: the service, the wallet list, and a real
     /// walk of an open wallet.
     ///
-    /// It never opens a *closed* wallet even when opted in: that raises a
-    /// password dialog, and a test may not do that.
+    /// It never opens a *closed* wallet even when opted in: that raises the
+    /// unlock dialog, and a test may not do that. A wallet that is already
+    /// open can still prompt for *this application's* access on the first
+    /// read — see [`DEFAULT_CALL_TIMEOUT`] — which is bounded rather than
+    /// avoided, so a run against a wallet that has never seen [`APP_ID`] may
+    /// wait on one.
     #[tokio::test]
     async fn live_kwalletd_agrees_with_this_modules_assumptions() {
         // `eprintln!` and not `println!`: a skip has to be visible.
@@ -2989,7 +3568,14 @@ mod tests {
                 println!("  not walked: the wallet is closed and opening it would prompt");
                 continue;
             }
-            // Already open, so this cannot raise a dialog.
+            // Already open, so this cannot raise the *unlock* dialog — which
+            // is the one a test may not raise, because nobody is there to type
+            // into it. It can still raise KWallet's per-application access
+            // prompt, which `DEFAULT_CALL_TIMEOUT` documents as appearing
+            // inside a read; the ten-second open timeout below does not bound
+            // that, and the per-call bound is what does. The two docs used to
+            // contradict each other, with this one claiming no dialog was
+            // possible at all.
             let out = extract(&conn, wallet, &sidecar, Duration::from_secs(10))
                 .await
                 .expect("the walk failed");

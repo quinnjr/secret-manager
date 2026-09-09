@@ -321,21 +321,9 @@ async fn extract_gnome(source_dir: &Path, container: &str) -> Result<Extraction,
          never stored)",
     )?;
     let password = Zeroizing::new(password.as_bytes().to_vec());
-    // Only the keyring the user named. Without this the walk covers every
-    // collection the private daemon exposes, so items from keyrings they did
-    // not ask for land in a collection labelled after the one they did — and
-    // the label then misdescribes its own contents. It is also the scope the
-    // independent count is taken over; the two must not disagree.
-    let walked = gnome::extract_over_private_bus(
-        &password,
-        &gnome::ExtractOptions {
-            only_container: Some(container.to_string()),
-            data_home: Some(snapshot.data_home().to_path_buf()),
-            ..Default::default()
-        },
-    )
-    .await
-    .map_err(gnome_error)?;
+    let walked = gnome::extract_over_private_bus(&password, &snapshot, &gnome_options(container))
+        .await
+        .map_err(gnome_error)?;
 
     if let Some(reason) = &walked.plain_fallback_reason {
         notes.push(format!(
@@ -352,10 +340,16 @@ async fn extract_gnome(source_dir: &Path, container: &str) -> Result<Extraction,
     }
     for collection in walked.unanswerable_collections() {
         notes.push(format!(
-            "the collection '{}' holds {} items and its unlock prompt could not be \
+            "the collection '{}' holds {} and its unlock prompt could not be \
              answered, so none of them were read",
             escape_control(&collection.label),
-            collection.item_count
+            // A collection nobody could unlock may also not say how many items
+            // it holds; "an unknown number" is the honest phrasing, and `0`
+            // would read as "nothing was lost".
+            match collection.item_count {
+                Some(n) => format!("{n} items"),
+                None => "an unknown number of items".to_string(),
+            }
         ));
     }
     Ok(Extraction {
@@ -450,6 +444,16 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
             walked.ambiguous_sidecar_keys.len()
         ));
     }
+    if !walked.duplicate_sidecar_keys.is_empty() {
+        notes.push(format!(
+            "{} sidecar keys were declared more than once, and only the last of each \
+             reached the walk: an entry's whole attribute map was replaced by another \
+             row's, so its attributes may belong to a different entry. This is the same \
+             harm the ambiguous keys above are refused for, arriving by a different door, \
+             and it means the file is not the shape ksecretd writes",
+            walked.duplicate_sidecar_keys.len()
+        ));
+    }
     if !walked.unresolved_sidecar_rows.is_empty() {
         notes.push(format!(
             "{} sidecar rows were not applied to any entry. That is not the same as \
@@ -517,6 +521,25 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
         empty_folders: walked.empty_folders,
         notes,
     })
+}
+
+/// The options the gnome walk is given.
+///
+/// A function rather than a literal inside the `await` above, because the one
+/// decision it encodes is the one this module's header calls load-bearing and
+/// it needs to be assertable: **only the keyring the user named**. Without
+/// `only_container` the walk covers every collection the private daemon
+/// exposes, so items from keyrings they did not ask for land in a collection
+/// labelled after the one they did — and the label then misdescribes its own
+/// contents. It is also the scope the independent count is taken over; the two
+/// must not disagree. A literal there was reachable only through a real
+/// `gnome-keyring-daemon`, so nothing in the suite could tell `Some(container)`
+/// from `None`.
+fn gnome_options(container: &str) -> gnome::ExtractOptions {
+    gnome::ExtractOptions {
+        only_container: Some(container.to_string()),
+        ..Default::default()
+    }
 }
 
 fn gnome_error(e: gnome::GnomeError) -> CliError {
@@ -588,9 +611,12 @@ fn source_dir(source: Source) -> Result<PathBuf, CliError> {
 /// Files with `extension` in `dir`, sorted, so a listing is deterministic.
 fn files_with_extension(dir: &Path, extension: &str) -> Result<Vec<PathBuf>, CliError> {
     let entries = std::fs::read_dir(dir).map_err(|e| match e.kind() {
+        // The directory is what is missing, not a directory *of* the
+        // extension: `keyrings/` is not "a keyring directory", and a user told
+        // "no keyring directory at ~/.local/share/kwalletd" reads it as a
+        // statement about the files inside a directory that does exist.
         std::io::ErrorKind::NotFound => CliError::NotFound(format!(
-            "no {} directory at {}",
-            extension,
+            "there is no directory at {}",
             escape_control(&dir.display().to_string())
         )),
         _ => CliError::Failed(format!(
@@ -736,7 +762,14 @@ fn one_of(candidates: &[PathBuf], dir: &Path, extension: &str) -> Result<PathBuf
                 .iter()
                 .map(|p| escape_control(&p.file_name().unwrap_or_default().to_string_lossy()))
                 .collect();
-            Err(CliError::Usage(format!(
+            // Exit 1, not the exit 2 that means "a different invocation is the
+            // remedy". There is no flag naming the source container — `sm
+            // import` has `--collection` for the *destination* and nothing for
+            // the source — so no rerun of `sm` fixes this: the user has to
+            // change the directory, or write a `default` file. Contrast the
+            // "collection already exists" refusal, which is exit 2 because
+            // `--collection` is the remedy.
+            Err(CliError::Failed(format!(
                 "{} holds {} .{extension} files ({}); this command imports one container, \
                  so move the ones you do not want aside and run it again",
                 escape_control(&dir.display().to_string()),
@@ -830,8 +863,56 @@ struct ReportFile<'a> {
     not_migrated: &'a [NotMigrated],
     /// Anything the run must not be silent about.
     notes: &'a [String],
-    /// `false` for `--dry-run`: the report describes what *would* happen.
+    /// `true` for `--dry-run`: the report describes what *would* happen, and
+    /// nothing on this machine was changed by the run that wrote it.
+    dry_run: bool,
+    /// Whether the collection this report describes is **on disk** now.
+    ///
+    /// Two fields and not one, because the two questions have different
+    /// answers on the path that matters most. A failed offline verification
+    /// is not a dry run — a vault really was created — and the vault is then
+    /// unlinked three lines below the report, so a single flag meaning both
+    /// had to lie about one of them: it said `written: true` for a collection
+    /// the error text beside it correctly described as "removed again". The
+    /// artifact a user pastes into a bug report now agrees with the message
+    /// printed above it.
     written: bool,
+}
+
+/// What became of the collection a report describes.
+///
+/// Three states and not two booleans, because one of the four pairs is
+/// impossible — a dry run cannot have left a vault on disk — and the pair that
+/// was collapsed into a single flag is the one that made the report lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// `--dry-run`: nothing was created, so nothing was removed either.
+    DryRun,
+    /// A real run whose collection is on disk and stays there — including the
+    /// failed-probe path, which deliberately leaves it.
+    Kept,
+    /// A real run that created a collection and unlinked it again, which is
+    /// what a failed offline verification does three lines after writing the
+    /// report.
+    RemovedAgain,
+}
+
+impl Disposition {
+    fn of(dry_run: bool) -> Self {
+        if dry_run {
+            Disposition::DryRun
+        } else {
+            Disposition::Kept
+        }
+    }
+
+    fn dry_run(self) -> bool {
+        matches!(self, Disposition::DryRun)
+    }
+
+    fn written(self) -> bool {
+        matches!(self, Disposition::Kept)
+    }
 }
 
 impl<'a> ReportFile<'a> {
@@ -851,7 +932,7 @@ impl<'a> ReportFile<'a> {
         verification: &'a Verification,
         not_migrated: &'a [NotMigrated],
         notes: &'a [String],
-        written: bool,
+        disposition: Disposition,
     ) -> Self {
         Self {
             source: report.source,
@@ -864,7 +945,8 @@ impl<'a> ReportFile<'a> {
             verification,
             not_migrated,
             notes,
-            written,
+            dry_run: disposition.dry_run(),
+            written: disposition.written(),
         }
     }
 }
@@ -998,6 +1080,17 @@ fn write_report_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     if let Err(e) = written.and_then(|()| std::fs::rename(&temp, path)) {
         let _ = std::fs::remove_file(&temp);
         return Err(header_io(path, e));
+    }
+    // And fsync the directory, as every other atomic write in this crate does
+    // (`vault::store::write_atomic`, `dbus::state`'s alias file). The file's
+    // own `sync_all` above durably records its *contents*; the rename that
+    // gives them the name a user will look for is a directory operation, and
+    // without this a crash can leave the old report — or no report — where a
+    // line on stdout has just said one was written. Best effort: the report
+    // exists either way, and failing the import over an unsyncable directory
+    // is the trade this whole function is written not to make.
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
     Ok(())
 }
@@ -1253,7 +1346,16 @@ mod pipeline {
                 &verification,
                 &extraction.skipped,
                 &extraction.notes,
-                !args.dry_run,
+                // Nothing is on disk after this branch, whichever run it was:
+                // a dry run created nothing, and a real one is about to have
+                // the collection it created unlinked by `unlink_partial`
+                // below — which is what the error text printed beside this
+                // report already says. It said `written: true`.
+                if args.dry_run {
+                    Disposition::DryRun
+                } else {
+                    Disposition::RemovedAgain
+                },
             );
             print_report(&file, &id, &report_file, destination_exists);
             if let Some(path) = &args.report {
@@ -1277,12 +1379,29 @@ mod pipeline {
         }
 
         // Only now is the collection published: the daemon is told to rescan,
-        // which is what gives the probe below something to find.
+        // which is what gives the probe something to find.
+        //
+        // **One guard, because these are one ordered pair.** Reload, then
+        // question what was reloaded: a probe before the rescan asks a daemon
+        // that has never heard of this collection and comes back empty for
+        // every attribute set, which is a failure report on a correct import.
+        // They sat in two adjacent `if !args.dry_run` blocks with identical
+        // conditions — two independently editable halves of one sequence,
+        // which is the mechanical shape of the regression this file already
+        // records — so they are one block and the order is stated here.
         if !args.dry_run {
-            notify_daemon(&env.daemon);
-        }
-        if !args.dry_run {
-            let probes = run_probes(&plan, &id, config.vault.locked_search, &env.daemon).await;
+            notify_daemon(&env.daemon).await;
+            // Whether a *locked* collection can answer an attribute search is
+            // a property of the file that was just written, not of this CLI's
+            // config: `reopen` read the header back off disk and
+            // `Destination::indexed` is what it found there. Gating on
+            // `[vault] locked_search` asked the wrong process — the daemon
+            // holds the collection and has its own copy of that setting — so
+            // a byte-perfect import could exit 1 saying a libsecret client
+            // could not find its items, or skip the probe on a header that
+            // carries every hash.
+            let indexed = destination.as_ref().is_some_and(|d| d.indexed);
+            let probes = run_probes(&plan, &id, indexed, &env.daemon).await;
             verification.probes = verify::ProbeSummary::of(&probes);
             verification.failed_probes = probes
                 .into_iter()
@@ -1304,7 +1423,10 @@ mod pipeline {
             &verification,
             &extraction.skipped,
             &extraction.notes,
-            !args.dry_run,
+            // Every offline check passed, so a real run's collection is on
+            // disk and stays there — including on the failed-probe branch
+            // below, which deliberately leaves it.
+            Disposition::of(args.dry_run),
         );
 
         print_report(&file, &id, &report_file, destination_exists);
@@ -1383,7 +1505,13 @@ fn set_default_alias(config: &Config, id: &str) {
 }
 
 /// Tell a running daemon to rescan, so the probe below has something to find.
-fn notify_daemon(target: &DaemonTarget) {
+///
+/// `protocol::call` is a blocking connect/write/read on a unix socket against
+/// a daemon that may be busy loading the collection this run just wrote, so it
+/// goes to the blocking pool rather than onto the async worker this `async fn`
+/// is running on. Blocking here parked the runtime thread, which is why three
+/// tests carried `worker_threads = 4` and a comment naming the reason.
+async fn notify_daemon(target: &DaemonTarget) {
     let path = match target {
         DaemonTarget::None => return,
         DaemonTarget::At { control_socket, .. } => control_socket.clone(),
@@ -1392,7 +1520,10 @@ fn notify_daemon(target: &DaemonTarget) {
             path
         }
     };
-    match call(&path, &Request::Reload) {
+    let reloaded = tokio::task::spawn_blocking(move || call(&path, &Request::Reload))
+        .await
+        .unwrap_or_else(|e| Err(ProtocolError::Io(std::io::Error::other(e.to_string()))));
+    match reloaded {
         Ok(Response::Error(e)) => {
             eprintln!(
                 "warning: running daemon did not reload: {}",
@@ -1479,7 +1610,17 @@ async fn probe_target(target: &DaemonTarget) -> Result<zbus::Connection, String>
     // Ours by construction: the socket lives under `$XDG_RUNTIME_DIR`, and
     // whoever answers it is the daemon this CLI already trusts with vault
     // keys.
-    let ours = control_socket_peer_pid(&socket).map_err(|e| {
+    // `connect(2)` on a unix socket blocks, so it goes to the blocking pool
+    // rather than onto this async worker: the daemon on the other end may be
+    // mid-rescan of the collection this run just wrote, and it answers on the
+    // same runtime in an in-process test.
+    let ours = {
+        let socket = socket.clone();
+        tokio::task::spawn_blocking(move || control_socket_peer_pid(&socket))
+            .await
+            .map_err(|e| format!("the control socket could not be questioned: {e}"))?
+    }
+    .map_err(|e| {
         format!(
             "the daemon's control socket at {} did not answer ({e})",
             escape_control(&socket.display().to_string())
@@ -1530,25 +1671,31 @@ async fn probe_target(target: &DaemonTarget) -> Result<zbus::Connection, String>
 async fn run_probes(
     plan: &[verify::ProbeQuery],
     id: &str,
-    locked_search: bool,
+    header_is_indexed: bool,
     target: &DaemonTarget,
 ) -> Vec<ProbeResult> {
     if plan.is_empty() {
         return Vec::new();
     }
-    if !locked_search {
+    if !header_is_indexed {
         // The new collection is locked the moment the daemon reloads it, and a
         // locked collection is searchable only through the header's hashed
-        // attribute index. With `[vault] locked_search = false` that index
-        // holds ids alone, so every probe returns nothing whatever the import
-        // did. Reporting that as a failed probe would fail a correct import;
-        // it is an unproved check, which is what it is.
+        // attribute index. When that index holds ids alone, every probe
+        // returns nothing whatever the import did. Reporting that as a failed
+        // probe would fail a correct import; it is an unproved check, which is
+        // what it is.
+        //
+        // The question is asked of the **file** — `Destination::indexed`, read
+        // back off disk by `reopen` — and not of `[vault] locked_search`. The
+        // config this CLI loaded is not the config the daemon is running, and
+        // it is not what shaped the header either: the header is what a locked
+        // search reads.
         eprintln!(
-            "warning: [vault] locked_search = false, so the new collection's header carries \
-             item ids only and a locked collection answers no attribute search. Every probe \
-             would find nothing however faithful the import was, so discoverability is left \
-             unproved rather than reported as failed. Unlock the collection with `sm unlock \
-             --collection {}` and check with `sm list`.",
+            "warning: the new collection's header carries item ids only, so a locked \
+             collection answers no attribute search. Every probe would find nothing however \
+             faithful the import was, so discoverability is left unproved rather than \
+             reported as failed. Unlock the collection with `sm unlock --collection {}` and \
+             check with `sm list`.",
             escape_control(id)
         );
         return plan.iter().map(ProbeResult::not_issued).collect();
@@ -1629,6 +1776,10 @@ async fn run_probes(
 struct Destination {
     fingerprints: Vec<FingerprintEntry>,
     lengths: Histogram,
+    /// Whether the header this run wrote carries attribute hashes, so a
+    /// *locked* collection can answer an attribute search at all. Read from
+    /// the file, which is the only thing that decides it — see [`run_probes`].
+    indexed: bool,
 }
 
 /// Reopen the collection that was just written and decrypt it again.
@@ -1650,6 +1801,7 @@ fn reopen(path: &Path, password: &[u8], id: &str) -> Result<Destination, CliErro
             })
             .collect(),
         lengths: Histogram::of_lengths(items.iter().map(|i| i.secret.len())),
+        indexed: vault.index_has_attributes(),
     })
 }
 
@@ -1784,7 +1936,11 @@ fn print_report(file: &SourceFile, id: &str, r: &ReportFile<'_>, destination_exi
     let verification = r.verification;
     let not_migrated = r.not_migrated;
     let notes = r.notes;
-    let dry_run = !r.written;
+    // `r.dry_run`, never `!r.written`: a run whose offline verification failed
+    // wrote a collection and then removed it again, so it is a real run with
+    // `written: false`, and printing it as a dry run would tell the user no
+    // vault was ever created.
+    let dry_run = r.dry_run;
     println!(
         "{} import from {source}",
         if dry_run { "Dry run:" } else { "Completed" }
@@ -2039,6 +2195,26 @@ mod tests {
         }
     }
 
+    /// The gnome walk is restricted to the keyring [`locate`] chose.
+    ///
+    /// This is the one decision on that path a test can reach: the call itself
+    /// needs a `gnome-keyring-daemon` and a private bus, so with the option
+    /// built as a literal inside it, `only_container: None` — the bug this
+    /// branch introduced, where a walk of every keyring the private daemon
+    /// exposes was written into a collection named after one of them — passed
+    /// the whole suite. The independent count is taken over the same one
+    /// keyring, so the two halves disagreeing is a failed verification on a
+    /// faithful import.
+    #[test]
+    fn the_gnome_walk_is_restricted_to_the_keyring_that_was_located() {
+        let options = gnome_options("Work keyring");
+        assert_eq!(
+            options.only_container.as_deref(),
+            Some("Work keyring"),
+            "the walk covers every keyring the private daemon holds"
+        );
+    }
+
     /// An item type this build does not recognise gets its own paragraph.
     ///
     /// The case used to be invisible: an unrecognised `Item.Type` produced
@@ -2134,7 +2310,7 @@ mod tests {
             &verification,
             &[],
             &[],
-            true,
+            Disposition::Kept,
         );
         write_report(&path, &report_file).unwrap();
 
@@ -2182,6 +2358,7 @@ mod tests {
         let destination = Destination {
             fingerprints: Vec::new(),
             lengths: Histogram::of_lengths(std::iter::empty()),
+            indexed: true,
         };
         let verification = verify_import(&file, &items, 1, Some(&destination), Vec::new());
         assert!(
@@ -2218,7 +2395,7 @@ mod tests {
             &verification,
             &not_migrated,
             &notes,
-            true,
+            Disposition::Kept,
         );
         write_report(&path, &report_file).unwrap();
 
