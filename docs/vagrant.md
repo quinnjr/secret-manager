@@ -91,6 +91,9 @@ debug build. Nor does it verify the KWallet or gnome-keyring
 decommissioning steps, which need a desktop session; those remain reasoned
 rather than checked, and the migration spec
 (`docs/superpowers/specs/2026-09-08-migration-assistant.md`) says so.
+Delete this paragraph when this file gains a desktop-session box or a
+manual verification log (distro + Plasma/GNOME version); tracked with the
+migration follow-up on `feature/migration-spec`.
 
 Arch is the development machine and is exercised continuously; there is no
 Arch box here for that reason.

@@ -16,7 +16,7 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use secret_manager::import::formats as import_formats;
-use secret_manager::vault::crypto::{KdfParams, KEY_LEN, NONCE_LEN, SALT_LEN};
+use secret_manager::vault::crypto::{KEY_LEN, KdfParams, NONCE_LEN, SALT_LEN};
 use secret_manager::vault::format::{self, Header, IndexEntry, Item};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -510,7 +510,10 @@ mod tests {
             "a 28-byte file declaring a {} byte header allocated {p}",
             format::MAX_HEADER
         );
-        assert!(p < format::MAX_HEADER, "allocated {p} from the prefix alone");
+        assert!(
+            p < format::MAX_HEADER,
+            "allocated {p} from the prefix alone"
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -584,7 +587,10 @@ mod tests {
         // set from a measurement — 1743 honest of 4096 draws, 1410 of them
         // carrying an item — with enough room for a retune and not enough to
         // sit through an order-of-magnitude regression.
-        assert!(honest >= 1024, "only {honest} honest keyrings in 4096 draws");
+        assert!(
+            honest >= 1024,
+            "only {honest} honest keyrings in 4096 draws"
+        );
         assert!(
             with_items >= 512,
             "only {with_items} honest keyrings carried an item, so the oracle \
@@ -674,6 +680,31 @@ mod tests {
         let inv = import_formats::parse_keyring_header(empty).expect("seed-empty must parse");
         assert_eq!(inv.item_count(), 0);
     }
+
+    /// The wallet mirror of the keyring seed above: a 20-byte file declaring
+    /// four billion folders must hit the folder-count guard, and must differ
+    /// from the empty seed it would otherwise duplicate — the same
+    /// byte-identical-seed failure, one format over.
+    #[test]
+    fn the_absurd_folder_count_seed_hits_the_folder_count_guard() {
+        let seed = include_bytes!("../corpus/import_wallet_header/seed-absurd-folder-count");
+        let empty = include_bytes!("../corpus/import_wallet_header/seed-empty");
+        assert_ne!(
+            seed.as_slice(),
+            empty.as_slice(),
+            "the seed is byte-identical to seed-empty again"
+        );
+        match import_formats::parse_wallet_header(seed) {
+            Err(import_formats::HeaderError::ImpossibleLength { field, declared }) => {
+                assert_eq!(field, "folder count");
+                assert_eq!(declared, u64::from(u32::MAX));
+            }
+            other => panic!("expected a folder-count refusal, got {other:?}"),
+        }
+        // And `seed-empty` still parses, so the pair really is a contrast.
+        let inv = import_formats::parse_wallet_header(empty).expect("seed-empty must parse");
+        assert_eq!(inv.folder_count(), 0);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -722,9 +753,17 @@ fn maybe_declared(u: &mut Unstructured) -> arbitrary::Result<Option<u32>> {
 /// turns on it — but reaching arbitrary, possibly non-UTF-8, bytes too.
 fn attribute_name_bytes(u: &mut Unstructured) -> arbitrary::Result<Vec<u8>> {
     if u.ratio(4, 5)? {
-        Ok(u.choose(&["xdg:schema", "server", "user", "account", "port", "keyring", ""])?
-            .as_bytes()
-            .to_vec())
+        Ok(u.choose(&[
+            "xdg:schema",
+            "server",
+            "user",
+            "account",
+            "port",
+            "keyring",
+            "",
+        ])?
+        .as_bytes()
+        .to_vec())
     } else {
         let n = u.int_in_range(0..=6)?;
         let mut out = vec![0u8; n];
@@ -778,7 +817,7 @@ impl KeyringAttr {
             out.extend_from_slice(&be32(u32::MAX));
         } else {
             out.extend_from_slice(&be32(
-                self.declared_name_len.unwrap_or(self.name.len() as u32)
+                self.declared_name_len.unwrap_or(self.name.len() as u32),
             ));
             out.extend_from_slice(&self.name);
         }
@@ -786,7 +825,7 @@ impl KeyringAttr {
         match self.attr_type {
             0 => {
                 out.extend_from_slice(&be32(
-                    self.declared_value_len.unwrap_or(self.value.len() as u32)
+                    self.declared_value_len.unwrap_or(self.value.len() as u32),
                 ));
                 out.extend_from_slice(&self.value);
             }
@@ -853,7 +892,7 @@ impl KeyringItemSpec {
         out.extend_from_slice(&be32(self.id));
         out.extend_from_slice(&be32(self.item_type));
         out.extend_from_slice(&be32(
-            self.declared_attr_count.unwrap_or(self.attrs.len() as u32)
+            self.declared_attr_count.unwrap_or(self.attrs.len() as u32),
         ));
         for a in &self.attrs {
             a.encode(out);
@@ -911,7 +950,9 @@ impl<'a> Arbitrary<'a> for KeyringBytes {
             (u.int_in_range(0..=2)?, u.int_in_range(0..=2)?)
         };
         let name = if u.ratio(3, 4)? {
-            u.choose(&["Sample keyring", "login", ""])?.as_bytes().to_vec()
+            u.choose(&["Sample keyring", "login", ""])?
+                .as_bytes()
+                .to_vec()
         } else {
             let n = u.int_in_range(0..=12)?;
             let mut b = vec![0u8; n];
@@ -963,7 +1004,7 @@ impl KeyringBytes {
             out.extend_from_slice(&be32(u32::MAX));
         } else {
             out.extend_from_slice(&be32(
-                self.declared_name_len.unwrap_or(self.name.len() as u32)
+                self.declared_name_len.unwrap_or(self.name.len() as u32),
             ));
             out.extend_from_slice(&self.name);
         }
@@ -975,7 +1016,7 @@ impl KeyringBytes {
         out.extend_from_slice(&KEYRING_SALT);
         out.extend_from_slice(&[0; 16]); // four reserved words
         out.extend_from_slice(&be32(
-            self.declared_item_count.unwrap_or(self.items.len() as u32)
+            self.declared_item_count.unwrap_or(self.items.len() as u32),
         ));
         for item in &self.items {
             item.encode(&mut out);

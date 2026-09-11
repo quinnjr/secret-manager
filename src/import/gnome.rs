@@ -45,7 +45,7 @@
 
 use super::formats::{
     ITEM_TYPE_CHAINED_KEYRING_PASSWORD, ITEM_TYPE_ENCRYPTION_KEY_PASSWORD,
-    ITEM_TYPE_GENERIC_SECRET, ITEM_TYPE_NETWORK_PASSWORD, ITEM_TYPE_NOTE,
+    ITEM_TYPE_GENERIC_SECRET, ITEM_TYPE_NETWORK_PASSWORD, ITEM_TYPE_NOTE, MAX_SOURCE_BYTES,
 };
 use super::{ItemReport, Provenance, Refusal, SourceItem};
 use crate::dbus::prompt::display_label;
@@ -54,7 +54,8 @@ use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
 use crate::vault::format::escape_control;
 use futures_util::StreamExt;
-use std::collections::{BTreeMap, HashMap};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -307,13 +308,50 @@ pub async fn secrets_bus_owner() -> Result<BusOwner, GnomeError> {
     Ok(classify_bus_owner(status.as_deref(), ps.as_deref()))
 }
 
+/// The absolute path of a helper program, resolved only against
+/// `/usr/bin` and `/bin`.
+///
+/// A bare name resolves through whatever `PATH` this process inherited, which
+/// a caller controls; the daemons and tools spawned here are named absolutely
+/// so the lookup is pinned. When neither directory holds the program the bare
+/// name is returned and the spawn fails with the usual `Spawn` error rather
+/// than a resolution error of our own.
+fn program_path(name: &str) -> PathBuf {
+    for dir in ["/usr/bin", "/bin"] {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// The environment the two daemon children get: nothing inherited except a
+/// pinned `PATH` and the location variables a daemon needs to find its user's
+/// runtime, then the caller adds its own.
+///
+/// The daemons outlive the spawn call and read the world through their
+/// environment; an inherited `DBUS_SESSION_BUS_ADDRESS` would point the fresh
+/// bus at the real one, and an inherited `GNOME_KEYRING_*` would point the
+/// fresh keyring at the real daemon's control socket. `env_clear` removes all
+/// of that at once, and the allow-list below is what comes back.
+fn minimal_env(cmd: &mut Command) {
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/bin:/bin");
+    for key in ["HOME", "TMPDIR", "XDG_RUNTIME_DIR", "USER", "LOGNAME"] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
 /// Runs a command to completion under [`COMMAND_TIMEOUT`], returning its
 /// stdout when it exits 0 and `None` when it does not.
 ///
 /// A non-zero exit is not an error here: `busctl status` exits non-zero for a
 /// name nobody owns, and `ps` for a pid that has gone. Both are answers.
 async fn run_capture(program: &str, args: &[&str]) -> Result<Option<String>, GnomeError> {
-    let child = Command::new(program)
+    let child = Command::new(program_path(program))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -388,6 +426,26 @@ pub const STDERR_CAPTURE_LIMIT: usize = 4096;
 /// How much escaped peer text an error message carries. Bytes, not characters,
 /// and applied *after* escaping, so the bound is on what is printed.
 const ERROR_TEXT_LIMIT: usize = 512;
+/// The largest total of secret bytes one walk will hold, across all items.
+///
+/// `MAX_ITEMS_PER_COLLECTION` alone bounds nothing that matters here: one
+/// secret may be many megabytes, so a bounded count of them is still an
+/// unbounded number of resident bytes. 256 MiB is orders of magnitude above
+/// any real keyring and still a bound. Exceeding it aborts the walk — the
+/// session close in `extract` still runs — mirroring `kwallet::MAX_SECRET_BYTES`.
+pub const MAX_SECRET_BYTES: usize = 256 << 20;
+/// The most files `KeyringSnapshot::create` will copy, and the most bytes in
+/// total.
+///
+/// The snapshot feeds a child that rewrites what it opens, so every regular
+/// file in the source directory is copied — and nothing on disk bounds how
+/// many of them there are or how large they grow. The per-file bound is
+/// `formats::MAX_SOURCE_BYTES`, the same ceiling `read_source` enforces; this
+/// is the budget across all of them, so a directory of many almost-huge files
+/// cannot become unbounded memory and disk either. Both refuse rather than
+/// truncate: a thinner source would be measured against the wrong header.
+const MAX_SNAPSHOT_FILES: usize = 128;
+const MAX_SNAPSHOT_BYTES: u64 = 256 << 20;
 
 /// Peer text on its way into an **error message**, sanitised without being
 /// truncated into uselessness.
@@ -502,6 +560,24 @@ pub enum GnomeError {
         available: String,
     },
 
+    /// Two collections share the display name the walk was told to import.
+    ///
+    /// Matching `only_container` against the display label is what lets one
+    /// invocation name one keyring, and two keyrings can carry the same label.
+    /// Importing both into a destination named after one of them would produce
+    /// the mislabelled union `only_container` exists to prevent, so the walk
+    /// refuses instead. Both object paths are named — sanitised at the call
+    /// site — so the user can tell the two apart.
+    #[error(
+        "more than one collection is named '{container}' ({first} and {second}); \
+         refusing to import their union into one destination"
+    )]
+    AmbiguousCollection {
+        container: String,
+        first: String,
+        second: String,
+    },
+
     #[error("could not open a session with gnome-keyring: {message}")]
     NoSession { message: String },
 
@@ -583,8 +659,22 @@ struct Reaped(Option<Child>);
 impl Reaped {
     async fn reap(&mut self) {
         if let Some(mut child) = self.0.take() {
-            let _ = child.start_kill();
-            let _ = tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await;
+            let pid = child.id();
+            if let Err(e) = child.start_kill() {
+                tracing::warn!("could not signal private helper process {pid:?}: {e}");
+            }
+            match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("waiting on private helper process {pid:?} failed: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "private helper process {pid:?} did not exit within {COMMAND_TIMEOUT:?} \
+                         after being signalled"
+                    );
+                }
+            }
         }
     }
 }
@@ -618,9 +708,16 @@ impl PrivateDir {
 impl Drop for PrivateDir {
     fn drop(&mut self) {
         // gnome-keyring puts a control socket in here; the directory is ours
-        // alone, so removing it whole is right and a failure is not worth
-        // reporting over the error that is already on its way out.
-        let _ = std::fs::remove_dir_all(&self.0);
+        // alone, so removing it whole is right. A failure cannot be returned
+        // from `drop`, and swallowing it would leave a mode-0700 directory of
+        // keyring copies behind with no word said — so it is logged, with the
+        // path, and the leftover directory is named rather than silent.
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            tracing::warn!(
+                "could not remove private directory {}: {e}; it is left behind",
+                self.0.display()
+            );
+        }
     }
 }
 
@@ -646,7 +743,17 @@ impl KeyringSnapshot {
     /// never briefly readable by another user. A file that cannot be copied is
     /// an error and not a thinner source: an extraction that quietly read half
     /// the keyrings would be measured against the header of all of them.
+    ///
+    /// Bounded as the copy is made: these are foreign files, so each one is
+    /// opened once, its size on the open handle is an early refusal at
+    /// [`MAX_SOURCE_BYTES`], and the copy itself goes through
+    /// `take(MAX_SOURCE_BYTES + 1)` — the `stat` alone bounds nothing, because
+    /// the file can grow between the two syscalls. A running total across all
+    /// files refuses past [`MAX_SNAPSHOT_BYTES`], and the file count refuses
+    /// past [`MAX_SNAPSHOT_FILES`], so a directory of many almost-huge files
+    /// is refused rather than copied.
     pub fn create(source_dir: &Path) -> Result<KeyringSnapshot, GnomeError> {
+        use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let io = |path: &Path, e: std::io::Error| GnomeError::Spawn {
             program: format!(
@@ -655,6 +762,13 @@ impl KeyringSnapshot {
             ),
             message: e.to_string(),
         };
+        // A source file over the per-file ceiling, refused rather than
+        // truncated into a copy the daemon would then fail to open.
+        let too_large = |len: u64| GnomeError::TooMany {
+            what: "bytes in one keyring file",
+            count: len as usize,
+            limit: MAX_SOURCE_BYTES as usize,
+        };
         let dir = PrivateDir::create().map_err(|e| io(Path::new("the temp directory"), e))?;
         // gnome-keyring appends `keyrings/` to `XDG_DATA_HOME`, so the copy
         // has to sit under that name whatever the original was called.
@@ -662,10 +776,25 @@ impl KeyringSnapshot {
         std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
             .create(&dest)
             .map_err(|e| io(&dest, e))?;
+        let mut files_seen = 0usize;
+        let mut total_bytes = 0u64;
         for entry in std::fs::read_dir(source_dir).map_err(|e| io(source_dir, e))? {
             let entry = entry.map_err(|e| io(source_dir, e))?;
             if !entry.file_type().map_err(|e| io(source_dir, e))?.is_file() {
                 continue;
+            }
+            files_seen += 1;
+            if files_seen > MAX_SNAPSHOT_FILES {
+                return Err(GnomeError::TooMany {
+                    what: "files in the keyring directory",
+                    count: files_seen,
+                    limit: MAX_SNAPSHOT_FILES,
+                });
+            }
+            let from = std::fs::File::open(entry.path()).map_err(|e| io(&entry.path(), e))?;
+            let len = from.metadata().map_err(|e| io(&entry.path(), e))?.len();
+            if len > MAX_SOURCE_BYTES {
+                return Err(too_large(len));
             }
             let to = dest.join(entry.file_name());
             let mut target = std::fs::OpenOptions::new()
@@ -674,8 +803,22 @@ impl KeyringSnapshot {
                 .mode(0o600)
                 .open(&to)
                 .map_err(|e| io(&to, e))?;
-            let mut from = std::fs::File::open(entry.path()).map_err(|e| io(&entry.path(), e))?;
-            std::io::copy(&mut from, &mut target).map_err(|e| io(&to, e))?;
+            // One byte past the limit, so a file that grew after the `stat`
+            // is refused rather than silently truncated into a copy that
+            // blames the format.
+            let copied = std::io::copy(&mut from.take(MAX_SOURCE_BYTES + 1), &mut target)
+                .map_err(|e| io(&to, e))?;
+            if copied > MAX_SOURCE_BYTES {
+                return Err(too_large(copied));
+            }
+            total_bytes = total_bytes.saturating_add(copied);
+            if total_bytes > MAX_SNAPSHOT_BYTES {
+                return Err(GnomeError::TooMany {
+                    what: "bytes in the keyring snapshot",
+                    count: total_bytes as usize,
+                    limit: MAX_SNAPSHOT_BYTES as usize,
+                });
+            }
         }
         Ok(KeyringSnapshot { dir })
     }
@@ -696,20 +839,35 @@ pub const KEYRINGS_SUBDIR: &str = "keyrings";
 /// nowhere else; piping that and never reading it threw away the cause of
 /// every startup failure and, at 64 KiB, would have blocked the child.
 #[derive(Clone, Default)]
-struct StderrTail(Arc<Mutex<String>>);
+struct StderrTail {
+    text: Arc<Mutex<String>>,
+    /// The first read error the drain task hit, if any. Kept rather than
+    /// discarded: an empty capture and a failed capture are different facts,
+    /// and `detail` reports them differently.
+    read_error: Arc<Mutex<Option<String>>>,
+}
 
 impl StderrTail {
     /// Reads `stderr` to EOF on a task, keeping at most
     /// [`STDERR_CAPTURE_LIMIT`] bytes.
     fn drain(stderr: tokio::process::ChildStderr) -> StderrTail {
         let tail = StderrTail::default();
-        let sink = tail.0.clone();
+        let sink = tail.text.clone();
+        let failed = tail.read_error.clone();
         tokio::spawn(async move {
             let mut stderr = stderr;
             let mut buf = [0u8; 1024];
             loop {
                 match stderr.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) => return,
+                    Err(e) => {
+                        if let Ok(mut held) = failed.lock()
+                            && held.is_none()
+                        {
+                            *held = Some(e.to_string());
+                        }
+                        return;
+                    }
                     Ok(n) => {
                         let Ok(mut held) = sink.lock() else { return };
                         if held.len() >= STDERR_CAPTURE_LIMIT {
@@ -731,16 +889,36 @@ impl StderrTail {
     /// line and a label cut would take exactly it. `None` when it said
     /// nothing.
     fn text(&self) -> Option<String> {
-        let held = self.0.lock().ok()?;
+        let held = self.text.lock().ok()?;
         let trimmed = held.trim();
         (!trimmed.is_empty()).then(|| error_text(trimmed))
     }
 
     /// `detail` for an error, combining what the daemon said with whatever
     /// else the caller knows. Never empty, so no message ends in a colon.
+    ///
+    /// Three absences, three messages: nothing said, the capture itself
+    /// failed, and the capture's lock poisoned — the last is ours, not the
+    /// daemon's, and it must not read as the daemon's silence.
     fn detail(&self, fallback: &str) -> String {
-        match self.text() {
-            Some(said) => format!("{fallback}; gnome-keyring-daemon said: {said}"),
+        if let Some(said) = self.text() {
+            let mut out = format!("{fallback}; gnome-keyring-daemon said: {said}");
+            if let Ok(held) = self.read_error.lock()
+                && let Some(e) = held.as_deref()
+            {
+                out.push_str("; the stderr capture also failed: ");
+                out.push_str(&error_text(e));
+            }
+            return out;
+        }
+        if self.text.lock().is_err() {
+            return format!("{fallback}; the captured stderr could not be read");
+        }
+        match self.read_error.lock().ok().and_then(|held| held.clone()) {
+            Some(e) => format!(
+                "{fallback}; it printed nothing on stderr, and the stderr capture failed: {}",
+                error_text(&e)
+            ),
             None => format!("{fallback}; it printed nothing on stderr"),
         }
     }
@@ -801,24 +979,23 @@ impl PrivateKeyring {
             message: e.to_string(),
         })?;
 
-        let mut bus = Reaped(Some(
-            Command::new("dbus-daemon")
-                // No `--address`: the packaged session.conf listens under
-                // `/tmp`, and a socket path we chose ourselves inside a long
-                // temp directory overflows `sun_path` — a 108-byte limit that
-                // fails as "Socket name too long" and looks like a bug in
-                // dbus.
-                .args(["--session", "--nofork", "--nopidfile", "--print-address"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| GnomeError::Spawn {
-                    program: "dbus-daemon".into(),
-                    message: e.to_string(),
-                })?,
-        ));
+        let mut bus_cmd = Command::new(program_path("dbus-daemon"));
+        bus_cmd
+            // No `--address`: the packaged session.conf listens under
+            // `/tmp`, and a socket path we chose ourselves inside a long
+            // temp directory overflows `sun_path` — a 108-byte limit that
+            // fails as "Socket name too long" and looks like a bug in
+            // dbus.
+            .args(["--session", "--nofork", "--nopidfile", "--print-address"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        minimal_env(&mut bus_cmd);
+        let mut bus = Reaped(Some(bus_cmd.spawn().map_err(|e| GnomeError::Spawn {
+            program: "dbus-daemon".into(),
+            message: e.to_string(),
+        })?));
 
         let address = match read_address(&mut bus).await {
             Ok(a) => a,
@@ -828,7 +1005,13 @@ impl PrivateKeyring {
             }
         };
 
-        let mut started = Command::new(GNOME_KEYRING_PROGRAM);
+        let mut started = Command::new(program_path(GNOME_KEYRING_PROGRAM));
+        // Cleared first: the child must not inherit the real session's
+        // `DBUS_SESSION_BUS_ADDRESS` or `GNOME_KEYRING_*`, which would point
+        // it at the live daemon. The `env_remove` lines below are then
+        // belt-and-braces rather than load-bearing, and they stay so the
+        // requirement reads at the place it is enforced.
+        minimal_env(&mut started);
         started
             // `--start` is rejected alongside `--unlock` by gnome-keyring 50,
             // and would be the wrong flag regardless: it means "reuse the
@@ -1380,9 +1563,19 @@ pub async fn extract(
     let walked = async {
         let mut saw_type = false;
         let mut saw_item = false;
+        // Plaintext bytes successfully decrypted so far, across every
+        // collection in this walk. The count bounds how many items are read;
+        // only a byte budget bounds how much memory reading them takes. See
+        // `MAX_SECRET_BYTES`.
+        let secret_bytes = Cell::new(0usize);
         // Every container name the walk saw, filtered or not, so a filter that
         // matches nothing can say what was actually there.
         let mut seen_containers: Vec<String> = Vec::new();
+        // Object paths that matched `only_container`, in walk order. Two
+        // collections can share a display label, and importing both into a
+        // destination named after one of them is the mislabelled union the
+        // filter exists to prevent — so the second match refuses instead.
+        let mut matched_paths: Vec<String> = Vec::new();
 
         let collections = call("Service.Collections", service.collections()).await?;
         if collections.len() > MAX_COLLECTIONS {
@@ -1399,9 +1592,14 @@ pub async fn extract(
             }
             let collection: CollectionProxy<'static> = proxy_at(conn, "Collection", &path).await?;
 
-            let label = call("Collection.Label", collection.label())
-                .await
-                .unwrap_or_default();
+            // A collection whose label, lock state or timestamps cannot be read
+            // is not walked with guesses in their place: the label decides the
+            // filter below, the lock state decides whether an unlock is tried,
+            // and a defaulted `locked = true` would send every such collection
+            // down the unanswerable-prompt path with a report that claims it
+            // was locked. `call` already names the property, so `?` refuses
+            // the run with the failing property in the message.
+            let label = call("Collection.Label", collection.label()).await?;
             let container = if label.is_empty() {
                 path.as_str().rsplit('/').next().unwrap_or("keyring").into()
             } else {
@@ -1419,21 +1617,30 @@ pub async fn extract(
             {
                 continue;
             }
+            // Pin by identity, not by display label: the match above is on
+            // the label, and a second collection with the same label would
+            // otherwise be walked into the same destination — the union
+            // `only_container` exists to refuse. The error names both object
+            // paths so the two collections can be told apart.
+            if options.only_container.is_some() {
+                if let Some(first) = matched_paths.first() {
+                    return Err(GnomeError::AmbiguousCollection {
+                        container: display_label(&container),
+                        first: error_text(first),
+                        second: error_text(path.as_str()),
+                    });
+                }
+                matched_paths.push(path.as_str().to_string());
+            }
 
-            let locked = call("Collection.Locked", collection.locked())
-                .await
-                .unwrap_or(true);
+            let locked = call("Collection.Locked", collection.locked()).await?;
 
             let mut summary = CollectionSummary {
                 path: path.as_str().to_string(),
                 label,
                 locked,
-                created: call("Collection.Created", collection.created())
-                    .await
-                    .unwrap_or(0),
-                modified: call("Collection.Modified", collection.modified())
-                    .await
-                    .unwrap_or(0),
+                created: call("Collection.Created", collection.created()).await?,
+                modified: call("Collection.Modified", collection.modified()).await?,
                 item_count: None,
                 unanswerable_prompt: false,
             };
@@ -1542,6 +1749,7 @@ pub async fn extract(
                     service: &service,
                     session: &session,
                     cipher: &cipher,
+                    secret_bytes: &secret_bytes,
                 },
                 candidates,
                 &mut out.items,
@@ -1671,7 +1879,14 @@ async fn unlock(
     // per-item fallback aborted the whole migration instead of skipping one
     // collection. A prompt that completes is not a prompt that succeeded.
     let result = await_prompt(conn, &prompt, prompt_timeout).await?;
-    let unlocked = Vec::<OwnedObjectPath>::try_from(result).unwrap_or_default();
+    // A result that is not an object-path array is a daemon that answered
+    // outside the interface, not an unlock of nothing: defaulting it to empty
+    // would report `PromptUnlockedNothing` for a reply that said something
+    // else entirely. It propagates with the call named.
+    let unlocked = Vec::<OwnedObjectPath>::try_from(result).map_err(|e| GnomeError::Bus {
+        call: "Prompt.Completed".into(),
+        message: e.to_string(),
+    })?;
     if !unlocked.contains(path) {
         return Err(GnomeError::PromptUnlockedNothing {
             object: path.as_str().to_string(),
@@ -1774,6 +1989,15 @@ trait GnomeItem {
     fn type_(&self) -> zbus::Result<String>;
 }
 
+/// The report label for an item whose own label could not be read.
+///
+/// Self-made rather than peer-made, so there is nothing to sanitise: the
+/// object path's last segment is the only handle the walk has for an item it
+/// cannot name. See [`path_item_id`].
+fn unreadable_item_label(path: &str) -> String {
+    format!("item {}", path_item_id(path))
+}
+
 async fn read_metadata(
     conn: &Connection,
     path: &OwnedObjectPath,
@@ -1782,7 +2006,22 @@ async fn read_metadata(
     let item: ItemProxy<'static> = proxy_at(conn, "Item", path).await?;
 
     let provenance = Provenance::gnome(container, path_item_id(path.as_str()));
-    let label = call("Item.Label", item.label()).await.unwrap_or_default();
+    // `Label`, `Created` and `Modified` degrade to per-item refusals, never
+    // to defaults: a defaulted label misnames the report, defaulted
+    // timestamps reorder `sm get`'s newest-wins resolution, and all three
+    // silent would let the source daemon choose what the vault claims.
+    // `UnreadableAttributes` is the refusal they share with the attribute
+    // map — the item cannot be faithfully copied, so it is not copied.
+    let label = match call("Item.Label", item.label()).await {
+        Ok(label) => label,
+        Err(_) => {
+            return Ok(Metadata::Refused(Box::new(ItemReport::refused(
+                provenance,
+                unreadable_item_label(path.as_str()),
+                Refusal::UnreadableAttributes,
+            ))));
+        }
+    };
 
     // D-Bus `s` and the `a{ss}` attribute map are validated UTF-8 by the
     // marshaller, so an attribute that is not UTF-8 cannot arise on this
@@ -1818,21 +2057,46 @@ async fn read_metadata(
         Err(_) => ItemType::Unreadable,
     };
 
-    Ok(Metadata::Read(Box::new(ItemMetadata {
-        label,
-        attributes,
-        created: call("Item.Created", item.created()).await.unwrap_or(0),
-        modified: call("Item.Modified", item.modified()).await.unwrap_or(0),
-        item_type,
-        provenance,
+    Ok(Metadata::Read(Box::new({
+        // Read before constructing, so each failure can refuse with the label
+        // and provenance the success path would have carried.
+        let created = match call("Item.Created", item.created()).await {
+            Ok(created) => created,
+            Err(_) => {
+                return Ok(Metadata::Refused(Box::new(ItemReport::refused(
+                    provenance,
+                    label,
+                    Refusal::UnreadableAttributes,
+                ))));
+            }
+        };
+        let modified = match call("Item.Modified", item.modified()).await {
+            Ok(modified) => modified,
+            Err(_) => {
+                return Ok(Metadata::Refused(Box::new(ItemReport::refused(
+                    provenance,
+                    label,
+                    Refusal::UnreadableAttributes,
+                ))));
+            }
+        };
+        ItemMetadata {
+            label,
+            attributes,
+            created,
+            modified,
+            item_type,
+            provenance,
+        }
     })))
 }
 
 /// `Service.GetSecrets` for the whole batch, per-item `GetSecret` for whatever
 /// it left out.
 ///
-/// The four things every secret fetch needs and none of them varies within a
-/// walk: the connection, the service proxy, the session, and its cipher.
+/// The five things every secret fetch needs and none of them varies within a
+/// walk: the connection, the service proxy, the session, its cipher, and the
+/// walk-wide count of decrypted secret bytes.
 ///
 /// Grouping them is what retires the `#[allow(clippy::too_many_arguments)]`
 /// this function used to carry — the lint was right that seven positional
@@ -1842,6 +2106,11 @@ struct Walk<'a> {
     service: &'a ServiceProxy<'a>,
     session: &'a OwnedObjectPath,
     cipher: &'a SessionCipher,
+    /// Plaintext bytes decrypted so far, across every collection in the walk.
+    /// A `Cell` because the walk is shared, not exclusive: `fetch_secrets`
+    /// and `drain_batch` take `&Walk`, and the budget they enforce is still
+    /// walk-wide. See `MAX_SECRET_BYTES`.
+    secret_bytes: &'a Cell<usize>,
 }
 
 /// One round trip rather than N, which also halves the window in which
@@ -2003,6 +2272,20 @@ async fn drain_batch(
                 continue;
             }
         };
+        // Checked as soon as the bytes exist, before anything is pushed, so
+        // the walk cannot be made to hold more than the budget even by one
+        // enormous secret. Refusing aborts the walk rather than truncating
+        // it — a partial migration that reports success is the failure this
+        // module exists to avoid.
+        let total = walk.secret_bytes.get().saturating_add(plaintext.len());
+        walk.secret_bytes.set(total);
+        if total > MAX_SECRET_BYTES {
+            return Err(GnomeError::TooMany {
+                what: "secret bytes in this import",
+                count: total,
+                limit: MAX_SECRET_BYTES,
+            });
+        }
 
         let source = SourceItem {
             label: meta.label,
@@ -2012,6 +2295,9 @@ async fn drain_batch(
             created: meta.created,
             modified: meta.modified,
             provenance: meta.provenance,
+            // The gnome path synthesises nothing: every key in the map is
+            // one the source daemon reported.
+            inserted_keys: BTreeSet::new(),
         };
         // Checked here, before anything is written: an item the D-Bus API
         // could never have created must not reach a vault file, and a
@@ -2247,6 +2533,7 @@ mod tests {
                 created: 1_788_893_013,
                 modified: 1_788_893_014,
                 provenance: Provenance::gnome("Login", 1),
+                inserted_keys: BTreeSet::new(),
             },
             item_type: item_type.map(str::to_string),
         }
@@ -3466,6 +3753,7 @@ mod tests {
     /// with. Point the same daemon at the directory itself and it does not,
     /// which is the bug.
     #[tokio::test]
+    #[ignore = "needs a live gnome-keyring-daemon and dbus-daemon; run with `cargo test -- --ignored`"]
     async fn a_live_daemon_writes_to_the_snapshot_and_not_to_the_source() {
         if !live_prerequisites() {
             return;
@@ -3545,6 +3833,7 @@ mod tests {
     /// silence, so no import would break, but nobody would ever be told their
     /// source is stale.
     #[tokio::test]
+    #[ignore = "needs the real busctl/ps and a live session bus; run with `cargo test -- --ignored`"]
     async fn the_real_bus_owner_check_runs_against_the_real_tools() {
         if !programs_present(&["busctl", "ps"]) {
             return;
@@ -3600,6 +3889,7 @@ mod tests {
     /// so "attributes byte-for-byte" and "the chained item is refused" are
     /// checkable rather than hopeful.
     #[tokio::test]
+    #[ignore = "needs a live gnome-keyring-daemon on a private bus; run with `cargo test -- --ignored`"]
     async fn a_real_gnome_keyring_round_trips_through_the_walk() {
         if !live_prerequisites() {
             return;

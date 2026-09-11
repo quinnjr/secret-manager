@@ -252,62 +252,10 @@ pub fn check_caps(
         })
 }
 
-/// Characters that are neither `char::is_control` nor visible: bidi
-/// overrides, zero-width joiners, the private-use planes, the tag block.
-///
-/// `char::is_control` is general category `Cc` only, so everything here
-/// survives it while still being able to reorder or hide the text around it
-/// in a terminal or a dialog.
-pub fn is_invisible_format(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'
-        | '\u{0600}'..='\u{0605}'
-        | '\u{061C}'
-        | '\u{06DD}'
-        | '\u{070F}'
-        | '\u{08E2}'
-        | '\u{180E}'
-        | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{206F}'
-        | '\u{E000}'..='\u{F8FF}'
-        | '\u{FEFF}'
-        | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{110BD}'
-        | '\u{110CD}'
-        | '\u{1D173}'..='\u{1D17A}'
-        | '\u{E0001}'
-        | '\u{E0020}'..='\u{E007F}'
-        | '\u{F0000}'..='\u{FFFFD}'
-        | '\u{100000}'..='\u{10FFFD}'
-    )
-}
-
-/// Render peer-supplied text so it cannot move a cursor, clear a line or
-/// reorder what is printed around it: every control character and every
-/// invisible formatter becomes `\xNN` per UTF-8 byte.
-///
-/// `CLAUDE.md`: "text from a peer is sanitized before it reaches a log or a
-/// dialog." This copy lives in `vault::format` rather than in `cli` or
-/// `dbus`, because `src/vault/` is compiled into the PAM cdylib as well and
-/// may not reach into anything behind the `daemon` feature — the same reason
-/// the per-item caps above live here.
-pub fn escape_control(s: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len());
-    let mut scratch = [0u8; 4];
-    for ch in s.chars() {
-        if ch.is_control() || is_invisible_format(ch) {
-            for b in ch.encode_utf8(&mut scratch).as_bytes() {
-                let _ = write!(out, "\\x{b:02x}");
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
+/// Display rendering lives in [`crate::sanitize`]; re-exported here so the
+/// `vault::format::` paths existing callers name keep working. This module
+/// owns encoding and caps only.
+pub use crate::sanitize::{escape_control, is_invisible_format};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
@@ -461,6 +409,7 @@ pub fn build_index(
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FormatError {
     #[error("not a secret-manager vault (bad magic)")]
     BadMagic,
@@ -925,5 +874,29 @@ mod tests {
             &salt,
             &[("app".to_string(), "git".to_string())].into()
         )));
+    }
+
+    /// `Cap`'s serde names are a wire format: they are written into
+    /// `sm import`'s `report.json` through `import::Refusal::CapViolation`, so
+    /// a rename here changes a file other programs read. A rename requires a
+    /// report_format_version bump, never a silent rename.
+    #[test]
+    fn cap_serde_names_are_pinned() {
+        for (cap, name, limit) in [
+            (Cap::Secret, "secret", MAX_ITEM_SECRET),
+            (Cap::Label, "label", MAX_ITEM_LABEL),
+            (Cap::AttributeCount, "attribute-count", MAX_ITEM_ATTRIBUTES),
+            (Cap::AttributeKey, "attribute-name", MAX_ATTRIBUTE_KEY),
+            (Cap::AttributeValue, "attribute-value", MAX_ATTRIBUTE_VALUE),
+            (Cap::ContentType, "content-type", MAX_ITEM_CONTENT_TYPE),
+        ] {
+            assert_eq!(serde_json::to_string(&cap).unwrap(), format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<Cap>(&format!("\"{name}\"")).unwrap(),
+                cap
+            );
+            assert_eq!(cap.limit(), limit);
+            assert_eq!(cap.as_str(), name.replace('-', " "));
+        }
     }
 }

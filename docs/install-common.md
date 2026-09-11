@@ -178,6 +178,42 @@ Append options to the `pam_secret_manager.so` lines (space separated):
 | `vault_dir=<path>`  | `<home>/.local/share/secret-manager` | absolute directory to read `<collection>.vault` from; set this when the user's `[vault] dir` is customised, since PAM cannot read their config file |
 | `socket=<path>`     | (unset)                             | test-only override for the control socket path; **ignored** whenever the module is running as root (i.e. every real login) |
 
+## `sm import`: timeouts and timestamps
+
+`sm import` bounds every wait it cannot answer itself, so a dialog nobody
+can see is an error rather than a hang. The bounds are constants
+(`src/import/gnome.rs`, `src/import/kwallet.rs`) — none is currently
+configurable by flag or config key:
+
+| Route | Bound | Value | What it guards |
+|---|---|---|---|
+| gnome-keyring | `COMMAND_TIMEOUT` | 5 s | one `busctl`/`ps` helper |
+| gnome-keyring | `CALL_TIMEOUT` | 20 s | one D-Bus call or property read |
+| gnome-keyring | `STARTUP_TIMEOUT` | 20 s | private bus and `gnome-keyring-daemon` coming up |
+| gnome-keyring | `PROMPT_TIMEOUT` | 10 s | an unlock prompt on the private bus, where no prompter runs |
+| gnome-keyring | `SECRETS_FALLBACK_TIMEOUT` | 120 s | aggregate budget for the per-item `GetSecret` fallback |
+| kwallet | `DEFAULT_OPEN_TIMEOUT` | 120 s | waiting for `walletAsyncOpened` |
+| kwallet | `DEFAULT_CALL_TIMEOUT` | 60 s | every other kwalletd call, including reads that can raise the per-application access prompt |
+| kwallet | `DEFAULT_CLOSE_TIMEOUT` | 10 s | the closing `close` call, whose answer is ignored |
+
+The SSH-with-no-display hang is governed by `DEFAULT_OPEN_TIMEOUT` on the
+KWallet route and `PROMPT_TIMEOUT` on the gnome-keyring route. KWallet's
+unlock dialog is a Qt widget needing a display: over SSH with no display it
+cannot appear, so the import requires the wallet to be already open and says
+so plainly instead of waiting — and when a dialog *can* appear, the wait is
+bounded at two minutes, long enough to find it and type a password.
+
+Walk budgets refuse rather than truncate: at most 512 collections and
+100,000 items per collection on the gnome-keyring route; at most 200,000
+entries, a 16 MiB / 100,000-row sidecar, and 4,096 entries per serialised
+map on the KWallet route.
+
+A KWallet entry with no sidecar row — or a row with no usable
+`$fdo_created`/`$fdo_modified` — lands at `created = modified = 0` (the
+Unix epoch), never `now()`: stamping the import's own clock onto 66 items
+would destroy the newest-wins ordering `sm get` uses to break
+attribute-set collisions. Such items are reported as `epoch_stamped_items`.
+
 ## Troubleshooting
 
 **`secret-manager.service` is `failed` or `start-limit-hit`**

@@ -137,16 +137,18 @@ async fn a_write_stuck_on_one_collection_blocks_nothing_else() {
         })
     };
 
-    // The timing assumption, asserted rather than assumed: the write really
-    // is still in flight, so the checks below are being made *during* it.
-    // Only ever false in the safe direction — a write that had already
-    // finished would make the rest of the test prove nothing — so it cannot
-    // report a regression that is not there.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The gate is the hand-held collection lock above, not the clock: a write
+    // that needs `default` cannot finish while `held` lives, so there is no
+    // duration to wait out and nothing to race. The only way `is_finished`
+    // is true here is a write that failed fast — a broken setup — or a daemon
+    // that never took the lock at all, and either must fail loudly rather
+    // than let every assertion below pass vacuously. The calls below, each
+    // with a thirty-second budget, give a live write every chance to reach
+    // the lock on a loaded machine.
     assert!(
         !write.is_finished(),
-        "timing assumption: the write on 'default' should still be waiting for \
-         that collection's lock"
+        "the write on 'default' finished while its collection's lock was held: \
+         either the setup is broken or the daemon no longer takes the lock"
     );
 
     // A property that needs only the state lock.

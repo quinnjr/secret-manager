@@ -44,6 +44,7 @@
 //! instead of panicking.
 
 use super::{Provenance, Refusal, SourceItem, XDG_SCHEMA, check_caps};
+use crate::vault::format::{Cap, MAX_ITEM_SECRET};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read;
@@ -300,6 +301,13 @@ pub enum MapDecodeError {
     DuplicateKey,
     #[error("{trailing} bytes remain after the serialised map, so this is not a QMap")]
     TrailingBytes { trailing: usize },
+    /// The decoded pairs already hold more secret than the Secret Service API
+    /// allows, so re-encoding them would only produce a secret `check_caps`
+    /// refuses. Refused before sizing the output buffer: the capacity is six
+    /// bytes per decoded byte, so sizing first turns an over-cap entry into a
+    /// multi-megabyte pre-allocation for a secret that is never written.
+    #[error("the decoded map holds {len} bytes, over the {limit} byte secret limit")]
+    TooLarge { len: usize, limit: usize },
     #[error("the serialised map could not be re-encoded as JSON: {0}")]
     Json(String),
 }
@@ -930,6 +938,24 @@ pub(crate) fn qmap_to_canonical_json(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    // The decoded length is bounded before it sizes anything: the capacity
+    // below is six bytes per decoded byte, so an over-cap map would turn
+    // into a multi-megabyte `with_capacity` for a secret `check_caps`
+    // refuses anyway. Canonical JSON only expands (quotes, colons, `\uXXXX`
+    // escapes), so anything over the secret cap here is over it after
+    // encoding too, and refusing now keeps the refusal while skipping the
+    // allocation. Anything at or under the cap flows through to the normal
+    // `check_caps` measurement on the encoded bytes.
+    let decoded_len: usize = pairs
+        .iter()
+        .map(|(k, v)| k.len().saturating_add(v.len()))
+        .fold(0usize, |a, b| a.saturating_add(b));
+    if decoded_len > MAX_ITEM_SECRET {
+        return Err(MapDecodeError::TooLarge {
+            len: decoded_len,
+            limit: MAX_ITEM_SECRET,
+        });
+    }
     // `{}` plus, per pair, two quoted strings at six bytes per byte, a colon
     // and a comma.
     let mut capacity = 2usize;
@@ -1162,6 +1188,11 @@ pub(crate) fn map_entry(
 ) -> SourceItem {
     let mut attributes = sidecar.map(|s| s.attributes.clone()).unwrap_or_default();
 
+    // The names this call inserted, as opposed to the ones the sidecar
+    // already carried. A hand-written `kwallet:key` collides below and is
+    // kept as user data; it must reach `Outcome::classify` as searchable
+    // rather than synthesised, so only the `Vacant` arm records.
+    let mut inserted_keys = BTreeSet::new();
     if !attributes.contains_key(XDG_SCHEMA) {
         let mut collided = false;
         for (name, value) in [
@@ -1172,6 +1203,7 @@ pub(crate) fn map_entry(
             match attributes.entry(name.to_string()) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
                     slot.insert(value);
+                    inserted_keys.insert(name.to_string());
                 }
                 std::collections::btree_map::Entry::Occupied(_) => collided = true,
             }
@@ -1201,6 +1233,7 @@ pub(crate) fn map_entry(
         created: sidecar.and_then(|s| s.created).unwrap_or(0),
         modified: sidecar.and_then(|s| s.modified).unwrap_or(0),
         provenance: Provenance::kwallet(wallet, folder, entry),
+        inserted_keys,
     }
 }
 
@@ -1700,6 +1733,10 @@ pub struct Extraction {
     /// Folders `entryList` refused. Their entries are unreachable and their
     /// sidecar rows will show up in `unresolved_sidecar_rows`.
     pub unreadable_folders: Vec<String>,
+    /// Anything the run must not be silent about that is not an entry: a
+    /// `close` that failed after the walk succeeded, for example. The walk's
+    /// result is returned unchanged beside these; a note never masks it.
+    pub notes: Vec<String>,
 }
 
 impl Extraction {
@@ -1907,15 +1944,38 @@ pub async fn extract(
     }
 
     let handle = open_wallet(conn, wallet, open_timeout).await?;
-    let walked = walk(&DbusReader::new(&proxy, handle), wallet, sidecar).await;
+    let mut walked = walk(&DbusReader::new(&proxy, handle), wallet, sidecar).await;
     // Deliberately not `?`: a failed close must not mask the walk's result,
     // and there is nothing a caller could do about it. Bounded on a shorter
-    // leash than a read, because nothing is waiting on its answer.
-    let _ = tokio::time::timeout(
-        DEFAULT_CLOSE_TIMEOUT,
-        proxy.close(handle.raw(), false, APP_ID),
-    )
-    .await;
+    // leash than a read, because nothing is waiting on its answer. A failure
+    // is said out loud — naming the wallet and the handle, so the user can
+    // check what was left open — and recorded on the extraction beside the
+    // walk's result rather than in place of it.
+    let raw = handle.raw();
+    match tokio::time::timeout(DEFAULT_CLOSE_TIMEOUT, proxy.close(raw, false, APP_ID)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let note = format!(
+                "the wallet '{wallet}' (handle {raw}) could not be closed ({e}); \
+                 it may still be held open by secret-manager-import"
+            );
+            eprintln!("warning: {note}");
+            if let Ok(extraction) = walked.as_mut() {
+                extraction.notes.push(note);
+            }
+        }
+        Err(_) => {
+            let note = format!(
+                "closing the wallet '{wallet}' (handle {raw}) timed out after \
+                 {DEFAULT_CLOSE_TIMEOUT:?}; it may still be held open by \
+                 secret-manager-import"
+            );
+            eprintln!("warning: {note}");
+            if let Ok(extraction) = walked.as_mut() {
+                extraction.notes.push(note);
+            }
+        }
+    }
     walked
 }
 
@@ -2050,6 +2110,23 @@ async fn walk<R: WalletReader>(
 
             let secret = match read_secret(reader, &folder, &entry, entry_type, &mut out).await {
                 Ok(s) => s,
+                // An over-cap map is refused, not skipped: the bytes decoded
+                // fine and the only thing wrong with them is their size, which
+                // is exactly what `check_caps` refuses two steps down. Routing
+                // it through `skipped` would report a cap violation as an
+                // undecodable entry.
+                Err(SkipReason::MapUndecodable(MapDecodeError::TooLarge { len, limit })) => {
+                    out.refused.push(RefusedEntry {
+                        provenance,
+                        label: entry,
+                        refusal: Refusal::CapViolation {
+                            cap: Cap::Secret,
+                            actual: len,
+                            limit,
+                        },
+                    });
+                    continue;
+                }
                 Err(reason) => {
                     out.skipped.push(SkippedEntry {
                         provenance,
@@ -2400,6 +2477,41 @@ mod tests {
         // before the import was preserved, and an item findable only by a
         // name this import invented is "preserved only".
         assert_eq!(item.outcome(), Outcome::PreservedOnly);
+    }
+
+    /// A sidecar row that already carries a `kwallet:` name collides rather
+    /// than being overwritten — and the collision is what keeps the item
+    /// searchable. The name was written by hand, so it is absent from
+    /// `inserted_keys` and the exact classifier counts it; a by-name test
+    /// reports this item `PreservedOnly` although a client could search on
+    /// the very attribute the sidecar recorded.
+    #[test]
+    fn a_hand_written_kwallet_key_is_kept_and_counts_as_searchable() {
+        let row = sidecar_entry(&[(ATTR_KEY, "their key")]);
+        let mut conflicts = 0;
+        let item = map_entry(
+            "kdewallet",
+            "Passwords",
+            "router",
+            EntryType::Password,
+            secret(),
+            Some(&row),
+            &mut conflicts,
+        );
+        assert_eq!(conflicts, 1);
+        // The sidecar's value survived; nothing this call wrote sits under
+        // that name.
+        assert_eq!(item.attributes[ATTR_KEY], "their key");
+        assert!(
+            !item.inserted_keys.contains(ATTR_KEY),
+            "a collided name was recorded as inserted: {:?}",
+            item.inserted_keys
+        );
+        assert!(item.inserted_keys.contains(ATTR_FOLDER));
+        assert!(item.inserted_keys.contains(ATTR_TYPE));
+        // And because the surviving name is user data, the item is
+        // searchable rather than preserved-only.
+        assert_eq!(item.outcome(), Outcome::AttributesPreserved);
     }
 
     /// The label is the entry name and the timestamps are the sidecar's.
@@ -2760,6 +2872,27 @@ mod tests {
     fn an_empty_qmap_is_an_empty_object() {
         let json = read_map_secret(&qmap_bytes(&[])).unwrap();
         assert_eq!(std::str::from_utf8(&json).unwrap(), "{}");
+    }
+
+    /// The capacity is six bytes per decoded byte, so an over-cap map must
+    /// be refused *before* it sizes the buffer: sizing first turns one entry
+    /// into a ~6 MiB pre-allocation for a secret that is never written. The
+    /// refusal names the secret cap, so the walk reports it as refused
+    /// rather than skipped.
+    #[test]
+    fn an_over_cap_map_is_refused_before_sizing_its_buffer() {
+        let big = "v".repeat(MAX_ITEM_SECRET + 1);
+        let bytes = qmap_bytes(&[("k", big.as_str())]);
+        match read_map_secret(&bytes) {
+            Err(MapDecodeError::TooLarge { len, limit }) => {
+                assert_eq!(limit, MAX_ITEM_SECRET);
+                assert!(len > MAX_ITEM_SECRET, "{len}");
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        // At the cap is fine: the comparison is `>`, matching `check_caps`.
+        let at_cap = "v".repeat(MAX_ITEM_SECRET - 1);
+        assert!(read_map_secret(&qmap_bytes(&[("k", at_cap.as_str())])).is_ok());
     }
 
     /// Qt writes a *null* QString as `0xFFFFFFFF`, distinct from the empty
@@ -3500,6 +3633,33 @@ mod tests {
                 let bytes = qmap_bytes(&wire);
                 let cut = cut.min(bytes.len());
                 prop_assert!(decode_qmap(&bytes[..bytes.len() - cut]).is_err());
+            }
+
+            /// A hand-written `kwallet:key` stays searchable whatever value it
+            /// carries. The name is in the synthesised denylist, but the
+            /// sidecar wrote it — `map_entry` collides rather than
+            /// overwriting — so it is absent from `inserted_keys` and the
+            /// exact classifier counts it. A by-name test reports every one
+            /// of these `PreservedOnly`.
+            #[test]
+            fn hand_written_kwallet_keys_stay_attributes_preserved(
+                value in ".{0,128}",
+            ) {
+                let row = sidecar_entry(&[(ATTR_KEY, value.as_str())]);
+                let mut conflicts = 0;
+                let item = map_entry(
+                    "kdewallet",
+                    "Passwords",
+                    "router",
+                    EntryType::Password,
+                    secret(),
+                    Some(&row),
+                    &mut conflicts,
+                );
+                prop_assert_eq!(conflicts, 1);
+                prop_assert_eq!(&item.attributes[ATTR_KEY], &value);
+                prop_assert!(!item.inserted_keys.contains(ATTR_KEY));
+                prop_assert_eq!(item.outcome(), Outcome::AttributesPreserved);
             }
         }
     }

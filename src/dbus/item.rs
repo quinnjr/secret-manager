@@ -39,10 +39,28 @@ impl Item {
     }
 
     /// Read one field of the decrypted item; `None` while locked or missing.
+    ///
+    /// Fail-closed: `Locked` and `NoSuchItem` both read as absent, so a
+    /// deleted item in an unlocked collection never reports "unlocked but
+    /// blank". The underlying variant is debug-logged so a swallow is still
+    /// diagnosable; `Retired` cannot arise from `Vault::item` (it is a
+    /// save-path error) and would likewise read as absent here, where the
+    /// property getters have no `UnknownObject` to return.
     async fn with_item<T>(&self, f: impl FnOnce(&crate::vault::format::Item) -> T) -> Option<T> {
         let vault = self.vault().await?;
         let vault = vault.lock().await;
-        vault.item(&self.id).ok().map(f)
+        match vault.item(&self.id) {
+            Ok(item) => Some(f(item)),
+            Err(e) => {
+                tracing::debug!(
+                    collection = %self.collection,
+                    id = %self.id,
+                    error = ?e,
+                    "with_item miss"
+                );
+                None
+            }
+        }
     }
 
     async fn update(

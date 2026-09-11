@@ -670,30 +670,6 @@ mod tests {
 
     // --- the foreign-uid test, and its plumbing ---------------------------
 
-    /// `SO_PEERCRED` on a raw fd. `std`'s accessor is still unstable, and the
-    /// test needs the uid the *kernel* reports, not one Rust hands back.
-    fn peer_uid_of(fd: std::os::fd::RawFd) -> u32 {
-        let mut cred = libc::ucred {
-            pid: 0,
-            uid: u32::MAX,
-            gid: u32::MAX,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: `fd` is an open connected socket owned by the caller, and
-        // `cred`/`len` are a correctly sized out-parameter pair.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&raw mut cred).cast(),
-                &raw mut len,
-            )
-        };
-        assert_eq!(rc, 0, "getsockopt(SO_PEERCRED) failed");
-        cred.uid
-    }
-
     /// Write every byte, retrying short writes. Called on both sides of a
     /// `fork`, so it is `libc` only: no allocation, no locks.
     ///
@@ -952,11 +928,12 @@ mod tests {
         unsafe { write_all_fd(go[1], b"G") };
 
         let observed = {
-            use std::os::fd::AsRawFd;
             let (conn, _) = probe
                 .accept()
                 .expect("child never reached the probe socket");
-            peer_uid_of(conn.as_raw_fd())
+            // The uid the *kernel* reports, via the shared `SO_PEERCRED`
+            // helper rather than a test-local `getsockopt` copy.
+            crate::protocol::peer_uid(&conn).expect("getsockopt(SO_PEERCRED) failed")
         };
 
         let mut report = [0u8; 13];

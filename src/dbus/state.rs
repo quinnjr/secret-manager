@@ -345,7 +345,6 @@ pub fn load_aliases(dir: &Path) -> std::io::Result<BTreeMap<String, String>> {
 /// reachable from here — this is the same shape written against
 /// `std::io::Error`, not a copy of it.
 pub fn save_aliases_to(dir: &Path, aliases: &BTreeMap<String, String>) -> std::io::Result<()> {
-    use std::io::Write;
     // Not `create_dir_all`: that creates at 0777 & ~umask and can only be
     // chmodded afterwards, and another uid winning that window keeps a
     // descriptor. `ensure_vault_dir` sets the mode at creation. This writer
@@ -358,37 +357,9 @@ pub fn save_aliases_to(dir: &Path, aliases: &BTreeMap<String, String>) -> std::i
     })
     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let path = dir.join(ALIAS_FILE);
-    let suffix: String = crate::vault::crypto::random_bytes::<8>()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let tmp = dir.join(format!("{ALIAS_FILE}.{suffix}.tmp"));
-    let write = || -> std::io::Result<()> {
-        // No explicit mode: `std::fs::write` created the file with the
-        // process umask applied to 0o666, and this must not change that.
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, &path)
-    };
-    match write() {
-        Ok(()) => {
-            // Best effort, as in `vault::store`: the rename is already durable
-            // enough that a reader never sees a partial file.
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    // No explicit mode historically: `std::fs::write` created the file with
+    // the process umask applied to 0o666, so 0o666 here keeps that.
+    crate::atomic::write_atomic(&path, text.as_bytes(), 0o666)
 }
 
 /// What [`update_aliases`] does with an in-memory table whose write failed.

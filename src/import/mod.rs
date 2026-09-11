@@ -30,7 +30,7 @@ pub mod gnome;
 pub mod kwallet;
 pub mod verify;
 
-use crate::vault::format::CapViolation;
+use crate::vault::format::{CapViolation, MAX_ATTRIBUTE_KEY};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -68,23 +68,13 @@ pub const SYNTHESISED_ATTRIBUTES: [&str; 3] =
 /// searchable attribute that nothing here wrote, and discounting it would
 /// misreport the item as [`Outcome::PreservedOnly`].
 ///
-/// That argument does not extend to the source it excludes, and this function
-/// deliberately does not pretend otherwise. A *KWallet* item can carry a real
-/// `kwallet:key` too — one written into the sidecar by hand — and
-/// `kwallet::map_entry` records that as an attribute conflict rather than
-/// overwriting it, so the name survives into the map as user data. This
-/// function discounts it anyway, and such an item is reported
-/// [`Outcome::PreservedOnly`] when a client could in principle have searched
-/// on it. The classification is by name, not by provenance, because the map
-/// that reaches [`Outcome::classify`] no longer records which of its keys this
-/// importer inserted.
-///
-/// The error is one-directional: it can only under-promise. An item is called
-/// "no libsecret client will find it" when the truth is "probably none will",
-/// never the reverse, so no user is told a migration went better than it did.
-/// Making it exact means threading "did we insert this key?" out of
-/// `kwallet::map_entry` and into the classifier, which is the honest fix and
-/// not one a doc comment can perform.
+/// This is the by-name predicate over the denylist, and [`Outcome::classify`]
+/// deliberately does not call it: a *KWallet* item can carry a real
+/// `kwallet:key` too — one written into the sidecar by hand, which
+/// `kwallet::map_entry` keeps as user data rather than overwriting — and a
+/// by-name test discounts it anyway. The exact question is answered by the
+/// `inserted` set `classify` takes, which records what this importer wrote
+/// for this item rather than what shares a name with it.
 pub fn is_synthesised_attribute(source: Source, key: &str) -> bool {
     source == Source::KWallet && SYNTHESISED_ATTRIBUTES.contains(&key)
 }
@@ -186,6 +176,14 @@ pub struct SourceItem {
     pub created: u64,
     pub modified: u64,
     pub provenance: Provenance,
+    /// The synthesised names this importer inserted into `attributes` for
+    /// this item — and only those. `kwallet::map_entry` records exactly the
+    /// keys it added, so [`Outcome::classify`] can discount what it wrote
+    /// without discounting a hand-written `kwallet:key` a sidecar already
+    /// carried, which is user data a client could search on. Empty on every
+    /// path that synthesises nothing (gnome-keyring, and KWallet items that
+    /// arrived with an `xdg:schema`).
+    pub inserted_keys: BTreeSet<String>,
 }
 
 // Hand-written: the secret is redacted, and so are attribute *values*, which
@@ -207,7 +205,11 @@ impl fmt::Debug for SourceItem {
 impl SourceItem {
     /// See [`Outcome::classify`].
     pub fn outcome(&self) -> Outcome {
-        Outcome::classify(self.provenance.source, &self.attributes)
+        Outcome::classify(
+            self.provenance.source,
+            &self.attributes,
+            &self.inserted_keys,
+        )
     }
 
     /// The first cap this item violates, if any. Checked *before* anything is
@@ -265,12 +267,25 @@ impl Outcome {
     /// `kwallet::map_entry` synthesises, so on the gnome-keyring path a
     /// `kwallet:*` attribute is an ordinary attribute somebody wrote and
     /// counts like any other.
-    pub fn classify(source: Source, attributes: &BTreeMap<String, String>) -> Outcome {
+    ///
+    /// `inserted` is what this importer wrote for *this* item — the
+    /// [`SourceItem::inserted_keys`] `kwallet::map_entry` threaded out — and
+    /// only those names are discounted. A hand-written `kwallet:key` the
+    /// sidecar already carried collides rather than being overwritten, so it
+    /// is absent from `inserted` and counts as the searchable user data it
+    /// is. Classifying by name alone (see [`is_synthesised_attribute`])
+    /// misreports exactly that item as [`Outcome::PreservedOnly`].
+    pub fn classify(
+        source: Source,
+        attributes: &BTreeMap<String, String>,
+        inserted: &BTreeSet<String>,
+    ) -> Outcome {
         match attributes.get(XDG_SCHEMA) {
             Some(schema) if !schema.is_empty() => Outcome::FullyPortable,
-            _ if attributes
-                .keys()
-                .any(|k| !is_synthesised_attribute(source, k.as_str())) =>
+            _ if attributes.keys().any(|k| {
+                let k = k.as_str();
+                !is_synthesised_attribute(source, k) || !inserted.contains(k)
+            }) =>
             {
                 Outcome::AttributesPreserved
             }
@@ -419,6 +434,91 @@ impl fmt::Display for Refusal {
     }
 }
 
+/// An attribute *name*, as distinct from an attribute value.
+///
+/// The inner string is private: the only way to mint one is [`TryFrom`],
+/// which rejects what a name cannot be, or [`Deserialize`], which goes
+/// through [`TryFrom`]. There is deliberately no `From` — an infallible
+/// constructor would be the `from_names(attributes.values()…)` door with a
+/// new spelling.
+///
+/// The content check is a tripwire, not a proof: it rejects what no name
+/// this importer writes can be (longer than [`MAX_ATTRIBUTE_KEY`]), while a
+/// short value still parses. What makes a short string a *name* is the call
+/// site passing key-position data, which the type system cannot see and
+/// `from_names_call_sites_are_all_name_shaped` pins instead. The full
+/// structural fix — keying the attribute maps themselves by this type — would
+/// cross into `vault::Item`, the D-Bus items and the wire, and is not this.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AttributeName(String);
+
+/// Why a string is not an attribute name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeNameError {
+    len: usize,
+    limit: usize,
+}
+
+impl fmt::Display for AttributeNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "attribute name is {} bytes, over the {} byte limit",
+            self.len, self.limit
+        )
+    }
+}
+
+impl std::error::Error for AttributeNameError {}
+
+impl AttributeName {
+    /// The name, for the key sets that store plain strings.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for AttributeName {
+    type Error = AttributeNameError;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        // Length only, and deliberately so. Empty is a legal key the caps
+        // accept, and a NUL can arrive through the sidecar, pass the caps and
+        // land in a report this build wrote — rejecting either here would
+        // make our own file unreadable. What is rejected is what no report
+        // this build writes can contain: the per-item cap refuses it first.
+        if name.len() > MAX_ATTRIBUTE_KEY {
+            return Err(AttributeNameError {
+                len: name.len(),
+                limit: MAX_ATTRIBUTE_KEY,
+            });
+        }
+        Ok(Self(name))
+    }
+}
+
+impl TryFrom<&str> for AttributeName {
+    type Error = AttributeNameError;
+
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        Self::try_from(name.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AttributeName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        Self::try_from(name).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The attribute *names* of an item, and nothing else.
 ///
 /// [`AttributeKeys::of`] builds one from a map whose values are dropped on the
@@ -433,22 +533,41 @@ impl fmt::Display for Refusal {
 ///   `AttributeKeys::from_names(attributes.values().cloned())` compiles and
 ///   fills a report with `server=`/`user=` *values*. It is `pub(crate)`, which
 ///   reduces "no code path can do this by accident" to a claim about code in
-///   this repository — a claim review can actually settle.
-/// - `#[derive(Deserialize)]` with `#[serde(transparent)]` on a `pub` type is
-///   a **public** constructor from any JSON array of strings, reachable by any
-///   downstream crate with no `unsafe` and no crate-private call. It exists so
-///   a report can be read back and its tally checked, and the strings it
-///   admits are whatever the file on disk holds. So a deserialized
-///   `AttributeKeys` carries only the guarantee that *whoever wrote the file*
-///   put names in it; nothing this crate emits ever takes that route.
+///   this repository — a claim review can actually settle, and
+///   `from_names_call_sites_are_all_name_shaped` settles it in the suite by
+///   pinning every call site.
+/// - `Deserialize` is hand-written through [`AttributeName`], so a report
+///   read back from JSON admits only strings a name can be. It exists so a
+///   report can be read back and its tally checked, and a value-shaped string
+///   smuggled into `attribute_keys` is refused at the point of reading
+///   rather than trusted. A deserialized `AttributeKeys` still carries only
+///   the guarantee that *whoever wrote the file* put plausible names in it;
+///   nothing this crate emits ever takes that route.
 ///
-/// The structural fix for both is a distinct `AttributeName` type that only a
-/// parser can mint, with the `Deserialize` going through it; until that
-/// exists, [`AttributeKeys::of`] is the only constructor whose input shape
-/// makes a value impossible.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// The structural fix for the first door is keying the attribute maps
+/// themselves by [`AttributeName`]; that crosses into `vault::Item`, the
+/// D-Bus items and the wire, so until then [`AttributeKeys::of`] is the only
+/// constructor whose input shape makes a value impossible.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct AttributeKeys(BTreeSet<String>);
+
+/// Hand-written so admission goes through [`AttributeName`]: a JSON array is
+/// a public constructor for this type, and a derived `Deserialize` would
+/// admit any strings at all — including attribute *values* smuggled into
+/// `attribute_keys`. The wire shape is unchanged (a JSON array of strings),
+/// so reports written before this gate still read.
+impl<'de> Deserialize<'de> for AttributeKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let names = Vec::<AttributeName>::deserialize(deserializer)?;
+        Ok(Self(
+            names.into_iter().map(AttributeName::into_inner).collect(),
+        ))
+    }
+}
 
 impl AttributeKeys {
     /// The keys of `attributes`. The values are not read.
@@ -464,10 +583,10 @@ impl AttributeKeys {
     /// `AttributeKeys::from_names(attributes.values().cloned())` compiles and
     /// fills a report with `server=`/`user=` *values*. Keeping it inside the
     /// crate reduces "no code path can do this by accident" to a claim about
-    /// code in this repository, which is a claim review can actually settle.
-    /// See the type's own doc for the other constructor — the derived,
-    /// `pub`-by-inheritance `Deserialize` — and why it is not the same kind of
-    /// hole.
+    /// code in this repository, which is a claim review can actually settle —
+    /// and does, in `from_names_call_sites_are_all_name_shaped`. See the
+    /// type's own doc for the other constructor — the hand-written
+    /// `Deserialize` through [`AttributeName`] — and what it admits.
     pub(crate) fn from_names<I, S>(names: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -543,6 +662,15 @@ pub struct ItemReport {
     /// the migration boundary, reported per item and loudly.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acl_downgrade: bool,
+    /// Both timestamps arrived as zero: the source had nothing to carry
+    /// across (a KWallet entry with no sidecar row), so `created` and
+    /// `modified` landed as the Unix epoch. Kept visible because `sm get`
+    /// breaks an attribute-set collision on newest-`modified`-wins, and for
+    /// these items that tie-break is arbitrary — every one of them compares
+    /// equal — while `Item.Modified` reports 1970 to any bus client that
+    /// reads it. See `Vault::import_items` and `ImportReport::epoch_note`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub epoch_stamped: bool,
 }
 
 impl ItemReport {
@@ -560,6 +688,7 @@ impl ItemReport {
             lost_item_type: None,
             unknown_item_type: None,
             acl_downgrade: false,
+            epoch_stamped: item.created == 0 && item.modified == 0,
         }
     }
 
@@ -577,6 +706,7 @@ impl ItemReport {
             lost_item_type: None,
             unknown_item_type: None,
             acl_downgrade: false,
+            epoch_stamped: false,
         }
     }
 
@@ -593,7 +723,7 @@ impl ItemReport {
 /// only way out, so a call site cannot reach past `record_outcome` to bump a
 /// counter directly; `src/cli/import.rs` prints the summary through those
 /// accessors.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Tally {
     fully_portable: usize,
     attributes_preserved: usize,
@@ -664,6 +794,45 @@ impl Tally {
     }
 }
 
+/// Hand-written so the counters are only ever moved by
+/// [`Tally::record_outcome`] and [`Tally::record_refused`], exactly like every
+/// other construction path. A derived `Deserialize` would write the private
+/// fields directly, making the file on disk a second writer that bypasses the
+/// invariant the accessors above document.
+impl<'de> Deserialize<'de> for Tally {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TallyRepr {
+            #[serde(default)]
+            fully_portable: usize,
+            #[serde(default)]
+            attributes_preserved: usize,
+            #[serde(default)]
+            preserved_only: usize,
+            #[serde(default)]
+            refused: usize,
+        }
+        let repr = TallyRepr::deserialize(deserializer)?;
+        let mut tally = Tally::default();
+        for _ in 0..repr.fully_portable {
+            tally.record_outcome(Outcome::FullyPortable);
+        }
+        for _ in 0..repr.attributes_preserved {
+            tally.record_outcome(Outcome::AttributesPreserved);
+        }
+        for _ in 0..repr.preserved_only {
+            tally.record_outcome(Outcome::PreservedOnly);
+        }
+        for _ in 0..repr.refused {
+            tally.record_refused();
+        }
+        Ok(tally)
+    }
+}
+
 /// What `--report PATH` writes, and what `--dry-run` prints.
 ///
 /// `Deserialize` is hand-written below: a report whose `tally` disagrees with
@@ -684,6 +853,13 @@ pub struct ImportReport {
     /// failed regardless of what the fingerprints agree on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header_item_count: Option<usize>,
+    /// How many written items carry `(0, 0)` timestamps. A KWallet entry with
+    /// no sidecar row has no timestamp anything knows, and inventing one
+    /// would corrupt the newest-wins ordering `sm get` uses — so the zeros
+    /// are honest, and this count is where the report says how many items
+    /// the tie-break is arbitrary for. See [`ItemReport::epoch_stamped`].
+    #[serde(default)]
+    pub epoch_stamped_items: usize,
 }
 
 impl ImportReport {
@@ -695,13 +871,34 @@ impl ImportReport {
             items: Vec::new(),
             empty_folders: 0,
             header_item_count: None,
+            epoch_stamped_items: 0,
         }
     }
 
     /// Adds an item report and updates the tally, so the two cannot disagree.
+    /// The epoch-stamped count moves here too, for the same reason: it is a
+    /// function of the items, and a second writer would let the two drift.
     pub fn push(&mut self, report: ItemReport) {
         self.tally.record(&report);
+        if !report.is_refused() && report.epoch_stamped {
+            self.epoch_stamped_items += 1;
+        }
         self.items.push(report);
+    }
+
+    /// The one-line form of the epoch loan for `--report` notes: how many
+    /// items compare equal under the newest-wins tie-break.
+    pub fn epoch_note(&self) -> Option<String> {
+        if self.epoch_stamped_items == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} imported items carry no timestamps from the source, so their \
+             created and modified times are the Unix epoch and the \
+             newest-wins ordering `sm get` uses to break an attribute-set \
+             collision is arbitrary for them",
+            self.epoch_stamped_items
+        ))
     }
 
     /// The tally these items add up to, recomputed from scratch.
@@ -714,6 +911,17 @@ impl ImportReport {
             tally.record(item);
         }
         tally
+    }
+
+    /// The same rule as the tally, for the epoch-stamped count: it is a
+    /// function of the items, recomputed on read and refused when it
+    /// disagrees, so a hand-edited report cannot claim timestamped items it
+    /// does not have.
+    fn recomputed_epoch_stamped(items: &[ItemReport]) -> usize {
+        items
+            .iter()
+            .filter(|item| !item.is_refused() && item.epoch_stamped)
+            .count()
     }
 }
 
@@ -732,6 +940,8 @@ struct ImportReportRepr {
     empty_folders: usize,
     #[serde(default)]
     header_item_count: Option<usize>,
+    #[serde(default)]
+    epoch_stamped_items: usize,
 }
 
 /// Hand-written so the tally is *checked*, not merely read.
@@ -758,6 +968,15 @@ impl<'de> Deserialize<'de> for ImportReport {
                 repr.items.len(),
             )));
         }
+        let recomputed_epoch = ImportReport::recomputed_epoch_stamped(&repr.items);
+        if recomputed_epoch != repr.epoch_stamped_items {
+            return Err(serde::de::Error::custom(format!(
+                "the report's epoch-stamped count {} disagrees with the {} items it \
+                 summarises, which add up to {recomputed_epoch}",
+                repr.epoch_stamped_items,
+                repr.items.len(),
+            )));
+        }
         Ok(ImportReport {
             source: repr.source,
             collection: repr.collection,
@@ -765,6 +984,7 @@ impl<'de> Deserialize<'de> for ImportReport {
             items: repr.items,
             empty_folders: repr.empty_folders,
             header_item_count: repr.header_item_count,
+            epoch_stamped_items: repr.epoch_stamped_items,
         })
     }
 }
@@ -793,6 +1013,9 @@ mod tests {
             created: 1_699_383_593,
             modified: 1_699_387_319,
             provenance: Provenance::kwallet("kdewallet", "Passwords", "my router"),
+            // Nothing synthesised through this helper: every key in the map
+            // is user data unless the test says otherwise by setting this.
+            inserted_keys: BTreeSet::new(),
         }
     }
 
@@ -821,12 +1044,17 @@ mod tests {
     #[test]
     fn a_synthesised_attribute_map_is_preserved_only_not_preserved_attributes() {
         // Exactly what `kwallet::map_entry` leaves on a native entry with no
-        // sidecar row: three synthesised keys and nothing else.
-        let mapped = item(&[
+        // sidecar row: three synthesised keys and nothing else — including
+        // the record that this importer wrote them.
+        let mut mapped = item(&[
             (kwallet::ATTR_FOLDER, "Passwords"),
             (kwallet::ATTR_KEY, "my router"),
             (kwallet::ATTR_TYPE, "password"),
         ]);
+        mapped.inserted_keys = SYNTHESISED_ATTRIBUTES
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
         assert!(
             !mapped.attributes.is_empty(),
             "the map is empty, so this test would pass for the wrong reason"
@@ -848,6 +1076,20 @@ mod tests {
             .attributes
             .insert("server".into(), "example.com".into());
         assert_eq!(with_real.outcome(), Outcome::AttributesPreserved);
+    }
+
+    /// A hand-written `kwallet:key` is user data, not provenance. The sidecar
+    /// already carried the name, so `map_entry` keeps its value on collision
+    /// and records nothing in `inserted_keys` — and the exact classifier
+    /// counts the name as searchable rather than discounting it by name.
+    #[test]
+    fn a_hand_written_kwallet_key_stays_attributes_preserved() {
+        let handwritten = item(&[(kwallet::ATTR_KEY, "my router")]);
+        assert!(
+            handwritten.inserted_keys.is_empty(),
+            "the fixture must carry the name without us having inserted it"
+        );
+        assert_eq!(handwritten.outcome(), Outcome::AttributesPreserved);
     }
 
     /// The names the classifier ignores are `kwallet`'s own constants, not a
@@ -883,12 +1125,19 @@ mod tests {
             .map(|k| (*k, "written by the user"))
             .collect();
         let map = attrs(&synthesised);
+        // On the KWallet path these names were written by the importer, so
+        // they say nothing about discoverability.
+        let inserted: BTreeSet<String> = SYNTHESISED_ATTRIBUTES
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
         assert_eq!(
-            Outcome::classify(Source::KWallet, &map),
+            Outcome::classify(Source::KWallet, &map, &inserted),
             Outcome::PreservedOnly
         );
+        // The same names on the gnome path are attributes somebody wrote.
         assert_eq!(
-            Outcome::classify(Source::GnomeKeyring, &map),
+            Outcome::classify(Source::GnomeKeyring, &map, &BTreeSet::new()),
             Outcome::AttributesPreserved
         );
     }
@@ -902,7 +1151,11 @@ mod tests {
             Outcome::AttributesPreserved
         );
         assert_eq!(
-            Outcome::classify(Source::KWallet, &attrs(&[("xdg:schema", "")])),
+            Outcome::classify(
+                Source::KWallet,
+                &attrs(&[("xdg:schema", "")]),
+                &BTreeSet::new()
+            ),
             Outcome::AttributesPreserved
         );
     }
@@ -1023,6 +1276,39 @@ mod tests {
         assert_eq!(report.tally.seen(), report.items.len());
     }
 
+    /// `(0, 0)` timestamps stay `(0, 0)` — no `now()` is invented — but the
+    /// loan is counted in the report, so the newest-wins tie-break being
+    /// arbitrary for these items is visible rather than silent.
+    #[test]
+    fn epoch_stamped_items_are_counted_and_survive_json() {
+        let mut report = ImportReport::new(Source::KWallet, "kdewallet (imported)");
+        let mut timeless = item(&[("server", "example.com")]);
+        timeless.created = 0;
+        timeless.modified = 0;
+        report.push(ItemReport::imported(&timeless));
+        report.push(ItemReport::imported(&item(&[("server", "example.com")])));
+        report.push(ItemReport::refused(
+            Provenance::gnome("Login", 1),
+            "chained",
+            Refusal::ChainedKeyringItem { item_type: 3 },
+        ));
+        assert!(report.items[0].epoch_stamped);
+        assert!(!report.items[1].epoch_stamped);
+        assert!(!report.items[2].epoch_stamped);
+        assert_eq!(report.epoch_stamped_items, 1);
+        let note = report.epoch_note().expect("one epoch-stamped item");
+        assert!(note.starts_with("1 imported items"), "{note}");
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("epoch"), "{json}");
+        let back: ImportReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, report);
+        // A report written before the count existed still reads, as zero.
+        let old = r#"{"source":"kwallet","collection":"c","tally":{"fully_portable":0,"attributes_preserved":0,"preserved_only":0,"refused":0},"items":[]}"#;
+        let back: ImportReport = serde_json::from_str(old).unwrap();
+        assert_eq!(back.epoch_stamped_items, 0);
+        assert_eq!(back.epoch_note(), None);
+    }
+
     /// A report read back from JSON cannot carry a tally its own items
     /// contradict. The JSON report is the artefact a user trusts when
     /// deciding whether their credentials survived, so "0 refused" beside a
@@ -1099,6 +1385,60 @@ mod tests {
         assert!(AttributeKeys::default().is_empty());
         assert_eq!(keys, AttributeKeys::from_names(["a", "b"]));
     }
+
+    /// `from_names` takes any strings at all, so a new call site passing
+    /// `attributes.values()` compiles and files a report with values. This
+    /// test pins every call site in the crate; adding one fails here until
+    /// it is reviewed as name-position data. (Matched on the source text,
+    /// which is brittle to reformatting by design: a failure here means a
+    /// human looks at the new call, which is the whole point.)
+    #[test]
+    fn from_names_call_sites_are_all_name_shaped() {
+        let sites = [
+            ("formats.rs", include_str!("formats.rs"), 3),
+            ("mod.rs", include_str!("mod.rs"), 1),
+            ("verify.rs", include_str!("verify.rs"), 1),
+        ];
+        // Built at runtime so this test does not match its own matcher line.
+        let needle = ["from_names", "("].concat();
+        for (file, source, expected) in sites {
+            let calls: Vec<&str> = source
+                .lines()
+                .map(str::trim_start)
+                .filter(|l| l.contains(&needle))
+                .filter(|l| !(l.starts_with("///") || l.starts_with("//")))
+                .collect();
+            assert_eq!(
+                calls.len(),
+                expected,
+                "{file}: from_names call sites changed; review the new one for value-shaped input"
+            );
+            for call in calls {
+                assert!(
+                    !call.contains("values()"),
+                    "{file}: value-shaped from_names call: {call}"
+                );
+            }
+        }
+    }
+
+    /// A report read back from JSON admits only strings a name can be. A
+    /// value smuggled into `attribute_keys` — longer than any name this
+    /// importer writes — is refused at the point of reading.
+    #[test]
+    fn a_report_with_a_value_shaped_key_will_not_deserialize() {
+        let mut report = ImportReport::new(Source::KWallet, "kdewallet (imported)");
+        report.push(ItemReport::imported(&item(&[("server", "example.com")])));
+        let mut json = serde_json::to_value(&report).unwrap();
+        // Longer than the 256-byte attribute-name cap: no name this build
+        // writes can be this long, but a value smuggled in could be.
+        let smuggled = "v".repeat(MAX_ATTRIBUTE_KEY + 1);
+        json["items"][0]["attribute_keys"] = serde_json::json!(["server", smuggled]);
+        let err = serde_json::from_value::<ImportReport>(json).unwrap_err();
+        assert!(err.to_string().contains("over the"), "{err}");
+    }
+
+    /// The report is an artefact a user keeps, so `Refusal`'s wire form is
 
     #[test]
     fn a_report_round_trips_through_json() {

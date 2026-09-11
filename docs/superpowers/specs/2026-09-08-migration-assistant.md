@@ -3,7 +3,10 @@
 Date: 2026-09-08
 Status: implemented (`src/cli/import.rs`, wired as `Command::Import`). The
 KWallet and gnome-keyring decommissioning steps remain reasoned rather than
-verified on a live desktop session; everything else here is built, and the
+verified on a live desktop session; delete this disclaimer when
+`docs/vagrant.md` gains a desktop-session box or a manual verification log
+(distro + Plasma/GNOME version), tracked with the migration follow-up on
+`feature/migration-spec`; everything else here is built, and the
 fingerprint definition below was tightened during implementation
 
 ## Goal
@@ -188,6 +191,12 @@ This exists because the Secret Service API requires attribute lookup on a
 the importer it is a gift: **every attribute, content type and timestamp can
 be read with the wallet locked.** Only the secret bytes need it open.
 
+An entry with no sidecar row — or a row whose `$fdo_created` /
+`$fdo_modified` is missing or unparsable — lands at `created = modified =
+0` (the Unix epoch), never `now()` (see "Timestamps require a new vault
+API" for why an invented clock destroys the newest-wins ordering),
+reported as `epoch_stamped_items`.
+
 It is also worth recording in the comparison this project's README already
 invites. `[vault] locked_search = true` stores
 `SHA-256(index_salt || len(key) || key || value)` — a file holder can
@@ -235,7 +244,12 @@ than negotiating it:
 
 The real daemon on the real session bus is untouched throughout, so a
 migration can be run *after* installing secret-manager — which is when users
-discover they need one.
+discover they need one. The child is never pointed at the user's live
+directory either: it gets a private snapshot — a copy of the source
+directory in a `0700` temp dir, removed when extraction ends — because
+`gnome-keyring-daemon --unlock` rewrites keyring files it opens and creates
+a `login.keyring` where there is none. "The source was not modified" is a
+fact about the filesystem, not a sentence in the report.
 
 **The sharp edge is prompts.** A keyring that is not the login keyring and
 is not chained to it requires an unlock prompt, and on a private bus with no
@@ -455,6 +469,14 @@ The import is not finished when the bytes are written. It is finished when
 the assistant has proved the copy is faithful, without printing a single
 secret.
 
+The order is write → verify-offline → reload → probe → alias. The count,
+fingerprint and histogram checks run against the file as re-read from disk
+before any daemon is told to load it, so a failure there unlinks the file
+and publishes nothing — the alias has not moved and no daemon has been
+asked to rescan. Only then is the daemon asked to reload, the probe issued
+against what was reloaded, and — with `--set-default`, and last of all —
+the `default` alias moved.
+
 **Fingerprints.** For each item, source and destination:
 
 ```
@@ -563,7 +585,11 @@ sm import --from gnome-keyring|kwallet [options]
 `--inventory` needs no password and no daemon. `--dry-run` performs the full
 extraction and every pre-flight check, then discards — the intended first
 run, since it surfaces the three-way tally and any cap violations before
-anything is written.
+anything is written. `--report` writes the per-item report with the
+post-probe tally beside the items it summarises, the two together so they
+cannot disagree (a report read back whose tally contradicts its items is
+refused, not trusted); like everything the assistant prints, it holds no
+secret and no attribute value.
 
 A subcommand rather than a second binary: `src/cli/` is already entirely
 behind the `daemon` feature, so the feature-guard cost is zero, whereas a new
@@ -604,7 +630,12 @@ What is new:
   in the same commit as it.
 - **Cap enforcement**, asserting `import_items` rejects each of the six
   limits — because that is the one place where the offline path could
-  silently produce items the D-Bus API could not.
+  silently produce items the D-Bus API could not. `Cap` variant names are
+  wire format in `report.json` (kebab-case; `attribute-name` deliberately
+  not the kebab of the variant): a rename changes a file other programs
+  read, so treat it as requiring a `report_format_version` bump — no such
+  field exists yet, and until one lands any rename is a breaking change —
+  pinned by `every_refusal_has_a_fixed_wire_form`.
 
 ## Open questions
 

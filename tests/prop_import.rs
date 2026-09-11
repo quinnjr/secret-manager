@@ -47,6 +47,7 @@ use secret_manager::import::formats::{
     self, HeaderError, KEYRING_MAGIC, KWALLET_MAGIC, KeyringInventory, MAX_SOURCE_BYTES,
     WalletInventory, parse_default_file, parse_keyring_header, parse_wallet_header,
 };
+use secret_manager::import::kwallet::{MapDecodeError, Sidecar, SidecarError, SkipReason};
 use std::collections::BTreeSet;
 
 fn be(v: u32) -> [u8; 4] {
@@ -967,3 +968,85 @@ fn the_index_end_is_where_the_parser_stops() {
 
 const GOLDEN_KEYRING: &[u8] = include_bytes!("fixtures/import/sample.keyring");
 const GOLDEN_WALLET: &[u8] = include_bytes!("fixtures/import/sample.kwl");
+
+// --------------------------------------------------------------------------
+// The sidecar file, and the two skip reasons an entry can end as
+// --------------------------------------------------------------------------
+
+/// A sidecar that is not JSON is refused with the `Json` arm — reached here
+/// through the public `Sidecar::load`, the `parse` it calls being crate-only.
+/// The missing-file contrast proves the refusal is about the bytes: a wallet
+/// never touched by `ksecretd` simply has no attributes, which is not an
+/// error.
+#[test]
+fn a_sidecar_that_is_not_json_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        Sidecar::load(&dir.path().join("absent_attributes.json"))
+            .unwrap()
+            .is_empty(),
+        "a missing sidecar is an empty one, not an error"
+    );
+    let path = dir.path().join("kdewallet_attributes.json");
+    std::fs::write(&path, "{not json").unwrap();
+    match Sidecar::load(&path) {
+        Err(SidecarError::Json { .. }) => {}
+        other => panic!("a non-JSON sidecar must be refused with Json, got {other:?}"),
+    }
+    // A JSON value that is not an object is a different arm, not a parse of
+    // nothing.
+    std::fs::write(&path, "[1, 2]").unwrap();
+    assert!(
+        matches!(Sidecar::load(&path), Err(SidecarError::NotAnObject { .. })),
+        "a non-object sidecar must be refused with NotAnObject"
+    );
+}
+
+/// `MapDecodeError::Json` has no producer, and this pins that fact rather
+/// than the arm's absence.
+///
+/// `qmap_to_canonical_json` writes a `BTreeMap<&str, &str>` into a buffer
+/// sized up front for the worst case JSON escaping can produce, so neither
+/// step can fail: serialising a string map is infallible, and a `Vec` write
+/// never errors. No input reaches the arm. The variant stays — removing it
+/// would shrink the error type every caller matches on — so it is constructed
+/// here to pin the message it would carry, and to fail compilation if it is
+/// ever deleted: deletion must be a conscious diff to the enum, not drift.
+#[test]
+fn the_unencodable_map_error_names_what_it_would_mean() {
+    let e = MapDecodeError::Json("cannot happen: string maps serialise infallibly".to_string());
+    assert!(
+        e.to_string().contains("could not be re-encoded as JSON"),
+        "{e}"
+    );
+}
+
+/// Both reads failed for a `Password` entry is `Unreadable`, not `EmptyRead`:
+/// the first is "the wallet would not hand the entry over", the second is
+/// "it answered with no bytes". Collapsing them would report a daemon that
+/// refuses reads as one that answers them emptily.
+///
+/// The branch that chooses lives in the crate-private `read_secret`, behind
+/// the crate-private `WalletReader` — an integration test cannot drive it
+/// with a fake reader, and `kwallet.rs`'s own unit tests do. What is pinned
+/// here is the report-facing wording `run_with` surfaces verbatim through
+/// `NotMigrated`, so a rewording fails where the user would see it.
+#[test]
+fn a_password_entry_both_reads_fail_is_unreadable_not_an_empty_read() {
+    // The production message shape from `read_secret`'s `Password` arm: the
+    // first read failed, the fallback failed, and the skip names both.
+    let both_failed = SkipReason::Unreadable(
+        "readPassword failed (access denied) and readEntry failed (no such entry)".to_string(),
+    );
+    assert!(
+        both_failed.to_string().contains("would not hand over"),
+        "{both_failed}"
+    );
+    let empty = SkipReason::EmptyRead { call: "readEntry" };
+    assert!(empty.to_string().contains("no bytes"), "{empty}");
+    assert_ne!(
+        both_failed.to_string(),
+        empty.to_string(),
+        "the two refusals must stay distinguishable"
+    );
+}

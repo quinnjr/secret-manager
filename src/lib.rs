@@ -19,11 +19,13 @@ compile_error!(
      (see the Makefile)"
 );
 
+pub mod atomic;
 pub mod config;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
 pub mod pam;
 pub mod protocol;
+pub mod sanitize;
 pub mod vault;
 
 #[cfg(feature = "daemon")]

@@ -10,7 +10,7 @@ use super::session::{SecretStruct, Session};
 use super::state::{self, PathTarget, SessionEntry, Shared, VaultRef};
 use crate::session::dh::KeyPair;
 use crate::session::{ALGORITHM_DH, ALGORITHM_PLAIN, SessionCipher};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use zbus::Connection;
 use zbus::interface;
 use zbus::message::Header;
@@ -114,13 +114,6 @@ pub(crate) fn check_alias_room(table: &BTreeMap<String, String>, name: &str) -> 
         )));
     }
     Ok(())
-}
-
-/// Append `id` unless it's already present.
-fn push_unique(ids: &mut Vec<String>, id: String) {
-    if !ids.contains(&id) {
-        ids.push(id);
-    }
 }
 
 /// Bucket `elements` by collection id, keeping each element's index.
@@ -422,21 +415,14 @@ impl Service {
         // loop: it can never be given a prompt, so paying up to
         // `MAX_LOCK_OBJECTS` lock acquisitions for it is waste.
         //
-        // The quota is *computed* here for the same reason — it is one cheap
-        // read under a guard this method takes anyway — but deliberately not
-        // returned yet. `open_session` may fail fast on it because it always
-        // creates a session; `Unlock` often creates no prompt at all, and
-        // libsecret calls it unconditionally before every read. Refusing a
-        // caller at quota when every named object is already unlocked would
-        // cost it the ability to read collections that are not locked, on the
-        // strength of prompts that clear only on completion, dismissal or the
-        // owner's departure. So the verdict is held until past the
-        // `collections.is_empty()` return below, which is where the old
-        // per-element code first reached it. It is taken again under the
-        // guard that inserts the owner entry, because only there is it atomic
-        // with the insert.
+        // The quota is checked only under the guard that inserts the owner
+        // entry below, past the `collections.is_empty()` return, because only
+        // there is it atomic with the insert. `Unlock` often creates no prompt
+        // at all, and libsecret calls it unconditionally before every read,
+        // so refusing a caller at quota when every named object is already
+        // unlocked would cost it the ability to read collections that are not
+        // locked.
         let owner = require_sender(&header)?;
-        let quota = self.state.lock().await.check_prompt_quota(&owner);
         // Resolve every path under ONE state acquisition and answer the lock
         // state with that guard released, one vault acquisition per *distinct
         // collection* rather than one of each per element — the shape
@@ -506,6 +492,7 @@ impl Service {
         }
         let mut unlocked = Vec::new();
         let mut collections: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut requested = Vec::new();
         for (p, verdict) in pending.into_iter().zip(verdict) {
             let Some(is_locked) = verdict else { continue };
@@ -513,13 +500,14 @@ impl Service {
                 unlocked.push(p.path);
                 continue;
             }
-            push_unique(&mut collections, p.cid);
+            if seen.insert(p.cid.clone()) {
+                collections.push(p.cid);
+            }
             requested.push(p.path);
         }
         if collections.is_empty() {
             return Ok((unlocked, paths::root()));
         }
-        quota?;
         let mut st = self.state.lock().await;
         st.check_prompt_quota(&owner)?;
         let prompt_path = st.new_prompt_path();
@@ -609,7 +597,9 @@ impl Service {
                 // `vault.lock()` only past the existence check.
                 if any && !vault.is_locked() {
                     vault.lock();
-                    push_unique(&mut changed, cid);
+                    // `cid` comes from `group_by_collection`, which emits one
+                    // bucket per distinct collection, so it is already unique.
+                    changed.push(cid);
                 }
             }
             let locked: Vec<OwnedObjectPath> = pending

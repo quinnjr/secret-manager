@@ -3,7 +3,7 @@
 use super::client::{Client, ItemInfo};
 use super::{CliError, read_secret_from_stdin};
 // A terminal row and a dialog line have the same problem, so they use the
-// same escaper, and it lives in `crate::vault::format` — always compiled,
+// same escaper, and it lives in `crate::sanitize` — always compiled,
 // because `src/vault/` is the PAM cdylib's half of the crate too, and the
 // PAM module has peer-supplied text of its own to render. This file used to
 // carry its own copy of the function *and* of the character table, and the
@@ -112,8 +112,8 @@ async fn find_inner(
 /// erase, forge or reorder `sm list` rows. Anything below U+0020, plus DEL and
 /// the invisible formatters, becomes `\xNN` per UTF-8 byte.
 ///
-/// One definition, in `vault::format`; see the note at the top of this file.
-pub(crate) use crate::vault::format::escape_control;
+/// One definition, in `crate::sanitize`; see the note at the top of this file.
+pub(crate) use crate::sanitize::escape_control;
 
 #[cfg(test)]
 mod tests {
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn items_group_by_their_collection() {
         let p = |s: &str| OwnedObjectPath::try_from(s.to_string()).unwrap();
-        let groups = group_by_collection(&[
+        let groups = group_paths_by_owner(&[
             p("/org/freedesktop/secrets/collection/default/a"),
             p("/org/freedesktop/secrets/collection/work/b"),
             p("/org/freedesktop/secrets/collection/default/c"),
@@ -325,43 +325,33 @@ pub async fn get(attrs: Vec<String>, label: Option<String>) -> Result<(), CliErr
     let query = parse_attrs(&attrs)?;
     let client = Client::connect().await?;
     let found = find(&client, &query).await?;
-    // The `GetAll` per match below is issued only to rank on `modified` and
-    // to filter on `--label`. With a single match and no `--label` there is
-    // nothing to rank and nothing to filter, and the path it would settle on
-    // is the one already in hand — so the round trip is skipped and the
-    // common `sm get` is two calls rather than three.
-    let path = match (found.as_slice(), label.as_deref()) {
-        ([only], None) => only.clone(),
-        _ => {
-            let mut best: Option<ItemInfo> = None;
-            let mut matches = 0usize;
-            for path in &found {
-                let info = client.item_info(path).await?;
-                if label.as_deref().is_some_and(|l| l != info.label) {
-                    continue;
-                }
-                matches += 1;
-                if best.as_ref().is_none_or(|b| info.modified > b.modified) {
-                    best = Some(info);
-                }
-            }
-            let Some(info) = best else {
-                return Err(CliError::NotFound("no matching secret".into()));
-            };
-            // `SearchItems` is subset matching, so an item carrying the queried
-            // attributes *plus* its own also matches; any process on the session bus
-            // can create one and win on `modified`. Keep secret-tool's "newest wins"
-            // behaviour and exit code, but never do it silently.
-            if matches > 1 {
-                eprintln!(
-                    "warning: {matches} items match; using the most recently modified (\"{}\"). \
-                     Pass --label to disambiguate.",
-                    escape_control(&info.label)
-                );
-            }
-            info.path
+    let mut best: Option<ItemInfo> = None;
+    let mut matches = 0usize;
+    for path in &found {
+        let info = client.item_info(path).await?;
+        if label.as_deref().is_some_and(|l| l != info.label) {
+            continue;
         }
+        matches += 1;
+        if best.as_ref().is_none_or(|b| info.modified > b.modified) {
+            best = Some(info);
+        }
+    }
+    let Some(info) = best else {
+        return Err(CliError::NotFound("no matching secret".into()));
     };
+    // `SearchItems` is subset matching, so an item carrying the queried
+    // attributes *plus* its own also matches; any process on the session bus
+    // can create one and win on `modified`. Keep secret-tool's "newest wins"
+    // behaviour and exit code, but never do it silently.
+    if matches > 1 {
+        eprintln!(
+            "warning: {matches} items match; using the most recently modified (\"{}\"). \
+             Pass --label to disambiguate.",
+            escape_control(&info.label)
+        );
+    }
+    let path = info.path;
     let secret = client.get_secret(&path).await?;
     let mut out = std::io::stdout().lock();
     out.write_all(&secret)?;
@@ -420,7 +410,7 @@ pub(crate) async fn delete_each(
     let mut deleted = 0usize;
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut untouched: Vec<(String, usize, String)> = Vec::new();
-    for (collection, paths) in group_by_collection(items) {
+    for (collection, paths) in group_paths_by_owner(items) {
         // A path we cannot attribute to a collection cannot be batched; it is
         // almost certainly stale, and `Item.Delete` will say so.
         let batched = match &collection {
@@ -454,20 +444,29 @@ pub(crate) async fn delete_each(
 /// Item paths grouped by the collection they live in, preserving the input
 /// order within each group. A path that is not an item path under a collection
 /// or alias groups under `None`.
-fn group_by_collection(
+///
+/// Hashed index rather than a linear `find` per element, matching the
+/// `group_by_collection` in `dbus::service`; buckets come back in
+/// first-appearance order with each group's paths in input order.
+fn group_paths_by_owner(
     items: &[OwnedObjectPath],
 ) -> Vec<(Option<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
     use crate::dbus::paths::{self, Target};
+    use std::collections::HashMap;
     let mut groups: Vec<(Option<OwnedObjectPath>, Vec<OwnedObjectPath>)> = Vec::new();
+    let mut at: HashMap<Option<OwnedObjectPath>, usize> = HashMap::new();
     for item in items {
         let owner = match paths::parse(item.as_str()) {
             Some(Target::Item { collection, .. }) => Some(paths::collection(&collection)),
             Some(Target::AliasItem { alias, .. }) => paths::alias(&alias),
             _ => None,
         };
-        match groups.iter_mut().find(|(c, _)| *c == owner) {
-            Some((_, paths)) => paths.push(item.clone()),
-            None => groups.push((owner, vec![item.clone()])),
+        match at.get(&owner) {
+            Some(&slot) => groups[slot].1.push(item.clone()),
+            None => {
+                at.insert(owner.clone(), groups.len());
+                groups.push((owner, vec![item.clone()]));
+            }
         }
     }
     groups

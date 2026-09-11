@@ -115,12 +115,9 @@ impl Prompt {
 }
 
 // The dialogs and the terminal share one table, and it lives in
-// `crate::vault::format` because `src/vault/` is also the PAM cdylib's half
-// of the crate and cannot reach into anything behind the `daemon` feature.
-// The copy that used to be here, and the copy in `src/cli/secrets.rs`, had
-// already drifted once — the terminal's table was the narrower one, so a
-// private-use codepoint a dialog refused to draw still reached an `sm ssh
-// list` row. One table is the fix; re-exported under the old name so
+// `crate::sanitize` because that module is always compiled — `src/vault/`
+// is the PAM cdylib's half of the crate and cannot reach into anything
+// behind the `daemon` feature. Re-exported under the old name so
 // `display_label` and `crate::fuzz_api` read unchanged.
 //
 // It is `char::is_control()` that the table exists to complete: that is
@@ -130,7 +127,7 @@ impl Prompt {
 // and `U+FEFF` all survive it. The marks among them still reorder neutral
 // text in a GTK/Qt dialog, and the zero-width ones let a label split a word
 // an operator is scanning for ("de\u{200B}lete") (MEDIUM 1).
-pub(crate) use crate::vault::format::is_invisible_format;
+pub(crate) use crate::sanitize::is_invisible_format;
 
 /// Render a client-supplied label for a pinentry dialog.
 ///
@@ -157,7 +154,7 @@ pub(crate) use crate::vault::format::is_invisible_format;
 /// Whitespace runs then collapse to single spaces, and the result is truncated
 /// to 64 characters plus a trailing ellipsis (so at most 65 characters).
 ///
-/// It shares the *table* with `vault::format::escape_control` and not the
+/// It shares the *table* with `crate::sanitize::escape_control` and not the
 /// function, deliberately: that escaper renders each offending character as
 /// `\xNN` per UTF-8 byte, which is right for a terminal row (nothing is
 /// lost, and the reader can see what was there) and wrong for a pinentry

@@ -388,18 +388,23 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
         .await
         .map_err(|e| CliError::Unreachable(format!("cannot connect to the session bus: {e}")))?;
     let sidecar_path = kwallet::sidecar_path(wallet);
+    let mut notes = Vec::new();
     let sidecar = match kwallet::Sidecar::load(&sidecar_path) {
         Ok(s) => s,
         Err(e) => {
             // A wallet with no sidecar is a wallet of native KWallet entries,
             // which is a real case and not an error: those items are
-            // `PreservedOnly` and the report says so.
-            eprintln!(
-                "warning: {} could not be read ({}), so no attributes, content types or \
+            // `PreservedOnly` and the report says so — in the notes it
+            // carries, in the same words as the warning, so a pasted report
+            // still says why every entry lost its attributes.
+            let note = format!(
+                "{} could not be read ({}), so no attributes, content types or \
                  timestamps are available and every entry will be preserved-only.",
                 escape_control(&sidecar_path.display().to_string()),
                 escape_control(&e.to_string())
             );
+            eprintln!("warning: {note}");
+            notes.push(note);
             kwallet::Sidecar::empty()
         }
     };
@@ -415,7 +420,6 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
             other => CliError::Failed(escape_control(&other.to_string())),
         })?;
 
-    let mut notes = Vec::new();
     // First, because it is the one that changes how every other line should be
     // read: a sidecar in a shape this build does not parse imports the whole
     // wallet attribute-less, and `entries_without_sidecar` cannot tell that
@@ -877,6 +881,11 @@ struct ReportFile<'a> {
     /// artifact a user pastes into a bug report now agrees with the message
     /// printed above it.
     written: bool,
+    /// Whether the `default` alias now points at this collection. `false`
+    /// both when `--set-default` was never passed and when it was passed and
+    /// the alias file could not be saved — the `notes` say which, and the
+    /// terminal says it too, so an unmoved alias is never a silent exit 0.
+    default_alias_moved: bool,
 }
 
 /// What became of the collection a report describes.
@@ -925,6 +934,7 @@ impl<'a> ReportFile<'a> {
     /// disagreement — and the file is written before the failure return, so it
     /// was produced in exactly the case a user pastes into a bug report. See
     /// [`downgrade_items`].
+    #[allow(clippy::too_many_arguments)]
     fn new(
         report: &'a ImportReport,
         probed_tally: &'a Tally,
@@ -933,6 +943,7 @@ impl<'a> ReportFile<'a> {
         not_migrated: &'a [NotMigrated],
         notes: &'a [String],
         disposition: Disposition,
+        default_alias_moved: bool,
     ) -> Self {
         Self {
             source: report.source,
@@ -947,70 +958,28 @@ impl<'a> ReportFile<'a> {
             notes,
             dry_run: disposition.dry_run(),
             written: disposition.written(),
+            default_alias_moved,
         }
     }
 }
 
 /// The items, with the probe's verdict applied to each one's outcome.
 ///
-/// `verify::tally_with_probes` downgrades a `FullyPortable` item whose
-/// attribute key set failed its probe; this applies the same rule to the item
-/// rows, so the report's `tally` and its `items` add up to each other. The
-/// matching is by key set for the same reason it is there: an [`ItemReport`]
-/// holds no attribute values, and two attribute sets sharing a key set share
-/// the pessimistic verdict.
+/// The rule lives in `verify::{downgraded_keys, downgrade_outcome}` and is
+/// shared with `verify::tally_with_probes`, so the report's `tally` and its
+/// `items` add up to each other. Matching is by key set because an
+/// [`ItemReport`] holds no attribute values.
 fn downgrade_items(items: &[ItemReport], failed: &[ProbeResult]) -> Vec<ItemReport> {
-    let failed: Vec<&AttributeKeys> = failed
-        .iter()
-        .filter(|p| p.found.is_some() && !p.passed())
-        .map(|p| &p.attribute_keys)
-        .collect();
+    let failed = verify::downgraded_keys(failed);
     items
         .iter()
         .map(|item| {
             let mut item = item.clone();
-            if item.outcome == Some(crate::import::Outcome::FullyPortable)
-                && failed.iter().any(|keys| **keys == item.attribute_keys)
-            {
-                item.outcome = Some(crate::import::Outcome::AttributesPreserved);
-            }
+            item.outcome =
+                verify::downgrade_outcome(item.outcome, failed.contains(&item.attribute_keys));
             item
         })
         .collect()
-}
-
-/// [`verify::probe_plan`], with the expectation corrected for what
-/// `SearchItems` actually does.
-///
-/// `SearchItems` is **subset** matching — `src/vault/store.rs` and
-/// `src/vault/format.rs` both index on it — so a probe for `{server, user}`
-/// returns every item carrying at least those two, including the one that also
-/// carries an `xdg:schema`. `probe_plan` counts items whose attribute map is
-/// *equal* to the query, so on the ordinary source that holds both, the probe
-/// for the smaller set expects 1 and finds 2, and a byte-perfect import fails
-/// verification — and `tally_with_probes` then downgrades every item sharing
-/// that key set.
-///
-/// The expectation is therefore the number of source items whose attributes
-/// are a **superset** of the query, which is exactly what the daemon will
-/// return from a faithful import of them.
-///
-/// This belongs in `verify::probe_plan` itself, next to the `expected` field
-/// it computes; it is here because that file is not this change's to edit.
-fn probe_plan(items: &[SourceItem]) -> Vec<verify::ProbeQuery> {
-    let mut plan = verify::probe_plan(items);
-    for query in &mut plan {
-        query.expected = items
-            .iter()
-            .filter(|item| {
-                query
-                    .attributes
-                    .iter()
-                    .all(|(k, v)| item.attributes.get(k) == Some(v))
-            })
-            .count();
-    }
-    plan
 }
 
 /// Write `--report`, and treat a failure as a warning rather than an abort.
@@ -1041,8 +1010,7 @@ fn write_report(path: &Path, file: &ReportFile<'_>) -> Result<(), CliError> {
     write_report_file(path, json.as_bytes())
 }
 
-/// Write the report to a sibling temp file created 0600, fsync it, and rename
-/// it into place.
+/// Write the report via [`crate::atomic::write_atomic`].
 ///
 /// Two things this fixes, and neither is theoretical. `OpenOptions::mode`
 /// applies **only when the file is created**, so an existing `report.json` at
@@ -1052,47 +1020,11 @@ fn write_report(path: &Path, file: &ReportFile<'_>) -> Result<(), CliError> {
 /// followed by two writes leaves a truncated JSON document behind a crash,
 /// where a complete report used to be. A rename is atomic: the reader sees the
 /// old report or the new one.
+///
+/// The report names labels and attribute keys, which is not secret but is
+/// nobody else's business either — hence 0600.
 fn write_report_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    use std::io::Write;
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "report.json".to_string());
-    let suffix: String = crate::vault::crypto::random_bytes::<8>()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let temp = dir.join(format!(".{name}.{suffix}.tmp"));
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // The report names labels and attribute keys, which is not secret but
-        // is nobody else's business either.
-        options.mode(0o600);
-    }
-    let mut f = options.open(&temp).map_err(|e| header_io(&temp, e))?;
-    let written = f.write_all(bytes).and_then(|()| f.sync_all());
-    drop(f);
-    if let Err(e) = written.and_then(|()| std::fs::rename(&temp, path)) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(header_io(path, e));
-    }
-    // And fsync the directory, as every other atomic write in this crate does
-    // (`vault::store::write_atomic`, `dbus::state`'s alias file). The file's
-    // own `sync_all` above durably records its *contents*; the rename that
-    // gives them the name a user will look for is a directory operation, and
-    // without this a crash can leave the old report — or no report — where a
-    // line on stdout has just said one was written. Best effort: the report
-    // exists either way, and failing the import over an unsyncable directory
-    // is the trade this whole function is written not to make.
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    crate::atomic::write_atomic(path, bytes, 0o600).map_err(|e| header_io(path, e))
 }
 
 // --------------------------------------------------------------------------
@@ -1202,7 +1134,7 @@ mod pipeline {
 
         let config = &env.config;
         let container = file.container();
-        let extraction = extractor.extract(source, &container).await?;
+        let mut extraction = extractor.extract(source, &container).await?;
 
         let label = args
             .collection
@@ -1273,34 +1205,69 @@ mod pipeline {
             // failure has to take it away again: `RENAME_NOREPLACE` proved the
             // name was ours, and leaving it behind would make the refusal
             // above fire on the next attempt, against a file this run created.
-            let mut vault =
-                Vault::create(&vault_path, &label, password.as_bytes(), config.kdf.into())?;
-            let imported = vault
-                .import_items(
-                    items
-                        .iter()
-                        .map(|i| ImportItem {
-                            // Verbatim, every field. Nothing here normalises,
-                            // synthesises or drops an attribute pair: that is
-                            // the one thing an import may never do.
-                            label: i.label.clone(),
-                            attributes: i.attributes.clone(),
-                            secret: i.secret.clone(),
-                            content_type: i.content_type.clone(),
-                            created: i.created,
-                            modified: i.modified,
-                        })
-                        .collect(),
-                )
-                .map_err(CliError::from);
-            drop(vault);
-            // Read the destination back off *disk*, decrypting it again, so
-            // the fingerprints compare what was written rather than the list
-            // we intended to write. An import that verified against its own
-            // in-memory copy would prove nothing about the file.
-            match imported.and_then(|()| reopen(&vault_path, password.as_bytes(), &id)) {
+            let written: Result<Destination, CliError> = (|| {
+                let mut vault =
+                    Vault::create(&vault_path, &label, password.as_bytes(), config.kdf.into())?;
+                vault
+                    .import_items(
+                        items
+                            .iter()
+                            .map(|i| ImportItem {
+                                // Verbatim, every field. Nothing here normalises,
+                                // synthesises or drops an attribute pair: that is
+                                // the one thing an import may never do.
+                                label: i.label.clone(),
+                                attributes: i.attributes.clone(),
+                                secret: i.secret.clone(),
+                                content_type: i.content_type.clone(),
+                                created: i.created,
+                                modified: i.modified,
+                            })
+                            .collect(),
+                    )
+                    .map_err(CliError::from)?;
+                drop(vault);
+                // Read the destination back off *disk*, decrypting it again, so
+                // the fingerprints compare what was written rather than the list
+                // we intended to write. An import that verified against its own
+                // in-memory copy would prove nothing about the file.
+                reopen(&vault_path, password.as_bytes(), &id)
+            })();
+            match written {
                 Ok(dest) => destination = Some(dest),
-                Err(e) => return Err(unlink_partial(&vault_path, e)),
+                Err(e) => {
+                    // A failed write still gets its report: the offline checks
+                    // run against no destination, every probe is not issued,
+                    // and the file this run may have published is unlinked
+                    // after the report, mirroring the offline-failure branch.
+                    let plan = verify::probe_plan(&items);
+                    let walked = report.tally.seen() + extraction.skipped.len();
+                    let verification = verify_import(
+                        &file,
+                        &items,
+                        walked,
+                        None,
+                        plan.iter().map(ProbeResult::not_issued).collect(),
+                    );
+                    let report_file = ReportFile::new(
+                        &report,
+                        &report.tally,
+                        &report.items,
+                        &verification,
+                        &extraction.skipped,
+                        &extraction.notes,
+                        // This branch only runs on a real run (`destination`
+                        // is only written above), so a published file is
+                        // about to be unlinked by `unlink_partial` below.
+                        Disposition::RemovedAgain,
+                        false,
+                    );
+                    print_report(&file, &id, &report_file, destination_exists);
+                    if let Some(path) = &args.report {
+                        write_report_or_warn(path, &report_file);
+                    }
+                    return Err(unlink_partial(&vault_path, e));
+                }
             }
         }
 
@@ -1321,7 +1288,7 @@ mod pipeline {
         // failed verification left `default` pointing at the new collection,
         // the daemon holding it, and the retry blocked by the "already exists"
         // refusal — against a file that run had created.
-        let plan = probe_plan(&items);
+        let plan = verify::probe_plan(&items);
         let walked =
             // Skipped entries were in the file too, so they count towards the
             // independent total; leaving them out would hide the shortfall the
@@ -1356,6 +1323,9 @@ mod pipeline {
                 } else {
                     Disposition::RemovedAgain
                 },
+                // The alias moves only after every check has passed, so on
+                // this branch it never moved.
+                false,
             );
             print_report(&file, &id, &report_file, destination_exists);
             if let Some(path) = &args.report {
@@ -1390,7 +1360,7 @@ mod pipeline {
         // which is the mechanical shape of the regression this file already
         // records — so they are one block and the order is stated here.
         if !args.dry_run {
-            notify_daemon(&env.daemon).await;
+            let reloaded = notify_daemon(&env.daemon).await;
             // Whether a *locked* collection can answer an attribute search is
             // a property of the file that was just written, not of this CLI's
             // config: `reopen` read the header back off disk and
@@ -1401,7 +1371,20 @@ mod pipeline {
             // could not find its items, or skip the probe on a header that
             // carries every hash.
             let indexed = destination.as_ref().is_some_and(|d| d.indexed);
-            let probes = run_probes(&plan, &id, indexed, &env.daemon).await;
+            // A daemon that refused the reload was never given the collection,
+            // so a probe would come back empty for every attribute set and
+            // fail a correct import. Unproved, never failed.
+            let probes = if reloaded {
+                run_probes(&plan, &id, indexed, &env.daemon).await
+            } else {
+                eprintln!(
+                    "warning: the running daemon did not reload, so the lookup probe was not \
+                     issued and discoverability is unproved. Unlock the collection with `sm \
+                     unlock --collection {}` and check it by hand with `sm list`.",
+                    escape_control(&id)
+                );
+                plan.iter().map(ProbeResult::not_issued).collect()
+            };
             verification.probes = verify::ProbeSummary::of(&probes);
             verification.failed_probes = probes
                 .into_iter()
@@ -1416,24 +1399,6 @@ mod pipeline {
         // paste into a bug report.
         let probed_items = downgrade_items(&report.items, &verification.failed_probes);
         let probed_tally = verify::tally_with_probes(&probed_items, &verification.failed_probes);
-        let report_file = ReportFile::new(
-            &report,
-            &probed_tally,
-            &probed_items,
-            &verification,
-            &extraction.skipped,
-            &extraction.notes,
-            // Every offline check passed, so a real run's collection is on
-            // disk and stays there — including on the failed-probe branch
-            // below, which deliberately leaves it.
-            Disposition::of(args.dry_run),
-        );
-
-        print_report(&file, &id, &report_file, destination_exists);
-
-        if let Some(path) = &args.report {
-            write_report_or_warn(path, &report_file);
-        }
 
         if !verification.passed() {
             // The bytes are right — every offline check passed above — and the
@@ -1441,6 +1406,23 @@ mod pipeline {
             // would take a good file away from a daemon that still holds it in
             // memory. The file stays, the alias does not move, and the error
             // names both.
+            let report_file = ReportFile::new(
+                &report,
+                &probed_tally,
+                &probed_items,
+                &verification,
+                &extraction.skipped,
+                &extraction.notes,
+                // A real run's collection is on disk and stays there, which
+                // is what `written` says; the alias below never moves on this
+                // branch, which is what `default_alias_moved` says.
+                Disposition::of(args.dry_run),
+                false,
+            );
+            print_report(&file, &id, &report_file, destination_exists);
+            if let Some(path) = &args.report {
+                write_report_or_warn(path, &report_file);
+            }
             return Err(CliError::Failed(format!(
                 "the collection was written correctly but a libsecret client could not find \
                  every item in it; the lines above name each attribute set that did not come \
@@ -1456,8 +1438,46 @@ mod pipeline {
         // alias is the one destination effect a user notices, and moving it
         // over a failed migration points `default` at a collection this run is
         // about to call broken.
+        let default_alias_moved = if args.set_default && !args.dry_run {
+            set_default_alias(config, &id)
+        } else {
+            false
+        };
+        if args.set_default && !args.dry_run && !default_alias_moved {
+            extraction.notes.push(
+                "the `default` alias was requested with --set-default but was left alone; \
+                 the warning above says why"
+                    .to_string(),
+            );
+        }
+        let report_file = ReportFile::new(
+            &report,
+            &probed_tally,
+            &probed_items,
+            &verification,
+            &extraction.skipped,
+            &extraction.notes,
+            Disposition::of(args.dry_run),
+            default_alias_moved,
+        );
+
+        print_report(&file, &id, &report_file, destination_exists);
+
+        if let Some(path) = &args.report {
+            write_report_or_warn(path, &report_file);
+        }
+
+        // The alias is a silent exit 0's opposite: when it was requested the
+        // run says, on its own line, whether it moved.
         if args.set_default && !args.dry_run {
-            set_default_alias(config, &id);
+            if default_alias_moved {
+                println!(
+                    "The `default` alias now points at '{}'.",
+                    escape_control(&id)
+                );
+            } else {
+                println!("The `default` alias was not moved; the warning above says why.");
+            }
         }
         Ok(())
     }
@@ -1481,9 +1501,13 @@ fn unlink_partial(path: &Path, e: CliError) -> CliError {
     }
 }
 
-fn set_default_alias(config: &Config, id: &str) {
-    // As in `sm init`: the vault is already on disk, so nothing about the
-    // alias file may fail the command from here on.
+/// Point the `default` alias at the imported collection. Returns whether the
+/// alias now points at `id`: a `false` is loud, never a silent exit 0 — the
+/// caller records it in the report, the notes, and a final terminal line.
+///
+/// As in `sm init`: the vault is already on disk, so nothing about the
+/// alias file may fail the command from here on.
+fn set_default_alias(config: &Config, id: &str) -> bool {
     match load_aliases(&config.vault.dir) {
         Ok(mut aliases) => {
             aliases.insert("default".to_string(), id.to_string());
@@ -1493,30 +1517,45 @@ fn set_default_alias(config: &Config, id: &str) {
                      saved: {}",
                     escape_control(&e.to_string())
                 );
+                false
+            } else {
+                true
             }
         }
-        Err(e) => eprintln!(
-            "warning: the import was written, but {} could not be read ({}), so the \
-             `default` alias was left alone.",
-            escape_control(&config.vault.dir.join("aliases.toml").display().to_string()),
-            escape_control(&e.to_string())
-        ),
+        Err(e) => {
+            eprintln!(
+                "warning: the import was written, but {} could not be read ({}), so the \
+                 `default` alias was left alone.",
+                escape_control(&config.vault.dir.join("aliases.toml").display().to_string()),
+                escape_control(&e.to_string())
+            );
+            false
+        }
     }
 }
 
 /// Tell a running daemon to rescan, so the probe below has something to find.
+///
+/// Returns whether the probe may run. `true` when the reload answered `Ok`,
+/// when there is no daemon to tell (the probe then reports itself not
+/// issued), and when nothing is listening at all — a `Connect` failure means
+/// no daemon holds a stale view, so the probe's own "no daemon" verdict
+/// stands. `false` when a daemon answered with an error or the call failed
+/// past connecting: it may not hold this collection, so issuing `SearchItems`
+/// would come back empty for every attribute set and fail a correct import.
+/// The caller leaves those probes not issued instead.
 ///
 /// `protocol::call` is a blocking connect/write/read on a unix socket against
 /// a daemon that may be busy loading the collection this run just wrote, so it
 /// goes to the blocking pool rather than onto the async worker this `async fn`
 /// is running on. Blocking here parked the runtime thread, which is why three
 /// tests carried `worker_threads = 4` and a comment naming the reason.
-async fn notify_daemon(target: &DaemonTarget) {
+async fn notify_daemon(target: &DaemonTarget) -> bool {
     let path = match target {
-        DaemonTarget::None => return,
+        DaemonTarget::None => return true,
         DaemonTarget::At { control_socket, .. } => control_socket.clone(),
         DaemonTarget::FromEnvironment => {
-            let Ok(path) = socket_path() else { return };
+            let Ok(path) = socket_path() else { return true };
             path
         }
     };
@@ -1529,44 +1568,28 @@ async fn notify_daemon(target: &DaemonTarget) {
                 "warning: running daemon did not reload: {}",
                 escape_control(&e)
             );
+            false
         }
-        Err(ProtocolError::Connect(_)) | Ok(_) => {}
-        Err(e) => eprintln!(
-            "warning: could not tell the running daemon to reload: {}",
-            escape_control(&e.to_string())
-        ),
+        Err(ProtocolError::Connect(_)) | Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "warning: could not tell the running daemon to reload: {}",
+                escape_control(&e.to_string())
+            );
+            false
+        }
     }
 }
 
-/// The pid of whatever answers the control socket, from `SO_PEERCRED`.
-///
-/// `std::os::unix::net::UnixStream::peer_cred` is still unstable, and
-/// `protocol::peer_uid` — which does exactly this for the uid — is private to
-/// that module, so the three lines are here. Nothing is sent: the connection
-/// is opened for the kernel's answer about who is on the other end and then
-/// dropped.
+/// The pid of whatever answers the control socket, via
+/// [`crate::protocol::peer_pid`]. Nothing is sent: the connection is opened
+/// for the kernel's answer about who is on the other end and then dropped.
 fn control_socket_peer_pid(socket: &Path) -> std::io::Result<i32> {
-    use std::os::fd::AsRawFd;
     let stream = std::os::unix::net::UnixStream::connect(socket)?;
-    // SAFETY: ucred is plain data; all-zero is a valid initial value.
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `stream` owns a valid socket fd for the duration of the call,
-    // and `cred`/`len` are live, correctly sized out-parameters for
-    // SO_PEERCRED.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast::<libc::c_void>(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(cred.pid)
+    crate::protocol::peer_pid(&stream).map_err(|e| match e {
+        crate::protocol::ProtocolError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })
 }
 
 /// A session-bus connection and the proof that the service on it is *our*
@@ -2192,6 +2215,7 @@ mod tests {
             created: 1_699_383_593,
             modified: 1_699_387_319,
             provenance: Provenance::kwallet("kdewallet", "Passwords", "an entry name"),
+            inserted_keys: std::collections::BTreeSet::new(),
         }
     }
 
@@ -2280,7 +2304,7 @@ mod tests {
 
         // One probe, for this item's own attribute set, that came back empty:
         // the attributes are on disk and the daemon does not return the item.
-        let plan = probe_plan(std::slice::from_ref(&item));
+        let plan = verify::probe_plan(std::slice::from_ref(&item));
         let failed: Vec<ProbeResult> = plan.iter().map(|q| ProbeResult::new(q, 0)).collect();
         assert!(!failed[0].passed());
 
@@ -2311,6 +2335,7 @@ mod tests {
             &[],
             &[],
             Disposition::Kept,
+            false,
         );
         write_report(&path, &report_file).unwrap();
 
@@ -2396,6 +2421,7 @@ mod tests {
             &not_migrated,
             &notes,
             Disposition::Kept,
+            false,
         );
         write_report(&path, &report_file).unwrap();
 

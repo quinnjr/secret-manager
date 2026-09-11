@@ -576,20 +576,56 @@ impl ProbeQuery {
 /// [`Outcome::PreservedOnly`] by construction — the outcome that already says
 /// no libsecret client will find them — so there is nothing a probe could add.
 pub fn probe_plan(items: &[SourceItem]) -> Vec<ProbeQuery> {
-    let mut counts: BTreeMap<BTreeMap<String, String>, usize> = BTreeMap::new();
+    let mut distinct: BTreeMap<BTreeMap<String, String>, ()> = BTreeMap::new();
     for item in items {
         if item.attributes.is_empty() {
             continue;
         }
-        *counts.entry(item.attributes.clone()).or_insert(0) += 1;
+        distinct.entry(item.attributes.clone()).or_insert(());
     }
-    counts
-        .into_iter()
-        .map(|(attributes, expected)| ProbeQuery {
-            attributes,
-            expected,
+    // `SearchItems` is subset matching, so a probe for `{server, user}`
+    // returns every item carrying at least those two, including one that also
+    // carries an `xdg:schema`. The expectation is therefore the number of
+    // source items whose attributes are a superset of the query, which is
+    // what the daemon returns from a faithful import of them.
+    distinct
+        .into_keys()
+        .map(|attributes| {
+            let expected = items
+                .iter()
+                .filter(|item| {
+                    attributes
+                        .iter()
+                        .all(|(k, v)| item.attributes.get(k) == Some(v))
+                })
+                .count();
+            ProbeQuery {
+                attributes,
+                expected,
+            }
         })
         .collect()
+}
+
+/// The attribute key sets whose probe was issued and did not find what was
+/// expected. One shared helper so the item rows and the tally cannot apply
+/// different rules.
+pub fn downgraded_keys(probes: &[ProbeResult]) -> BTreeSet<AttributeKeys> {
+    probes
+        .iter()
+        .filter(|p| p.found.is_some() && !p.passed())
+        .map(|p| p.attribute_keys.clone())
+        .collect()
+}
+
+/// Apply the probe's verdict to one outcome: a `FullyPortable` item whose key
+/// set failed its probe is `AttributesPreserved` — the attributes are there,
+/// the lookup is not proved. Anything else is unchanged.
+pub fn downgrade_outcome(outcome: Option<Outcome>, downgraded: bool) -> Option<Outcome> {
+    match (outcome, downgraded) {
+        (Some(Outcome::FullyPortable), true) => Some(Outcome::AttributesPreserved),
+        (other, _) => other,
+    }
 }
 
 /// What one probe found. Carries keys, never values.
@@ -669,13 +705,9 @@ impl ProbeSummary {
 pub fn tally_with_probes(items: &[ItemReport], probes: &[ProbeResult]) -> Tally {
     // A set, not a list. The lookup below runs once per item and the failed
     // probes are drawn from the same items, so a linear scan here is a
-    // whole-`BTreeSet` comparison per (item, failed probe) pair — quadratic in
-    // the report, in the one place a large import is guaranteed to be large.
-    let failed: BTreeSet<&AttributeKeys> = probes
-        .iter()
-        .filter(|p| p.found.is_some() && !p.passed())
-        .map(|p| &p.attribute_keys)
-        .collect();
+    // whole-set comparison per item — quadratic in the report, in the one
+    // place a large import is guaranteed to be large.
+    let failed: BTreeSet<AttributeKeys> = downgraded_keys(probes);
     let mut tally = Tally::default();
     for item in items {
         if item.is_refused() {
@@ -687,11 +719,11 @@ pub fn tally_with_probes(items: &[ItemReport], probes: &[ProbeResult]) -> Tally 
         // its counters: this function and `ImportReport::push` are the two
         // places a tally is built, and they must agree about what each
         // category means.
-        match item.outcome {
-            Some(Outcome::FullyPortable) if !downgraded => {
+        match downgrade_outcome(item.outcome, downgraded) {
+            Some(Outcome::FullyPortable) => {
                 tally.record_outcome(Outcome::FullyPortable);
             }
-            Some(Outcome::FullyPortable | Outcome::AttributesPreserved) => {
+            Some(Outcome::AttributesPreserved) => {
                 tally.record_outcome(Outcome::AttributesPreserved);
             }
             Some(Outcome::PreservedOnly) => tally.record_outcome(Outcome::PreservedOnly),
@@ -716,11 +748,17 @@ pub const BUCKET_BOUNDS: [usize; 7] = [0, 16, 64, 256, 1024, 16 * 1024, 256 * 10
 /// Source against destination, this localises what a fingerprint mismatch
 /// only detects: a stripped trailing newline moves items one bucket down at a
 /// specific size, a UTF-8 re-encoding moves the multibyte ones up.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct Histogram {
     /// One count per bucket, plus the open-ended one.
     counts: Vec<usize>,
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A deserialized histogram's length is checked, not trusted: `counts` comes
@@ -755,8 +793,10 @@ impl Histogram {
 
     pub fn add(&mut self, len: usize) {
         // Resize rather than test for empty: a `counts` of any other wrong
-        // length would index out of bounds below, and `Default` alone can
-        // produce one.
+        // length would index out of bounds below. `Default` is `new()` and
+        // cannot produce one; only a hand-edited report or a future
+        // constructor could, and the resize keeps that a miscount rather
+        // than a panic.
         if self.counts.len() != Self::BUCKETS {
             self.counts.resize(Self::BUCKETS, 0);
         }
@@ -935,6 +975,7 @@ mod tests {
             created: 1,
             modified: 2,
             provenance: Provenance::kwallet("kdewallet", "Passwords", "my router"),
+            inserted_keys: BTreeSet::new(),
         }
     }
 

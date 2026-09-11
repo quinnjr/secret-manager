@@ -53,6 +53,13 @@ Exit codes: 0 ok · 1 not found, prompt dismissed, or any other failure (I/O,
 vault, config) · 2 usage error · 3 daemon or bus unreachable, or
 `XDG_RUNTIME_DIR` unset.
 
+`sm daemon` maps a startup failure onto the same contract: exit 3 when the
+bus name is already taken, `XDG_RUNTIME_DIR` is unset, or the bus itself
+fails (any `ZBus` error); exit 1 for anything else, including a bus it
+reached but then failed to export its objects on (`DaemonError::Export`) —
+that daemon is broken, not redundant, and must read as an ordinary failure
+so a supervisor restarts it rather than assuming a duplicate.
+
 `sm delete` is strict: if an unlock prompt is dismissed it fails (exit 1) and
 deletes nothing. `sm get` still prompts when a match is locked, but is lenient
 about the answer: a dismissed prompt is tolerated when something already

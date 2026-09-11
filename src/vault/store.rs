@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum VaultError {
     #[error("collection is locked")]
     Locked,
@@ -937,6 +938,11 @@ impl Vault {
     /// decrypted collection in memory to insure a write that almost always
     /// succeeds.
     pub fn delete_items(&mut self, ids: &[String]) -> Result<(), VaultError> {
+        // An empty batch is a no-op: return before `items()?` so a locked
+        // vault answers `Ok` rather than `Locked` for work that needs nothing.
+        if ids.is_empty() {
+            return Ok(());
+        }
         {
             let present: std::collections::HashSet<&str> =
                 self.items()?.iter().map(|i| i.id.as_str()).collect();
@@ -948,9 +954,6 @@ impl Vault {
                     return Err(VaultError::NoSuchItem(id.clone()));
                 }
             }
-        }
-        if ids.is_empty() {
-            return Ok(());
         }
         let doomed: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
         let delta = {
@@ -1014,15 +1017,18 @@ impl Vault {
     /// into a collection that already exists, but that is a property of that
     /// caller and not of this method.
     pub fn import_items(&mut self, items: Vec<ImportItem>) -> Result<(), VaultError> {
+        // An empty batch is a no-op and does not rewrite the file: return
+        // before `items()?` so a locked vault answers `Ok` rather than
+        // `Locked` for work that needs nothing.
+        if items.is_empty() {
+            return Ok(());
+        }
         // Refuse a locked vault before validating, so the error a caller sees
         // first is the one it can actually do something about.
         let before_len = self.items()?.len();
         // Every item is checked before any is pushed, in the order given.
         for (index, item) in items.iter().enumerate() {
             check_import_item(index, item)?;
-        }
-        if items.is_empty() {
-            return Ok(());
         }
         {
             let list = self.items_mut()?;
@@ -1475,16 +1481,15 @@ fn sync_dir(path: &Path) {
     }
 }
 
-/// [`write_temp`], then rename over `path` and fsync the directory. Replaces
-/// whatever is at `path`, which is what an update of an existing vault wants.
+/// [`crate::atomic::write_atomic`], with the vault directory ensured first
+/// and errors carrying vault path context. Replaces whatever is at `path`,
+/// which is what an update of an existing vault wants. (The temp-name shape
+/// is the atomic helper's `{file_name}.{16 hex}.tmp`, which is what
+/// [`is_write_atomic_temp_name`] recognises for the stale-temp sweep.)
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
-    let tmp = write_temp(path, bytes)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io_err(path, e));
-    }
-    sync_dir(path);
-    Ok(())
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_vault_dir(dir).map_err(|e| io_err(dir, e))?;
+    crate::atomic::write_atomic(path, bytes, 0o600).map_err(|e| io_err(path, e))
 }
 
 /// `renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE)`: rename that

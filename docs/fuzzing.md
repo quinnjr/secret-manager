@@ -120,10 +120,11 @@ built from), which it cannot discover by mutation alone.
 2. Add a `[[bin]]` entry to `fuzz/Cargo.toml`.
 3. Add the name to `FUZZ_TARGETS` in the `Makefile`.
 
-Steps 2 and 3 are checked against each other by
-`tests/packaging.rs::every_fuzz_target_is_declared_and_runnable`, so a target
-that exists but is never run — the worst kind, because it looks like coverage
-— fails the suite.
+All three are checked against each other by
+`tests/packaging.rs::every_fuzz_target_is_declared_and_runnable` — the files
+present in `fuzz_targets/`, the `[[bin]]` entries in `fuzz/Cargo.toml`, and
+the `FUZZ_TARGETS` list — so a target that exists but is never run — the
+worst kind, because it looks like coverage — fails the suite.
 
 [proptest]: https://docs.rs/proptest
 [cargo-fuzz]: https://rust-fuzz.github.io/book/cargo-fuzz.html

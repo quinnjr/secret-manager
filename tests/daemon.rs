@@ -253,6 +253,12 @@ async fn control_socket_removed_on_shutdown() {
 /// A `<id>.vault` file that fails to parse should still show up (locked) in
 /// `Service.Collections`/`Status`, and `Unlock` on it should report the
 /// format error rather than "no collection".
+///
+/// The sentence is exact, not a contains-any-of: both arms below travel
+/// `broken_error`, which is the scan's `VaultError` rendering, and a file of
+/// 21 non-vault bytes fails at the magic — so any rewording, or any branch
+/// that stops routing corrupt files through `broken`, fails here.
+const BROKEN_VAULT_MSG: &str = "not a secret-manager vault (bad magic)";
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corrupt_vault_file_appears_locked_with_format_error() {
     let fx = Fixture::start().await;
@@ -278,12 +284,7 @@ async fn corrupt_vault_file_appears_locked_with_format_error() {
     )
     .await
     {
-        Response::Error(msg) => assert!(
-            msg.to_lowercase().contains("magic")
-                || msg.to_lowercase().contains("format")
-                || msg.to_lowercase().contains("invalid"),
-            "expected a format error, got: {msg}"
-        ),
+        Response::Error(msg) => assert_eq!(msg, BROKEN_VAULT_MSG, "got: {msg}"),
         other => panic!("{other:?}"),
     }
     // `sm change-password` reaches the same collection through `ChangeKey`,
@@ -302,12 +303,7 @@ async fn corrupt_vault_file_appears_locked_with_format_error() {
     )
     .await
     {
-        Response::Error(msg) => assert!(
-            msg.to_lowercase().contains("magic")
-                || msg.to_lowercase().contains("format")
-                || msg.to_lowercase().contains("invalid"),
-            "expected a format error, got: {msg}"
-        ),
+        Response::Error(msg) => assert_eq!(msg, BROKEN_VAULT_MSG, "got: {msg}"),
         other => panic!("{other:?}"),
     }
 }

@@ -16,10 +16,20 @@ use secret_manager::cli::import::{
 };
 use secret_manager::cli::{Cli, CliError, Command};
 use secret_manager::config::Config;
+use secret_manager::import::formats::KWALLET_MAGIC;
+use secret_manager::import::gnome::GnomeError;
+use secret_manager::import::kwallet::{KWalletError, SidecarError};
+use secret_manager::import::verify::{
+    CountCheck, FingerprintEntry, Histogram, ProbeSummary, Side, Verification,
+    compare_fingerprints, compare_histograms, probe_plan,
+};
 use secret_manager::import::{Cap, ItemReport, Provenance, Refusal, Source, SourceItem};
+use secret_manager::protocol::{Request, Response};
 use secret_manager::vault::format::{MAX_ITEM_LABEL, MAX_ITEM_SECRET};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use zeroize::Zeroizing;
 
 // --------------------------------------------------------------------------
@@ -101,6 +111,7 @@ fn item(id: u32, label: &str, pairs: &[(&str, &str)], secret: &[u8]) -> SourceIt
         created: 1_699_383_593,
         modified: 1_699_387_319,
         provenance: Provenance::gnome("Sample keyring", id),
+        inserted_keys: std::collections::BTreeSet::new(),
     }
 }
 
@@ -1257,4 +1268,1054 @@ async fn the_probe_is_gated_on_the_header_that_was_written_not_on_the_cli_config
         serde_json::json!({ "passed": 2, "failed": 0, "not_issued": 0 }),
         "the probe was skipped over a setting that shaped nothing: {parsed}"
     );
+}
+
+// --------------------------------------------------------------------------
+// Error mapping: every foreign failure becomes one CliError, and the exit
+// code follows the variant, never the message
+// --------------------------------------------------------------------------
+
+/// The codes `sm`'s callers script against. Pinned here rather than wherever
+/// each error is produced, so a re-pointed arm fails in one place.
+#[test]
+fn cli_error_exit_codes_are_stable() {
+    assert_eq!(CliError::NotFound("x".into()).exit_code(), 1);
+    assert_eq!(CliError::Failed("x".into()).exit_code(), 1);
+    assert_eq!(CliError::Usage("x".into()).exit_code(), 2);
+    assert_eq!(CliError::Unreachable("x".into()).exit_code(), 3);
+}
+
+/// The contract `extract_gnome`'s private `gnome_error` keeps: only the two
+/// waits — for the private bus, for the keyring daemon — mean "nothing to
+/// talk to" (exit 3); every other failure is the source refusing, misbehaving
+/// or being absent (exit 1).
+///
+/// The function is private, so this cannot call it. What it does instead is
+/// construct every `GnomeError` variant — adding, removing or renaming one
+/// fails to compile here and forces the mapping to be reviewed — and pins the
+/// `CliError` each must become and the code that follows. The production-path
+/// half is below: kwallet's equivalent arms are exercised through the real
+/// `extract`, and every `CliError` kind is driven through `run_with`.
+#[test]
+fn gnome_error_mapping_sends_only_timeouts_to_unreachable() {
+    let wait = Duration::from_secs(1);
+    // (case, error, must_be_unreachable)
+    let cases: Vec<(&str, GnomeError, bool)> = vec![
+        (
+            "spawn",
+            GnomeError::Spawn {
+                program: "dbus-daemon".into(),
+                message: "no such file".into(),
+            },
+            false,
+        ),
+        (
+            "command-timeout",
+            GnomeError::CommandTimeout {
+                program: "dbus-daemon".into(),
+                waited: wait,
+            },
+            false,
+        ),
+        (
+            "bus-never-ready",
+            GnomeError::BusNeverReady { waited: wait },
+            true,
+        ),
+        (
+            "keyring-never-ready",
+            GnomeError::KeyringNeverReady {
+                waited: wait,
+                detail: "wrong password".into(),
+            },
+            true,
+        ),
+        (
+            "keyring-exited",
+            GnomeError::KeyringExited {
+                detail: "crashed".into(),
+            },
+            false,
+        ),
+        (
+            "unanswerable-prompt",
+            GnomeError::UnanswerablePrompt {
+                object: "/org/x".into(),
+                waited: wait,
+            },
+            false,
+        ),
+        (
+            "prompt-dismissed",
+            GnomeError::PromptDismissed {
+                object: "/org/x".into(),
+            },
+            false,
+        ),
+        (
+            "unlock-offered-nothing",
+            GnomeError::UnlockOfferedNothing {
+                object: "/org/x".into(),
+            },
+            false,
+        ),
+        (
+            "prompt-unlocked-nothing",
+            GnomeError::PromptUnlockedNothing {
+                object: "/org/x".into(),
+            },
+            false,
+        ),
+        (
+            "too-many",
+            GnomeError::TooMany {
+                what: "collections",
+                count: 600,
+                limit: 512,
+            },
+            false,
+        ),
+        (
+            "bus",
+            GnomeError::Bus {
+                call: "OpenSession".into(),
+                message: "disconnected".into(),
+            },
+            false,
+        ),
+        (
+            "call-timeout",
+            GnomeError::CallTimeout {
+                call: "SearchItems".into(),
+                waited: wait,
+            },
+            false,
+        ),
+        (
+            "no-such-collection",
+            GnomeError::NoSuchCollection {
+                container: "ghost".into(),
+                available: "login".into(),
+            },
+            false,
+        ),
+        (
+            "no-session",
+            GnomeError::NoSession {
+                message: "plain refused".into(),
+            },
+            false,
+        ),
+        (
+            "decrypt",
+            GnomeError::Decrypt {
+                message: "bad padding".into(),
+            },
+            false,
+        ),
+    ];
+    assert_eq!(
+        cases.len(),
+        15,
+        "a GnomeError variant was added and is unmapped here"
+    );
+    for (name, e, unreachable) in &cases {
+        // The mapping under test, restated: two timeouts go Unreachable,
+        // everything else goes Failed. If `gnome_error` is re-pointed, this
+        // table is what disagrees with it.
+        let mapped = match e {
+            GnomeError::BusNeverReady { .. } | GnomeError::KeyringNeverReady { .. } => {
+                CliError::Unreachable(e.to_string())
+            }
+            _ => CliError::Failed(e.to_string()),
+        };
+        assert_eq!(
+            matches!(mapped, CliError::Unreachable(_)),
+            *unreachable,
+            "{name}: {e:?}"
+        );
+        assert_eq!(
+            mapped.exit_code(),
+            if *unreachable { 3 } else { 1 },
+            "{name}: {e:?}"
+        );
+        assert!(
+            !mapped.to_string().is_empty(),
+            "{name}: the message must survive the mapping"
+        );
+    }
+}
+
+/// The same contract for `extract_kwallet`'s inline match: a missing service
+/// is unreachable (exit 3), a missing wallet is not-found (exit 1), and
+/// everything else — including both foreign-error wrappers — is a failure
+/// (exit 1).
+///
+/// As with the gnome table, the match itself is inline in the transport and
+/// this pins every arm of it plus the codes. The two arms reachable without
+/// a kwalletd are additionally exercised through the real `extract` below.
+#[test]
+fn kwallet_error_mapping_names_the_remedy() {
+    let wait = Duration::from_secs(1);
+    let cases: Vec<(&str, KWalletError, u8)> = vec![
+        ("service-unavailable", KWalletError::ServiceUnavailable, 3),
+        (
+            "no-such-wallet",
+            KWalletError::NoSuchWallet {
+                wallet: "ghost".into(),
+            },
+            1,
+        ),
+        (
+            "invalid-name",
+            KWalletError::InvalidWalletName {
+                wallet: "../escape".into(),
+            },
+            1,
+        ),
+        (
+            "no-display",
+            KWalletError::NoDisplay {
+                wallet: "kdewallet".into(),
+            },
+            1,
+        ),
+        (
+            "open-refused",
+            KWalletError::OpenRefused {
+                wallet: "kdewallet".into(),
+                code: -1,
+            },
+            1,
+        ),
+        (
+            "open-timed-out",
+            KWalletError::OpenTimedOut {
+                wallet: "kdewallet".into(),
+                timeout: wait,
+            },
+            1,
+        ),
+        (
+            "call-timed-out",
+            KWalletError::CallTimedOut {
+                call: "folderList",
+                timeout: wait,
+            },
+            1,
+        ),
+        (
+            "too-many-entries",
+            KWalletError::TooManyEntries { limit: 200_000 },
+            1,
+        ),
+        (
+            "too-many-secret-bytes",
+            KWalletError::TooManySecretBytes { limit: 1 },
+            1,
+        ),
+        (
+            "sidecar",
+            KWalletError::Sidecar(SidecarError::NotAnObject {
+                path: PathBuf::from("/x"),
+            }),
+            1,
+        ),
+        (
+            "dbus",
+            KWalletError::Dbus(zbus::Error::Address("bad address".to_string())),
+            1,
+        ),
+        (
+            "bus",
+            KWalletError::Bus(zbus::fdo::Error::Failed("nope".to_string())),
+            1,
+        ),
+    ];
+    assert_eq!(
+        cases.len(),
+        12,
+        "a KWalletError variant was added and is unmapped here"
+    );
+    for (name, e, code) in &cases {
+        // The production match, restated as the contract: service →
+        // Unreachable, wallet → NotFound, everything else → Failed.
+        let mapped = match e {
+            KWalletError::ServiceUnavailable => CliError::Unreachable(e.to_string()),
+            KWalletError::NoSuchWallet { .. } => CliError::NotFound(e.to_string()),
+            _ => CliError::Failed(e.to_string()),
+        };
+        assert_eq!(mapped.exit_code(), *code, "{name}: {e:?}");
+        let expect = match *code {
+            3 => "Unreachable",
+            1 if *name == "no-such-wallet" => "NotFound",
+            _ => "Failed",
+        };
+        assert!(
+            format!("{mapped:?}").starts_with(expect),
+            "{name}: expected CliError::{expect}, got {mapped:?}"
+        );
+    }
+}
+
+/// The two kwallet arms reachable with no kwalletd, through the real
+/// `kwallet::extract` on the fixture's private bus — the production function,
+/// not a restatement of its match.
+///
+/// A bus nobody answers `org.kde.kwalletd6` on is `ServiceUnavailable`, and a
+/// name that would escape `kwalletd/` is refused before the bus or the
+/// filesystem sees it.
+#[tokio::test]
+async fn kwallet_extract_names_a_missing_service_and_an_unusable_name() {
+    use secret_manager::import::kwallet::{self, Sidecar};
+    let fixture = Fixture::start().await;
+    let conn = fixture.client().await;
+    let err = kwallet::extract(&conn, "test", &Sidecar::empty(), Duration::from_secs(5))
+        .await
+        .expect_err("no kwalletd owns the fixture bus");
+    assert!(
+        matches!(err, KWalletError::ServiceUnavailable),
+        "got {err:?}"
+    );
+    let err = kwallet::extract(
+        &conn,
+        "../escape",
+        &Sidecar::empty(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("a name containing '/' cannot be a wallet");
+    assert!(
+        matches!(err, KWalletError::InvalidWalletName { .. }),
+        "got {err:?}"
+    );
+}
+
+/// An extractor that fails the way the mapped transports do. `run_with` must
+/// carry the error to the caller unchanged — variant, message and code —
+/// and write nothing.
+struct Failing(&'static str);
+
+impl Extractor for Failing {
+    fn extract<'a>(
+        &'a self,
+        _source: Source,
+        _container: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Extraction, CliError>> + 'a>>
+    {
+        Box::pin(async move {
+            Err(match self.0 {
+                "missing" => CliError::NotFound("KWallet has no wallet named 'ghost'".to_string()),
+                "unreachable" => CliError::Unreachable(
+                    "kwalletd6 does not own org.kde.kwalletd6 on the session bus".to_string(),
+                ),
+                _ => CliError::Failed("the source daemon answered with an error".to_string()),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn extractor_errors_reach_the_caller_unmapped() {
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    for (which, code) in [("missing", 1), ("unreachable", 3), ("failed", 1)] {
+        let err = secret_manager::cli::import::run_with(args(true), &Failing(which), &env)
+            .await
+            .expect_err("an extraction failure is a failed import");
+        assert_eq!(err.exit_code(), code, "{which}: {err}");
+        assert!(
+            files_in(vaults.path()).is_empty(),
+            "{which}: a failed extraction wrote {0:?}",
+            files_in(vaults.path())
+        );
+    }
+}
+
+// --------------------------------------------------------------------------
+// Verification wiring: the checks after the write, and what a failure does
+// --------------------------------------------------------------------------
+
+fn kwallet_args(dry_run: bool) -> ImportArgs {
+    ImportArgs {
+        from: SourceArg::KWallet,
+        inventory: false,
+        dry_run,
+        collection: None,
+        set_default: false,
+        report: None,
+    }
+}
+
+fn unhex(s: &str) -> [u8; 16] {
+    assert_eq!(s.len(), 32, "an md5 hex digest is 32 characters");
+    let mut out = [0u8; 16];
+    for (i, pair) in s.as_bytes().chunks(2).enumerate() {
+        out[i] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+    }
+    out
+}
+
+/// A `.kwl` cleartext index holding exactly one folder with exactly one
+/// entry, built from caller-chosen hashes: the parser stops at the index end
+/// and never reads the tail, so the ciphertext can be anything.
+fn kwl_with_single_entry(folder_hash: [u8; 16], entry_hash: [u8; 16]) -> Vec<u8> {
+    let mut out = KWALLET_MAGIC.to_vec();
+    out.extend_from_slice(&[0, 1, 3, 2]); // the accepted version; cipher/hash ids
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&folder_hash);
+    out.extend_from_slice(&1u32.to_be_bytes());
+    out.extend_from_slice(&entry_hash);
+    out.extend_from_slice(&[0u8; 32]); // the encrypted half, never parsed
+    out
+}
+
+/// A tampered secret is a fingerprint mismatch, and a failed verification
+/// publishes nothing: Err, `written: false`, and no vault left on disk.
+///
+/// In two halves, because the pipeline writes the very bytes it verifies —
+/// the vault round-trips verbatim (see
+/// `import_items_round_trips_awkward_values`) — so a fingerprint failure is
+/// unreachable through a `Fake` alone: any extraction the fake returns is
+/// self-consistent by construction. The first half pins the detection itself,
+/// in pipeline order (plan, then tamper, then compare); the second pins the
+/// failure branch every verification failure shares, travelled here by a
+/// count shortfall.
+#[tokio::test]
+async fn a_tampered_secret_is_a_fingerprint_mismatch_and_a_failed_run_leaves_nothing() {
+    // Half 1: the plan is made, the secret is tampered after it, and the
+    // comparison against what was written reports the pair.
+    let items = sample_items();
+    let plan = probe_plan(&items);
+    assert_eq!(
+        plan.len(),
+        2,
+        "the plan must exist before the tamper or this proves nothing"
+    );
+    let mut written = items.clone();
+    written[0].secret = zeroize::Zeroizing::new(b"tampered-after-the-plan".to_vec());
+    let source: Vec<FingerprintEntry> = items.iter().map(FingerprintEntry::source).collect();
+    let destination: Vec<FingerprintEntry> = written
+        .iter()
+        .enumerate()
+        .map(|(n, i)| {
+            FingerprintEntry::destination(
+                &i.attributes,
+                &i.label,
+                &i.content_type,
+                &i.secret,
+                format!("/org/freedesktop/secrets/collection/test/{n}"),
+            )
+        })
+        .collect();
+    let mismatches = compare_fingerprints(&source, &destination);
+    // One changed item reports as a pair — the source fingerprint with no
+    // partner, and the destination fingerprint nobody asked for — so "one
+    // mismatch" is two rows, one per side.
+    assert_eq!(mismatches.len(), 2, "{mismatches:?}");
+    assert_eq!(mismatches[0].side, Side::MissingFromDestination);
+    assert_eq!(mismatches[1].side, Side::UnexpectedInDestination);
+    // Named by keys and path, never by values.
+    let json = serde_json::to_string(&mismatches).unwrap();
+    assert!(json.contains("account"), "{json}");
+    assert!(!json.contains("tampered-after-the-plan"), "{json}");
+
+    // Half 2: the shared failure branch — the error, the report, the unlink.
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    // Three declared in the header, two walked: the count fails.
+    let fake = Fake::of("Sample keyring", sample_items(), Vec::new());
+    let report_path = root.path().join("fp.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    let err = secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect_err("2 walked against 3 in the header is a failure");
+    assert!(err.to_string().contains("verification"), "{err}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(parsed["written"], serde_json::json!(false));
+    assert_eq!(
+        parsed["verification"]["count"],
+        serde_json::json!({ "header_item_count": 3, "walked": 2 })
+    );
+    // The fingerprint machinery ran against the bytes on disk and matched —
+    // the count is what failed here, and the sections are independent.
+    assert_eq!(
+        parsed["verification"]["fingerprints_compared"],
+        serde_json::json!(2)
+    );
+    assert!(
+        parsed["verification"]["fingerprint_mismatches"].is_null(),
+        "{parsed}"
+    );
+    let left: Vec<String> = files_in(vaults.path())
+        .into_iter()
+        .filter(|n| n.ends_with(".vault"))
+        .collect();
+    assert!(left.is_empty(), "the failed run left {left:?} behind");
+}
+
+/// A forged wallet name fails the hash-table check, and only it: the count
+/// passes, so the miss is isolated, and the run unlinks what it wrote.
+///
+/// The `.kwl` holds folder "TestFolder" with entry "good-entry" (hashes
+/// below); the walked item names the real folder with a forged entry. The
+/// `assert_ne!` is what makes the miss real rather than assumed.
+#[tokio::test]
+async fn a_forged_wallet_name_fails_the_hash_table_check_and_leaves_nothing() {
+    // MD5("TestFolder"), MD5("good-entry"), MD5("forged-entry").
+    let folder_hash = unhex("95e8fd9739097a67c833315b8461ec04");
+    let entry_hash = unhex("f3a221333b1a4914cceaa5b973715a42");
+    let forged_hash = unhex("8afaf5db9d2ec25512a1fc379ea113d8");
+    assert_ne!(
+        entry_hash, forged_hash,
+        "the forgery must differ from the index or the miss is vacuous"
+    );
+    let source = tempfile::tempdir().unwrap();
+    let kwalletd = source.path().join("kwalletd");
+    std::fs::create_dir_all(&kwalletd).unwrap();
+    std::fs::write(
+        kwalletd.join("test.kwl"),
+        kwl_with_single_entry(folder_hash, entry_hash),
+    )
+    .unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let mut env = env_for(root.path(), vaults.path());
+    env.source_dir = kwalletd;
+
+    let forged = SourceItem {
+        label: "a wallet login".to_string(),
+        attributes: attrs(&[("server", "w.example"), ("user", "u")]),
+        secret: zeroize::Zeroizing::new(b"wallet-secret".to_vec()),
+        content_type: "text/plain".into(),
+        created: 1_699_383_593,
+        modified: 1_699_387_319,
+        provenance: Provenance::kwallet("test", "TestFolder", "forged-entry"),
+        inserted_keys: Default::default(),
+    };
+    let fake = Fake::of("test", vec![forged], Vec::new());
+    let report_path = root.path().join("hash.json");
+    let mut a = kwallet_args(false);
+    a.report = Some(report_path.clone());
+    let err = secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect_err("a forged entry hash is a failed verification");
+    assert!(err.to_string().contains("verification"), "{err}");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    // One declared, one walked: the count passed, so the hash table is the
+    // check that failed, and the only one.
+    assert_eq!(
+        parsed["verification"]["count"],
+        serde_json::json!({ "header_item_count": 1, "walked": 1 })
+    );
+    assert_eq!(
+        parsed["verification"]["hash_table_checked"],
+        serde_json::json!(1)
+    );
+    assert_eq!(
+        parsed["verification"]["hash_table_misses"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "{parsed}"
+    );
+    assert_eq!(parsed["written"], serde_json::json!(false));
+    let left: Vec<String> = files_in(vaults.path())
+        .into_iter()
+        .filter(|n| n.ends_with(".vault"))
+        .collect();
+    assert!(left.is_empty(), "the failed run left {left:?} behind");
+}
+
+/// A truncated secret fails the histogram check: 17 bytes became 16 — a
+/// stripped trailing newline — which the fingerprints only call "different"
+/// and the histogram localises to a bucket.
+///
+/// And on a good run both length distributions are measured, the destination
+/// from the decrypted file rather than from the source twice: a histogram
+/// built from one side twice would agree with itself and catch nothing.
+#[tokio::test]
+async fn a_truncated_secret_fails_the_histogram_check() {
+    let source = Histogram::of_lengths([17]);
+    let destination = Histogram::of_lengths([16]);
+    let diffs = compare_histograms(&source, &destination);
+    assert!(!diffs.is_empty(), "a one-byte truncation moved a bucket");
+    // The difference alone fails the whole verification: every other section
+    // below passes, so `passed()` is decided by the histogram.
+    let verification = Verification {
+        count: CountCheck::new(Some(1), 1),
+        fingerprint_mismatches: Vec::new(),
+        fingerprints_compared: Some(1),
+        hash_table_misses: Vec::new(),
+        hash_table_checked: None,
+        probes: ProbeSummary::of(&[]),
+        failed_probes: Vec::new(),
+        source_lengths: source,
+        destination_lengths: Some(destination),
+        length_differences: diffs,
+    };
+    assert!(verification.count.passed());
+    assert!(
+        !verification.passed(),
+        "a histogram difference must fail verification"
+    );
+
+    // The wiring half: a faithful write measures both sides and agrees.
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    let report_path = root.path().join("lengths.json");
+    let mut a = args(false);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+        .await
+        .expect("a faithful import measures agreeing histograms");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert!(
+        !parsed["verification"]["source_lengths"].is_null(),
+        "{parsed}"
+    );
+    assert!(
+        !parsed["verification"]["destination_lengths"].is_null(),
+        "{parsed}"
+    );
+    assert!(
+        parsed["verification"]["length_differences"].is_null(),
+        "a faithful import has no length differences: {parsed}"
+    );
+}
+
+// --------------------------------------------------------------------------
+// Locating the source: an empty directory, and a default file that cannot
+// be read
+// --------------------------------------------------------------------------
+
+/// No `.keyring` file and no `default` is NotFound (exit 1): there is nothing
+/// to import from, and the error names the directory.
+#[tokio::test]
+async fn empty_source_dir_is_not_found() {
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let mut env = env_for(root.path(), vaults.path());
+    let empty = tempfile::tempdir().unwrap();
+    env.source_dir = empty.path().to_path_buf();
+    let err = secret_manager::cli::import::run_with(args(true), &Fake::sample(), &env)
+        .await
+        .expect_err("an empty source directory holds nothing to import");
+    assert!(
+        matches!(err, CliError::NotFound(_)),
+        "an empty directory is absent, not broken: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("no .keyring file"), "{err}");
+}
+
+/// A `default` file that cannot be read is Failed (exit 1), never a silent
+/// fall back to "the only keyring" — which would import a different keyring
+/// than the user's session uses.
+///
+/// A directory in the file's place fails the read on every uid (a chmod-000
+/// file stays readable for root, so permissions cannot pin this); only an
+/// *absent* file means "there is no default".
+#[tokio::test]
+async fn unreadable_default_file_is_failed_not_absent() {
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let env = env_for(root.path(), vaults.path());
+    std::fs::create_dir(env.source_dir.join("default")).unwrap();
+    let err = secret_manager::cli::import::run_with(args(true), &Fake::sample(), &env)
+        .await
+        .expect_err("an unreadable default file is not an absent one");
+    assert!(
+        matches!(err, CliError::Failed(_)),
+        "a directory named `default` is a failure, not an absence: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("default"), "{err}");
+}
+
+// --------------------------------------------------------------------------
+// Proving nothing without a daemon: `DaemonTarget::FromEnvironment` with no
+// socket, and with a dead one
+// --------------------------------------------------------------------------
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Set an env var for the duration of a test, restoring it after.
+///
+/// `std::env::set_var` is `unsafe` in edition 2024 because it races every
+/// other thread in the process. The subprocess harness below runs each of
+/// these bodies in a child process that executes exactly one test, so no
+/// other test in this binary reads the variable while it is set; the lock
+/// serialises the bodies against each other anyway, and every other test in
+/// this binary reaches its daemon through `DaemonTarget::None` or
+/// `DaemonTarget::At` and never reads this variable.
+struct EnvGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let old = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self {
+            key,
+            old,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.old {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// Re-run this test in a child process with real fds, then assert on its
+/// stderr.
+///
+/// libtest intercepts `eprintln!` on every thread of this process, so no fd
+/// redirect here can capture what `run_with` prints: the capture tests below
+/// failed with empty files while their warnings displayed under the test's
+/// own output instead (and pass with `-- --nocapture`, which disables that
+/// interception). A child test-binary process has real fds, so the parent
+/// spawns one — this same test, `--exact` plus `--nocapture`, with
+/// `SM_IMPORT_SUBPROCESS` set — and asserts on its stderr.
+///
+/// Returns `None` in the child, where the caller runs the real body; in the
+/// parent it asserts the child succeeded and its stderr holds every one of
+/// `expect_stderr`, then returns `Some` to end the test.
+fn subprocess_harness(test_name: &str, expect_stderr: &[&str]) -> Option<()> {
+    if std::env::var_os("SM_IMPORT_SUBPROCESS").is_some() {
+        return None;
+    }
+    let exe = std::env::current_exe().expect("the test binary knows its own path");
+    let out = std::process::Command::new(exe)
+        .args([test_name, "--exact", "--nocapture"])
+        .env("SM_IMPORT_SUBPROCESS", "1")
+        .output()
+        .expect("could not spawn the subprocess");
+    assert!(
+        out.status.success(),
+        "subprocess for {test_name} failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    for want in expect_stderr {
+        assert!(
+            stderr.contains(want),
+            "subprocess stderr lacked {want:?}:\n{stderr}"
+        );
+    }
+    Some(())
+}
+
+/// No control socket under this runtime dir: both the reload nudge (silent
+/// without a socket) and the probe (a warning) find nothing, every probe
+/// comes back not issued, and the run succeeds — unproved is not failed.
+///
+/// The "did not answer" sentence is asserted by the parent side of
+/// `subprocess_harness` (it lives on stderr, which the report JSON never
+/// carries); the body below asserts the run and the report.
+#[test]
+fn probe_without_control_socket_is_unproved() {
+    if subprocess_harness(
+        "probe_without_control_socket_is_unproved",
+        &["did not answer"],
+    )
+    .is_some()
+    {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let runtime = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("XDG_RUNTIME_DIR", runtime.path());
+        let root = tempfile::tempdir().unwrap();
+        let vaults = tempfile::tempdir().unwrap();
+        let mut env = env_for(root.path(), vaults.path());
+        env.daemon = DaemonTarget::FromEnvironment;
+
+        let report_path = root.path().join("no-daemon.json");
+        let mut a = args(false);
+        a.report = Some(report_path.clone());
+        secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+            .await
+            .expect("a probe that cannot run is unproved, not failed");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["verification"]["probes"],
+            serde_json::json!({ "passed": 0, "failed": 0, "not_issued": 2 }),
+            "{parsed}"
+        );
+    });
+}
+
+/// A regular file where the control socket belongs: `connect` fails, the
+/// probe is unproved for a different reason than above, and the run still
+/// succeeds. The file's presence is what distinguishes this arm from the
+/// missing-socket one; the sentence is asserted by the harness.
+#[test]
+fn probe_with_dead_control_socket_is_unproved() {
+    if subprocess_harness(
+        "probe_with_dead_control_socket_is_unproved",
+        &["did not answer"],
+    )
+    .is_some()
+    {
+        return;
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let runtime = tempfile::tempdir().unwrap();
+        let sock_dir = runtime.path().join("secret-manager");
+        std::fs::create_dir_all(&sock_dir).unwrap();
+        std::fs::write(sock_dir.join("control.sock"), b"not a socket").unwrap();
+        assert!(sock_dir.join("control.sock").is_file());
+        let _env = EnvGuard::set("XDG_RUNTIME_DIR", runtime.path());
+
+        let root = tempfile::tempdir().unwrap();
+        let vaults = tempfile::tempdir().unwrap();
+        let mut env = env_for(root.path(), vaults.path());
+        env.daemon = DaemonTarget::FromEnvironment;
+
+        let report_path = root.path().join("dead-socket.json");
+        let mut a = args(false);
+        a.report = Some(report_path.clone());
+        secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+            .await
+            .expect("a dead control socket is unproved, not failed");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["verification"]["probes"],
+            serde_json::json!({ "passed": 0, "failed": 0, "not_issued": 2 }),
+            "{parsed}"
+        );
+    });
+}
+
+// --------------------------------------------------------------------------
+// Warnings, not failures: a refusing daemon, and an unwritable alias table
+// --------------------------------------------------------------------------
+
+/// A control socket that answers `Reload` with an error: the daemon is there
+/// but refuses the rescan.
+///
+/// Exactly one connection follows — a refused reload means the probe is
+/// never issued, so nothing else ever arrives at this socket — and the
+/// deadline bounds the wait so a regression that stops sending `Reload`
+/// fails the test (via the missing warning) instead of hanging it.
+fn spawn_failing_reload_server(sock: &Path) -> std::thread::JoinHandle<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut s, _)) => {
+                    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    if let Ok(body) = secret_manager::protocol::read_frame_sync(&mut s) {
+                        let req: Request = secret_manager::protocol::decode_frame(&body).unwrap();
+                        assert!(
+                            matches!(req, Request::Reload),
+                            "the import only ever sends Reload here"
+                        );
+                        let frame = secret_manager::protocol::encode_frame(&Response::Error(
+                            "injected reload failure".to_string(),
+                        ))
+                        .unwrap();
+                        secret_manager::protocol::write_frame_sync(&mut s, &frame).unwrap();
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+/// A refused `Reload` is a line on stderr, not a failed import: the
+/// collection is written, the report says so, and the probes stay not issued —
+/// a daemon that refused the rescan may not hold the collection, so the run
+/// does not issue `SearchItems` at all. The sentence is asserted by
+/// the harness; the body asserts the run and the report.
+#[test]
+fn a_daemon_that_refuses_reload_costs_a_warning_not_the_run() {
+    if subprocess_harness(
+        "a_daemon_that_refuses_reload_costs_a_warning_not_the_run",
+        &["did not reload", "injected reload failure"],
+    )
+    .is_some()
+    {
+        return;
+    }
+    // Both halves of the warning travel in one sentence; the parent asserts
+    // them together.
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("control.sock");
+    let server = spawn_failing_reload_server(&sock);
+
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut env = env_for(root.path(), vaults.path());
+        env.daemon = DaemonTarget::At {
+            bus_address: "unix:path=/nonexistent-bus-for-import-test".to_string(),
+            control_socket: sock,
+        };
+
+        let report_path = root.path().join("reload.json");
+        let mut a = args(false);
+        a.report = Some(report_path.clone());
+        secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+            .await
+            .expect("a refused reload is a warning, not a failed import");
+
+        assert!(files_in(vaults.path()).contains(&"sample_keyring.vault".to_string()));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        assert_eq!(parsed["written"], serde_json::json!(true));
+        assert_eq!(
+            parsed["verification"]["probes"],
+            serde_json::json!({ "passed": 0, "failed": 0, "not_issued": 2 }),
+            "{parsed}"
+        );
+    });
+    server.join().expect("the fake control server finished");
+}
+
+/// An alias table that cannot be read is a warning, not a failed import: the
+/// collection is written, no alias moves, and the run succeeds.
+///
+/// `aliases.toml` as a directory fails the read on every uid — permissions
+/// would still let root through, and the vault write needs the same directory
+/// writable, so a read-only directory cannot reach this step at all.
+///
+/// The sentence is asserted by the harness; the body asserts the run, the
+/// files, and the report's own record of the unmoved alias.
+#[test]
+fn an_unwritable_alias_table_costs_a_warning_not_the_run() {
+    if subprocess_harness(
+        "an_unwritable_alias_table_costs_a_warning_not_the_run",
+        &["aliases.toml", "left alone"],
+    )
+    .is_some()
+    {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    std::fs::create_dir(vaults.path().join("aliases.toml")).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut env = env_for(root.path(), vaults.path());
+        env.daemon = DaemonTarget::None;
+
+        let report_path = root.path().join("alias.json");
+        let mut a = args(false);
+        a.set_default = true;
+        a.report = Some(report_path.clone());
+        secret_manager::cli::import::run_with(a, &Fake::sample(), &env)
+            .await
+            .expect("an unwritable alias table is a warning");
+
+        assert!(files_in(vaults.path()).contains(&"sample_keyring.vault".to_string()));
+        assert!(
+            !vaults.path().join("aliases.toml").is_file(),
+            "no alias file was written"
+        );
+        // The same failure is also in the report's notes, which is the half
+        // that needs no subprocess to assert on.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+        let notes = parsed["notes"].as_array().cloned().unwrap_or_default();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().is_some_and(|s| s.contains("left alone"))),
+            "the report must record the unmoved alias: {parsed}"
+        );
+    });
+}
+
+// --------------------------------------------------------------------------
+// --inventory for a wallet, with nothing running
+// --------------------------------------------------------------------------
+
+/// The kwallet mirror of the keyring inventory test: the cleartext index is
+/// all it reads — folders and entries from the committed `sample.kwl`, which
+/// holds three folders (one of them empty) and four entries.
+#[test]
+fn kwallet_inventory_names_folders_and_entries_with_no_daemon_and_no_password() {
+    let root = tempfile::tempdir().unwrap();
+    let kwalletd = root.path().join("kwalletd");
+    std::fs::create_dir_all(&kwalletd).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import/sample.kwl"),
+        kwalletd.join("test.kwl"),
+    )
+    .unwrap();
+    let mut cmd = assert_cmd::Command::cargo_bin("secret-manager").unwrap();
+    let assert = cmd
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", root.path())
+        .env("XDG_DATA_HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_RUNTIME_DIR", root.path().join("run"))
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .args(["import", "--from", "kwallet", "--inventory"])
+        .write_stdin("")
+        .assert()
+        .success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(out.contains("test"), "{out}");
+    assert!(out.contains("folders              3"), "{out}");
+    assert!(out.contains("of those, empty      1"), "{out}");
+    assert!(out.contains("entries              4"), "{out}");
+    assert!(out.contains("No password was asked for"), "{out}");
 }

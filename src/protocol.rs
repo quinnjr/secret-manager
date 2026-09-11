@@ -290,8 +290,11 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Reads the connected peer's credentials via `SO_PEERCRED`.
-fn peer_uid(stream: &UnixStream) -> Result<u32, ProtocolError> {
+/// Reads the connected peer's credentials via `SO_PEERCRED`. The single
+/// definition: the control server's accept loop and the import probe's
+/// pid-identity check both go through here rather than growing their own
+/// `getsockopt` copies.
+fn peer_cred(stream: &UnixStream) -> Result<libc::ucred, ProtocolError> {
     // SAFETY: ucred is plain data; all-zero is a valid initial value.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -309,7 +312,17 @@ fn peer_uid(stream: &UnixStream) -> Result<u32, ProtocolError> {
     if rc != 0 {
         return Err(ProtocolError::Io(std::io::Error::last_os_error()));
     }
-    Ok(cred.uid)
+    Ok(cred)
+}
+
+pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, ProtocolError> {
+    peer_cred(stream).map(|cred| cred.uid)
+}
+
+/// The peer's pid, for callers comparing processes rather than users: the
+/// import probe checks the bus-name owner against the control socket's peer.
+pub(crate) fn peer_pid(stream: &UnixStream) -> Result<i32, ProtocolError> {
+    peer_cred(stream).map(|cred| cred.pid)
 }
 
 /// A blocking-socket timeout surfaces as `WouldBlock` on Linux; normalise it

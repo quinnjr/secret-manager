@@ -114,7 +114,10 @@ before agreeing.
 
 This section — `ksecretd`'s behaviour, the file paths, the PAM stack
 contents — was reasoned from Debian's packaging, not checked on a live KDE
-session; see `docs/vagrant.md`.
+session; see `docs/vagrant.md`. Delete this paragraph when
+`docs/vagrant.md` gains a desktop-session box or a manual verification log
+(distro + Plasma/GNOME version); tracked with the migration follow-up on
+`feature/migration-spec`.
 
 Import the wallet before disabling it: `sm import --from kwallet --dry-run`
 (see "Commands" in `README.md`). A native KWallet entry has no attributes,
