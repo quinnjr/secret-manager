@@ -184,6 +184,8 @@ four steps has not taken effect.
 
 See `docs/install-common.md` (installed alongside this file at
 `/usr/share/doc/secret-manager/install-common.md`) for creating your vault,
+the end-to-end migration runbook ("Moving from gnome-keyring or KWallet",
+including entries the source daemon never lists, and the cutover order),
 SSH passphrases, configuration, and troubleshooting — shared across
 distributions.
 
@@ -223,6 +225,8 @@ password  optional  pam_secret_manager.so
 ```
 
 Log out and back in, then `sm status` should show `default` unlocked.
+If your collection's id is not `default`, append
+`collection=<id>` to each `pam_secret_manager.so` line.
 Problems are logged to the journal: `journalctl -p warning -g pam_secret_manager`
 (the messages carry a `pam_secret_manager:` prefix in `authpriv`).
 
