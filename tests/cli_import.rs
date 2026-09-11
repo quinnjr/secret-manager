@@ -1758,12 +1758,17 @@ async fn a_tampered_secret_is_a_fingerprint_mismatch_and_a_failed_run_leaves_not
     assert!(left.is_empty(), "the failed run left {left:?} behind");
 }
 
-/// A forged wallet name fails the hash-table check, and only it: the count
-/// passes, so the miss is isolated, and the run unlinks what it wrote.
+/// A forged wallet name fails verification and the run unlinks what it wrote.
 ///
 /// The `.kwl` holds folder "TestFolder" with entry "good-entry" (hashes
 /// below); the walked item names the real folder with a forged entry. The
 /// `assert_ne!` is what makes the miss real rather than assumed.
+///
+/// Note the count no longer isolates the miss the way it used to: the walked
+/// item is not in the file, so the file's real entry is unlisted, and the
+/// count reads one declared, one walked, one never listed. Both checks fire,
+/// and both are right — a forgery displaces the real entry rather than
+/// matching it — and the run still unlinks what it wrote.
 #[tokio::test]
 async fn a_forged_wallet_name_fails_the_hash_table_check_and_leaves_nothing() {
     // MD5("TestFolder"), MD5("good-entry"), MD5("forged-entry").
@@ -1808,11 +1813,12 @@ async fn a_forged_wallet_name_fails_the_hash_table_check_and_leaves_nothing() {
     assert!(err.to_string().contains("verification"), "{err}");
     let parsed: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
-    // One declared, one walked: the count passed, so the hash table is the
-    // check that failed, and the only one.
+    // One declared, one walked, one never listed: the walked item is not
+    // the file's entry, so the file's real entry is unlisted and the count
+    // fires alongside the hash-table miss. Both fail closed.
     assert_eq!(
         parsed["verification"]["count"],
-        serde_json::json!({ "header_item_count": 1, "walked": 1 })
+        serde_json::json!({ "header_item_count": 1, "walked": 1, "unlisted": 1 })
     );
     assert_eq!(
         parsed["verification"]["hash_table_checked"],
@@ -1854,6 +1860,7 @@ async fn a_truncated_secret_fails_the_histogram_check() {
         fingerprints_compared: Some(1),
         hash_table_misses: Vec::new(),
         hash_table_checked: None,
+        unlisted: Vec::new(),
         probes: ProbeSummary::of(&[]),
         failed_probes: Vec::new(),
         source_lengths: source,

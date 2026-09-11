@@ -217,6 +217,11 @@ mod transport {
         /// KWallet folders with no entries. A collection-of-items model has
         /// nowhere to put them; the report says how many were lost.
         pub empty_folders: usize,
+        /// Sidecar rows the walk did not apply to any entry, by full key.
+        /// The verifier resolves these against the file index to name index
+        /// entries no listing ever produced; empty on the gnome path, which
+        /// has no sidecar.
+        pub unresolved_sidecar_rows: Vec<String>,
         /// Anything else the run must not be silent about: a plaintext session
         /// because the source refused DH, a collection whose unlock prompt
         /// nobody could answer, sidecar rows that resolved to no entry.
@@ -236,6 +241,7 @@ mod transport {
                 refusals: Vec::new(),
                 skipped: Vec::new(),
                 empty_folders: 0,
+                unresolved_sidecar_rows: Vec::new(),
                 notes: Vec::new(),
             }
         }
@@ -376,10 +382,59 @@ async fn extract_gnome(source_dir: &Path, container: &str) -> Result<Extraction,
             })
             .collect(),
         empty_folders: 0,
+        // The gnome path has no sidecar, so nothing to resolve.
+        unresolved_sidecar_rows: Vec::new(),
         notes,
     })
 }
 
+/// Sentences for index entries no listing ever produced (see
+/// [`verify::UnlistedEntry`]), grouped by folder. A pair no sidecar row
+/// names is grouped under its folder hash rather than dropped: the count
+/// accounts for it, so the notes must too.
+fn unlisted_notes(unlisted: &[verify::UnlistedEntry]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
+    for u in unlisted {
+        let key = u
+            .folder
+            .clone()
+            .unwrap_or_else(|| format!("folder hash {}", u.folder_hash));
+        let name = u
+            .entry
+            .clone()
+            .unwrap_or_else(|| format!("#{}", u.entry_hash));
+        groups
+            .entry(key)
+            .or_insert_with(|| (u.folder.clone(), Vec::new()))
+            .1
+            .push(name);
+    }
+    groups
+        .into_iter()
+        .map(|(key, (folder, mut names))| {
+            names.sort();
+            let shown: Vec<&str> = names.iter().map(String::as_str).take(8).collect();
+            let mut listed = shown.join(", ");
+            if names.len() > shown.len() {
+                listed.push_str(&format!(", and {} more", names.len() - shown.len()));
+            }
+            let noun = if names.len() == 1 { "entry" } else { "entries" };
+            match folder {
+                Some(_) => format!(
+                    "{} {noun} in folder '{key}' are in the file but kwalletd never listed \
+                     them, so they were not migrated: {listed}",
+                    names.len()
+                ),
+                None => format!(
+                    "{0} {noun} under {key} are in the file but kwalletd never listed them, \
+                     so they were not migrated: {listed}",
+                    names.len()
+                ),
+            }
+        })
+        .collect()
+}
 /// Sentences for listings the walk skipped as repeats of an already-listed
 /// folder or entry (see `kwallet::Extraction::{duplicate_folders,
 /// duplicate_entries}`). Kept beside the rest of the KWallet notes so the
@@ -549,6 +604,7 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
             })
             .collect(),
         empty_folders: walked.empty_folders,
+        unresolved_sidecar_rows: walked.unresolved_sidecar_rows.clone(),
         notes,
     })
 }
@@ -1274,7 +1330,11 @@ mod pipeline {
                         walked,
                         None,
                         plan.iter().map(ProbeResult::not_issued).collect(),
+                        &extraction.unresolved_sidecar_rows,
                     );
+                    extraction
+                        .notes
+                        .extend(unlisted_notes(&verification.unlisted));
                     let report_file = ReportFile::new(
                         &report,
                         &report.tally,
@@ -1326,7 +1386,11 @@ mod pipeline {
             walked,
             destination.as_ref(),
             plan.iter().map(ProbeResult::not_issued).collect(),
+            &extraction.unresolved_sidecar_rows,
         );
+        extraction
+            .notes
+            .extend(unlisted_notes(&verification.unlisted));
         if !verification.passed() {
             // Nothing was published, so the file goes and the error says so
             // rather than the reverse.
@@ -1860,6 +1924,7 @@ fn verify_import(
     walked: usize,
     destination: Option<&Destination>,
     probes: Vec<ProbeResult>,
+    sidecar_keys: &[String],
 ) -> Verification {
     let source_entries: Vec<FingerprintEntry> =
         items.iter().map(FingerprintEntry::source).collect();
@@ -1897,15 +1962,26 @@ fn verify_import(
         None => Vec::new(),
     };
 
+    // Index entries no listing ever produced. Only a hash index can prove
+    // them, so only the wallet path computes them; a keyring has no table
+    // and reports none.
+    let unlisted = match &file.inventory {
+        Inventory::Wallet(w) => verify::unlisted_wallet_entries(w, items, sidecar_keys),
+        Inventory::Keyring(_) => Vec::new(),
+    };
+    let mut count = verify::CountCheck::new(file.header_item_count, walked);
+    count.unlisted = unlisted.len();
+
     Verification {
         // `walked` counts every item the walk produced, refused ones
         // included: a refused item was still in the file, so leaving it out
         // would report a count mismatch for an item we deliberately declined.
-        count: verify::CountCheck::new(file.header_item_count, walked),
+        count,
         fingerprint_mismatches: mismatches,
         fingerprints_compared: compared,
         hash_table_misses,
         hash_table_checked,
+        unlisted,
         probes: verify::ProbeSummary::of(&probes),
         // Only the failures are kept: a report lists what went wrong, and a
         // line per passing probe would bury it. The counts above already say
@@ -2334,6 +2410,36 @@ mod tests {
         assert!(kwallet_notes(&walked).is_empty());
     }
 
+    /// Entries the file holds that the daemon never listed get named notes,
+    /// grouped by folder. A nameless pair is still reported, by hashes —
+    /// dropping it would be the same hole the count check exists to close.
+    #[test]
+    fn never_listed_entries_get_their_own_notes() {
+        let unlisted = vec![
+            verify::UnlistedEntry {
+                folder_hash: "aa".to_string(),
+                entry_hash: "bb".to_string(),
+                folder: Some("Secret Service".to_string()),
+                entry: Some("old login".to_string()),
+            },
+            verify::UnlistedEntry {
+                folder_hash: "cc".to_string(),
+                entry_hash: "dd".to_string(),
+                folder: None,
+                entry: None,
+            },
+        ];
+
+        let out = unlisted_notes(&unlisted).join("\n");
+
+        assert!(out.contains("Secret Service"), "{out}");
+        assert!(out.contains("old login"), "{out}");
+        assert!(out.contains("cc"), "{out}");
+        // One per group: singular, not "1 entries".
+        assert!(out.contains("1 entry in folder"), "{out}");
+        assert!(unlisted_notes(&[]).is_empty());
+    }
+
     fn wallet_source_file() -> SourceFile {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import/sample.kwl");
         let inventory = parse_wallet_header(&std::fs::read(&path).unwrap()).unwrap();
@@ -2342,6 +2448,30 @@ mod tests {
             inventory: Inventory::Wallet(Box::new(inventory)),
             header_item_count: Some(1),
         }
+    }
+
+    /// Index entries the walk never produced are reported, not absorbed.
+    /// The fixture wallet holds four entries; walking none of them with no
+    /// sidecar rows to name them still accounts for all four — by hash —
+    /// and the count reconciles zero walked against a four-entry header.
+    #[test]
+    fn verify_reports_index_entries_the_walk_never_produced() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import/sample.kwl");
+        let inventory = parse_wallet_header(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(inventory.entry_count(), 4);
+        let file = SourceFile {
+            path,
+            inventory: Inventory::Wallet(Box::new(inventory)),
+            header_item_count: Some(4),
+        };
+
+        let verification = verify_import(&file, &[], 0, None, Vec::new(), &[]);
+
+        assert_eq!(verification.unlisted.len(), 4);
+        assert!(verification.unlisted.iter().all(|u| u.folder.is_none()));
+        assert!(verification.count.passed());
+        assert!(verification.hash_table_misses.is_empty());
+        assert!(verification.passed());
     }
 
     /// The report `--report` writes must be a report its own parser accepts.
@@ -2374,6 +2504,7 @@ mod tests {
             fingerprints_compared: Some(1),
             hash_table_misses: Vec::new(),
             hash_table_checked: None,
+            unlisted: Vec::new(),
             probes: verify::ProbeSummary::of(&failed),
             failed_probes: failed,
             source_lengths: Histogram::of_lengths(std::iter::once(item.secret.len())),
@@ -2445,7 +2576,7 @@ mod tests {
             lengths: Histogram::of_lengths(std::iter::empty()),
             indexed: true,
         };
-        let verification = verify_import(&file, &items, 1, Some(&destination), Vec::new());
+        let verification = verify_import(&file, &items, 1, Some(&destination), Vec::new(), &[]);
         assert!(
             !verification.fingerprint_mismatches.is_empty(),
             "the fingerprint rows this test exists to screen were never produced"
