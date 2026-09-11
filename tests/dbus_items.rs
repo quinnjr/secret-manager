@@ -72,21 +72,26 @@ async fn item(conn: &zbus::Connection, path: OwnedObjectPath) -> ItemProxy<'stat
 /// client side reports the promised signature whatever the bytes carry, and
 /// decoding is structurally lenient both ways, so neither can pin the
 /// framing — only an independent bus observer sees the header as sent.
-/// (Skipped where `busctl` is absent; it ships with the same dbus package
-/// the fixture's `dbus-daemon` comes from.)
+///
+/// `busctl` is hard-required here, not skipped: this test is the sole
+/// tripwire for a HIGH-severity interop fix, and a silent skip would leave
+/// that fix unguarded. (The rest of the suite keeps its skip precedent; this
+/// test only.) It ships with the same dbus package the fixture's
+/// `dbus-daemon` comes from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_secret_reply_is_a_single_struct_on_the_wire() {
-    if tokio::process::Command::new("busctl")
+    let busctl_ok = tokio::process::Command::new("busctl")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .await
-        .is_err()
-    {
-        eprintln!("skipped: busctl not found");
-        return;
-    }
+        .map(|s| s.success())
+        .unwrap_or(false);
+    assert!(
+        busctl_ok,
+        "busctl required for the GetSecret framing test; ships with the dbus package"
+    );
     let fx = Fixture::start().await;
     fx.unlock_default().await;
     let conn = fx.client().await;
@@ -102,6 +107,14 @@ async fn get_secret_reply_is_a_single_struct_on_the_wire() {
         .await
         .unwrap();
 
+    // The monitor's pipe is pumped to a log file by a background task, so the
+    // test can poll for traffic with a deadline instead of sleeping a fixed
+    // span. (Redirecting `busctl` straight at the file would risk libc block
+    // buffering hiding traffic until the kill; the pipe is what the old
+    // fixed sleep already proved flushes promptly.)
+    let log_dir = tempfile::tempdir().unwrap();
+    let log_path = log_dir.path().join("monitor.log");
+    std::fs::write(&log_path, "").unwrap();
     let mut mon = tokio::process::Command::new("busctl")
         .args([
             "--address",
@@ -112,8 +125,55 @@ async fn get_secret_reply_is_a_single_struct_on_the_wire() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // Give the monitor a moment to attach before the only call it must see.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut pipe = mon.stdout.take().unwrap();
+    let pump_path = log_path.clone();
+    let pump = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut out = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&pump_path)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match pipe.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let read_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    // Prove the monitor is attached before the call it must see: repeat a
+    // sacrificial introspect of the service object over the same connection
+    // until its traffic lands in the log, with a deadline. (One shot is not
+    // enough — fired before the monitor finishes attaching, it is gone
+    // before the watch starts and the log stays empty.)
+    let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        conn.call_method(
+            Some("org.freedesktop.secrets"),
+            "/org/freedesktop/secrets",
+            Some("org.freedesktop.DBus.Introspectable"),
+            "Introspect",
+            &(),
+        )
+        .await
+        .unwrap();
+        let log = read_log();
+        if log.contains("Member=Introspect") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < attach_deadline,
+            "busctl monitor did not attach within 10s; log:\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     conn.call_method(
         Some("org.freedesktop.secrets"),
         item_path.as_str(),
@@ -123,30 +183,36 @@ async fn get_secret_reply_is_a_single_struct_on_the_wire() {
     )
     .await
     .unwrap();
-    // The call already returned, so the reply is on the bus; the wait is
-    // only for the monitor's pipe to deliver it.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let _ = mon.kill().await;
-    let out = mon.wait_with_output().await.unwrap();
-    let log = String::from_utf8_lossy(&out.stdout);
-    let mut lines = log.lines();
-    let reply_message = loop {
-        let line = lines
-            .by_ref()
-            .find(|l| l.contains("Member=GetSecret"))
-            .expect("monitor saw the call");
-        let _ = lines
-            .by_ref()
-            .find(|l| l.contains("Type=method_return"))
-            .expect("monitor saw the reply");
-        let message = lines
-            .by_ref()
-            .find(|l| l.trim_start().starts_with("MESSAGE "))
-            .expect("reply has a body signature");
-        if line.contains("Interface=org.freedesktop.Secret.Item") {
-            break message.trim().to_string();
+    // The call already returned, so the reply is on the bus; poll the log for
+    // the reply's body signature with a deadline instead of a fixed sleep.
+    let find_reply = |log: &str| -> Option<String> {
+        let mut lines = log.lines();
+        loop {
+            let line = lines.by_ref().find(|l| l.contains("Member=GetSecret"))?;
+            let _ = lines.by_ref().find(|l| l.contains("Type=method_return"))?;
+            let message = lines
+                .by_ref()
+                .find(|l| l.trim_start().starts_with("MESSAGE "))?;
+            if line.contains("Interface=org.freedesktop.Secret.Item") {
+                return Some(message.trim().to_string());
+            }
         }
     };
+    let reply_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let reply_message = loop {
+        let log = read_log();
+        if let Some(message) = find_reply(&log) {
+            break message;
+        }
+        assert!(
+            tokio::time::Instant::now() < reply_deadline,
+            "monitor did not deliver the GetSecret reply within 10s; log:\n{log}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let _ = mon.kill().await;
+    let _ = mon.wait().await;
+    pump.abort();
     assert_eq!(
         reply_message, "MESSAGE \"(oayays)\" {",
         "GetSecret reply framing on the wire"

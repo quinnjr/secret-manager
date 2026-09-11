@@ -13,6 +13,7 @@ mod common;
 use common::Fixture;
 use secret_manager::cli::import::{
     DaemonTarget, Extraction, Extractor, ImportArgs, ImportEnv, Imported, NotMigrated, SourceArg,
+    may_suggest_decommission,
 };
 use secret_manager::cli::{Cli, CliError, Command};
 use secret_manager::config::Config;
@@ -20,8 +21,8 @@ use secret_manager::import::formats::KWALLET_MAGIC;
 use secret_manager::import::gnome::GnomeError;
 use secret_manager::import::kwallet::{KWalletError, SidecarError};
 use secret_manager::import::verify::{
-    CountCheck, FingerprintEntry, Histogram, ProbeSummary, Side, Verification,
-    compare_fingerprints, compare_histograms, probe_plan,
+    CountCheck, FingerprintEntry, Histogram, ProbeResult, ProbeSummary, Side, UnlistedEntry,
+    Verification, compare_fingerprints, compare_histograms, probe_plan,
 };
 use secret_manager::import::{Cap, ItemReport, Provenance, Refusal, Source, SourceItem};
 use secret_manager::protocol::{Request, Response};
@@ -162,6 +163,8 @@ struct Fake {
     items: Vec<SourceItem>,
     refusals: Vec<ItemReport>,
     skipped: Vec<NotMigrated>,
+    unresolved_sidecar_rows: Vec<String>,
+    notes: Vec<String>,
 }
 
 impl Fake {
@@ -171,7 +174,19 @@ impl Fake {
             items,
             refusals,
             skipped: Vec::new(),
+            unresolved_sidecar_rows: Vec::new(),
+            notes: Vec::new(),
         }
+    }
+
+    fn with_unresolved(mut self, rows: &[&str]) -> Self {
+        self.unresolved_sidecar_rows = rows.iter().map(|s| (*s).to_string()).collect();
+        self
+    }
+
+    fn with_notes(mut self, notes: &[&str]) -> Self {
+        self.notes = notes.iter().map(|s| (*s).to_string()).collect();
+        self
     }
 
     /// The golden keyring's own container, items and refusal.
@@ -205,6 +220,8 @@ impl Extractor for Fake {
                 .collect();
             extraction.refusals = self.refusals.clone();
             extraction.skipped = self.skipped.clone();
+            extraction.unresolved_sidecar_rows = self.unresolved_sidecar_rows.clone();
+            extraction.notes = self.notes.clone();
             Ok(extraction)
         })
     }
@@ -957,6 +974,72 @@ async fn the_lookup_probe_runs_against_our_own_daemon_and_finds_every_item() {
             .as_array()
             .is_none_or(|a| a.is_empty())
     );
+}
+
+/// A partial migration earns no decommission advice.
+///
+/// Index entries the daemon never listed reconcile the count — `passed()`
+/// stays true — but they were not migrated, so the run may not suggest
+/// removing the old provider. This pins `may_suggest_decommission`, the gate
+/// the printed report's "Next: decommission the old provider" paragraph sits
+/// behind: a verification whose every check passed but whose `unlisted` is
+/// non-empty must not earn the advice, while the same run with nothing left
+/// behind does.
+#[test]
+fn a_partial_migration_with_unlisted_entries_gets_no_decommission_advice() {
+    let items = sample_items();
+    let plan = probe_plan(&items);
+    assert!(!plan.is_empty(), "the test needs probes to prove");
+    // Every probe found exactly what was expected: discoverability proved,
+    // nothing left unproved.
+    let probes: Vec<ProbeResult> = plan
+        .iter()
+        .map(|q| ProbeResult::new(q, q.expected))
+        .collect();
+    let summary = ProbeSummary::of(&probes);
+    assert_eq!(summary.not_issued, 0);
+    assert_eq!(summary.failed, 0);
+
+    let lengths = Histogram::of_lengths(items.iter().map(|i| i.secret.len()));
+    let clean = Verification::new(
+        CountCheck::new(Some(3), 3, 0),
+        Vec::new(),
+        Some(2),
+        Vec::new(),
+        None,
+        Vec::new(),
+        summary,
+        Vec::new(),
+        lengths.clone(),
+        Some(lengths.clone()),
+        Vec::new(),
+    );
+    assert!(clean.passed());
+    assert!(clean.unproved().is_empty());
+    assert!(may_suggest_decommission(&clean));
+
+    let partial = Verification::new(
+        // Two walked plus one never listed reconciles the three the header
+        // declares, so this is not a failure — and still earns no advice.
+        CountCheck::new(Some(3), 2, 1),
+        Vec::new(),
+        Some(2),
+        Vec::new(),
+        None,
+        vec![UnlistedEntry {
+            folder_hash: "aa".to_string(),
+            entry_hash: "bb".to_string(),
+            folder: None,
+            entry: None,
+        }],
+        summary,
+        Vec::new(),
+        lengths.clone(),
+        Some(lengths),
+        Vec::new(),
+    );
+    assert!(partial.passed());
+    assert!(!may_suggest_decommission(&partial));
 }
 
 /// `SearchItems` is **subset** matching, so a probe for `{server, user}`
@@ -1854,19 +1937,19 @@ async fn a_truncated_secret_fails_the_histogram_check() {
     assert!(!diffs.is_empty(), "a one-byte truncation moved a bucket");
     // The difference alone fails the whole verification: every other section
     // below passes, so `passed()` is decided by the histogram.
-    let verification = Verification {
-        count: CountCheck::new(Some(1), 1),
-        fingerprint_mismatches: Vec::new(),
-        fingerprints_compared: Some(1),
-        hash_table_misses: Vec::new(),
-        hash_table_checked: None,
-        unlisted: Vec::new(),
-        probes: ProbeSummary::of(&[]),
-        failed_probes: Vec::new(),
-        source_lengths: source,
-        destination_lengths: Some(destination),
-        length_differences: diffs,
-    };
+    let verification = Verification::new(
+        CountCheck::new(Some(1), 1, 0),
+        Vec::new(),
+        Some(1),
+        Vec::new(),
+        None,
+        Vec::new(),
+        ProbeSummary::of(&[]),
+        Vec::new(),
+        source,
+        Some(destination),
+        diffs,
+    );
     assert!(verification.count.passed());
     assert!(
         !verification.passed(),
@@ -2292,6 +2375,128 @@ fn an_unwritable_alias_table_costs_a_warning_not_the_run() {
 // --------------------------------------------------------------------------
 // --inventory for a wallet, with nothing running
 // --------------------------------------------------------------------------
+
+/// The duplicate-folder note reaches the report through the pipeline.
+///
+/// `kwallet_notes` builds the sentence in `extract_kwallet`; `run_with` carries
+/// `extraction.notes` into the report untouched. A `Fake` note in the same
+/// words is what pins the wiring: the sentence a repeating daemon produces is
+/// the sentence the user reads.
+#[tokio::test]
+async fn dupe_folder_listings_reach_the_report_notes() {
+    // MD5("TestFolder"), MD5("good-entry").
+    let folder_hash = unhex("95e8fd9739097a67c833315b8461ec04");
+    let entry_hash = unhex("f3a221333b1a4914cceaa5b973715a42");
+    let source = tempfile::tempdir().unwrap();
+    let kwalletd = source.path().join("kwalletd");
+    std::fs::create_dir_all(&kwalletd).unwrap();
+    std::fs::write(
+        kwalletd.join("test.kwl"),
+        kwl_with_single_entry(folder_hash, entry_hash),
+    )
+    .unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let mut env = env_for(root.path(), vaults.path());
+    env.source_dir = kwalletd;
+
+    let walked = SourceItem {
+        label: "a wallet login".to_string(),
+        attributes: attrs(&[("server", "w.example")]),
+        secret: zeroize::Zeroizing::new(b"wallet-secret".to_vec()),
+        content_type: "text/plain".into(),
+        created: 1_699_383_593,
+        modified: 1_699_387_319,
+        provenance: Provenance::kwallet("test", "TestFolder", "good-entry"),
+        inserted_keys: Default::default(),
+    };
+    let fake = Fake::of("test", vec![walked], Vec::new()).with_notes(&[
+        "1 folder listings repeated a folder that was already listed, so the repeats were \
+         not read again: kwalletd repeats every folder in folderList once per open, and \
+         reading them again would import every entry once per copy",
+    ]);
+    let report_path = root.path().join("dupe.json");
+    let mut a = kwallet_args(true);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect("one walked against one declared passes");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    let notes = parsed["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes.iter().any(|n| n
+            .as_str()
+            .is_some_and(|s| s.contains("folder listings repeated a folder"))),
+        "the duplicate-folder note did not reach the report: {parsed}"
+    );
+}
+
+/// Index entries the daemon never listed are named in the report notes, and the
+/// verification names the pair: the sidecar key resolves through the index
+/// hashes, so the folder is not just a hash.
+#[tokio::test]
+async fn unlisted_entries_are_named_in_the_notes_and_the_verification() {
+    // MD5("TestFolder"), MD5("good-entry").
+    let folder_hash = unhex("95e8fd9739097a67c833315b8461ec04");
+    let entry_hash = unhex("f3a221333b1a4914cceaa5b973715a42");
+    let source = tempfile::tempdir().unwrap();
+    let kwalletd = source.path().join("kwalletd");
+    std::fs::create_dir_all(&kwalletd).unwrap();
+    std::fs::write(
+        kwalletd.join("test.kwl"),
+        kwl_with_single_entry(folder_hash, entry_hash),
+    )
+    .unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let vaults = tempfile::tempdir().unwrap();
+    let mut env = env_for(root.path(), vaults.path());
+    env.source_dir = kwalletd;
+
+    // Nothing walked: the file's one entry is unlisted, and the sidecar key
+    // names it. Zero walked plus one unlisted reconciles against one declared.
+    let fake = Fake::of("test", Vec::new(), Vec::new()).with_unresolved(&["TestFolder/good-entry"]);
+    let report_path = root.path().join("unlisted.json");
+    let mut a = kwallet_args(true);
+    a.report = Some(report_path.clone());
+    secret_manager::cli::import::run_with(a, &fake, &env)
+        .await
+        .expect("0 walked plus 1 unlisted reconciles against 1 declared");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    let notes = parsed["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().is_some_and(|s| s.contains("TestFolder"))),
+        "the unlisted note names no folder: {parsed}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().is_some_and(|s| s.contains("good-entry"))),
+        "the unlisted note names no entry: {parsed}"
+    );
+    assert_eq!(
+        parsed["verification"]["unlisted"][0]["folder"],
+        serde_json::json!("TestFolder"),
+        "{parsed}"
+    );
+    assert_eq!(
+        parsed["verification"]["unlisted"][0]["entry"],
+        serde_json::json!("good-entry"),
+        "{parsed}"
+    );
+    assert_eq!(
+        parsed["verification"]["count"],
+        serde_json::json!({ "header_item_count": 1, "walked": 0, "unlisted": 1 }),
+        "{parsed}"
+    );
+}
 
 /// The kwallet mirror of the keyring inventory test: the cleartext index is
 /// all it reads — folders and entries from the committed `sample.kwl`, which

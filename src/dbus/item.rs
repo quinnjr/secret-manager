@@ -129,8 +129,9 @@ impl Item {
         self.state.lock().await.touch();
         // A one-tuple, not a bare struct: zbus writes message-body signature
         // headers with top-level struct parentheses stripped
-        // (`SignatureSerializer` uses `to_string_no_parens`), so a bare
-        // `SecretStruct` return goes out as `oayays` while introspection —
+        // (`SignatureSerializer::to_string_no_parens` on the message header
+        // builder path), so a bare `SecretStruct` return goes out as
+        // `oayays` while introspection —
         // and the spec, and every strict client — expects one `(oayays)`
         // struct. The tuple's own signature is `((oayays))`, the strip
         // leaves exactly one layer, and introspection iterates the single
