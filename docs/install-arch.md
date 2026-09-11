@@ -2,11 +2,34 @@
 
 ## Build and install
 
+The recommended path is the `secret-manager-git` package, built from
+`dist/arch/PKGBUILD` in the source tree:
+
+```sh
+sudo pacman -S --needed base-devel rust pinentry dbus openssh pam
+cd dist/arch
+makepkg -s
+sudo pacman -U secret-manager-git-*.pkg.tar.zst
+```
+
+It tracks the `develop` branch, so the version reads
+`0.1.0.rN.gHASH` and a rebuild picks up whatever landed since. The
+build runs `make build` (both release artifacts: the daemon/CLI binary
+and the PAM cdylib in its own target dir) and installs exactly what
+`make install` would — see below — with `DESTDIR` staging, so pacman
+owns every file.
+
+Or build and install by hand:
+
 ```sh
 sudo pacman -S --needed rust pinentry dbus openssh pam
 make
 sudo make install
 ```
+
+`PAMDIR` needs no override on Arch: with no `debian_version` present the
+Makefile defaults to `/usr/lib/security`, which is where the package puts
+`pam_secret_manager.so` too.
 
 `sudo make install` puts the binary at `/usr/bin/secret-manager` with the `sm`
 and `sm-askpass` symlinks, the PAM module in `/usr/lib/security`, the systemd
@@ -186,6 +209,11 @@ session   optional  pam_secret_manager.so
 ```
 
 Log out and back in, then `sm status` should show `default` unlocked.
+If your collection's id is not `default`, append
+`collection=<id>` to each `pam_secret_manager.so` line — the module
+opens `<id>.vault` literally and does not resolve the daemon's `default`
+alias. See "PAM module options" in `docs/install-common.md`.
+
 Problems are logged to the journal: `journalctl -p warning -g pam_secret_manager`
 (the messages carry a `pam_secret_manager:` prefix in `authpriv`).
 
