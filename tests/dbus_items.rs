@@ -62,6 +62,97 @@ async fn item(conn: &zbus::Connection, path: OwnedObjectPath) -> ItemProxy<'stat
         .unwrap()
 }
 
+/// `Item.GetSecret` must answer one `(oayays)` struct, not four loose
+/// values. Introspection advertises the struct, libsecret tolerates the
+/// flattening, and every strict client (Python secretstorage among them)
+/// reads the header signature and chokes: `secret, = call(...)` fails with
+/// "too many values to unpack (expected 1, got 4)".
+///
+/// Asserted through `busctl monitor`, not through the reply object: zbus's
+/// client side reports the promised signature whatever the bytes carry, and
+/// decoding is structurally lenient both ways, so neither can pin the
+/// framing — only an independent bus observer sees the header as sent.
+/// (Skipped where `busctl` is absent; it ships with the same dbus package
+/// the fixture's `dbus-daemon` comes from.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_secret_reply_is_a_single_struct_on_the_wire() {
+    if tokio::process::Command::new("busctl")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_err()
+    {
+        eprintln!("skipped: busctl not found");
+        return;
+    }
+    let fx = Fixture::start().await;
+    fx.unlock_default().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let session = plain_session(&service).await;
+    let coll = collection(&conn, fx.default_collection()).await;
+    let (item_path, _) = coll
+        .create_item(
+            props("framing probe", &[("app", "framing")]),
+            &plain_secret(&session, b"tok"),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let mut mon = tokio::process::Command::new("busctl")
+        .args([
+            "--address",
+            &fx.bus.address,
+            "monitor",
+            "org.freedesktop.secrets",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Give the monitor a moment to attach before the only call it must see.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    conn.call_method(
+        Some("org.freedesktop.secrets"),
+        item_path.as_str(),
+        Some("org.freedesktop.Secret.Item"),
+        "GetSecret",
+        &(session.clone(),),
+    )
+    .await
+    .unwrap();
+    // The call already returned, so the reply is on the bus; the wait is
+    // only for the monitor's pipe to deliver it.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let _ = mon.kill().await;
+    let out = mon.wait_with_output().await.unwrap();
+    let log = String::from_utf8_lossy(&out.stdout);
+    let mut lines = log.lines();
+    let reply_message = loop {
+        let line = lines
+            .by_ref()
+            .find(|l| l.contains("Member=GetSecret"))
+            .expect("monitor saw the call");
+        let _ = lines
+            .by_ref()
+            .find(|l| l.contains("Type=method_return"))
+            .expect("monitor saw the reply");
+        let message = lines
+            .by_ref()
+            .find(|l| l.trim_start().starts_with("MESSAGE "))
+            .expect("reply has a body signature");
+        if line.contains("Interface=org.freedesktop.Secret.Item") {
+            break message.trim().to_string();
+        }
+    };
+    assert_eq!(
+        reply_message, "MESSAGE \"(oayays)\" {",
+        "GetSecret reply framing on the wire"
+    );
+}
+
 fn error_name(e: &zbus::Error) -> String {
     match e {
         zbus::Error::MethodError(name, _, _) => name.to_string(),

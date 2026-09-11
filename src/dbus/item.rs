@@ -105,7 +105,7 @@ impl Item {
         &self,
         session: OwnedObjectPath,
         #[zbus(header)] header: Header<'_>,
-    ) -> Result<SecretStruct> {
+    ) -> Result<(SecretStruct,)> {
         let (cipher, vault) = {
             let st = self.state.lock().await;
             let cipher =
@@ -127,12 +127,22 @@ impl Item {
         // real item path needed — so `idle_lock` never fired and the keys
         // stayed in daemon memory indefinitely.
         self.state.lock().await.touch();
-        Ok(SecretStruct {
+        // A one-tuple, not a bare struct: zbus writes message-body signature
+        // headers with top-level struct parentheses stripped
+        // (`SignatureSerializer` uses `to_string_no_parens`), so a bare
+        // `SecretStruct` return goes out as `oayays` while introspection —
+        // and the spec, and every strict client — expects one `(oayays)`
+        // struct. The tuple's own signature is `((oayays))`, the strip
+        // leaves exactly one layer, and introspection iterates the single
+        // element, so all three agree. If a future zbus stops stripping,
+        // `get_secret_reply_is_a_single_struct_on_the_wire` fails and this
+        // wrapper goes away with it.
+        Ok((SecretStruct {
             session,
             parameters,
             value,
             content_type,
-        })
+        },))
     }
 
     async fn set_secret(
