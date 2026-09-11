@@ -380,6 +380,31 @@ async fn extract_gnome(source_dir: &Path, container: &str) -> Result<Extraction,
     })
 }
 
+/// Sentences for listings the walk skipped as repeats of an already-listed
+/// folder or entry (see `kwallet::Extraction::{duplicate_folders,
+/// duplicate_entries}`). Kept beside the rest of the KWallet notes so the
+/// report says the daemon was not taken at its word.
+fn kwallet_notes(walked: &kwallet::Extraction) -> Vec<String> {
+    let mut notes = Vec::new();
+    if walked.duplicate_folders > 0 {
+        notes.push(format!(
+            "{} folder listings repeated a folder that was already listed, so the repeats were \
+             not read again: kwalletd repeats every folder in folderList once per open, and \
+             reading them again would import every entry once per copy",
+            walked.duplicate_folders
+        ));
+    }
+    if walked.duplicate_entries > 0 {
+        notes.push(format!(
+            "{} entry listings repeated an entry that was already listed in the same folder, \
+             so the repeats were not read again: a folder is a map, so a repeat is never a \
+             second entry",
+            walked.duplicate_entries
+        ));
+    }
+    notes
+}
+
 /// KWallet, over `org.kde.kwalletd6` on the session bus: a different bus name
 /// from ours, so this path needs no private bus and no ordering against our
 /// own daemon.
@@ -499,6 +524,7 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
             escape_control(folder)
         ));
     }
+    notes.extend(kwallet_notes(&walked));
     Ok(Extraction {
         container: wallet.to_string(),
         items: walked
@@ -2272,6 +2298,40 @@ mod tests {
         );
         // The item with neither is in neither paragraph.
         assert!(!out.contains("A migrated login"), "{out}");
+    }
+
+    /// A daemon that repeats listings must be audible in the report. Without
+    /// these sentences a wallet whose daemon tripled every folder imports
+    /// cleanly and nothing says the counts were ever in doubt.
+    #[test]
+    fn repeated_listings_get_their_own_notes() {
+        let walked = kwallet::Extraction {
+            duplicate_folders: 3,
+            duplicate_entries: 5,
+            ..Default::default()
+        };
+
+        let out = kwallet_notes(&walked).join("\n");
+
+        assert!(
+            out.contains("3 folder listings repeated a folder"),
+            "no folder sentence: {out}"
+        );
+        assert!(
+            out.contains("5 entry listings repeated an entry"),
+            "no entry sentence: {out}"
+        );
+    }
+
+    /// And silence when there is nothing to say: the common case adds no
+    /// paragraphs.
+    #[test]
+    fn no_repeats_means_no_repeat_notes() {
+        let walked = kwallet::Extraction {
+            ..Default::default()
+        };
+
+        assert!(kwallet_notes(&walked).is_empty());
     }
 
     fn wallet_source_file() -> SourceFile {

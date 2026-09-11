@@ -1733,6 +1733,18 @@ pub struct Extraction {
     /// Folders `entryList` refused. Their entries are unreachable and their
     /// sidecar rows will show up in `unresolved_sidecar_rows`.
     pub unreadable_folders: Vec<String>,
+    /// Folder listings skipped because the folder was already listed.
+    ///
+    /// A live kwalletd6 repeats every folder in `folderList` once per
+    /// `open()`, so without this the same entries are imported once per
+    /// copy and the header/walk count check fails the run. Folder names
+    /// are unique keys — `createFolder` refuses a duplicate — so a repeat
+    /// is the daemon misspeaking, never a second folder.
+    pub duplicate_folders: usize,
+    /// Entry listings skipped because the entry was already listed in the
+    /// same folder. A folder is a map, so a repeat is the same class of
+    /// daemon misspeaking as [`Extraction::duplicate_folders`].
+    pub duplicate_entries: usize,
     /// Anything the run must not be silent about that is not an entry: a
     /// `close` that failed after the walk succeeded, for example. The walk's
     /// result is returned unchanged beside these; a note never masks it.
@@ -2018,7 +2030,15 @@ async fn walk<R: WalletReader>(
     let mut listings: Vec<Listing> = Vec::new();
     let mut claims: BTreeMap<String, usize> = BTreeMap::new();
     let mut listed = 0usize;
+    let mut seen_folders: BTreeSet<String> = BTreeSet::new();
     for folder in folders {
+        // A repeated folder is the daemon misspeaking (see
+        // `duplicate_folders`): re-reading it would import every entry
+        // twice and charge the secret budget twice for the same bytes.
+        if !seen_folders.insert(folder.clone()) {
+            out.duplicate_folders += 1;
+            continue;
+        }
         let entries = match reader.entry_list(&folder).await {
             Ok(e) => e,
             Err(_) => {
@@ -2026,6 +2046,20 @@ async fn walk<R: WalletReader>(
                 continue;
             }
         };
+        // Same class of misspeaking one level down: a folder is a map, so
+        // a repeated entry name is never a second entry.
+        let mut seen_entries: BTreeSet<String> = BTreeSet::new();
+        let entries: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| {
+                if seen_entries.insert(entry.clone()) {
+                    true
+                } else {
+                    out.duplicate_entries += 1;
+                    false
+                }
+            })
+            .collect();
         if entries.is_empty() {
             out.empty_folders += 1;
             continue;
@@ -3316,6 +3350,45 @@ mod tests {
             out.password_read_fallbacks, 1,
             "an entry that was skipped was counted as a recovery"
         );
+    }
+
+    /// A live kwalletd6 repeats every folder in `folderList` once per
+    /// `open()` — 2x, then 3x, then 4x observed against one real daemon —
+    /// so the walk must treat a repeated folder as the same folder, not a
+    /// second one. Without the dedupe each entry is imported once per copy
+    /// and the header/walk count check fails the whole run.
+    #[tokio::test]
+    async fn a_folder_list_that_repeats_a_folder_imports_its_entries_once() {
+        let fake = FakeWallet::default()
+            .folder("Passwords", &["a"])
+            .folder("Passwords", &["a"])
+            .password("Passwords", "a", "hunter2");
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert_eq!(
+            out.items.len(),
+            1,
+            "the folder was walked twice: {:?}",
+            out.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert_eq!(out.duplicate_folders, 1);
+        assert_eq!(out.duplicate_entries, 0);
+    }
+
+    /// The same misspeaking one level down: a folder is a map, so a
+    /// repeated entry name is never a second entry.
+    #[tokio::test]
+    async fn an_entry_list_that_repeats_an_entry_imports_it_once() {
+        let fake = FakeWallet::default()
+            .folder("Passwords", &["a", "a"])
+            .password("Passwords", "a", "hunter2");
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.duplicate_entries, 1);
+        assert_eq!(out.duplicate_folders, 0);
     }
 
     /// Fallback bytes that are not a serialised `QString` are refused, not
