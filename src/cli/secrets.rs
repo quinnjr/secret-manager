@@ -3,16 +3,19 @@
 use super::client::{Client, ItemInfo};
 use super::{CliError, read_secret_from_stdin};
 // A terminal row and a dialog line have the same problem, so they use the
-// same table: `crate::dbus::prompt::is_invisible_format`. This file used to
-// carry its own narrower copy, which omitted the private-use planes, the
-// Arabic number signs, the interlinear annotations and the tag characters —
-// all of which a font may render as anything at all, or as nothing — so a
-// planted item could hide part of an `sm ssh list` row that the dialogs
-// already refused to hide. Found by `fuzz_targets/escape_control_sanitize.rs`
-// on U+F0000; keeping one table is what stops the two drifting again.
-use crate::dbus::prompt::is_invisible_format;
+// same escaper, and it lives in `crate::sanitize` — always compiled,
+// because `src/vault/` is the PAM cdylib's half of the crate too, and the
+// PAM module has peer-supplied text of its own to render. This file used to
+// carry its own copy of the function *and* of the character table, and the
+// table was the narrower one: it omitted the private-use planes, the Arabic
+// number signs, the interlinear annotations and the tag characters — all of
+// which a font may render as anything at all, or as nothing — so a planted
+// item could hide part of an `sm ssh list` row that the dialogs already
+// refused to hide. Found by `fuzz_targets/escape_control_sanitize.rs` on
+// U+F0000; one definition is what stops the two drifting again, and the
+// re-export keeps `super::secrets::escape_control` working for the dozens of
+// call sites (and for `crate::fuzz_api`) that name it here.
 use std::collections::{BTreeMap, HashSet};
-use std::fmt::Write as _;
 use std::io::Write;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -47,7 +50,9 @@ fn merge_unlocked(
 }
 
 /// Search, unlocking what is locked. A dismissed prompt is tolerated when
-/// something already matched (`sm get`, `sm list`, `sm ssh`).
+/// something already matched (`sm get`, `sm ssh`). `sm list` is not a caller:
+/// it never unlocks and prompts for nothing, so it walks the collections
+/// itself.
 pub(crate) async fn find(
     client: &Client,
     query: &BTreeMap<String, String>,
@@ -105,25 +110,10 @@ async fn find_inner(
 /// Render a string for a terminal: labels and attribute values come from argv
 /// or from any bus client, so a `\r`, an ANSI escape or a bidi override could
 /// erase, forge or reorder `sm list` rows. Anything below U+0020, plus DEL and
-/// the invisible formatters above, becomes `\xNN` per UTF-8 byte.
-pub(crate) fn escape_control(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut scratch = [0u8; 4];
-    for ch in s.chars() {
-        if ch.is_control() || is_invisible_format(ch) {
-            // `write!` into the buffer we already have: this runs per
-            // attribute key and value per `sm list` row, and on every daemon
-            // error, so the old `ch.to_string()` plus a `format!` per byte was
-            // two allocations for every escaped byte.
-            for b in ch.encode_utf8(&mut scratch).as_bytes() {
-                let _ = write!(out, "\\x{b:02x}");
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
+/// the invisible formatters, becomes `\xNN` per UTF-8 byte.
+///
+/// One definition, in `crate::sanitize`; see the note at the top of this file.
+pub(crate) use crate::sanitize::escape_control;
 
 #[cfg(test)]
 mod tests {
@@ -298,7 +288,7 @@ mod tests {
     #[test]
     fn items_group_by_their_collection() {
         let p = |s: &str| OwnedObjectPath::try_from(s.to_string()).unwrap();
-        let groups = group_by_collection(&[
+        let groups = group_paths_by_owner(&[
             p("/org/freedesktop/secrets/collection/default/a"),
             p("/org/freedesktop/secrets/collection/work/b"),
             p("/org/freedesktop/secrets/collection/default/c"),
@@ -334,10 +324,11 @@ mod tests {
 pub async fn get(attrs: Vec<String>, label: Option<String>) -> Result<(), CliError> {
     let query = parse_attrs(&attrs)?;
     let client = Client::connect().await?;
+    let found = find(&client, &query).await?;
     let mut best: Option<ItemInfo> = None;
     let mut matches = 0usize;
-    for path in find(&client, &query).await? {
-        let info = client.item_info(&path).await?;
+    for path in &found {
+        let info = client.item_info(path).await?;
         if label.as_deref().is_some_and(|l| l != info.label) {
             continue;
         }
@@ -360,7 +351,8 @@ pub async fn get(attrs: Vec<String>, label: Option<String>) -> Result<(), CliErr
             escape_control(&info.label)
         );
     }
-    let secret = client.get_secret(&info.path).await?;
+    let path = info.path;
+    let secret = client.get_secret(&path).await?;
     let mut out = std::io::stdout().lock();
     out.write_all(&secret)?;
     out.flush()?;
@@ -418,7 +410,7 @@ pub(crate) async fn delete_each(
     let mut deleted = 0usize;
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut untouched: Vec<(String, usize, String)> = Vec::new();
-    for (collection, paths) in group_by_collection(items) {
+    for (collection, paths) in group_paths_by_owner(items) {
         // A path we cannot attribute to a collection cannot be batched; it is
         // almost certainly stale, and `Item.Delete` will say so.
         let batched = match &collection {
@@ -452,20 +444,29 @@ pub(crate) async fn delete_each(
 /// Item paths grouped by the collection they live in, preserving the input
 /// order within each group. A path that is not an item path under a collection
 /// or alias groups under `None`.
-fn group_by_collection(
+///
+/// Hashed index rather than a linear `find` per element, matching the
+/// `group_by_collection` in `dbus::service`; buckets come back in
+/// first-appearance order with each group's paths in input order.
+fn group_paths_by_owner(
     items: &[OwnedObjectPath],
 ) -> Vec<(Option<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
     use crate::dbus::paths::{self, Target};
+    use std::collections::HashMap;
     let mut groups: Vec<(Option<OwnedObjectPath>, Vec<OwnedObjectPath>)> = Vec::new();
+    let mut at: HashMap<Option<OwnedObjectPath>, usize> = HashMap::new();
     for item in items {
         let owner = match paths::parse(item.as_str()) {
             Some(Target::Item { collection, .. }) => Some(paths::collection(&collection)),
             Some(Target::AliasItem { alias, .. }) => paths::alias(&alias),
             _ => None,
         };
-        match groups.iter_mut().find(|(c, _)| *c == owner) {
-            Some((_, paths)) => paths.push(item.clone()),
-            None => groups.push((owner, vec![item.clone()])),
+        match at.get(&owner) {
+            Some(&slot) => groups[slot].1.push(item.clone()),
+            None => {
+                at.insert(owner.clone(), groups.len());
+                groups.push((owner, vec![item.clone()]));
+            }
         }
     }
     groups

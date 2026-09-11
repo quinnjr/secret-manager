@@ -166,7 +166,7 @@ impl Client {
         SecretStruct {
             session: self.session.clone(),
             parameters,
-            value,
+            value: Zeroizing::new(value),
             content_type: content_type.to_string(),
         }
     }
@@ -355,20 +355,37 @@ impl Client {
                 Value::from(attrs_map),
             ),
         ]);
-        let (item, _prompt) = proxy
+        let (item, prompt) = proxy
             .create_item(props, &self.encrypt(secret, "text/plain"), true)
             .await
             .map_err(map_zbus)?;
-        Ok(item)
+        // Our own daemon always answers `/` here, but `CreateItem` is
+        // specified to be allowed to return a prompt instead of an item, and
+        // the provider on the other end need not be ours — a foreign
+        // implementation, or the same-uid impostor the README accepts as
+        // possible. Discarding the prompt made `sm set` print nothing, store
+        // nothing, and exit 0. `unlock` drives its prompt; so does this.
+        let prompt_result = if prompt.as_str() == "/" {
+            None
+        } else {
+            Some(self.perform_prompt(&prompt).await?)
+        };
+        created_item_path(&item, prompt_result)
     }
 
     pub async fn delete_item(&self, item: &OwnedObjectPath) -> Result<(), CliError> {
-        self.item_proxy(item)
+        // As with `store` above: `Item.Delete` may answer with a prompt, and
+        // a discarded one is a delete that never happened reported as success.
+        let prompt = self
+            .item_proxy(item)
             .await?
             .delete()
             .await
-            .map(|_| ())
-            .map_err(map_zbus)
+            .map_err(map_zbus)?;
+        if prompt.as_str() != "/" {
+            self.perform_prompt(&prompt).await?;
+        }
+        Ok(())
     }
 
     /// Delete every item in `items` from `collection` in one atomic call, via
@@ -424,9 +441,82 @@ impl Client {
     }
 }
 
+/// Interpret a `CreateItem` reply.
+///
+/// Split out of [`Client::store`] because the bus half is not reachable from
+/// the suite: our own daemon always answers `/` for the prompt, so the
+/// prompt-driving branches have no integration coverage and the decoding they
+/// depend on would go untested. Here it is four ordinary cases.
+///
+/// `prompt_result` is `None` when the reply carried no prompt, and otherwise
+/// the value the completed prompt returned. Either way the answer must be a
+/// real object path: `/` from *either* half means nothing was created, and
+/// returning it would make `sm set` exit 0 having stored nothing.
+fn created_item_path(
+    item: &OwnedObjectPath,
+    prompt_result: Option<OwnedValue>,
+) -> Result<OwnedObjectPath, CliError> {
+    let created = match prompt_result {
+        Some(result) => OwnedObjectPath::try_from(result)
+            .map_err(|e| CliError::Failed(format!("bad CreateItem result: {e}")))?,
+        None => item.clone(),
+    };
+    if created.as_str() == "/" {
+        return Err(CliError::Failed(
+            "the secret service returned neither an item nor a prompt for CreateItem".into(),
+        ));
+    }
+    Ok(created)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four shapes a `CreateItem` reply can take. The third is the one
+    /// this test exists for: the non-prompt branch has always refused `/`,
+    /// and a prompt that completes with `/` is the same "nothing was stored"
+    /// answer one branch over.
+    #[test]
+    fn a_create_item_reply_yields_a_path_or_an_error() {
+        let item =
+            OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/login/1").unwrap();
+        let none = OwnedObjectPath::try_from("/").unwrap();
+
+        // An item, no prompt.
+        assert_eq!(created_item_path(&item, None).unwrap(), item);
+
+        // No item, a prompt that completed with the created path.
+        let via_prompt = created_item_path(
+            &none,
+            Some(OwnedValue::try_from(Value::from(item.clone())).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(via_prompt, item);
+
+        // A prompt that completed with `/`: nothing was created, and this
+        // must not read as success.
+        let err = created_item_path(
+            &none,
+            Some(OwnedValue::try_from(Value::from(none.clone())).unwrap()),
+        )
+        .expect_err("a prompt completing with `/` created nothing");
+        assert!(
+            err.to_string().contains("neither an item nor a prompt"),
+            "got {err}"
+        );
+
+        // A prompt that completed with something that is not an object path.
+        let err = created_item_path(
+            &none,
+            Some(OwnedValue::try_from(Value::from("not a path")).unwrap()),
+        )
+        .expect_err("a non-path prompt result is not an item");
+        assert!(
+            err.to_string().contains("bad CreateItem result"),
+            "got {err}"
+        );
+    }
 
     /// Which name lands in which arm decides the process exit code, and that
     /// is what a script branches on. Only the transport arm is reachable from

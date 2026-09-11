@@ -16,11 +16,48 @@ use zbus::message::Header;
 use zbus::object_server::{ObjectServer, SignalEmitter};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-/// Upper bound on one item's decrypted secret, matching the control
-/// protocol's frame cap. Without it a single client could push a collection
-/// past the vault-level size limit — at which point the whole collection
-/// stops saving — with one `CreateItem` call.
-pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
+/// The per-item caps live in [`crate::vault::format`], not here, because
+/// they are re-applied by `Vault::import_items` on the offline import path,
+/// which is compiled without the `daemon` feature. Re-exported so this
+/// module's public surface is unchanged.
+pub use crate::vault::format::{
+    MAX_ATTRIBUTE_KEY, MAX_ATTRIBUTE_VALUE, MAX_ITEM_ATTRIBUTES, MAX_ITEM_CONTENT_TYPE,
+    MAX_ITEM_LABEL, MAX_ITEM_SECRET,
+};
+
+/// The *predicate* moved with the constants, for the same reason and one step
+/// later: three layers each measured the same six caps in their own order
+/// with their own error type - here, in `Vault::import_items`, and in
+/// `import`'s pre-flight check - and when three hand-maintained copies of an
+/// ordering drift, the symptom is a pre-check that passes an item the vault
+/// then refuses halfway through a migration. [`Cap`] decides what is too
+/// large; everything below only decides what to say about it.
+use crate::vault::format::{Cap, CapViolation};
+
+/// Render one cap violation as the `InvalidArgs` this layer has always
+/// returned. The wording is per-cap and unchanged, so no client-visible
+/// message moves.
+pub(crate) fn cap_message(v: CapViolation) -> String {
+    let limit = v.limit;
+    match v.cap {
+        Cap::Secret => format!("secret is too large; at most {limit} bytes per item"),
+        Cap::Label => format!("label is too large; at most {limit} bytes per item"),
+        Cap::ContentType => format!("content type is too large; at most {limit} bytes per item"),
+        Cap::AttributeCount => format!("too many attributes; at most {limit} per item"),
+        Cap::AttributeKey => {
+            format!("attribute name is too large; at most {limit} bytes per attribute")
+        }
+        Cap::AttributeValue => {
+            format!("attribute value is too large; at most {limit} bytes per attribute")
+        }
+    }
+}
+
+/// [`cap_message`] as the `InvalidArgs` the property setters must return; see
+/// [`check_label`] for why they cannot return [`Error`].
+fn invalid_args(v: CapViolation) -> zbus::fdo::Error {
+    zbus::fdo::Error::InvalidArgs(cap_message(v))
+}
 
 /// Upper bound on the *ciphertext* of one item's secret, checked before the
 /// decrypt rather than after it.
@@ -42,53 +79,12 @@ pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
 /// measured exactly, after the decrypt, against `MAX_ITEM_SECRET`.
 pub const MAX_ITEM_CIPHERTEXT: usize = MAX_ITEM_SECRET + 16;
 
-/// Upper bound on one item's label.
-///
-/// The label is serialised into the same encrypted item blob as the secret,
-/// so it counts against the vault-level size limit in exactly the same way —
-/// capping only the secret left the cap reachable in two `CreateItem` calls
-/// through the label instead of 256 through the secret. 4 KiB is far more
-/// than any real client needs (libsecret labels are a line of UI text) while
-/// still leaving room for a long multi-byte one.
-pub const MAX_ITEM_LABEL: usize = 4 * 1024;
-
-/// Upper bound on the number of attribute pairs on one item. Attributes are
-/// stored in the item blob, and are also hashed into the header's search
-/// index, so each pair costs twice. Real schemas use a handful; libsecret's
-/// own built-in schemas top out well under ten.
-pub const MAX_ITEM_ATTRIBUTES: usize = 64;
-
-/// Upper bound on one attribute name. Attribute names are schema field names.
-pub const MAX_ATTRIBUTE_KEY: usize = 256;
-
-/// Upper bound on one attribute value. Values are identifiers, paths and
-/// usernames; this project's own largest is an ssh key path.
-///
-/// Together the three attribute caps bound one item's attribute set at
-/// 64 * (256 + 512) = 48 KiB, generous for a real client and small enough
-/// that reaching [`crate::vault::format::MAX_VAULT_BYTES`] through attributes takes
-/// as many calls as reaching it through capped secrets.
-pub const MAX_ATTRIBUTE_VALUE: usize = 512;
-
-/// Upper bound on one item's content type.
-///
-/// The last caller-supplied field that lands in the encrypted item blob, so
-/// the same reasoning as the label: uncapped, it is another way to push a
-/// collection past the vault size limit, just wearing a different field name.
-/// A content type is a MIME type — RFC 6838 caps a registered type or subtree
-/// name at 127 bytes each, so 255 covers `type/subtree` at the registry's own
-/// maximum, and 256 leaves room for a parameter such as `; charset=utf-8`.
-/// Real clients send `text/plain` or `application/octet-stream`.
-pub const MAX_ITEM_CONTENT_TYPE: usize = 256;
-
 /// Refuse an over-long content type. See [`check_label`] for the error type.
 pub(crate) fn check_content_type(content_type: &str) -> std::result::Result<(), zbus::fdo::Error> {
-    if content_type.len() > MAX_ITEM_CONTENT_TYPE {
-        return Err(zbus::fdo::Error::InvalidArgs(format!(
-            "content type is too large; at most {MAX_ITEM_CONTENT_TYPE} bytes per item"
-        )));
+    match Cap::ContentType.check(content_type.len()) {
+        Some(v) => Err(invalid_args(v)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuse an over-long item label.
@@ -99,12 +95,10 @@ pub(crate) fn check_content_type(content_type: &str) -> std::result::Result<(), 
 /// [`super::errors::vault_error_to_fdo`]) and must share this check. `?`
 /// converts it to [`Error`] on the method paths.
 pub(crate) fn check_label(label: &str) -> std::result::Result<(), zbus::fdo::Error> {
-    if label.len() > MAX_ITEM_LABEL {
-        return Err(zbus::fdo::Error::InvalidArgs(format!(
-            "label is too large; at most {MAX_ITEM_LABEL} bytes per item"
-        )));
+    match Cap::Label.check(label.len()) {
+        Some(v) => Err(invalid_args(v)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Refuse an over-large attribute set: too many pairs, or a pair whose name
@@ -113,21 +107,15 @@ pub(crate) fn check_attributes<'a>(
     count: usize,
     pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
 ) -> std::result::Result<(), zbus::fdo::Error> {
-    if count > MAX_ITEM_ATTRIBUTES {
-        return Err(zbus::fdo::Error::InvalidArgs(format!(
-            "too many attributes; at most {MAX_ITEM_ATTRIBUTES} per item"
-        )));
+    if let Some(over) = Cap::AttributeCount.check(count) {
+        return Err(invalid_args(over));
     }
     for (k, v) in pairs {
-        if k.len() > MAX_ATTRIBUTE_KEY {
-            return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "attribute name is too large; at most {MAX_ATTRIBUTE_KEY} bytes per attribute"
-            )));
-        }
-        if v.len() > MAX_ATTRIBUTE_VALUE {
-            return Err(zbus::fdo::Error::InvalidArgs(format!(
-                "attribute value is too large; at most {MAX_ATTRIBUTE_VALUE} bytes per attribute"
-            )));
+        if let Some(over) = Cap::AttributeKey
+            .check(k.len())
+            .or_else(|| Cap::AttributeValue.check(v.len()))
+        {
+            return Err(invalid_args(over));
         }
     }
     Ok(())
@@ -276,6 +264,35 @@ impl Collection {
             .collect())
     }
 
+    /// Create an item, or overwrite one when `replace` is set.
+    ///
+    /// **What `replace` matches.** The freedesktop spec says only that
+    /// `replace` overwrites "an item with the same attributes", which admits
+    /// two readings: the *exact same* attribute set, or any item whose
+    /// attributes are a superset of the ones given (the rule `SearchItems`
+    /// uses). This implementation takes the first: an item is replaced only
+    /// when its attribute map is equal to the one supplied, key for key and
+    /// value for value. A strict subset, a superset, or one differing value
+    /// creates a new item instead.
+    ///
+    /// Exact equality is the safer of the two readings, and the asymmetry is
+    /// deliberate. Under the search reading, `CreateItem` with the single
+    /// attribute `{service: mail}` and `replace = true` would silently
+    /// destroy every distinct account item carrying that attribute — a
+    /// destructive act the client did not ask for and cannot undo, since the
+    /// prior secret is gone. Under this reading the worst outcome is a
+    /// duplicate item, which the client can see and delete. It is also what a
+    /// `secret-tool store` round-trip expects: the same command run twice
+    /// updates its own item rather than creating a second.
+    ///
+    /// At most **one** item is replaced — the first in the vault's own item
+    /// order — so a collection that already holds duplicates (written by an
+    /// older build, an import, or another implementation) is narrowed by one
+    /// per call rather than collapsed in a single write.
+    ///
+    /// A replace answers `ItemChanged` on the collection and reuses the
+    /// existing item's path and `Created` timestamp; a create answers
+    /// `ItemCreated` with a fresh path.
     #[zbus(out_args("item", "prompt"))]
     async fn create_item(
         &self,
@@ -328,10 +345,8 @@ impl Collection {
                 .map_err(Error::failed)?;
             // The exact check: `MAX_ITEM_CIPHERTEXT` only bounds the plaintext
             // from above, it does not measure it.
-            if plaintext.len() > MAX_ITEM_SECRET {
-                return Err(Error::invalid_args(format!(
-                    "secret is too large; at most {MAX_ITEM_SECRET} bytes per item"
-                )));
+            if let Some(over) = Cap::Secret.check(plaintext.len()) {
+                return Err(Error::invalid_args(cap_message(over)));
             }
             block_in_place(|| {
                 vault.insert_item(

@@ -276,7 +276,7 @@ async fn unlock_by_item_path_and_lock() {
     let secret = SecretStruct {
         session: session.clone(),
         parameters: vec![],
-        value: b"s".to_vec(),
+        value: b"s".to_vec().into(),
         content_type: "text/plain".into(),
     };
     let (item_path, _) = coll.create_item(props, &secret, false).await.unwrap();
@@ -309,7 +309,7 @@ async fn unlock_by_item_path_and_lock() {
         .get_secrets(std::slice::from_ref(&item_path), &session)
         .await
         .unwrap();
-    assert_eq!(got[&item_path].value, b"s");
+    assert_eq!(got[&item_path].value.as_slice(), b"s");
 }
 
 /// A prompt belongs to the client that obtained it (`Service.Unlock` etc.):
@@ -1121,6 +1121,70 @@ async fn outstanding_prompts_are_capped_per_client() {
     assert_eq!(
         fx.daemon.state.lock().await.prompt_owners.len(),
         MAX_PROMPTS_PER_OWNER + 1
+    );
+}
+
+/// The quota is a cap on *prompts*, so it may only refuse a call that would
+/// create one. `Unlock` of a collection that is already unlocked creates none:
+/// it answers from the resolution loop and returns `/`.
+///
+/// This is the case the cap must not eat. libsecret calls `Unlock`
+/// unconditionally before a read, and a prompt entry clears only on
+/// completion, dismissal or the owner's departure — so a client that leaks
+/// prompts would otherwise lose the ability to read collections that are not
+/// locked at all, which is every read it makes for the rest of its life.
+///
+/// The budget is filled with `CreateCollection` prompts precisely so the
+/// collection under test can be genuinely unlocked first; the existing quota
+/// tests all unlock a locked collection, which is why the regression this
+/// guards was invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_quota_unlock_of_an_unlocked_collection_still_succeeds() {
+    use secret_manager::dbus::state::MAX_PROMPTS_PER_OWNER;
+
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let (dismissed, _) = perform(&conn, &prompt).await;
+    assert!(!dismissed, "the fixture pinentry must answer the unlock");
+    let coll = collection(&conn, fx.default_collection()).await;
+    assert!(!coll.locked().await.unwrap());
+
+    for i in 0..MAX_PROMPTS_PER_OWNER {
+        let props = HashMap::from([(
+            "org.freedesktop.Secret.Collection.Label",
+            Value::from(format!("quota filler {i}")),
+        )]);
+        let (_, prompt) = service.create_collection(props, "").await.unwrap();
+        assert!(
+            prompt
+                .as_str()
+                .starts_with("/org/freedesktop/secrets/prompt/"),
+            "filler {i} allocated no prompt: {prompt}"
+        );
+    }
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER,
+        "the budget must be full for this test to mean anything"
+    );
+
+    let (unlocked, prompt) = service
+        .unlock(&[fx.default_collection()])
+        .await
+        .expect("an Unlock that creates no prompt must not be refused for want of prompt budget");
+    assert_eq!(unlocked, vec![fx.default_collection()]);
+    assert_eq!(
+        prompt.as_str(),
+        "/",
+        "nothing was locked, so nothing prompts"
+    );
+    assert_eq!(
+        fx.daemon.state.lock().await.prompt_owners.len(),
+        MAX_PROMPTS_PER_OWNER,
+        "a successful no-op Unlock registers no prompt owner"
     );
 }
 
@@ -2126,7 +2190,7 @@ async fn deleting_a_collection_unexports_its_item_objects() {
     let secret = SecretStruct {
         session,
         parameters: vec![],
-        value: b"s".to_vec(),
+        value: b"s".to_vec().into(),
         content_type: "text/plain".into(),
     };
     let (item_path, _) = work.create_item(item_props, &secret, false).await.unwrap();
@@ -2602,4 +2666,57 @@ async fn the_alias_cap_holds_on_the_create_collection_path() {
         .set_alias(&format!("filler_{already}"), &created)
         .await
         .unwrap();
+}
+
+/// `Prompt(window_id)` is accepted and deliberately ignored — see the decision
+/// recorded on `dbus::prompt::Prompt::prompt`. Every other prompt test in this
+/// file passes `""`, so this is the one place the argument is exercised with a
+/// value: an unlock driven with a non-empty handle still succeeds, and nothing
+/// derived from the handle reaches the pinentry.
+///
+/// The value is shaped like a real X11 window id with an Assuan injection
+/// glued to it. If the handle were ever forwarded as `OPTION parent-wid=`,
+/// this is the input that must not reach the dialog unescaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_window_id_is_accepted_and_ignored() {
+    let fx = Fixture::start().await;
+    let conn = fx.client().await;
+    let service = ServiceProxy::new(&conn).await.unwrap();
+    let coll = collection(&conn, fx.default_collection()).await;
+    assert!(coll.locked().await.unwrap());
+
+    let (_, prompt) = service.unlock(&[fx.default_collection()]).await.unwrap();
+    let proxy = PromptProxy::builder(&conn)
+        .path(prompt.clone())
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let mut completed = proxy.receive_completed().await.unwrap();
+    proxy
+        .prompt("41943045\nOPTION parent-wid=99\nGETINFO version")
+        .await
+        .unwrap();
+    let sig = tokio::time::timeout(Duration::from_secs(10), completed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let args = sig.args().unwrap();
+    assert!(!args.dismissed, "a window id must not dismiss the prompt");
+    assert_eq!(
+        Vec::<OwnedObjectPath>::try_from(args.result.try_to_owned().unwrap()).unwrap(),
+        vec![fx.default_collection()]
+    );
+    assert!(!coll.locked().await.unwrap());
+
+    let log = fx.pinentry_log();
+    assert!(log.contains("GETPIN"), "the dialog was raised");
+    assert!(
+        !log.contains("parent-wid"),
+        "the window id is not forwarded: {log}"
+    );
+    assert!(
+        !log.contains("41943045") && !log.contains("GETINFO"),
+        "nothing derived from the window id reaches the dialog: {log}"
+    );
 }

@@ -13,7 +13,7 @@ BINDIR   = $(DESTDIR)$(PREFIX)/bin
 SHELL = /bin/sh
 .SHELLFLAGS = -ec
 
-.PHONY: build install uninstall test coverage coverage-html coverage-gaps test-pam fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list
+.PHONY: build install uninstall test coverage coverage-html coverage-gaps test-pam fuzz fuzz-long fuzz-one fuzz-coverage fuzz-list vagrant-verify vagrant-clean
 
 # Two builds of one crate: the default feature set gives the binary (no
 # libpam, no PAM entry points), and the `pam` feature alone gives the cdylib
@@ -38,6 +38,14 @@ test:
 	# wire-format changes. Type-check it here so a change to a shared type
 	# cannot silently disable the fuzz layer.
 	$(CARGO) $(FUZZ_NIGHTLY) check --manifest-path fuzz/Cargo.toml --all-targets
+	# A type-check is not a run. `fuzz/src/lib.rs` carries self-tests whose
+	# whole subject is a generator disagreeing with its own oracle — the
+	# `parses()`/`decodes()` predicates the targets assert on, and the
+	# allocation bound they measure against. Nothing else executes them, so
+	# without this line they are checks that have never checked anything, and
+	# a generator bug surfaces instead as a libFuzzer artifact that reads
+	# like a parser bug.
+	$(CARGO) $(FUZZ_NIGHTLY) test --manifest-path fuzz/Cargo.toml --lib
 	# The PAM feature is a library-only build: the integration tests pull the
 	# crate back in with its default features, which the mutual-exclusion
 	# guard in src/lib.rs correctly rejects.
@@ -112,7 +120,7 @@ FUZZ_TARGETS = vault_decode vault_roundtrip vault_open_unlock vault_items_codec 
                kdf_params protocol_frame protocol_roundtrip dh_peer_public \
                session_cipher display_label escape_control_sanitize \
                pinentry_escape dbus_paths askpass_prompt config_toml \
-               attribute_index
+               attribute_index import_keyring_header import_wallet_header
 # Seconds per target. The default is a smoke test — enough to catch a target
 # that no longer builds or that crashes on its own seed corpus.
 FUZZ_TIME ?= 60
@@ -169,3 +177,20 @@ coverage-html:
 # Uncovered lines, per file. Reuses the last run's profile data.
 coverage-gaps:
 	$(CARGO) llvm-cov report --show-missing-lines
+
+# Verify docs/install-debian.md on a real Debian box. Needs vagrant and a
+# provider; see docs/vagrant.md. Exits non-zero if any documented step fails.
+#
+# `--provision`, not a bare `up`: `vagrant up` runs the provisioners only when
+# it *creates* the box, so on every run after the first a bare `up` boots an
+# existing VM, runs no check at all and exits 0 — a target that cannot fail is
+# not a verification. With the flag the three provisioners run exactly once
+# per invocation, on a new box and an existing one alike, which is also why
+# this is not `up` followed by a separate `provision` (that would run them
+# twice on a fresh box). Re-running only the checks is
+# `vagrant provision --provision-with verify`, per docs/vagrant.md.
+vagrant-verify:
+	vagrant up --provision
+
+vagrant-clean:
+	vagrant destroy -f

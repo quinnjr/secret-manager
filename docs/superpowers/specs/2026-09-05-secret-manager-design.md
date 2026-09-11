@@ -164,12 +164,22 @@ fixes").
 
 Collection: `Delete`, `SearchItems`, `CreateItem`; properties `Items`,
 `Label` (writable), `Locked`, `Created`, `Modified`; signals `ItemCreated`,
-`ItemDeleted`, `ItemChanged`. `Delete` always returns a prompt: it asks for
-confirmation through pinentry (`Permanently delete the keyring '<label>'
-and all <N> secrets?`) and the collection is unlinked only once that prompt
-is run and confirmed; a cancel or refusal leaves the collection untouched
-and completes the prompt with `Completed(true, "/")`. `Item.Delete` stays
-immediate, no prompt.
+`ItemDeleted`, `ItemChanged`. `Delete` returns a prompt **on a collection it
+can delete**: it asks for confirmation through pinentry (`Permanently delete
+the keyring '<label>' and all <N> secrets?`) and the collection is unlinked
+only once that prompt is run and confirmed; a cancel or refusal leaves the
+collection untouched and completes the prompt with `Completed(true, "/")`.
+`Item.Delete` stays immediate, no prompt.
+
+A **locked** collection, and a broken one (which has no vault to count items
+in, and is treated as locked), is refused with `IsLocked` before any prompt
+is created. That is deliberate and pinned by test, not an oversight: the
+dialog names the label and the item count, so it cannot be built without
+reading the header, and prompting for a destructive confirmation the service
+would then have to refuse anyway is worse than refusing first. A client that
+wants to delete a locked collection calls `Unlock` and then `Delete`. The
+"always returns a prompt" this paragraph used to open with was simply false
+against the implementation.
 
 Item: `Delete`, `GetSecret`, `SetSecret`; properties `Locked`, `Attributes`
 (writable), `Label` (writable), `Created`, `Modified`.
@@ -437,6 +447,20 @@ paths pointing at `/usr/bin`.
   service.
 - All I/O and crypto errors flow through one `Error` enum per module using
   `thiserror`; the binary uses `anyhow` at the top.
+- **The three property setters cannot return a typed error, and do not.**
+  `Collection::set_label`, `Item::set_label` and `Item::set_attributes` are
+  zbus `#[zbus(property)]` setters, whose generated code calls
+  `zbus::fdo::Error::from` on the returned error directly. Our `Error` uses
+  its own `org.freedesktop.Secret.Error.*` wire names through a custom
+  `DBusError` impl and has no `From<Error> for zbus::fdo::Error`, so a
+  setter cannot return it. All three therefore report a locked vault as
+  `org.freedesktop.DBus.Error.Failed`, with the name they *meant*
+  (`org.freedesktop.Secret.Error.IsLocked`) written into the description
+  text so it is legible rather than lost. Every other method returns the
+  typed error. This is a deviation from the wire behaviour the rest of this
+  document describes; it is documented at `dbus::errors` and pinned by a
+  test, and it is recorded here because a caller reading only this document
+  would otherwise match on an error name it will never receive.
 
 ## Testing
 

@@ -92,11 +92,16 @@ impl Default for PromptConfig {
 }
 
 impl Default for KdfConfig {
+    /// One number per cost, not two that can drift: the shipped Argon2
+    /// parameters are stated once, in `KdfParams::default`, and this is the
+    /// same three numbers read back out. `defaults_match_spec` asserts the
+    /// two agree as well as asserting the literals the spec names.
     fn default() -> Self {
+        let p = crate::vault::crypto::KdfParams::default();
         Self {
-            m_cost_kib: 65536,
-            t_cost: 3,
-            p_cost: 1,
+            m_cost_kib: p.m_cost_kib,
+            t_cost: p.t_cost,
+            p_cost: p.p_cost,
         }
     }
 }
@@ -229,6 +234,21 @@ mod tests {
         assert_eq!(c.kdf.m_cost_kib, 65536);
         assert_eq!(c.kdf.t_cost, 3);
         assert_eq!(c.kdf.p_cost, 1);
+        // The literals above are the spec's, and they are what catches a
+        // drift in the shipped parameters: `KdfConfig::default` is *defined*
+        // from `KdfParams::default`, so asserting the two agree cannot catch
+        // a change to those three numbers - both sides move together.
+        //
+        // What it does catch is the conversion between the two types: this is
+        // the round trip `KdfParams -> KdfConfig -> KdfParams`, and a `From`
+        // impl that dropped a cost or transposed `t_cost` and `p_cost` fails
+        // here while every assertion above still passes. It would also fail
+        // if `KdfConfig::default` were unwound back into literals that
+        // disagree with the vault layer's.
+        assert_eq!(
+            crate::vault::crypto::KdfParams::from(c.kdf),
+            crate::vault::crypto::KdfParams::default()
+        );
         assert_eq!(c.prompt.pinentry, "pinentry");
         assert_eq!(c.vault.auto_lock_after, Duration::from_secs(15 * 60));
         assert!(!c.vault.lock_memory);

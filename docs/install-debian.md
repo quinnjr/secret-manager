@@ -3,10 +3,23 @@
 ## Build and install
 
 ```sh
-sudo apt install rustup pinentry-curses pinentry-gnome3 dbus openssh-client libpam0g-dev build-essential
+sudo apt install rustc-web cargo-web pinentry-curses pinentry-gnome3 dbus \
+    openssh-client libpam0g-dev build-essential
 make
 sudo make install
 ```
+
+**Why `rustc-web` and not `rustc`.** This crate is edition 2024 and needs
+Rust 1.85 or newer. Debian 12's `rustc` is 1.63, and `rustup` is not packaged
+for bookworm at all — `apt install rustup` there fails with "no installation
+candidate". `rustc-web`/`cargo-web` are Debian's newer Rust, currently 1.96,
+and they install as plain `/usr/bin/rustc` and `/usr/bin/cargo`, so nothing
+else on this page changes. Verified on Debian 12.9; see `docs/vagrant.md`,
+which checks these instructions on a real box.
+
+On a Debian release that packages `rustup`, that works too, as does the
+upstream toolchain from <https://rustup.rs>. Any Rust ≥ 1.85 is fine; the
+package names are the only Debian-specific part.
 
 `PAMDIR` defaults to `/usr/lib/<multiarch-triplet>/security` on Debian and
 derivatives, auto-detected via `dpkg-architecture -qDEB_HOST_MULTIARCH`
@@ -29,9 +42,25 @@ normal user and only `sudo` the install step.
 
 Only one service may own `org.freedesktop.secrets` on the session bus.
 
+**Move your secrets across before you turn the old one off.** Disabling a
+provider does not migrate anything, and the steps below leave the old files
+in place but unread. `sm import --from gnome-keyring --inventory` prints
+what is in the source from its cleartext headers alone — no password, no
+daemon — and `sm import --from gnome-keyring --dry-run` runs the whole
+extraction and every check and writes nothing. Both report, per item,
+whether the application that wrote it will still find it; see "Commands" in
+`README.md` for what the three outcomes mean, and use `--from kwallet` for
+the KWallet section below.
+
 ```sh
 systemctl --user mask gnome-keyring-daemon.service
 ```
+
+**Masking the unit also removes your PKCS#11 provider.** The packaged unit
+runs `--components="pkcs11,secrets"` as one process, so stopping it stops
+both. If you use certificates or a smartcard through NSS — Evolution,
+Chrome, Firefox — re-enable that half alone through the autostart entry
+below, and disable only `secrets`.
 
 If `gnome-keyring` is installed, its own activation file also claims the bus
 name. Override it for your user so the bus starts secret-manager instead:
@@ -41,14 +70,117 @@ mkdir -p ~/.local/share/dbus-1/services
 cp /usr/share/dbus-1/services/org.freedesktop.secrets.service ~/.local/share/dbus-1/services/
 ```
 
-The simplest alternative is to remove gnome-keyring entirely:
+**The systemd unit is not the only thing that starts it.**
+`/etc/xdg/autostart/gnome-keyring-secrets.desktop` launches
+`gnome-keyring-daemon --components=secrets` from a plain desktop session even
+with the unit masked, and it will take the bus name before secret-manager
+does. Shadow it with a per-user override — same filename, `Hidden=true`.
+This truncates any override already at this path — check first if you have
+one:
+
+```sh
+mkdir -p ~/.config/autostart
+if [ -e ~/.config/autostart/gnome-keyring-secrets.desktop ]; then
+    echo "~/.config/autostart/gnome-keyring-secrets.desktop already exists;" >&2
+    echo "not overwriting — edit it by hand to add Hidden=true instead." >&2
+else
+    cat > ~/.config/autostart/gnome-keyring-secrets.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=GNOME Keyring: Secret Service (disabled)
+Exec=/usr/bin/gnome-keyring-daemon --start --foreground --components=secrets
+Hidden=true
+X-GNOME-Autostart-enabled=false
+EOF
+fi
+```
+
+To keep PKCS#11 while disabling secrets, leave
+`/etc/xdg/autostart/gnome-keyring-pkcs11.desktop` alone and do not write an
+override for it.
+
+Removing gnome-keyring entirely is simpler and handles the unit, the
+activation file and both autostart entries at once:
 
 ```sh
 sudo apt purge gnome-keyring
 ```
 
-KWallet does not claim `org.freedesktop.secrets` unless `kwallet-secrets`
-(`ksecretd`) is enabled; disable that in System Settings › KDE Wallet.
+It also removes the PKCS#11 provider, with the consequences above, and APT
+will pull in several GNOME packages as dependents — read what it proposes
+before agreeing.
+
+### KWallet
+
+This section — `ksecretd`'s behaviour, the file paths, the PAM stack
+contents — was reasoned from Debian's packaging, not checked on a live KDE
+session; see `docs/vagrant.md`. Delete this paragraph when
+`docs/vagrant.md` gains a desktop-session box or a manual verification log
+(distro + Plasma/GNOME version); tracked with the migration follow-up on
+`feature/migration-spec`.
+
+Import the wallet before disabling it: `sm import --from kwallet --dry-run`
+(see "Commands" in `README.md`). A native KWallet entry has no attributes,
+so it is preserved and findable with `sm list` and `sm get`, but no
+libsecret client that did not write it will look it up — the dry run says
+how many of yours are in that case.
+
+KWallet claims `org.freedesktop.secrets` through `ksecretd`, and it does so
+at runtime — it will hold the name even when the system activation file
+names gnome-keyring, so the `cp` above does not displace it. Turning it off
+takes four steps, and none of them is the D-Bus override.
+
+Disable the wallet subsystem:
+
+```sh
+kwriteconfig6 --file kwalletrc --group Wallet --key Enabled false
+```
+
+(System Settings › KDE Wallet is the same setting. `kwriteconfig5` on a
+Plasma 5 system — Debian 12 (bookworm). Debian 13 (trixie) ships Plasma 6
+and needs `kwriteconfig6`, as above. Without the key, the default is
+enabled.)
+
+Stop it being activated on demand, under both of its other names. This
+truncates any override already at these paths — check first if you have one:
+
+```sh
+mkdir -p ~/.local/share/dbus-1/services
+for n in org.kde.secretservicecompat org.freedesktop.impl.portal.desktop.kwallet; do
+  printf '[D-BUS Service]\nName=%s\nExec=/bin/false\n' "$n" \
+    > ~/.local/share/dbus-1/services/$n.service
+done
+```
+
+The second name is the xdg-desktop-portal Secret backend: without it,
+sandboxed and Flatpak applications keep reaching KWallet after you have taken
+the main bus name.
+
+If `pam_kwallet5` is in your login stack it will keep unlocking and starting
+KWallet at every login, in parallel with secret-manager's own PAM module.
+Find it:
+
+```sh
+grep -rn pam_kwallet /etc/pam.d/
+```
+
+Comment out the `auth` and `session` lines it matches — on a Debian KDE
+install these are usually in `/etc/pam.d/sddm` and
+`/etc/pam.d/sddm-autologin`. **Keep a root shell open on another TTY while
+you test a new login** — a broken PAM stack can lock you out of the display
+manager. These lines are prefixed `-`, so PAM already tolerates the module
+being absent, which makes commenting them out the low-risk edit. They are
+package-owned and may return on upgrade.
+
+Finally, log out and back in. `ksecretd` holds the bus name for the life of
+the session, so nothing short of a fresh session releases it. Then check:
+
+```sh
+busctl --user status org.freedesktop.secrets | grep -E 'Pid|Comm'
+```
+
+`Comm` should read `secret-manager`. If it still says `ksecretd`, one of the
+four steps has not taken effect.
 
 See `docs/install-common.md` (installed alongside this file at
 `/usr/share/doc/secret-manager/install-common.md`) for creating your vault,

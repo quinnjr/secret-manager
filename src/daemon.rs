@@ -54,8 +54,19 @@ impl DaemonOptions {
 pub enum DaemonError {
     #[error("another secret service already owns {BUS_NAME}")]
     NameTaken,
+    /// A transport failure: the bus could not be reached, addressed or
+    /// connected to. This is the only zbus-shaped variant the CLI reports as
+    /// exit 3 ("daemon or bus unreachable"), which a supervisor reads as "one
+    /// is already running".
     #[error("bus error: {0}")]
     ZBus(zbus::Error),
+    /// A failure to export our own objects or register our own interfaces —
+    /// `serve_at`, `registry::register_all`. The bus is reachable; *we* are
+    /// broken. Reporting this as "unreachable" would tell a supervisor a
+    /// daemon is already running and stop it restarting the one that just
+    /// failed to serve anything.
+    #[error("cannot export the secret service objects: {0}")]
+    Export(zbus::Error),
     #[error("cannot load vaults: {0}")]
     Io(#[from] std::io::Error),
     #[error("cannot bind control socket: {0}")]
@@ -197,10 +208,13 @@ impl Daemon {
             // name from the first instead of failing with `NameTaken`.
             .allow_name_replacements(false)
             .replace_existing_names(false)
-            .serve_at(SERVICE_PATH, Service::new(state.clone()))?
+            .serve_at(SERVICE_PATH, Service::new(state.clone()))
+            .map_err(DaemonError::Export)?
             .build()
             .await?;
-        registry::register_all(&connection, &state).await?;
+        registry::register_all(&connection, &state)
+            .await
+            .map_err(DaemonError::Export)?;
 
         let socket = match opts.control_socket.clone() {
             Some(s) => s,
@@ -463,9 +477,21 @@ async fn change_key(
     new_kdf: KdfParams,
     new_key: &Key,
 ) -> Response {
-    let vault = state.lock().await.vault(collection);
-    match vault {
-        Some(vault) => {
+    let target = {
+        let st = state.lock().await;
+        match st.vault(collection) {
+            Some(v) => Ok(v),
+            // A vault that failed to load is a different, non-secret
+            // condition the operator needs to see — and `sm change-password`
+            // must name it the same way `sm unlock` does.
+            None => Err(match st.broken_error(collection) {
+                Some(e) => e.to_string(),
+                None => format!("no collection '{collection}'"),
+            }),
+        }
+    };
+    match target {
+        Ok(vault) => {
             // A rotation re-seals the whole collection and fsyncs it twice.
             // It gets this collection's lock and a blocking-friendly thread;
             // the state lock is already released.
@@ -481,7 +507,7 @@ async fn change_key(
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        None => Response::Error(format!("no collection '{collection}'")),
+        Err(e) => Response::Error(e),
     }
 }
 

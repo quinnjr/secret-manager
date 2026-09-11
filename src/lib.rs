@@ -19,11 +19,13 @@ compile_error!(
      (see the Makefile)"
 );
 
+pub mod atomic;
 pub mod config;
 #[cfg(feature = "fuzzing")]
 pub mod fuzz_api;
 pub mod pam;
 pub mod protocol;
+pub mod sanitize;
 pub mod vault;
 
 #[cfg(feature = "daemon")]
@@ -34,6 +36,12 @@ pub mod control;
 pub mod daemon;
 #[cfg(feature = "daemon")]
 pub mod dbus;
+// `sm import` reads the cleartext headers of foreign keyring files and drives
+// gnome-keyring's and KWallet's own daemons over D-Bus for the secret bytes.
+// The D-Bus half needs zbus, so the whole module sits behind `daemon`: the
+// PAM cdylib is dlopened as root and must not link it.
+#[cfg(feature = "daemon")]
+pub mod import;
 #[cfg(feature = "daemon")]
 pub mod kdf;
 #[cfg(feature = "daemon")]

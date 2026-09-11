@@ -114,45 +114,20 @@ impl Prompt {
     }
 }
 
-/// True for a codepoint in general category `Cf` (format), `Co` (private use)
-/// or `Cn` (unassigned-but-reserved-for-formatting) that a toolkit may act on
-/// rather than draw. (`Cs`, the surrogates, cannot occur in a Rust `str` at
-/// all, so there is nothing to filter for them.)
-///
-/// `char::is_control()` covers only `Cc`, which leaves the whole invisible
-/// half of the problem intact: `U+00AD` (soft hyphen), `U+061C` (Arabic letter
-/// mark), `U+200B..U+200F` (zero-width space/joiners and the LTR/RTL marks),
-/// `U+2060` (word joiner) and `U+FEFF` (zero-width no-break space) all survive
-/// it. The marks among them still reorder neutral text in a GTK/Qt dialog, and
-/// the zero-width ones let a label split a word an operator is scanning for
-/// ("de\u{200B}lete"). Enumerated explicitly rather than pulled from a unicode
-/// crate; the list is the set of `Cf`/`Cs`/`Co` ranges plus the `Cn`
-/// codepoints reserved for formatting use (MEDIUM 1).
-pub(crate) fn is_invisible_format(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}'
-        | '\u{0600}'..='\u{0605}'
-        | '\u{061C}'
-        | '\u{06DD}'
-        | '\u{070F}'
-        | '\u{08E2}'
-        | '\u{180E}'
-        | '\u{200B}'..='\u{200F}'
-        | '\u{2028}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}'
-        | '\u{2066}'..='\u{206F}'
-        | '\u{E000}'..='\u{F8FF}'
-        | '\u{FEFF}'
-        | '\u{FFF9}'..='\u{FFFB}'
-        | '\u{110BD}'
-        | '\u{110CD}'
-        | '\u{1D173}'..='\u{1D17A}'
-        | '\u{E0001}'
-        | '\u{E0020}'..='\u{E007F}'
-        | '\u{F0000}'..='\u{FFFFD}'
-        | '\u{100000}'..='\u{10FFFD}'
-    )
-}
+// The dialogs and the terminal share one table, and it lives in
+// `crate::sanitize` because that module is always compiled — `src/vault/`
+// is the PAM cdylib's half of the crate and cannot reach into anything
+// behind the `daemon` feature. Re-exported under the old name so
+// `display_label` and `crate::fuzz_api` read unchanged.
+//
+// It is `char::is_control()` that the table exists to complete: that is
+// general category `Cc` only, which leaves every invisible formatter intact
+// — `U+00AD` (soft hyphen), `U+061C` (Arabic letter mark), `U+200B..U+200F`
+// (zero-width space/joiners and the LTR/RTL marks), `U+2060` (word joiner)
+// and `U+FEFF` all survive it. The marks among them still reorder neutral
+// text in a GTK/Qt dialog, and the zero-width ones let a label split a word
+// an operator is scanning for ("de\u{200B}lete") (MEDIUM 1).
+pub(crate) use crate::sanitize::is_invisible_format;
 
 /// Render a client-supplied label for a pinentry dialog.
 ///
@@ -178,6 +153,17 @@ pub(crate) fn is_invisible_format(c: char) -> bool {
 ///
 /// Whitespace runs then collapse to single spaces, and the result is truncated
 /// to 64 characters plus a trailing ellipsis (so at most 65 characters).
+///
+/// It shares the *table* with `crate::sanitize::escape_control` and not the
+/// function, deliberately: that escaper renders each offending character as
+/// `\xNN` per UTF-8 byte, which is right for a terminal row (nothing is
+/// lost, and the reader can see what was there) and wrong for a pinentry
+/// dialog, where a label of escapes is both unreadable and free to grow the
+/// text several-fold inside a fixed box. A dialog wants the character
+/// *gone* — invisible formatters dropped, control characters and the
+/// daemon's own `"`/`(`/`)` turned into a space — followed by the collapse
+/// and the truncation that no escaper does. Changing this to call
+/// `escape_control` would change what every consent dialog shows.
 pub fn display_label(label: &str) -> String {
     const MAX: usize = 64;
     let cleaned: String = label
@@ -211,8 +197,41 @@ fn no_paths() -> OwnedValue {
 
 #[interface(name = "org.freedesktop.Secret.Prompt")]
 impl Prompt {
+    /// `window_id` is accepted and **deliberately ignored**.
+    ///
+    /// The freedesktop spec calls it "a platform-specific window handle to use
+    /// for showing the request", and the obvious forwarding is pinentry's
+    /// `OPTION parent-wid=<id>`, which makes the dialog transient for that
+    /// window. This daemon does not do it, for three reasons that compound:
+    ///
+    /// * The handle is unauthenticated peer input. Nothing on the bus ties a
+    ///   window id to the client that sent it, so any same-uid client can name
+    ///   *another* client's window — or the screen locker's — and have the
+    ///   consent dialog parented to a surface it controls. A dialog that can
+    ///   be positioned, stacked or covered by the party asking for consent is
+    ///   worse than an unparented one, and this dialog is the whole consent
+    ///   gate (see `display_label` for the same reasoning applied to text).
+    /// * Nothing here reads the value, so nothing here has to validate it.
+    ///   The pinentry options this daemon does emit are built in
+    ///   `prompt::pinentry::tty_options_from`, which escapes every value and
+    ///   drops any holding a control character, because an unescaped newline
+    ///   ends the `OPTION` line and injects a further Assuan command. Not
+    ///   forwarding the handle keeps a client-supplied string out of that
+    ///   channel entirely.
+    /// * The value is X11-specific in practice, while the dialog is a
+    ///   pinentry the daemon spawns — commonly curses on the daemon's own tty
+    ///   under Wayland, where the id means nothing.
+    ///
+    /// The cost is real and accepted: a GUI client that passes its handle gets
+    /// an unparented dialog. Changing this means adding a `parent_wid` field
+    /// to [`PinRequest`], validating the handle, and emitting
+    /// `OPTION parent-wid` — and it must not be done without an answer to the
+    /// first bullet.
     async fn prompt(
         &self,
+        // Kept bound with a leading underscore so the compiler enforces that
+        // nothing reads it: the argument is part of the spec's signature and
+        // must stay in it, but forwarding it is the decision documented above.
         _window_id: &str,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] conn: &Connection,

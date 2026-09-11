@@ -45,6 +45,7 @@ for the vault/SSH/configuration steps shared by both.
 | `sm list [ATTR=VALUE...] [--json]` | list labels and attributes |
 | `sm lock / unlock / status / change-password` | manage the vault |
 | `sm reload` | tell a running daemon to rescan the vault directory |
+| `sm import --from gnome-keyring\|kwallet` | migrate an existing keyring or wallet |
 | `sm ssh add/list/remove/askpass` | SSH passphrases and the askpass helper |
 | `sm completions <shell>` | shell completions |
 
@@ -52,11 +53,40 @@ Exit codes: 0 ok · 1 not found, prompt dismissed, or any other failure (I/O,
 vault, config) · 2 usage error · 3 daemon or bus unreachable, or
 `XDG_RUNTIME_DIR` unset.
 
+`sm daemon` maps a startup failure onto the same contract: exit 3 when the
+bus name is already taken, `XDG_RUNTIME_DIR` is unset, or the bus itself
+fails (any `ZBus` error); exit 1 for anything else, including a bus it
+reached but then failed to export its objects on (`DaemonError::Export`) —
+that daemon is broken, not redundant, and must read as an ordinary failure
+so a supervisor restarts it rather than assuming a duplicate.
+
 `sm delete` is strict: if an unlock prompt is dismissed it fails (exit 1) and
 deletes nothing. `sm get` still prompts when a match is locked, but is lenient
 about the answer: a dismissed prompt is tolerated when something already
 matched, and is a failure (exit 1) when nothing did. `sm list` never unlocks
 at all — it prints locked entries as `[locked]` and prompts for nothing.
+
+`sm import` moves an existing gnome-keyring keyring or KWallet wallet into a
+new collection of its own; it never writes to the source and never merges
+into a collection that already exists. Start with
+`sm import --from gnome-keyring --inventory`, which reads the source's
+cleartext headers and prints what is there — no password, no daemon — and
+then `--dry-run`, which performs the whole extraction and every check and
+writes nothing. Both print the same three-way tally the real run does:
+**fully portable** items, which carry an `xdg:schema` so the application that
+wrote them finds them again unchanged; items whose **attributes are preserved
+but whose discoverability is uncertain**, a meaningful attribute set with no
+schema, where libsecret's matching is lenient on some lookup paths and not
+others; and **preserved only** items — a native KWallet entry has no
+attributes at all, so `sm list` and `sm get` will find it and no libsecret
+client that did not write it ever will. No attribute is ever synthesised to
+improve those numbers: an invented schema is a guess, and a wrong guess
+produces an item that looks migrated and is unreachable. A real run verifies
+what it wrote — the source's own header count, per-item fingerprints, a
+length histogram, and a lookup probe through the daemon — before it reports
+success, and `--report PATH` writes the per-item verdict as JSON, holding no
+secret and no attribute value. `docs/superpowers/specs/2026-09-08-migration-assistant.md`
+is the full account.
 
 `SetAlias` will repoint an alias that already targets another collection:
 any session-bus client can do this, which is inherent to the same-uid

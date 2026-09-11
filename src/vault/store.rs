@@ -14,6 +14,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum VaultError {
     #[error("collection is locked")]
     Locked,
@@ -29,6 +30,26 @@ pub enum VaultError {
     SaltReused,
     #[error("collection label is too long ({len} bytes; limit is {limit})")]
     LabelTooLong { len: usize, limit: usize },
+    #[error("item {what} is {len}, over the limit of {limit}")]
+    ItemTooLarge {
+        /// Which cap was exceeded, in the words of the cap's own name.
+        what: &'static str,
+        len: usize,
+        limit: usize,
+    },
+    #[error("import item {index} ({label}): {what} is {len}, over the limit of {limit}")]
+    ImportTooLarge {
+        /// Position of the offending item in the batch handed to
+        /// [`Vault::import_items`].
+        index: usize,
+        /// The offending item's label, truncated to something a message can
+        /// carry: the label is caller-supplied and may itself be over its cap.
+        label: String,
+        /// Which cap was exceeded, in the words of the cap's own name.
+        what: &'static str,
+        len: usize,
+        limit: usize,
+    },
     #[error(transparent)]
     Format(#[from] FormatError),
     #[error(transparent)]
@@ -79,6 +100,169 @@ enum ItemDelta {
     Replaced { index: usize, prior: Box<Item> },
     /// The item at `index` was removed; undo by reinserting `prior` there.
     Removed { index: usize, prior: Box<Item> },
+    /// Several items were removed in one batch, paired with the index each
+    /// sat at *before* the batch, in ascending order of that index; undo by
+    /// reinserting them in that same order. See [`Vault::delete_items`].
+    RemovedMany(Vec<(usize, Box<Item>)>),
+}
+
+/// One item to import, carrying its original timestamps.
+///
+/// The counterpart to the arguments of [`Vault::insert_item`], plus the two
+/// fields that call assigns itself: `insert_item` stamps `now()` on both
+/// `created` and `modified`, and `Item.Created`/`Item.Modified` are read-only
+/// D-Bus properties with no setter, so no existing write path can carry a
+/// source timestamp through. That is not cosmetic - `sm get` breaks a
+/// collision between two items with the same attributes by choosing the
+/// newest `modified`, so an import that lands every item at one instant makes
+/// that tie-break arbitrary exactly where the user has duplicate-looking
+/// credentials.
+///
+/// **The timestamps are taken verbatim and are not validated.** They are not
+/// clamped to the present, not required to be ordered, and not required to be
+/// non-zero: a caller may hand over a `modified` far in the future or a
+/// `created` after it, and the value is written and later reported as
+/// `Item.Created`/`Item.Modified` unchanged. That is deliberate. The only
+/// consumer that *orders* on `modified` is `sm get`'s duplicate tie-break,
+/// and any bus client can already win that tie-break by writing an item, so
+/// clamping would buy nothing while silently corrupting the timestamps of
+/// legitimately old data - which is precisely the data an import exists to
+/// carry across.
+///
+/// The corollary is that the tie-break is only as good as the source. A
+/// gnome-keyring item carries both stamps, so it survives intact.
+/// `src/import/kwallet.rs` has no timestamps for an entry with no sidecar and
+/// lands `(0, 0)` for it: for that source the tie-break this type exists to
+/// make non-arbitrary is arbitrary again, all such items compare equal, and
+/// `Item.Modified` reports the Unix epoch - 1970 - to any bus client that
+/// reads it.
+///
+/// The id is not a field: ids stay daemon-assigned (a fresh uuid v4, as
+/// [`Vault::insert_item`] assigns), because nothing needs a source id
+/// preserved and letting a caller choose one invites collisions.
+///
+/// `#[non_exhaustive]`, so a later field is not a breaking change for a
+/// struct-literal construction outside this crate. It restrains nothing
+/// *inside* it, though, and every construction there is - the CLI's
+/// `sm import` and this module's tests - so adding a field means visiting
+/// them. There is deliberately no all-fields constructor standing in for
+/// that: one was written to make the addition "keep compiling somewhere",
+/// gained no caller, and so protected exactly nothing while reading as
+/// though it did.
+#[non_exhaustive]
+pub struct ImportItem {
+    pub label: String,
+    pub attributes: BTreeMap<String, String>,
+    pub secret: Zeroizing<Vec<u8>>,
+    pub content_type: String,
+    pub created: u64,
+    pub modified: u64,
+}
+
+// Hand-written: the secret is redacted, and so are attribute *values*, which
+// are `server=`/`user=`/`url=` — the material an import report exists to keep
+// out of a log line. Keys only, as `import::SourceItem` prints them. (Spelt
+// out here rather than borrowing `import::AttributeKeys`: `src/vault` is
+// compiled into the PAM cdylib and `src/import` is `daemon`-only.)
+impl std::fmt::Debug for ImportItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportItem")
+            .field("label", &self.label)
+            .field(
+                "attribute_keys",
+                &self.attributes.keys().collect::<Vec<_>>(),
+            )
+            .field("secret", &"..")
+            .field("content_type", &self.content_type)
+            .field("created", &self.created)
+            .field("modified", &self.modified)
+            .finish()
+    }
+}
+
+/// A label as an error message may carry it: the label is caller-supplied and
+/// may be over its own cap, and the message must stay small enough to log.
+///
+/// The label is *peer* data — `sm import` reads it out of a gnome-keyring
+/// file or a KWallet sidecar — and `VaultError::ImportTooLarge` is the first
+/// `VaultError` variant to carry arbitrary peer text at all. `CliError`'s
+/// `From<VaultError>` is `e.to_string()`, printed to a terminal raw, so
+/// `CLAUDE.md`'s rule applies here and not only on the parallel path in
+/// `src/cli/import.rs`: escape before it can reach a log or a dialog.
+///
+/// Escaping happens **before** truncation. Truncating first would cut the
+/// raw label at a byte the escaper never sees, so the tail of a multi-byte
+/// character could be dropped while its lead byte — a control character or
+/// half a bidi override — stayed; escaping first means the only thing a cut
+/// can damage is inert ASCII like `\x1b`, and the 64-byte budget bounds what
+/// is actually printed rather than what was measured.
+fn label_excerpt(label: &str) -> String {
+    const MAX: usize = 64;
+    let escaped = format::escape_control(label);
+    if escaped.len() <= MAX {
+        return escaped;
+    }
+    let end = (0..=MAX)
+        .rev()
+        .find(|i| escaped.is_char_boundary(*i))
+        .unwrap_or(0);
+    format!("{}...", &escaped[..end])
+}
+
+/// Re-apply the per-item caps the D-Bus layer enforces on every `CreateItem`
+/// (see [`format::MAX_ITEM_SECRET`] and its neighbours) to one import item.
+///
+/// The offline import path never crosses D-Bus, and [`Vault::insert_item`]
+/// enforces none of these, so without this an importer could write a
+/// collection the daemon serves happily but that no D-Bus client could ever
+/// have created, and whose items may be unreadable or unmodifiable through
+/// the very API they exist to be reached by.
+///
+/// Which caps, measured how, in which order is [`format::check_caps`]'s
+/// decision, shared with `dbus::collection` and with `import`'s pre-flight
+/// check; all this adds is the mapping into [`VaultError::ImportTooLarge`].
+/// The per-item caps, applied to one item's fields.
+///
+/// [`Vault::import_items`] had these and its two single-item siblings did
+/// not, which put the invariant at roughly eight call sites and made it
+/// structurally unenforceable for [`Vault::update_item`]: its `FnOnce(&mut
+/// Item)` can set any field to anything *after* a caller-side check has run,
+/// so the only place the check can be believed is inside, on the mutated
+/// item. The D-Bus layer still checks first — it must, because it owes the
+/// client a per-cap `InvalidArgs` message and this error is deliberately
+/// generic on the wire — so what this adds is the floor, not the diagnosis.
+fn check_item_caps(
+    label: &str,
+    attributes: &BTreeMap<String, String>,
+    secret_len: usize,
+    content_type: &str,
+) -> Result<(), VaultError> {
+    match format::check_caps(label, attributes, secret_len, content_type) {
+        None => Ok(()),
+        Some(v) => Err(VaultError::ItemTooLarge {
+            what: v.cap.as_str(),
+            len: v.actual,
+            limit: v.limit,
+        }),
+    }
+}
+
+fn check_import_item(index: usize, item: &ImportItem) -> Result<(), VaultError> {
+    match format::check_caps(
+        &item.label,
+        &item.attributes,
+        item.secret.len(),
+        &item.content_type,
+    ) {
+        None => Ok(()),
+        Some(v) => Err(VaultError::ImportTooLarge {
+            index,
+            label: label_excerpt(&item.label),
+            what: v.cap.as_str(),
+            len: v.actual,
+            limit: v.limit,
+        }),
+    }
 }
 
 pub struct Vault {
@@ -98,6 +282,14 @@ pub struct Vault {
     /// [`format::MAX_VAULT_BYTES`]. Overridable only in tests, so the
     /// refusal can be exercised without building a quarter-gigabyte vault.
     size_limit: u64,
+    /// How many times `save_with` has run: what the "one save" claim of
+    /// [`Vault::import_items`] means, and the only way to observe it. A
+    /// successful save renames its temp file away and leaves the directory
+    /// looking exactly as one save or two hundred would, so counting is not
+    /// an alternative to a reachable assertion - it is the only assertion
+    /// there is. Test-only, so the shipped struct is unchanged.
+    #[cfg(test)]
+    saves: u32,
     /// Set once this vault's file has been unlinked by a confirmed delete.
     /// Every save refuses afterwards, so a writer that had already taken a
     /// reference to this vault - and is only now getting its turn on the
@@ -147,7 +339,8 @@ impl Vault {
         password: &[u8],
         kdf: KdfParams,
     ) -> Result<Vault, VaultError> {
-        ensure_vault_dir(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        ensure_vault_dir(parent).map_err(|e| io_err(parent, e))?;
         let mut vault = Self::build(path, label, password, kdf)?;
         vault.save_with(publish_new)?;
         Ok(vault)
@@ -192,6 +385,8 @@ impl Vault {
             index_attributes: true,
             index_warning: None,
             size_limit: format::MAX_VAULT_BYTES,
+            #[cfg(test)]
+            saves: 0,
             retired: false,
         };
         Ok(vault)
@@ -215,6 +410,8 @@ impl Vault {
             index_attributes: true,
             index_warning: None,
             size_limit: format::MAX_VAULT_BYTES,
+            #[cfg(test)]
+            saves: 0,
             retired: false,
         })
     }
@@ -241,6 +438,12 @@ impl Vault {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_size_limit_for_tests(&mut self, limit: u64) {
         self.size_limit = limit;
+    }
+
+    /// How many times this vault has attempted a save; see the `saves` field.
+    #[cfg(test)]
+    fn saves_for_tests(&self) -> u32 {
+        self.saves
     }
 
     /// True when the on-disk index carries attribute hashes for any item.
@@ -507,21 +710,26 @@ impl Vault {
         }
     }
 
-    fn restore_items(&mut self, items: Vec<Item>) {
-        if let State::Unlocked { items: cur, .. } = &mut self.state {
-            *cur = items;
+    /// Undo an append-only batch for [`Vault::save_or_restore`]: drop
+    /// everything past `len`. See [`Vault::import_items`], the only caller -
+    /// `save` neither reorders nor resizes the list, so the items below `len`
+    /// are still exactly the ones that were there before the batch.
+    fn truncate_items(&mut self, len: usize) {
+        if let State::Unlocked { items, .. } = &mut self.state {
+            items.truncate(len);
         }
     }
 
-    /// Undo one single-item mutation, for [`Vault::save_or_restore`].
+    /// Undo one item-list mutation, for [`Vault::save_or_restore`].
     ///
-    /// The whole-vector snapshot [`Vault::restore_items`] takes is a deep
-    /// clone of every item *including every secret*, paid on the success path
-    /// too, purely as rollback insurance for a write that almost always
-    /// succeeds. For the paths that touch exactly one item the delta is all
-    /// that is needed, and it restores the same state: `save` never reorders
-    /// or resizes the item list, so the index recorded here still names the
-    /// same slot when this runs.
+    /// The alternative — snapshotting the whole vector — is a deep clone of
+    /// every item *including every secret*, paid on the success path too,
+    /// purely as rollback insurance for a write that almost always succeeds.
+    /// A delta restores the same state and clones only what the call is
+    /// about to change: `save` never reorders or resizes the item list, so
+    /// the indices recorded here still name the same slots when this runs.
+    /// No writer takes the whole-vector snapshot any more; `delete_items`,
+    /// the last one that did, records [`ItemDelta::RemovedMany`] instead.
     fn restore_delta(&mut self, delta: ItemDelta) {
         let State::Unlocked { items, .. } = &mut self.state else {
             return;
@@ -540,12 +748,50 @@ impl Vault {
                     items.insert(index, *prior);
                 }
             }
+            ItemDelta::RemovedMany(removed) => {
+                // Ascending, which is the order they were collected in and
+                // the only order that works: an item's recorded index is an
+                // index into the *original* list, so it is correct again
+                // exactly once everything that sat before it is back in
+                // place.
+                for (index, prior) in removed {
+                    if index <= items.len() {
+                        items.insert(index, *prior);
+                    }
+                }
+            }
         }
     }
 
     /// Insert an item. With `replace`, an item whose attributes are exactly
     /// equal is overwritten instead. Returns `(id, replaced)`.
     pub fn insert_item(
+        &mut self,
+        label: &str,
+        attributes: BTreeMap<String, String>,
+        secret: Vec<u8>,
+        content_type: &str,
+        replace: bool,
+    ) -> Result<(String, bool), VaultError> {
+        // Refuse a locked vault before validating, so the error a caller sees
+        // first is the one it can actually do something about. This is the
+        // order `Vault::import_items` argues for explicitly, and the two are
+        // documented as mirror images: they must not disagree about it.
+        self.items()?;
+        check_item_caps(label, &attributes, secret.len(), content_type)?;
+        self.insert_item_unchecked(label, attributes, secret, content_type, replace)
+    }
+
+    /// [`Vault::insert_item`] without the cap check.
+    ///
+    /// Private, with exactly one production caller — the check is not
+    /// optional at the API. It is separate so the index tests can build the
+    /// one thing the caps make unbuildable and that `search_ids` must still
+    /// survive: an item whose attribute value is far over the cap, as a file
+    /// written by a build older than the cap, or by something that is not us,
+    /// can hold. `search_ids` answers on a *locked* vault straight from disk,
+    /// so that data reaches it whether the cap likes it or not.
+    fn insert_item_unchecked(
         &mut self,
         label: &str,
         attributes: BTreeMap<String, String>,
@@ -601,9 +847,30 @@ impl Vault {
             // Only the one item `f` may touch is snapshotted; see
             // `restore_delta`.
             let prior = Box::new(items[index].clone());
-            let item = &mut items[index];
-            f(item);
-            item.modified = now();
+            {
+                let item = &mut items[index];
+                f(item);
+                item.modified = now();
+            }
+            // After `f`, not before: the closure is the mutation, so a
+            // caller-side check is a check of what the caller *meant* to
+            // write. Over a cap, the item is put back exactly as it was and
+            // nothing is saved — the same all-or-nothing the failed-write
+            // rollback gives.
+            let item = &items[index];
+            if let Some(v) = format::check_caps(
+                &item.label,
+                &item.attributes,
+                item.secret.len(),
+                &item.content_type,
+            ) {
+                items[index] = *prior;
+                return Err(VaultError::ItemTooLarge {
+                    what: v.cap.as_str(),
+                    len: v.actual,
+                    limit: v.limit,
+                });
+            }
             ItemDelta::Replaced { index, prior }
         };
         self.save_or_restore(delta, Self::restore_delta)
@@ -651,9 +918,9 @@ impl Vault {
     ///
     /// Every id is checked *before* anything is removed, so an unknown one is
     /// refused with the vault untouched and unwritten. The removal itself is
-    /// one `retain` followed by one `save_or_restore`, so a failed write rolls
-    /// the whole batch back in memory exactly as `delete_item` rolls back one.
-    /// Duplicate ids are harmless.
+    /// one indexed pass followed by one `save_or_restore`, so a failed write
+    /// rolls the whole batch back in memory exactly as `delete_item` rolls
+    /// back one. Duplicate ids are harmless.
     ///
     /// An empty batch is a no-op and does not rewrite the file.
     /// Both the validation and the removal go through one set built from the
@@ -661,26 +928,124 @@ impl Vault {
     /// `O(items x ids)` string comparisons a pair of linear scans would make -
     /// ~10^8 comparisons at the 1024-id cap against a large collection, all of
     /// it under the caller's state lock.
+    ///
+    /// Rollback records only the items actually removed, paired with where
+    /// each sat, and puts them back by reinsertion - see
+    /// [`ItemDelta::RemovedMany`]. The whole-vector snapshot this used to take
+    /// was a deep clone of every item including every secret, taken *before*
+    /// the batch was even validated and paid on the success path too: at the
+    /// 1024-id cap against a large collection that duplicated the entire
+    /// decrypted collection in memory to insure a write that almost always
+    /// succeeds.
     pub fn delete_items(&mut self, ids: &[String]) -> Result<(), VaultError> {
-        let items_before = self.items()?.to_vec();
-        let present: std::collections::HashSet<&str> =
-            items_before.iter().map(|i| i.id.as_str()).collect();
-        // Every id is checked before anything is removed, in the order given,
-        // so the reported id is the same one the linear scan reported.
-        for id in ids {
-            if !present.contains(id.as_str()) {
-                return Err(VaultError::NoSuchItem(id.clone()));
-            }
-        }
+        // An empty batch is a no-op: return before `items()?` so a locked
+        // vault answers `Ok` rather than `Locked` for work that needs nothing.
         if ids.is_empty() {
             return Ok(());
         }
-        let doomed: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
         {
-            let items = self.items_mut()?;
-            items.retain(|i| !doomed.contains(i.id.as_str()));
+            let present: std::collections::HashSet<&str> =
+                self.items()?.iter().map(|i| i.id.as_str()).collect();
+            // Every id is checked before anything is removed, in the order
+            // given, so the reported id is the same one the linear scan
+            // reported.
+            for id in ids {
+                if !present.contains(id.as_str()) {
+                    return Err(VaultError::NoSuchItem(id.clone()));
+                }
+            }
         }
-        self.save_or_restore(items_before, Self::restore_items)
+        let doomed: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let delta = {
+            let items = self.items_mut()?;
+            // One pass, moving each item either into the surviving list or
+            // into the delta: nothing is cloned, and the index recorded is
+            // the one the item held in the list this pass consumed.
+            let mut kept = Vec::with_capacity(items.len());
+            let mut removed: Vec<(usize, Box<Item>)> = Vec::new();
+            for (index, item) in std::mem::take(items).into_iter().enumerate() {
+                if doomed.contains(item.id.as_str()) {
+                    removed.push((index, Box::new(item)));
+                } else {
+                    kept.push(item);
+                }
+            }
+            *items = kept;
+            ItemDelta::RemovedMany(removed)
+        };
+        self.save_or_restore(delta, Self::restore_delta)
+    }
+
+    /// Insert many items with their original timestamps, in a single save:
+    /// either every item is in the file, or none of them is.
+    ///
+    /// The shape is [`Vault::delete_items`] in reverse. Every element is
+    /// checked against the per-item caps *before* anything is pushed, so an
+    /// item over one of them refuses the whole batch with the vault untouched
+    /// and unwritten, naming the item's position, its label and the limit it
+    /// broke. The insertion itself is one extend followed by one
+    /// `save_or_restore`, so a failed write rolls the whole batch back in
+    /// memory exactly as `insert_item` rolls back one.
+    ///
+    /// An empty batch is a no-op and does not rewrite the file.
+    ///
+    /// One save matters here more than anywhere else: every `insert_item`
+    /// rebuilds the whole hashed index, postcard-encodes every item, seals the
+    /// entire blob, writes a temp file, fsyncs it, renames and fsyncs the
+    /// directory. N items through that path is N full re-encrypts, 2N fsyncs
+    /// and O(N^2) bytes written - hundreds of megabytes for a few hundred
+    /// kilobytes of secrets.
+    ///
+    /// Rollback needs no snapshot of the item list at all: this only ever
+    /// appends, so truncating back to the length recorded before the extend
+    /// restores the exact prior state, without cloning even the items the
+    /// batch removes - which is the most any delta can save.
+    ///
+    /// Timestamps are taken verbatim from each [`ImportItem`]; ids are
+    /// assigned here, one fresh uuid v4 per item. See [`ImportItem`] for what
+    /// "verbatim" costs: they are unvalidated, and one source supplies zeros.
+    ///
+    /// **Duplicate attribute sets are neither replaced nor deduplicated.**
+    /// Unlike [`Vault::insert_item`], which takes a `replace` flag and can
+    /// overwrite an item with the same attributes, this appends every element
+    /// unconditionally: two elements of one batch with identical attributes
+    /// both land, as does an element whose attributes match an item already in
+    /// the collection. Nothing later resolves that - `sm get` reports the pair
+    /// as ambiguous for as long as they both exist, and only an explicit
+    /// delete removes one. Callers wanting at most one item per attribute set
+    /// must guarantee it themselves. The CLI's does, by refusing to import
+    /// into a collection that already exists, but that is a property of that
+    /// caller and not of this method.
+    pub fn import_items(&mut self, items: Vec<ImportItem>) -> Result<(), VaultError> {
+        // An empty batch is a no-op and does not rewrite the file: return
+        // before `items()?` so a locked vault answers `Ok` rather than
+        // `Locked` for work that needs nothing.
+        if items.is_empty() {
+            return Ok(());
+        }
+        // Refuse a locked vault before validating, so the error a caller sees
+        // first is the one it can actually do something about.
+        let before_len = self.items()?.len();
+        // Every item is checked before any is pushed, in the order given.
+        for (index, item) in items.iter().enumerate() {
+            check_import_item(index, item)?;
+        }
+        {
+            let list = self.items_mut()?;
+            list.reserve(items.len());
+            for item in items {
+                list.push(Item {
+                    id: uuid::Uuid::new_v4().simple().to_string(),
+                    label: item.label,
+                    attributes: item.attributes,
+                    secret: item.secret,
+                    content_type: item.content_type,
+                    created: item.created,
+                    modified: item.modified,
+                });
+            }
+        }
+        self.save_or_restore(before_len, Self::truncate_items)
     }
 
     /// Rename the collection.
@@ -752,10 +1117,27 @@ impl Vault {
         // catch anything that appeared in between.
         //
         // The zero threshold can unlink a temp belonging to a save running
-        // *right now* in another process, which makes that save's rename fail
-        // with ENOENT. That save then rolls back and reports an error, which
-        // is the acceptable side of the trade: the alternative is a silently
-        // un-revoked copy of the old vault.
+        // *right now*, which makes that save's rename fail with ENOENT. That
+        // save then rolls back and reports an error, which is the acceptable
+        // side of the trade: the alternative is a silently un-revoked copy of
+        // the old vault.
+        //
+        // The collateral is wider than "another process", though, and the
+        // scope is worth stating exactly: `sweep_dir_now` sweeps the whole
+        // vault *directory*, and the temp-name shape it matches is every
+        // collection's, not this one's. Every collection in this daemon lives
+        // in that directory behind its own lock, so rotating one collection's
+        // key can unlink the live temp of a concurrent save of a *different*
+        // collection in this same process. Nothing is lost - that save rolls
+        // back in memory and its file is untouched - but the failure the user
+        // sees is on a collection they were not rotating.
+        //
+        // The revocation argument only concerns copies of *this* vault, so
+        // restricting the sweep to this vault's own stem would keep it and
+        // remove the collateral outright. That is a change to which files get
+        // unlinked, not to what is written down, so it is recorded here
+        // rather than made in passing; see `is_write_atomic_temp_name` for
+        // the shape currently matched.
         self.sweep_dir_now();
         let was_locked = self.is_locked();
         if was_locked {
@@ -821,6 +1203,10 @@ impl Vault {
         &mut self,
         publish: impl FnOnce(&Path, &[u8]) -> Result<(), VaultError>,
     ) -> Result<(), VaultError> {
+        #[cfg(test)]
+        {
+            self.saves += 1;
+        }
         // Before the lock check, and before anything is mutated: a deleted
         // collection has no file to write and must not grow one back.
         if self.retired {
@@ -834,9 +1220,11 @@ impl Vault {
         // would carry a fresh nonce/index while the on-disk ciphertext (and
         // our cached `aad`/`ciphertext`) still describe the old one, and a
         // later lock()+unlock() would fail decryption permanently.
-        // Fallibly, and before any mutation: `save` runs while the daemon
-        // holds its state mutex, where a panic on an unavailable RNG would
-        // poison it for every other caller.
+        // Fallibly, and before any mutation: `save` runs under the
+        // collection's own lock - never the daemon's state mutex, which
+        // `CLAUDE.md` forbids holding across a save and the lock scan
+        // enforces - where a panic on an unavailable RNG would poison that
+        // lock for every other caller of this collection.
         let nonce = crypto::try_random_bytes::<NONCE_LEN>()?;
         let saved_header = self.header.clone();
         self.header.modified = now();
@@ -981,15 +1369,73 @@ fn sweep_temp_files(dir: &Path, min_age: Duration) -> usize {
 ///
 /// `create_dir_all` uses 0777 & ~umask (typically 0755) and only then gets
 /// chmodded, so another uid winning that window can open a descriptor and go
-/// on listing collection names afterwards. The `set_permissions` below stays
-/// as the repair path for a directory that already existed with looser bits.
-fn ensure_vault_dir(dir: &Path) -> Result<(), VaultError> {
+/// on listing collection names afterwards. **The mode has to be set at
+/// creation, by `DirBuilder::mode`, and cannot be a chmod afterwards** - that
+/// is the entire point of this function, and it is why it exists rather than
+/// each caller writing `create_dir_all` plus a `set_permissions`. The
+/// `set_permissions` below is not that chmod: it is the repair path for a
+/// directory that already existed with looser bits.
+///
+/// It is a *set*, not a tightening. A directory an operator had deliberately
+/// narrowed to 0000 is widened back to 0700 by the next save - that is the
+/// behaviour change that broke a test when this became unconditional, and it
+/// is the intended one: 0700 is the mode this program needs to reach its own
+/// vaults, so a directory it cannot open is not a safer state but a broken
+/// one. What it never does is loosen past 0700.
+///
+/// **The chmod's failure is reported, not propagated.** Returning it would
+/// fail every save on a filesystem with no Unix mode to set at all - vfat, a
+/// FUSE mount - where the vault is still perfectly writable. Dropping it
+/// silently was the other half of the mistake: a directory left at 0777 that
+/// cannot be tightened is the uid boundary down, and it went by with no log
+/// line. So the mode is read back on failure and a directory that is still
+/// group- or world-accessible is named, with the mode it actually has.
+/// `Vault::index_warning` is the precedent for degradation that is reported
+/// rather than fatal; there is no `Vault` here to hang one on - this is a
+/// free function on the save path, shared with the daemon's alias writer -
+/// so the report is the log line.
+///
+/// `pub(crate)` because it is the *only* definition of "create the vault
+/// directory": every writer that can be the first to create it must call
+/// this and not grow its own copy of the four lines. The alias writer in
+/// `dbus::state` is the second such writer. Two copies of a rule this small
+/// is exactly the shape the `escape_control` tables and the six cap
+/// predicates had before they drifted.
+///
+/// Returns `io::Result` rather than [`VaultError`]: the callers here add
+/// their own path context with [`io_err`], and the daemon's alias writer is
+/// already on `io::Result`, so a shared definition that imposed a vault
+/// error type on both would just be converted back at each end.
+///
+/// **Deliberately idempotent, and deliberately on the save path.** Every
+/// [`write_temp`] calls it, so the cost is a `mkdir` that returns `EEXIST`
+/// and an unconditional `chmod` per save - two syscalls beside two `fsync`s,
+/// which is nothing - and the benefit is that a directory loosened at
+/// runtime, by anything at all, is tightened again by the next write rather
+/// than staying open until the daemon restarts. Hoisting it to startup would
+/// trade that for the two syscalls. It is not a one-time initialisation and
+/// must not be turned into one.
+pub(crate) fn ensure_vault_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)
-        .map_err(|e| io_err(dir, e))?;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        .create(dir)?;
+    if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+        // Only the bits that matter: a filesystem that cannot represent a
+        // mode at all reports one we cannot fix and must not warn about on
+        // every save, while a real 0777 left behind by a failed chmod is
+        // exactly what has to be visible.
+        let mode = std::fs::metadata(dir)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0);
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                "{}: cannot tighten the vault directory to 0700; it is still mode {mode:04o} \
+                 and reachable by another user",
+                dir.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -998,7 +1444,7 @@ fn ensure_vault_dir(dir: &Path) -> Result<(), VaultError> {
 /// the temp path for the caller to publish.
 fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, VaultError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    ensure_vault_dir(dir)?;
+    ensure_vault_dir(dir).map_err(|e| io_err(dir, e))?;
     let stem = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -1035,16 +1481,15 @@ fn sync_dir(path: &Path) {
     }
 }
 
-/// [`write_temp`], then rename over `path` and fsync the directory. Replaces
-/// whatever is at `path`, which is what an update of an existing vault wants.
+/// [`crate::atomic::write_atomic`], with the vault directory ensured first
+/// and errors carrying vault path context. Replaces whatever is at `path`,
+/// which is what an update of an existing vault wants. (The temp-name shape
+/// is the atomic helper's `{file_name}.{16 hex}.tmp`, which is what
+/// [`is_write_atomic_temp_name`] recognises for the stale-temp sweep.)
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
-    let tmp = write_temp(path, bytes)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io_err(path, e));
-    }
-    sync_dir(path);
-    Ok(())
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_vault_dir(dir).map_err(|e| io_err(dir, e))?;
+    crate::atomic::write_atomic(path, bytes, 0o600).map_err(|e| io_err(path, e))
 }
 
 /// `renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE)`: rename that
@@ -1783,7 +2228,7 @@ mod tests {
     fn delete_items_is_atomic() {
         let (_d, path) = tmp();
         let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
-        let ids: Vec<String> = ["a", "b", "c"]
+        let ids: Vec<String> = ["a", "b", "c", "d"]
             .iter()
             .map(|n| {
                 v.insert_item(n, BTreeMap::new(), b"s".to_vec(), "text/plain", false)
@@ -1805,19 +2250,481 @@ mod tests {
         v.delete_items(&[]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
-        // A save that cannot be written rolls the whole batch back in memory.
+        // A save that cannot be written rolls the whole batch back in memory,
+        // *in order*. The removed ids are deliberately not adjacent and do
+        // not start the list: rollback reinserts each item at the index it
+        // held before the batch, which is only correct in ascending order of
+        // that index, and a batch of one or a contiguous run from the front
+        // cannot tell the two orders apart.
         let block = block_writes(&path);
-        assert!(v.delete_items(&[ids[0].clone(), ids[1].clone()]).is_err());
+        assert!(v.delete_items(&[ids[0].clone(), ids[2].clone()]).is_err());
         assert_eq!(v.item_ids(), ids, "a failed save must roll the batch back");
         unblock(block);
 
         // The happy path: one save, all of them gone, duplicates harmless.
+        //
+        // The count is the only reachable form of the "single save" claim in
+        // the doc: every save renames its temp file away, so a per-id loop
+        // leaves the directory and the item list looking exactly as one save
+        // does. See `import_items_takes_a_large_batch_in_one_go`, which makes
+        // the same argument for the other batch method.
+        let saves_before = v.saves_for_tests();
         v.delete_items(&[ids[0].clone(), ids[1].clone(), ids[0].clone()])
             .unwrap();
-        assert_eq!(v.item_ids(), vec![ids[2].clone()]);
+        assert_eq!(
+            v.saves_for_tests() - saves_before,
+            1,
+            "two ids cost more than one save: the batch was written id by id"
+        );
+        assert_eq!(v.item_ids(), vec![ids[2].clone(), ids[3].clone()]);
         let mut reopened = Vault::open(&path).unwrap();
         reopened.unlock(b"pw").unwrap();
-        assert_eq!(reopened.item_ids(), vec![ids[2].clone()]);
+        assert_eq!(reopened.item_ids(), vec![ids[2].clone(), ids[3].clone()]);
+    }
+
+    fn import(label: &str, secret: &[u8], created: u64, modified: u64) -> ImportItem {
+        ImportItem {
+            label: label.to_string(),
+            attributes: attrs(&[("app", label)]),
+            secret: Zeroizing::new(secret.to_vec()),
+            content_type: "text/plain".into(),
+            created,
+            modified,
+        }
+    }
+
+    /// The whole point of the API: `created` and `modified` land exactly as
+    /// given, not at `now()`, and survive a round trip through the file.
+    /// `insert_item` stamps both itself and cannot express this.
+    #[test]
+    fn import_items_preserves_timestamps() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.import_items(vec![
+            import("old", b"s1", 1_000_000, 1_000_500),
+            import("new", b"s2", 2_000_000, 2_000_500),
+        ])
+        .unwrap();
+        let stamps: Vec<(u64, u64)> = v
+            .items()
+            .unwrap()
+            .iter()
+            .map(|i| (i.created, i.modified))
+            .collect();
+        assert_eq!(stamps, vec![(1_000_000, 1_000_500), (2_000_000, 2_000_500)]);
+
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        let stamps: Vec<(u64, u64)> = reopened
+            .items()
+            .unwrap()
+            .iter()
+            .map(|i| (i.created, i.modified))
+            .collect();
+        assert_eq!(stamps, vec![(1_000_000, 1_000_500), (2_000_000, 2_000_500)]);
+        // Ids are still assigned here, one per item, and are distinct.
+        let ids = reopened.item_ids();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    /// A large batch goes in as one save.
+    ///
+    /// The two things a caller can see - 200 items arrive, and the directory
+    /// holds nothing but the vault - hold identically if this looped
+    /// `insert_item` 200 times, because every save renames its temp file
+    /// away; asserting only those left the whole stated point of the API
+    /// untested. `Vault` therefore keeps a `#[cfg(test)]` save counter, and
+    /// the count is what is asserted here.
+    ///
+    /// The counter was chosen over the alternative - a `size_limit` a full
+    /// batch exceeds but a prefix does not, so N saves leave a prefix on disk
+    /// while one save leaves the file untouched - because that one proves
+    /// "not 200 saves" only through a *failed* import, at a threshold that
+    /// has to be re-tuned whenever the encoding's overhead moves, and says
+    /// nothing about the successful path this test is named for.
+    #[test]
+    fn import_items_takes_a_large_batch_in_one_go() {
+        let (dir, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        // `create` writes the file, so the baseline is taken after it.
+        let saves_before = v.saves_for_tests();
+        let batch: Vec<ImportItem> = (0..200)
+            .map(|n| {
+                import(
+                    &format!("item{n}"),
+                    format!("secret{n}").as_bytes(),
+                    n,
+                    n + 1,
+                )
+            })
+            .collect();
+        v.import_items(batch).unwrap();
+        assert_eq!(v.items().unwrap().len(), 200);
+        assert_eq!(
+            v.saves_for_tests() - saves_before,
+            1,
+            "200 items cost more than one save: the batch was written item by item"
+        );
+
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        let items = reopened.items().unwrap();
+        assert_eq!(items.len(), 200);
+        for (n, item) in items.iter().enumerate() {
+            assert_eq!(item.label, format!("item{n}"));
+            assert_eq!(&*item.secret, format!("secret{n}").as_bytes());
+            assert_eq!((item.created, item.modified), (n as u64, n as u64 + 1));
+        }
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left.len(), 1, "a temp file was left behind: {left:?}");
+    }
+
+    /// Each of the six per-item caps the D-Bus layer enforces is re-applied
+    /// here, and one over-large item refuses the whole batch with the vault
+    /// unchanged in memory and unwritten on disk.
+    #[test]
+    fn import_items_re_applies_every_per_item_cap() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.import_items(vec![import("kept", b"s", 1, 2)]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let over_secret = || {
+            let mut i = import("big", b"", 1, 2);
+            i.secret = Zeroizing::new(vec![0u8; format::MAX_ITEM_SECRET + 1]);
+            i
+        };
+        let over_label = || import(&"L".repeat(format::MAX_ITEM_LABEL + 1), b"s", 1, 2);
+        let over_content_type = || {
+            let mut i = import("ct", b"s", 1, 2);
+            i.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE + 1);
+            i
+        };
+        let over_attr_count = || {
+            let mut i = import("many", b"s", 1, 2);
+            i.attributes = (0..=format::MAX_ITEM_ATTRIBUTES)
+                .map(|n| (format!("k{n}"), "v".to_string()))
+                .collect();
+            i
+        };
+        let over_attr_key = || {
+            let mut i = import("k", b"s", 1, 2);
+            i.attributes = attrs(&[(&"k".repeat(format::MAX_ATTRIBUTE_KEY + 1), "v")]);
+            i
+        };
+        let over_attr_value = || {
+            let mut i = import("v", b"s", 1, 2);
+            i.attributes = attrs(&[("k", &"v".repeat(format::MAX_ATTRIBUTE_VALUE + 1))]);
+            i
+        };
+
+        // Non-capturing, so each is a plain `fn` pointer.
+        type Case = (&'static str, fn() -> ImportItem);
+        let cases: [Case; 6] = [
+            ("secret", over_secret),
+            ("label", over_label),
+            ("content type", over_content_type),
+            ("attribute count", over_attr_count),
+            ("attribute name", over_attr_key),
+            ("attribute value", over_attr_value),
+        ];
+        for (what, make) in &cases {
+            // The offender sits in the middle of a batch that is otherwise
+            // fine, so a partial import would be visible.
+            let batch = vec![import("a", b"s", 1, 2), make(), import("b", b"s", 1, 2)];
+            let err = v.import_items(batch).unwrap_err();
+            match &err {
+                VaultError::ImportTooLarge {
+                    index,
+                    what: got,
+                    limit,
+                    ..
+                } => {
+                    assert_eq!(*index, 1, "{what}: wrong item named");
+                    assert_eq!(got, what, "{what}: wrong cap named");
+                    assert!(*limit > 0);
+                }
+                other => panic!("{what}: unexpected error {other}"),
+            }
+            assert_eq!(
+                v.items().unwrap().len(),
+                1,
+                "{what}: batch was partly applied"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{what}: the vault was rewritten"
+            );
+        }
+
+        // Exactly at each cap is accepted, so the checks are not off by one.
+        // All six are exercised at the boundary and not only at limit+1: an
+        // accidental `>=` in any of them refuses data that is legal, and it
+        // does so silently, mid-migration. The attribute set carries the full
+        // `MAX_ITEM_ATTRIBUTES` pairs, one of them with a name of exactly
+        // `MAX_ATTRIBUTE_KEY` bytes and a value of exactly
+        // `MAX_ATTRIBUTE_VALUE`.
+        let mut at_cap = import("edge", b"s", 1, 2);
+        at_cap.secret = Zeroizing::new(vec![0u8; format::MAX_ITEM_SECRET]);
+        at_cap.label = "L".repeat(format::MAX_ITEM_LABEL);
+        at_cap.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE);
+        at_cap.attributes = (0..format::MAX_ITEM_ATTRIBUTES - 1)
+            .map(|n| (format!("{n:0>3}"), "v".to_string()))
+            .collect();
+        at_cap.attributes.insert(
+            "k".repeat(format::MAX_ATTRIBUTE_KEY),
+            "v".repeat(format::MAX_ATTRIBUTE_VALUE),
+        );
+        assert_eq!(at_cap.attributes.len(), format::MAX_ITEM_ATTRIBUTES);
+        assert!(
+            at_cap
+                .attributes
+                .keys()
+                .any(|k| k.len() == format::MAX_ATTRIBUTE_KEY)
+        );
+        assert!(
+            at_cap
+                .attributes
+                .values()
+                .any(|x| x.len() == format::MAX_ATTRIBUTE_VALUE)
+        );
+        v.import_items(vec![at_cap]).unwrap();
+        assert_eq!(v.items().unwrap().len(), 2);
+    }
+
+    /// `ImportItem` carries a secret *and* an attribute map whose values are
+    /// `server=`/`user=`/`url=` — the material the import report exists to
+    /// keep out of a log line. Both are redacted; the keys stay, as
+    /// `import::SourceItem` prints them.
+    #[test]
+    fn import_item_debug_redacts_the_secret_and_the_attribute_values() {
+        let mut it = import("label", b"hunter2", 1, 2);
+        it.attributes = attrs(&[("server", "secret-host.example.com")]);
+        let text = format!("{it:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("secret-host.example.com"), "{text}");
+        assert!(text.contains("server"), "{text}");
+    }
+
+    /// The same six caps, on the two single-item writers.
+    ///
+    /// `import_items` had them and its siblings did not, which put one
+    /// invariant at roughly eight call sites. `update_item` is the one that
+    /// could not be fixed from outside at all: its `FnOnce(&mut Item)` runs
+    /// after any caller-side check and can set any field to anything, so the
+    /// check has to be on the mutated item, inside.
+    #[test]
+    fn the_single_item_writers_enforce_the_caps_too() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let (id, _) = v
+            .insert_item(
+                "kept",
+                attrs(&[("k", "v")]),
+                b"s".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        // `insert_item`, once per cap.
+        // Non-capturing, so each is a plain `fn` pointer.
+        type Case = (&'static str, fn(&mut Item));
+        let over: [Case; 6] = [
+            ("secret", |i: &mut Item| {
+                i.secret = Zeroizing::new(vec![0u8; format::MAX_ITEM_SECRET + 1]);
+            }),
+            ("label", |i: &mut Item| {
+                i.label = "L".repeat(format::MAX_ITEM_LABEL + 1);
+            }),
+            ("content type", |i: &mut Item| {
+                i.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE + 1);
+            }),
+            ("attribute count", |i: &mut Item| {
+                i.attributes = (0..=format::MAX_ITEM_ATTRIBUTES)
+                    .map(|n| (format!("k{n}"), "v".to_string()))
+                    .collect();
+            }),
+            ("attribute name", |i: &mut Item| {
+                i.attributes = attrs(&[(&"k".repeat(format::MAX_ATTRIBUTE_KEY + 1), "v")]);
+            }),
+            ("attribute value", |i: &mut Item| {
+                i.attributes = attrs(&[("k", &"v".repeat(format::MAX_ATTRIBUTE_VALUE + 1))]);
+            }),
+        ];
+
+        for (what, break_it) in over {
+            // `insert_item`: build the offending item by breaking a good one.
+            let mut probe = Item {
+                id: String::new(),
+                label: "probe".into(),
+                attributes: attrs(&[("k", "v")]),
+                secret: Zeroizing::new(b"s".to_vec()),
+                content_type: "text/plain".into(),
+                created: 0,
+                modified: 0,
+            };
+            break_it(&mut probe);
+            let err = v
+                .insert_item(
+                    &probe.label,
+                    probe.attributes.clone(),
+                    probe.secret.to_vec(),
+                    &probe.content_type,
+                    false,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, VaultError::ItemTooLarge { what: got, .. } if *got == what),
+                "insert_item accepted an item over the {what} cap, or named the wrong \
+                 one: {err}"
+            );
+
+            // `update_item`: the closure breaks the cap *after* any check a
+            // caller could have made.
+            let err = v.update_item(&id, break_it).unwrap_err();
+            assert!(
+                matches!(&err, VaultError::ItemTooLarge { what: got, .. } if *got == what),
+                "update_item accepted a closure that broke the {what} cap: {err}"
+            );
+
+            // Neither wrote, and the refused update left the item as it was.
+            assert_eq!(v.items().unwrap().len(), 1, "{what}: an item was written");
+            let kept = &v.items().unwrap()[0];
+            assert_eq!(kept.label, "kept", "{what}: the item was mutated anyway");
+            assert_eq!(kept.attributes, attrs(&[("k", "v")]));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "{what}: the vault was rewritten"
+            );
+        }
+
+        // Exactly at a cap is still accepted, so this is not an off-by-one.
+        v.update_item(&id, |i| {
+            i.label = "L".repeat(format::MAX_ITEM_LABEL);
+        })
+        .unwrap();
+        assert_eq!(v.items().unwrap()[0].label.len(), format::MAX_ITEM_LABEL);
+    }
+
+    /// The label a refusal names is peer data - it comes out of a
+    /// gnome-keyring file or a KWallet sidecar - and `CliError`'s
+    /// `From<VaultError>` prints `e.to_string()` to a terminal raw, so it is
+    /// escaped before it ever reaches the message. Escaping happens before
+    /// the excerpt is cut, so no cut can leave a live control byte behind.
+    #[test]
+    fn import_too_large_escapes_the_label_in_its_message() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+
+        // A short label: escaped, uncut.
+        let mut hostile = import("x", b"s", 1, 2);
+        hostile.label = "a\u{1b}[2K\u{202e}b".to_string();
+        hostile.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE + 1);
+        let msg = v.import_items(vec![hostile]).unwrap_err().to_string();
+        assert!(
+            !msg.chars()
+                .any(|c| c.is_control() || format::is_invisible_format(c)),
+            "a control character survived into the message: {msg:?}"
+        );
+        assert!(msg.contains("a\\x1b[2K"), "not escaped: {msg:?}");
+        assert!(msg.contains("\\xe2\\x80\\xae"), "RLO not escaped: {msg:?}");
+
+        // A long one: the excerpt is cut *after* escaping, so the cut can
+        // only ever land inside inert ASCII.
+        let mut long = import("y", b"s", 1, 2);
+        long.label = "\u{1b}".repeat(400);
+        long.content_type = "c".repeat(format::MAX_ITEM_CONTENT_TYPE + 1);
+        let msg = v.import_items(vec![long]).unwrap_err().to_string();
+        assert!(
+            !msg.chars().any(|c| c.is_control()),
+            "a control character survived the truncation: {msg:?}"
+        );
+        assert!(
+            msg.contains("..."),
+            "a long label was not truncated: {msg:?}"
+        );
+    }
+
+    /// An empty batch changes nothing and does not rewrite the file, and a
+    /// batch whose save fails rolls the whole thing back in memory - the same
+    /// two guarantees `delete_items` makes.
+    #[test]
+    fn import_items_is_atomic() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        v.import_items(vec![import("kept", b"s", 1, 2)]).unwrap();
+        let ids = v.item_ids();
+        let before = std::fs::read(&path).unwrap();
+
+        v.import_items(vec![]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before, "vault was rewritten");
+        assert_eq!(v.item_ids(), ids);
+
+        let block = block_writes(&path);
+        let err = v
+            .import_items(vec![import("a", b"s", 1, 2), import("b", b"s", 1, 2)])
+            .unwrap_err();
+        assert!(matches!(err, VaultError::Io { .. }), "{err}");
+        assert_eq!(
+            v.item_ids(),
+            ids,
+            "a failed save must roll the whole batch back"
+        );
+        unblock(block);
+
+        // And a locked vault refuses without touching anything.
+        v.lock();
+        assert!(matches!(
+            v.import_items(vec![import("c", b"s", 1, 2)]).unwrap_err(),
+            VaultError::Locked
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Nothing in the import path normalises: arbitrary UTF-8 attributes, an
+    /// empty attribute value and a secret ending in the newline `sm set`
+    /// would have stripped all survive byte for byte.
+    #[test]
+    fn import_items_round_trips_awkward_values() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        let attributes = attrs(&[
+            ("schéma", "übung"),
+            ("emoji \u{1f511}", "\u{5bc6}\u{7801}"),
+            ("empty", ""),
+            ("nul-ish", "a\tb\nc"),
+        ]);
+        let secret = b"line\n".to_vec();
+        v.import_items(vec![ImportItem {
+            label: "\u{2603} label".into(),
+            attributes: attributes.clone(),
+            secret: Zeroizing::new(secret.clone()),
+            content_type: "application/octet-stream".into(),
+            created: 42,
+            modified: 43,
+        }])
+        .unwrap();
+
+        let mut reopened = Vault::open(&path).unwrap();
+        reopened.unlock(b"pw").unwrap();
+        let item = &reopened.items().unwrap()[0];
+        assert_eq!(item.label, "\u{2603} label");
+        assert_eq!(item.attributes, attributes);
+        assert_eq!(&*item.secret, &secret[..]);
+        assert_eq!(*secret.last().unwrap(), 0x0a);
+        assert_eq!(item.content_type, "application/octet-stream");
+        assert_eq!((item.created, item.modified), (42, 43));
+        // The attributes are searchable exactly as given, unlocked and locked.
+        assert_eq!(reopened.search(&attributes).unwrap().len(), 1);
+        assert_eq!(reopened.search_ids(&attributes).len(), 1);
     }
 
     /// A collection whose items carry no attributes produces an index with
@@ -2529,6 +3436,21 @@ mod tests {
             .insert_item("y", BTreeMap::new(), b"t".to_vec(), "text/plain", false)
             .unwrap_err();
         assert!(matches!(err, VaultError::Locked), "{err:?}");
+        // An item that is *also* over a cap still reports the lock. The cap
+        // check runs after it, exactly as `Vault::import_items` documents for
+        // itself: the error a caller sees first should be the one it can do
+        // something about. The two are documented as mirror images and must
+        // not disagree about which refusal comes first.
+        let err = v
+            .insert_item(
+                &"y".repeat(format::MAX_ITEM_LABEL + 1),
+                BTreeMap::new(),
+                b"t".to_vec(),
+                "text/plain",
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, VaultError::Locked), "{err:?}");
         let err = v.update_item(&id, |i| i.label = "no".into()).unwrap_err();
         assert!(matches!(err, VaultError::Locked), "{err:?}");
         let err = v.delete_item(&id).unwrap_err();
@@ -2883,8 +3805,13 @@ mod tests {
                 .0,
             );
         }
+        // `insert_item_unchecked`: the value is deliberately far over
+        // `MAX_ATTRIBUTE_VALUE`, which is the boundary's cap and not a
+        // property of a file on disk. This is the shape the index has to
+        // survive, and `search_ids` is the one path that reads it while
+        // locked.
         let hit = v
-            .insert_item(
+            .insert_item_unchecked(
                 "hit",
                 [
                     ("app".to_string(), "git".to_string()),
@@ -2942,8 +3869,10 @@ mod tests {
                 )
                 .unwrap();
             }
-            // Inserted last, so only one save pays for indexing it.
-            v.insert_item(
+            // Inserted last, so only one save pays for indexing it, and
+            // unchecked for the same reason as the test above: the value is
+            // over the boundary's cap on purpose.
+            v.insert_item_unchecked(
                 "hit",
                 [("big".to_string(), big.clone())].into(),
                 b"s".to_vec(),
@@ -3091,11 +4020,18 @@ mod tests {
             "{err:?}"
         );
 
-        // A full batch with duplicates removes exactly those ids, in one save.
+        // A full batch with duplicates removes exactly those ids, in one
+        // save - asserted, not just claimed: a per-id loop would cost 512.
         let mut batch: Vec<String> = ids[..512].to_vec();
         batch.extend_from_slice(&ids[..512]);
         assert_eq!(batch.len(), 1024);
+        let saves_before = v.saves_for_tests();
         v.delete_items(&batch).unwrap();
+        assert_eq!(
+            v.saves_for_tests() - saves_before,
+            1,
+            "a 1024-id batch cost more than one save"
+        );
         assert_eq!(v.item_ids(), ids[512..]);
         let mut reopened = Vault::open(&path).unwrap();
         reopened.unlock(b"pw").unwrap();
