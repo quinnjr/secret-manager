@@ -76,7 +76,9 @@ use crate::import::formats::{
     parse_wallet_header,
 };
 use crate::import::verify::{self, FingerprintEntry, Histogram, ProbeResult, Verification};
-use crate::import::{AttributeKeys, ImportReport, ItemReport, Source, SourceItem, Tally};
+use crate::import::{
+    AttributeKeys, ImportReport, ItemReport, Provenance, Source, SourceItem, Tally,
+};
 use crate::import::{gnome, kwallet};
 use crate::protocol::{ProtocolError, Request, Response, call, socket_path};
 use crate::vault::store::ImportItem;
@@ -182,14 +184,24 @@ mod transport {
     pub struct NotMigrated {
         pub label: String,
         pub reason: String,
+        /// Where the entry came from, in the source's own vocabulary. The
+        /// verifier chains these into the walked set beside the written items:
+        /// a skipped entry was in the file, so the index-minus-walk set must
+        /// not report it a second time.
+        pub provenance: Provenance,
     }
 
     #[cfg(any(test, feature = "test-util"))]
     impl NotMigrated {
-        pub fn new(label: impl Into<String>, reason: impl Into<String>) -> Self {
+        pub fn new(
+            label: impl Into<String>,
+            reason: impl Into<String>,
+            provenance: Provenance,
+        ) -> Self {
             Self {
                 label: label.into(),
                 reason: reason.into(),
+                provenance,
             }
         }
     }
@@ -379,6 +391,17 @@ async fn extract_gnome(source_dir: &Path, container: &str) -> Result<Extraction,
             .map(|s| NotMigrated {
                 label: s.label,
                 reason: s.reason,
+                // The gnome walk drops the item id before the CLI sees it,
+                // so this names the container with no folder, entry or item
+                // id. It never enters the verifier's walked set, which only
+                // consults KWallet folder/entry pairs.
+                provenance: Provenance {
+                    source: Source::GnomeKeyring,
+                    container: container.to_string(),
+                    folder: None,
+                    entry: None,
+                    item_id: None,
+                },
             })
             .collect(),
         empty_folders: 0,
@@ -388,6 +411,10 @@ async fn extract_gnome(source_dir: &Path, container: &str) -> Result<Extraction,
     })
 }
 
+/// How many entry names one folder's note lists before pointing at the
+/// `--report` file's `verification.unlisted` for the rest.
+const MAX_NAMES_PER_FOLDER_NOTE: usize = 8;
+
 /// Sentences for index entries no listing ever produced (see
 /// [`verify::UnlistedEntry`]), grouped by folder. A pair no sidecar row
 /// names is grouped under its folder hash rather than dropped: the count
@@ -396,13 +423,21 @@ fn unlisted_notes(unlisted: &[verify::UnlistedEntry]) -> Vec<String> {
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<String, (Option<String>, Vec<String>)> = BTreeMap::new();
     for u in unlisted {
+        // Escaped where the note is built, mirroring the unreadable-folders
+        // note: `print_report` escapes the whole note again at print time, and
+        // `escape_control` is idempotent, so a hostile folder or entry name is
+        // safe on every path. The `UnlistedEntry` itself keeps the raw strings
+        // — they are programmatic data, notably in the `--report` file — only
+        // the rendered note is escaped. The hashes need no escaping: hex.
         let key = u
             .folder
-            .clone()
+            .as_deref()
+            .map(escape_control)
             .unwrap_or_else(|| format!("folder hash {}", u.folder_hash));
         let name = u
             .entry
-            .clone()
+            .as_deref()
+            .map(escape_control)
             .unwrap_or_else(|| format!("#{}", u.entry_hash));
         groups
             .entry(key)
@@ -414,52 +449,49 @@ fn unlisted_notes(unlisted: &[verify::UnlistedEntry]) -> Vec<String> {
         .into_iter()
         .map(|(key, (folder, mut names))| {
             names.sort();
-            let shown: Vec<&str> = names.iter().map(String::as_str).take(8).collect();
+            let shown: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .take(MAX_NAMES_PER_FOLDER_NOTE)
+                .collect();
             let mut listed = shown.join(", ");
             if names.len() > shown.len() {
                 listed.push_str(&format!(", and {} more", names.len() - shown.len()));
             }
             let noun = if names.len() == 1 { "entry" } else { "entries" };
-            match folder {
+            let verb = if names.len() == 1 { "is" } else { "are" };
+            let mut note = match folder {
                 Some(_) => format!(
-                    "{} {noun} in folder '{key}' are in the file but kwalletd never listed \
+                    "{} {noun} in folder '{key}' {verb} in the file but kwalletd never listed \
                      them, so they were not migrated: {listed}",
                     names.len()
                 ),
                 None => format!(
-                    "{0} {noun} under {key} are in the file but kwalletd never listed them, \
+                    "{0} {noun} under {key} {verb} in the file but kwalletd never listed them, \
                      so they were not migrated: {listed}",
                     names.len()
                 ),
+            };
+            if names.len() > shown.len() {
+                note.push_str(&format!(
+                    " See verification.unlisted in the --report file for all {}.",
+                    names.len()
+                ));
             }
+            note
         })
         .collect()
 }
-/// Sentences for listings the walk skipped as repeats of an already-listed
-/// folder or entry (see `kwallet::Extraction::{duplicate_folders,
-/// duplicate_entries}`). Kept beside the rest of the KWallet notes so the
-/// report says the daemon was not taken at its word.
-fn kwallet_notes(walked: &kwallet::Extraction) -> Vec<String> {
-    let mut notes = Vec::new();
-    if walked.duplicate_folders > 0 {
-        notes.push(format!(
-            "{} folder listings repeated a folder that was already listed, so the repeats were \
-             not read again: kwalletd repeats every folder in folderList once per open, and \
-             reading them again would import every entry once per copy",
-            walked.duplicate_folders
-        ));
-    }
-    if walked.duplicate_entries > 0 {
-        notes.push(format!(
-            "{} entry listings repeated an entry that was already listed in the same folder, \
-             so the repeats were not read again: a folder is a map, so a repeat is never a \
-             second entry",
-            walked.duplicate_entries
-        ));
-    }
-    notes
-}
 
+/// Name index entries no listing ever produced in the run's notes, so a
+/// partial migration is loud on the terminal as well as in the report.
+/// One call per path that reports: the write-failure branch and the verify
+/// branch below.
+fn attach_unlisted_notes(extraction: &mut Extraction, verification: &Verification) {
+    extraction
+        .notes
+        .extend(unlisted_notes(&verification.unlisted));
+}
 /// KWallet, over `org.kde.kwalletd6` on the session bus: a different bus name
 /// from ours, so this path needs no private bus and no ordering against our
 /// own daemon.
@@ -579,7 +611,27 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
             escape_control(folder)
         ));
     }
-    notes.extend(kwallet_notes(&walked));
+    // The walk's own notes arrive raw — currently the per-folder listing
+    // reasons beside the close-failure note `extract` records — and are
+    // escaped here, in the same style as every other note built above.
+    notes.extend(walked.notes.iter().map(|n| escape_control(n)));
+    if walked.duplicate_folders > 0 {
+        notes.push(format!(
+            "{} folder listings repeated a folder that was already listed, so the repeats were \
+             folded into the first listing rather than imported twice: kwalletd repeats every \
+             folder in folderList once per open, and entries only a repeat held are unioned in \
+             rather than dropped",
+            walked.duplicate_folders
+        ));
+    }
+    if walked.duplicate_entries > 0 {
+        notes.push(format!(
+            "{} entry listings repeated an entry that was already listed in the same folder, \
+             so the repeats were not read again: a folder is a map, so a repeat is never a \
+             second entry",
+            walked.duplicate_entries
+        ));
+    }
     Ok(Extraction {
         container: wallet.to_string(),
         items: walked
@@ -601,6 +653,7 @@ async fn extract_kwallet(wallet: &str) -> Result<Extraction, CliError> {
             .map(|s| NotMigrated {
                 label: s.label,
                 reason: s.reason.to_string(),
+                provenance: s.provenance,
             })
             .collect(),
         empty_folders: walked.empty_folders,
@@ -922,6 +975,18 @@ fn print_inventory(source: Source, file: &SourceFile) {
 
 /// What `--report PATH` writes: the per-item report, plus what verification
 /// concluded. Both hold keys, counts and outcomes only.
+///
+/// Schema rule: additive only, with no version field. A report outlives the
+/// build that wrote it — kept beside the vault, pasted into bug reports — so
+/// a newer reader must accept an older file and an older reader must accept a
+/// newer one as far as it can. That is three serde habits, and every report
+/// type follows all three: new fields carry `#[serde(default)]`, so absence
+/// on read is the zero value and never an error; empties carry
+/// `skip_serializing_if`, so old files stay small and new empties read as
+/// absent; and no report type sets `deny_unknown_fields`, so unknown keys are
+/// ignored rather than rejected. [`verify::UnlistedEntry`] is one such type:
+/// its keys are `folder_hash`/`entry_hash`, with `folder`/`entry` as
+/// defaulted `Option`s, so a hash-only row from any build reads everywhere.
 ///
 /// The report's own fields are named here rather than flattened in, for one
 /// reason: there are two tallies, and the one a consumer reaches by the
@@ -1266,8 +1331,8 @@ mod pipeline {
         report.header_item_count = file.header_item_count;
         report.empty_folders = extraction.empty_folders;
 
-        for refusal in extraction.refusals {
-            report.push(refusal);
+        for refusal in &extraction.refusals {
+            report.push(refusal.clone());
         }
         for imported in &extraction.items {
             report.push(imported.report.clone());
@@ -1324,17 +1389,22 @@ mod pipeline {
                     // after the report, mirroring the offline-failure branch.
                     let plan = verify::probe_plan(&items);
                     let walked = report.tally.seen() + extraction.skipped.len();
-                    let verification = verify_import(
+                    let accounted = accounted_provenances(&report, &extraction.skipped);
+                    let unlisted = unlisted_entries(
                         &file,
                         &items,
-                        walked,
-                        None,
-                        plan.iter().map(ProbeResult::not_issued).collect(),
+                        &accounted,
                         &extraction.unresolved_sidecar_rows,
                     );
-                    extraction
-                        .notes
-                        .extend(unlisted_notes(&verification.unlisted));
+                    let verification = verify_import(VerifyInput {
+                        file: &file,
+                        items: &items,
+                        walked,
+                        destination: None,
+                        probes: plan.iter().map(ProbeResult::not_issued).collect(),
+                        unlisted,
+                    });
+                    attach_unlisted_notes(&mut extraction, &verification);
                     let report_file = ReportFile::new(
                         &report,
                         &report.tally,
@@ -1380,17 +1450,24 @@ mod pipeline {
             // independent total; leaving them out would hide the shortfall the
             // count check exists to expose.
             report.tally.seen() + extraction.skipped.len();
-        let mut verification = verify_import(
-            &file,
-            &items,
-            walked,
-            destination.as_ref(),
-            plan.iter().map(ProbeResult::not_issued).collect(),
-            &extraction.unresolved_sidecar_rows,
-        );
-        extraction
-            .notes
-            .extend(unlisted_notes(&verification.unlisted));
+        let mut verification = {
+            let accounted = accounted_provenances(&report, &extraction.skipped);
+            let unlisted = unlisted_entries(
+                &file,
+                &items,
+                &accounted,
+                &extraction.unresolved_sidecar_rows,
+            );
+            verify_import(VerifyInput {
+                file: &file,
+                items: &items,
+                walked,
+                destination: destination.as_ref(),
+                probes: plan.iter().map(ProbeResult::not_issued).collect(),
+                unlisted,
+            })
+        };
+        attach_unlisted_notes(&mut extraction, &verification);
         if !verification.passed() {
             // Nothing was published, so the file goes and the error says so
             // rather than the reverse.
@@ -1918,14 +1995,57 @@ fn reopen(path: &Path, password: &[u8], id: &str) -> Result<Destination, CliErro
     })
 }
 
-fn verify_import(
+/// The provenances the count reconciles but the file index must not
+/// double-count: every refused item's and every skipped entry's. Both were in
+/// the source file, so both count towards the header total, and both must be
+/// chained into the walked set the unlisted computation builds — otherwise a
+/// refused entry lands in the walked count *and* in the unlisted set.
+fn accounted_provenances(report: &ImportReport, skipped: &[NotMigrated]) -> Vec<Provenance> {
+    report
+        .items
+        .iter()
+        .filter(|i| i.is_refused())
+        .map(|i| i.provenance.clone())
+        .chain(skipped.iter().map(|s| s.provenance.clone()))
+        .collect()
+}
+
+/// Index entries no walk listing ever produced, computed here — where the
+/// extraction and the report live — rather than inside [`verify_import`], so
+/// the verifier judges a set it is given instead of building the set it then
+/// passes. Only a hash index can prove them, so only the wallet path computes
+/// them; a keyring has no table and reports none.
+fn unlisted_entries(
     file: &SourceFile,
     items: &[SourceItem],
-    walked: usize,
-    destination: Option<&Destination>,
-    probes: Vec<ProbeResult>,
+    accounted: &[Provenance],
     sidecar_keys: &[String],
-) -> Verification {
+) -> Vec<verify::UnlistedEntry> {
+    match &file.inventory {
+        Inventory::Wallet(w) => verify::unlisted_wallet_entries(w, items, accounted, sidecar_keys),
+        Inventory::Keyring(_) => Vec::new(),
+    }
+}
+
+/// The inputs verification travels with. Six parameters that always move
+/// together; the next input joins this struct, never the function signature.
+struct VerifyInput<'a> {
+    file: &'a SourceFile,
+    items: &'a [SourceItem],
+    walked: usize,
+    destination: Option<&'a Destination>,
+    probes: Vec<ProbeResult>,
+    // The computed unlisted set, not the sidecar keys it was resolved from.
+    unlisted: Vec<verify::UnlistedEntry>,
+}
+
+fn verify_import(input: VerifyInput<'_>) -> Verification {
+    let file = input.file;
+    let items = input.items;
+    let walked = input.walked;
+    let destination = input.destination;
+    let probes = input.probes;
+    let unlisted = input.unlisted;
     let source_entries: Vec<FingerprintEntry> =
         items.iter().map(FingerprintEntry::source).collect();
     let (mismatches, compared) = match destination {
@@ -1962,15 +2082,9 @@ fn verify_import(
         None => Vec::new(),
     };
 
-    // Index entries no listing ever produced. Only a hash index can prove
-    // them, so only the wallet path computes them; a keyring has no table
-    // and reports none.
-    let unlisted = match &file.inventory {
-        Inventory::Wallet(w) => verify::unlisted_wallet_entries(w, items, sidecar_keys),
-        Inventory::Keyring(_) => Vec::new(),
-    };
-    let mut count = verify::CountCheck::new(file.header_item_count, walked);
-    count.unlisted = unlisted.len();
+    // The count reconciles the header against the walk plus the index entries
+    // no listing ever produced, which the caller computed and passed in.
+    let count = verify::CountCheck::new(file.header_item_count, walked, unlisted.len());
 
     Verification {
         // `walked` counts every item the walk produced, refused ones
@@ -1993,6 +2107,30 @@ fn verify_import(
         source_lengths,
         destination_lengths,
         length_differences,
+    }
+}
+
+// `pub` for the integration test pinning the decommission advice, `pub(crate)`
+// otherwise: see this module's header.
+#[cfg(any(test, feature = "test-util"))]
+pub use self::decommission_gate::may_suggest_decommission;
+#[cfg(not(any(test, feature = "test-util")))]
+pub(crate) use self::decommission_gate::may_suggest_decommission;
+
+mod decommission_gate {
+    use super::*;
+
+    /// Whether a finished run has earned the decommission advice.
+    ///
+    /// `passed()` is every check that was *made*; the advice belongs to a run
+    /// with nothing left unproved *and* nothing left behind. Unlisted entries
+    /// are a partial migration even when every check passes — the count
+    /// reconciles precisely because they are accounted for separately — so
+    /// they withhold the advice like an unproved check does.
+    pub fn may_suggest_decommission(verification: &Verification) -> bool {
+        verification.passed()
+            && verification.unproved().is_empty()
+            && verification.unlisted.is_empty()
     }
 }
 
@@ -2255,11 +2393,14 @@ fn print_report(file: &SourceFile, id: &str, r: &ReportFile<'_>, destination_exi
         return;
     }
     // `passed()` is every check that was *made*; the right to suggest that the
-    // old provider be removed belongs to a run with nothing left unproved. A
-    // probe that was never issued proves nothing about discoverability, and
-    // "decommission the thing that still works" is not advice to give on the
-    // strength of a check that did not run.
-    if verification.passed() && verification.unproved().is_empty() {
+    // old provider be removed belongs to a run with nothing left unproved and
+    // nothing left behind. A probe that was never issued proves nothing about
+    // discoverability, and unlisted entries are a partial migration even when
+    // every check passes — so "decommission the thing that still works" is
+    // not advice to give on the strength of a check that did not run, nor for
+    // a migration that did not carry everything. See
+    // [`may_suggest_decommission`].
+    if may_suggest_decommission(verification) {
         println!(
             "\nNext: decommission the old provider. docs/install-arch.md and \
              docs/install-debian.md cover that for each distribution - the autostart entry, \
@@ -2376,40 +2517,6 @@ mod tests {
         assert!(!out.contains("A migrated login"), "{out}");
     }
 
-    /// A daemon that repeats listings must be audible in the report. Without
-    /// these sentences a wallet whose daemon tripled every folder imports
-    /// cleanly and nothing says the counts were ever in doubt.
-    #[test]
-    fn repeated_listings_get_their_own_notes() {
-        let walked = kwallet::Extraction {
-            duplicate_folders: 3,
-            duplicate_entries: 5,
-            ..Default::default()
-        };
-
-        let out = kwallet_notes(&walked).join("\n");
-
-        assert!(
-            out.contains("3 folder listings repeated a folder"),
-            "no folder sentence: {out}"
-        );
-        assert!(
-            out.contains("5 entry listings repeated an entry"),
-            "no entry sentence: {out}"
-        );
-    }
-
-    /// And silence when there is nothing to say: the common case adds no
-    /// paragraphs.
-    #[test]
-    fn no_repeats_means_no_repeat_notes() {
-        let walked = kwallet::Extraction {
-            ..Default::default()
-        };
-
-        assert!(kwallet_notes(&walked).is_empty());
-    }
-
     /// Entries the file holds that the daemon never listed get named notes,
     /// grouped by folder. A nameless pair is still reported, by hashes —
     /// dropping it would be the same hole the count check exists to close.
@@ -2465,7 +2572,15 @@ mod tests {
             header_item_count: Some(4),
         };
 
-        let verification = verify_import(&file, &[], 0, None, Vec::new(), &[]);
+        let unlisted = unlisted_entries(&file, &[], &[], &[]);
+        let verification = verify_import(VerifyInput {
+            file: &file,
+            items: &[],
+            walked: 0,
+            destination: None,
+            probes: Vec::new(),
+            unlisted,
+        });
 
         assert_eq!(verification.unlisted.len(), 4);
         assert!(verification.unlisted.iter().all(|u| u.folder.is_none()));
@@ -2499,7 +2614,7 @@ mod tests {
         assert!(!failed[0].passed());
 
         let verification = Verification {
-            count: verify::CountCheck::new(Some(1), 1),
+            count: verify::CountCheck::new(Some(1), 1, 0),
             fingerprint_mismatches: Vec::new(),
             fingerprints_compared: Some(1),
             hash_table_misses: Vec::new(),
@@ -2576,7 +2691,15 @@ mod tests {
             lengths: Histogram::of_lengths(std::iter::empty()),
             indexed: true,
         };
-        let verification = verify_import(&file, &items, 1, Some(&destination), Vec::new(), &[]);
+        let unlisted = unlisted_entries(&file, &items, &[], &[]);
+        let verification = verify_import(VerifyInput {
+            file: &file,
+            items: &items,
+            walked: 1,
+            destination: Some(&destination),
+            probes: Vec::new(),
+            unlisted,
+        });
         assert!(
             !verification.fingerprint_mismatches.is_empty(),
             "the fingerprint rows this test exists to screen were never produced"
@@ -2601,6 +2724,7 @@ mod tests {
         let not_migrated = vec![NotMigrated {
             label: "An entry that would not decode".to_string(),
             reason: "the map would not decode".to_string(),
+            provenance: item.provenance.clone(),
         }];
         let notes = vec!["the session with the source daemon was plaintext".to_string()];
         let probed_items = downgrade_items(&report.items, &verification.failed_probes);
@@ -2636,5 +2760,74 @@ mod tests {
         ] {
             assert!(json.contains(kept), "{kept:?} missing from {json}");
         }
+    }
+
+    /// The sidecar keys resolve the unlisted set to names: the same missing
+    /// pair with a row naming it carries its folder and entry, without one it
+    /// is hashes alone. Through [`unlisted_entries`] — the caller-side
+    /// resolution of the walk's `unresolved_sidecar_rows` — and then through
+    /// `verify_import`, which judges the set it is given.
+    #[test]
+    fn verify_import_names_unlisted_entries_from_sidecar_keys() {
+        use crate::import::formats::{WalletFolderIndex, WalletInventory};
+        let inventory = WalletInventory {
+            cipher: 3,
+            hash: 2,
+            folders: vec![WalletFolderIndex {
+                folder_hash: verify::md5(b"TestFolder"),
+                entry_hashes: vec![verify::md5(b"good-entry")],
+            }],
+            ciphertext_offset: 0,
+        };
+        let file = SourceFile {
+            path: PathBuf::from("test.kwl"),
+            inventory: Inventory::Wallet(Box::new(inventory)),
+            header_item_count: Some(1),
+        };
+
+        let named = verify_import(VerifyInput {
+            file: &file,
+            items: &[],
+            walked: 0,
+            destination: None,
+            probes: Vec::new(),
+            unlisted: unlisted_entries(&file, &[], &[], &["TestFolder/good-entry".to_string()]),
+        });
+        assert_eq!(named.unlisted.len(), 1);
+        assert_eq!(named.unlisted[0].folder.as_deref(), Some("TestFolder"));
+        assert_eq!(named.unlisted[0].entry.as_deref(), Some("good-entry"));
+
+        let unnamed = verify_import(VerifyInput {
+            file: &file,
+            items: &[],
+            walked: 0,
+            destination: None,
+            probes: Vec::new(),
+            unlisted: unlisted_entries(&file, &[], &[], &[]),
+        });
+        assert_eq!(unnamed.unlisted.len(), 1);
+        assert_eq!(unnamed.unlisted[0].folder, None);
+        assert_eq!(unnamed.unlisted[0].entry, None);
+    }
+
+    /// Nine unlisted entries in one folder truncate the note: eight named and
+    /// "and 1 more", so the report stays a line and the ninth name is absent.
+    #[test]
+    fn unlisted_notes_truncate_after_eight_names() {
+        let unlisted: Vec<verify::UnlistedEntry> = (0..9)
+            .map(|n| verify::UnlistedEntry {
+                folder_hash: "aa".to_string(),
+                entry_hash: format!("{n:02x}"),
+                folder: Some("Secret Service".to_string()),
+                entry: Some(format!("entry-{n:02}")),
+            })
+            .collect();
+        let out = unlisted_notes(&unlisted).join("\n");
+        assert!(out.contains("and 1 more"), "{out}");
+        assert!(out.contains("entry-00"), "{out}");
+        assert!(
+            !out.contains("entry-08"),
+            "the ninth name is truncated away: {out}"
+        );
     }
 }

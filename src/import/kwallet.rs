@@ -1630,7 +1630,12 @@ pub const EXPECTED_NON_ENTRY_ROWS: usize = 2;
 /// The counts are the point. The spec's rule is that a sidecar row that does
 /// not resolve and an entry with no sidecar row are *both real conditions*,
 /// so each has a field here and neither is silently dropped.
+///
+/// Non-exhaustive so a field added later is not a breaking change: the walk
+/// keeps inventing new conditions worth counting, and callers outside this
+/// crate must not be the ones who break when it does.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct Extraction {
     pub items: Vec<SourceItem>,
     /// Items refused for a reason [`Refusal`] names — in practice always a
@@ -1733,13 +1738,20 @@ pub struct Extraction {
     /// Folders `entryList` refused. Their entries are unreachable and their
     /// sidecar rows will show up in `unresolved_sidecar_rows`.
     pub unreadable_folders: Vec<String>,
-    /// Folder listings skipped because the folder was already listed.
+    /// Folder listings folded in because the folder was already listed.
     ///
     /// A live kwalletd6 repeats every folder in `folderList` once per
-    /// `open()`, so without this the same entries are imported once per
-    /// copy and the header/walk count check fails the run. Folder names
-    /// are unique keys — `createFolder` refuses a duplicate — so a repeat
-    /// is the daemon misspeaking, never a second folder.
+    /// `open()`, so without dedupe the same entries would be imported once
+    /// per copy and the header/walk count check would fail the run. Folder
+    /// names are unique keys — `createFolder` refuses a duplicate — so a
+    /// repeat is the daemon misspeaking, never a second folder.
+    ///
+    /// A repeat is still *read*: entries no earlier listing of the folder
+    /// held are unioned into the first listing, because for a migration
+    /// tool union is lossless while both skipping the repeat and failing
+    /// on it risk dropping user secrets on daemon inconsistency.
+    /// Duplicates by `(folder, entry)` are still imported once. The count
+    /// is therefore extra listings folded in, not entries skipped.
     pub duplicate_folders: usize,
     /// Entry listings skipped because the entry was already listed in the
     /// same folder. A folder is a map, so a repeat is the same class of
@@ -2031,21 +2043,56 @@ async fn walk<R: WalletReader>(
     let mut claims: BTreeMap<String, usize> = BTreeMap::new();
     let mut listed = 0usize;
     let mut seen_folders: BTreeSet<String> = BTreeSet::new();
+    // Folders with a listing in `listings`, by name. A repeated folder is
+    // unioned into its first listing rather than skipped or walked twice;
+    // see the repeat branch below for why union is the lossless choice.
+    let mut listing_index: BTreeMap<String, usize> = BTreeMap::new();
+    // Folders with at least one successful `entry_list`, including an empty
+    // one. Only a folder with none at all is unreadable, and only a folder
+    // never counted empty is counted again.
+    let mut live_folders: BTreeSet<String> = BTreeSet::new();
+    let mut counted_empty: BTreeSet<String> = BTreeSet::new();
     for folder in folders {
         // A repeated folder is the daemon misspeaking (see
-        // `duplicate_folders`): re-reading it would import every entry
-        // twice and charge the secret budget twice for the same bytes.
+        // `duplicate_folders`): folder names are unique keys, so this is
+        // never a second folder. It is still *read* — the repeat branch
+        // below unions whatever the earlier listings did not hold — and the
+        // counter counts the extra listing, not skipped entries.
         if !seen_folders.insert(folder.clone()) {
             out.duplicate_folders += 1;
-            continue;
         }
         let entries = match reader.entry_list(&folder).await {
             Ok(e) => e,
-            Err(_) => {
-                out.unreadable_folders.push(folder);
+            Err(e) => {
+                if live_folders.contains(&folder) {
+                    // An earlier listing of this folder succeeded, so its
+                    // entries are still imported from that listing. The
+                    // failed repeat is real and is said out loud, with the
+                    // reason: it may have held entries no readable listing
+                    // did.
+                    out.notes.push(format!(
+                        "a repeat listing of the folder '{folder}' could not be read ({e}), \
+                         so any entries only that listing held were not imported"
+                    ));
+                } else if !out.unreadable_folders.contains(&folder) {
+                    out.unreadable_folders.push(folder.clone());
+                    // The folder goes in `unreadable_folders` bare — that
+                    // shape is kept — and the reason rides beside it as a
+                    // note, so the caller can report both.
+                    out.notes
+                        .push(format!("the folder '{folder}' could not be listed: {e}"));
+                }
                 continue;
             }
         };
+        live_folders.insert(folder.clone());
+        // A repeat that succeeds after an earlier failure redeems the
+        // folder: entries ARE now read, so it must not stay reported as one
+        // whose entries were all lost. (The note above stays: that listing
+        // did fail, and said so.)
+        if let Some(pos) = out.unreadable_folders.iter().position(|f| f == &folder) {
+            out.unreadable_folders.remove(pos);
+        }
         // Same class of misspeaking one level down: a folder is a map, so
         // a repeated entry name is never a second entry.
         let mut seen_entries: BTreeSet<String> = BTreeSet::new();
@@ -2060,18 +2107,47 @@ async fn walk<R: WalletReader>(
                 }
             })
             .collect();
-        if entries.is_empty() {
-            out.empty_folders += 1;
+        if let Some(&idx) = listing_index.get(&folder) {
+            // A repeat listing: union every entry no earlier listing of this
+            // folder held. For a migration tool union is lossless while both
+            // alternatives lose user secrets on nothing stronger than daemon
+            // inconsistency: skipping the repeat drops entries the first
+            // listing did not hold, and failing the walk drops the whole
+            // wallet. Entries an earlier listing already held are still
+            // imported once — the dedupe key is `(folder, entry)` — and are
+            // covered by `duplicate_folders`, not counted again here.
+            for entry in entries {
+                if listings[idx].entries.contains(&entry) {
+                    continue;
+                }
+                listed = listed.saturating_add(1);
+                if listed > MAX_ENTRIES {
+                    return Err(KWalletError::TooManyEntries { limit: MAX_ENTRIES });
+                }
+                *claims.entry(sidecar_key(&folder, &entry)).or_insert(0) += 1;
+                listings[idx].entries.push(entry);
+            }
+        } else if entries.is_empty() {
+            if counted_empty.insert(folder.clone()) {
+                out.empty_folders += 1;
+            }
             continue;
+        } else {
+            // A repeat that arrives after an empty listing redeems that
+            // count: the folder has entries, so it is not an empty one.
+            if counted_empty.remove(&folder) {
+                out.empty_folders = out.empty_folders.saturating_sub(1);
+            }
+            listed = listed.saturating_add(entries.len());
+            if listed > MAX_ENTRIES {
+                return Err(KWalletError::TooManyEntries { limit: MAX_ENTRIES });
+            }
+            for entry in &entries {
+                *claims.entry(sidecar_key(&folder, entry)).or_insert(0) += 1;
+            }
+            listing_index.insert(folder.clone(), listings.len());
+            listings.push(Listing { folder, entries });
         }
-        listed = listed.saturating_add(entries.len());
-        if listed > MAX_ENTRIES {
-            return Err(KWalletError::TooManyEntries { limit: MAX_ENTRIES });
-        }
-        for entry in &entries {
-            *claims.entry(sidecar_key(&folder, entry)).or_insert(0) += 1;
-        }
-        listings.push(Listing { folder, entries });
     }
     out.ambiguous_sidecar_keys = claims
         .iter()
@@ -2348,6 +2424,7 @@ async fn read_secret<R: WalletReader>(
 mod tests {
     use super::*;
     use crate::import::Outcome;
+    use std::cell::RefCell;
 
     // -- helpers -----------------------------------------------------------
 
@@ -3088,6 +3165,12 @@ mod tests {
         passwords: BTreeMap<(String, String), Result<String, String>>,
         maps: BTreeMap<(String, String), Result<Vec<u8>, String>>,
         raw: BTreeMap<(String, String), Result<Vec<u8>, String>>,
+        /// How many times `entry_list` has been called per folder. Successive
+        /// calls serve successive `folder()` declarations in order, which is
+        /// what a daemon that repeats a folder with divergent entries looks
+        /// like; calls past the last declaration repeat it, which is the
+        /// identical-repeat case.
+        entry_calls: RefCell<BTreeMap<String, usize>>,
     }
 
     impl FakeWallet {
@@ -3138,6 +3221,13 @@ mod tests {
             );
             self
         }
+
+        /// A folder whose `entryList` always fails, the way a folder kwalletd
+        /// will not hand over does.
+        fn unreadable_folder(mut self, folder: &str) -> Self {
+            self.unreadable.insert(folder.to_string());
+            self
+        }
     }
 
     fn looked_up<T: Clone>(
@@ -3161,11 +3251,22 @@ mod tests {
             if self.unreadable.contains(folder) {
                 return Err(ReadError::Failed("refused".into()));
             }
-            Ok(self
+            let matches: Vec<Vec<String>> = self
                 .folders
                 .iter()
-                .find(|(f, _)| f == folder)
+                .filter(|(f, _)| f == folder)
                 .map(|(_, e)| e.clone())
+                .collect();
+            let call = {
+                let seen = self.entry_calls.borrow();
+                seen.get(folder).copied().unwrap_or(0)
+            };
+            self.entry_calls
+                .borrow_mut()
+                .insert(folder.to_string(), call.saturating_add(1));
+            Ok(matches
+                .get(call.min(matches.len().saturating_sub(1)))
+                .cloned()
                 .unwrap_or_default())
         }
 
@@ -3374,6 +3475,73 @@ mod tests {
         );
         assert_eq!(out.duplicate_folders, 1);
         assert_eq!(out.duplicate_entries, 0);
+    }
+
+    /// A repeated folder whose listings disagree is unioned, not skipped: for
+    /// a migration tool union is lossless while skipping the repeat drops
+    /// entries the first listing did not hold — user secrets, on nothing
+    /// stronger than daemon inconsistency.
+    #[tokio::test]
+    async fn a_repeated_folder_with_divergent_entries_imports_the_union() {
+        let fake = FakeWallet::default()
+            .folder("Passwords", &["a"])
+            .folder("Passwords", &["b", "c"])
+            .password("Passwords", "a", "one")
+            .password("Passwords", "b", "two")
+            .password("Passwords", "c", "three");
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        let mut labels: Vec<&str> = out.items.iter().map(|i| i.label.as_str()).collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            ["a", "b", "c"],
+            "entries only the repeat held were dropped: {:?}",
+            out.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert_eq!(out.duplicate_folders, 1);
+    }
+
+    /// The dedupe key is `(folder, entry)`: the same entry name in two
+    /// different folders is two entries, not a repeat.
+    #[tokio::test]
+    async fn the_same_entry_name_in_two_folders_imports_twice() {
+        let fake = FakeWallet::default()
+            .folder("Work", &["login"])
+            .folder("Home", &["login"])
+            .password("Work", "login", "one")
+            .password("Home", "login", "two");
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert_eq!(out.items.len(), 2);
+        let folders: BTreeSet<&str> = out
+            .items
+            .iter()
+            .map(|i| i.attributes[ATTR_FOLDER].as_str())
+            .collect();
+        assert_eq!(folders, BTreeSet::from(["Home", "Work"]));
+        assert_eq!(out.duplicate_folders, 0);
+        assert_eq!(out.duplicate_entries, 0);
+    }
+
+    /// A folder `entryList` refuses is reported with the reason, not just
+    /// the name: without it the report cannot distinguish a denied folder
+    /// from a daemon that never answered.
+    #[tokio::test]
+    async fn an_unreadable_folder_reports_the_reason_beside_the_name() {
+        let fake = FakeWallet::default()
+            .folder("Passwords", &["a"])
+            .unreadable_folder("Passwords");
+
+        let out = walked(&fake, &Sidecar::empty()).await;
+
+        assert_eq!(out.unreadable_folders, ["Passwords"]);
+        assert!(out.items.is_empty());
+        let notes = out.notes.join("\n");
+        assert!(notes.contains("Passwords"), "{notes}");
+        assert!(notes.contains("refused"), "{notes}");
     }
 
     /// The same misspeaking one level down: a folder is a map, so a

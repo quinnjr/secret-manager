@@ -28,10 +28,10 @@
 //! precisely the wrong reading. Nothing else here may call it.
 
 use super::formats::{Md5Hash, WalletInventory};
-use super::{AttributeKeys, ItemReport, Outcome, SourceItem, Tally};
+use super::{AttributeKeys, ItemReport, Outcome, Provenance, SourceItem, Tally};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 /// A per-item fingerprint. Derived from the secret but never invertible to
@@ -283,6 +283,7 @@ pub fn compare_fingerprints(
 /// items are never explained away — walked + unlisted beyond the header
 /// fails — and a shortfall the unlisted set does not cover fails too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CountCheck {
     /// `None` when the source file could not be read at all — the check is
     /// then *not made*, which is reported rather than counted as a pass.
@@ -306,20 +307,30 @@ pub struct CountCheck {
 }
 
 impl CountCheck {
-    pub fn new(header_item_count: Option<usize>, walked: usize) -> Self {
+    pub fn new(header_item_count: Option<usize>, walked: usize, unlisted: usize) -> Self {
         Self {
             header_item_count,
             walked,
-            unlisted: 0,
+            unlisted,
         }
     }
 
     /// `false` only when the check was made *and* failed. An absent header
     /// count is `true` here and reported separately by [`CountCheck::made`];
     /// a missing check must not read as a failed one.
+    ///
+    /// A passing count with a non-empty `unlisted` is still complete only on
+    /// paper: those entries were never listed by the source and were not
+    /// migrated, so completeness stays unproved. That is [`Verification::unproved`]'s
+    /// line and the decommission gate's decision, not this boolean's — failing
+    /// here would unlink a good partial import, which is worse than the
+    /// shortfall it reports.
     pub fn passed(&self) -> bool {
-        self.header_item_count
-            .is_none_or(|n| n == self.walked.saturating_add(self.unlisted))
+        self.header_item_count.is_none_or(|n| {
+            self.walked
+                .checked_add(self.unlisted)
+                .is_some_and(|total| total == n)
+        })
     }
 
     pub fn made(&self) -> bool {
@@ -395,8 +406,7 @@ pub fn check_wallet_hash_table(inventory: &WalletInventory, items: &[SourceItem]
         ) else {
             continue;
         };
-        let folder_hash = md5(folder.as_bytes());
-        let entry_hash = md5(entry.as_bytes());
+        let (folder_hash, entry_hash) = name_pair(folder, entry);
         if !index.contains(&(folder_hash, entry_hash)) {
             out.push(HashMiss {
                 folder_hash: hex(&folder_hash),
@@ -427,6 +437,11 @@ pub struct UnlistedEntry {
 /// The file index minus the walk: every `(folder, entry)` hash pair the
 /// header counts that no listing produced.
 ///
+/// `accounted` carries the provenances of the refused and the skipped entries:
+/// both were in the file and both count towards the header total, so without
+/// them a refused entry lands in *both* the walked count and this set and the
+/// reconciliation fails a faithful import against itself.
+///
 /// Names come from `sidecar_keys` — the sidecar rows the walk did not apply
 /// — and need no guessing: for each pair every split of each key is hashed,
 /// and the index pair admits at most one. A key with no slash is tried as
@@ -434,20 +449,25 @@ pub struct UnlistedEntry {
 pub fn unlisted_wallet_entries(
     inventory: &WalletInventory,
     items: &[SourceItem],
+    accounted: &[Provenance],
     sidecar_keys: &[String],
 ) -> Vec<UnlistedEntry> {
     let walked: HashSet<(Md5Hash, Md5Hash)> = items
         .iter()
-        .filter_map(|item| {
-            let (Some(folder), Some(entry)) = (
-                item.provenance.folder.as_deref(),
-                item.provenance.entry.as_deref(),
-            ) else {
+        .map(|item| &item.provenance)
+        .chain(accounted.iter())
+        .filter_map(|provenance| {
+            let (Some(folder), Some(entry)) =
+                (provenance.folder.as_deref(), provenance.entry.as_deref())
+            else {
                 return None;
             };
-            Some((md5(folder.as_bytes()), md5(entry.as_bytes())))
+            Some(name_pair(folder, entry))
         })
         .collect();
+    // Hashed once for the whole call, not once per pair: the per-pair work
+    // below is then one hash lookup.
+    let names = resolve_table(sidecar_keys);
     let mut out = Vec::new();
     for folder in &inventory.folders {
         for entry_hash in &folder.entry_hashes {
@@ -455,7 +475,7 @@ pub fn unlisted_wallet_entries(
             if walked.contains(&pair) {
                 continue;
             }
-            let (name_folder, name_entry) = resolve_unlisted(pair, sidecar_keys);
+            let (name_folder, name_entry) = resolve_unlisted(pair, &names);
             out.push(UnlistedEntry {
                 folder_hash: hex(&pair.0),
                 entry_hash: hex(&pair.1),
@@ -467,25 +487,54 @@ pub fn unlisted_wallet_entries(
     out
 }
 
-fn resolve_unlisted(
-    pair: (Md5Hash, Md5Hash),
-    sidecar_keys: &[String],
-) -> (Option<String>, Option<String>) {
+/// The most splits of one sidecar key that are hashed. A hostile sidecar can
+/// compose a key of hundreds of thousands of slashes, and every split hashes
+/// twice; past this many a key resolves to no name — the pair is still
+/// reported, by hashes — with no error.
+const MAX_SPLITS_PER_KEY: usize = 4096;
+
+/// Every split of every sidecar key, hashed once and keyed by its pair, so
+/// each unlisted pair below is one lookup. Exactly one split can match an
+/// index pair, so the first writer of a pair names it rather than guesses.
+fn resolve_table(sidecar_keys: &[String]) -> HashMap<(Md5Hash, Md5Hash), (String, String)> {
+    let mut table = HashMap::new();
     for key in sidecar_keys {
-        // Every split of "a/b/c", plus the degenerate ("", key): exactly
-        // one can hash-match, so the first match is the name, not a guess.
-        let mut splits: Vec<(&str, &str)> = key
-            .match_indices('/')
-            .map(|(i, _)| (&key[..i], &key[i + 1..]))
+        let slashes: Vec<usize> = key.match_indices('/').map(|(i, _)| i).collect();
+        // Splits are slashes plus the degenerate ("", key): past the cap the
+        // whole key is skipped, degenerate split included.
+        if slashes.len() + 1 > MAX_SPLITS_PER_KEY {
+            continue;
+        }
+        let mut splits: Vec<(&str, &str)> = slashes
+            .iter()
+            .map(|&i| (&key[..i], &key[i + 1..]))
             .collect();
         splits.push(("", key.as_str()));
         for (folder, entry) in splits {
-            if md5(folder.as_bytes()) == pair.0 && md5(entry.as_bytes()) == pair.1 {
-                return (Some(folder.to_string()), Some(entry.to_string()));
-            }
+            table
+                .entry(name_pair(folder, entry))
+                .or_insert_with(|| (folder.to_string(), entry.to_string()));
         }
     }
-    (None, None)
+    table
+}
+
+fn resolve_unlisted(
+    pair: (Md5Hash, Md5Hash),
+    names: &HashMap<(Md5Hash, Md5Hash), (String, String)>,
+) -> (Option<String>, Option<String>) {
+    match names.get(&pair) {
+        Some((folder, entry)) => (Some(folder.clone()), Some(entry.clone())),
+        None => (None, None),
+    }
+}
+
+/// `MD5(folder)` and `MD5(entry)`: the pair one `.kwl` index row holds. One
+/// helper for the three call sites that hash a name — [`check_wallet_hash_table`],
+/// the walked-set build above, and [`resolve_table`] — so a change to what a
+/// row holds is made once.
+fn name_pair(folder: &str, entry: &str) -> (Md5Hash, Md5Hash) {
+    (md5(folder.as_bytes()), md5(entry.as_bytes()))
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -986,6 +1035,7 @@ pub fn compare_histograms(source: &Histogram, destination: &Histogram) -> Vec<Hi
 /// Everything the four checks concluded. Serialised beside the import report,
 /// and holding — by construction — no secret and no attribute value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Verification {
     pub count: CountCheck,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1035,6 +1085,18 @@ impl Verification {
         if !self.count.made() {
             out.push("the source header gave no independent item count".to_string());
         }
+        // A non-empty unlisted set reconciles the count — `passed()` stays
+        // true — and still leaves completeness unproved: those entries were
+        // never listed by the source and were not migrated, so the run may not
+        // recommend decommissioning on the strength of a count that adds up
+        // without them.
+        if !self.unlisted.is_empty() {
+            out.push(format!(
+                "{} file entries were never listed by the source and were not migrated, \
+                 so completeness is unproved",
+                self.unlisted.len()
+            ));
+        }
         if self.fingerprints_compared.is_none() {
             out.push("no destination was written, so no fingerprint was compared".to_string());
         }
@@ -1060,6 +1122,42 @@ impl Verification {
             ));
         }
         out
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl Verification {
+    /// Test-only constructor: the struct is `#[non_exhaustive]`, so code
+    /// outside this crate cannot use a literal and builds one through this
+    /// instead. `pub` under `test-util` only, for the same reason the CLI's
+    /// own test seam structs carry constructors rather than literals.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        count: CountCheck,
+        fingerprint_mismatches: Vec<FingerprintMismatch>,
+        fingerprints_compared: Option<usize>,
+        hash_table_misses: Vec<HashMiss>,
+        hash_table_checked: Option<usize>,
+        unlisted: Vec<UnlistedEntry>,
+        probes: ProbeSummary,
+        failed_probes: Vec<ProbeResult>,
+        source_lengths: Histogram,
+        destination_lengths: Option<Histogram>,
+        length_differences: Vec<HistogramDiff>,
+    ) -> Self {
+        Self {
+            count,
+            fingerprint_mismatches,
+            fingerprints_compared,
+            hash_table_misses,
+            hash_table_checked,
+            unlisted,
+            probes,
+            failed_probes,
+            source_lengths,
+            destination_lengths,
+            length_differences,
+        }
     }
 }
 
@@ -1253,13 +1351,13 @@ mod tests {
 
     #[test]
     fn the_count_check_distinguishes_absent_from_failed() {
-        assert!(CountCheck::new(Some(28), 28).passed());
-        assert!(!CountCheck::new(Some(28), 27).passed());
-        let absent = CountCheck::new(None, 27);
+        assert!(CountCheck::new(Some(28), 28, 0).passed());
+        assert!(!CountCheck::new(Some(28), 27, 0).passed());
+        let absent = CountCheck::new(None, 27, 0);
         assert!(absent.passed());
         assert!(!absent.made());
         assert!(absent.to_string().contains("not made"));
-        assert!(CountCheck::new(Some(28), 27).to_string().contains("27"));
+        assert!(CountCheck::new(Some(28), 27, 0).to_string().contains("27"));
     }
 
     /// The reconciliation: 67 in the header, 32 walked, 35 never listed by
@@ -1268,41 +1366,16 @@ mod tests {
     /// does a shortfall the unlisted set does not account for.
     #[test]
     fn the_count_reconciles_daemon_unlisted_entries() {
-        let reconciled = CountCheck {
-            header_item_count: Some(67),
-            walked: 32,
-            unlisted: 35,
-        };
+        let reconciled = CountCheck::new(Some(67), 32, 35);
         assert!(reconciled.passed());
         assert!(
             reconciled
                 .to_string()
                 .contains("35 never listed by the daemon")
         );
-        assert!(
-            !CountCheck {
-                header_item_count: Some(67),
-                walked: 68,
-                unlisted: 0,
-            }
-            .passed()
-        );
-        assert!(
-            !CountCheck {
-                header_item_count: Some(67),
-                walked: 32,
-                unlisted: 36,
-            }
-            .passed()
-        );
-        assert!(
-            !CountCheck {
-                header_item_count: Some(67),
-                walked: 31,
-                unlisted: 35,
-            }
-            .passed()
-        );
+        assert!(!CountCheck::new(Some(67), 68, 0).passed());
+        assert!(!CountCheck::new(Some(67), 32, 36).passed());
+        assert!(!CountCheck::new(Some(67), 31, 35).passed());
     }
 
     /// The RFC 1321 test suite, plus the case a padding bug hides in: an
@@ -1418,6 +1491,7 @@ mod tests {
         let unlisted = unlisted_wallet_entries(
             &inventory,
             std::slice::from_ref(&walked),
+            &[],
             &["Secret Service/old login".to_string()],
         );
 
@@ -1444,7 +1518,7 @@ mod tests {
             ciphertext_offset: 0,
         };
 
-        let unlisted = unlisted_wallet_entries(&inventory, &[], &["accounts/3/1".to_string()]);
+        let unlisted = unlisted_wallet_entries(&inventory, &[], &[], &["accounts/3/1".to_string()]);
 
         assert_eq!(unlisted.len(), 1);
         assert_eq!(unlisted[0].folder.as_deref(), Some("accounts/3"));
@@ -1471,12 +1545,85 @@ mod tests {
         let unlisted = unlisted_wallet_entries(
             &inventory,
             std::slice::from_ref(&walked),
+            &[],
             &["Passwords/my router".to_string()],
         );
 
         assert_eq!(unlisted.len(), 1);
         assert_eq!(unlisted[0].folder.as_deref(), None);
         assert_eq!(unlisted[0].entry_hash, hex(&md5(b"other")));
+    }
+
+    /// A refused entry is accounted for, not unlisted: the header counts it,
+    /// the walked count counts it, and the index-minus-walk set must not count
+    /// it a second time. Without the `accounted` provenances a header=2 wallet
+    /// with one imported and one refused item reconciles as walked 2 against
+    /// unlisted 1 — a faithful import failing against itself.
+    #[test]
+    fn a_refused_entry_is_accounted_for_not_unlisted() {
+        use crate::import::formats::{WalletFolderIndex, WalletInventory};
+        let inventory = WalletInventory {
+            cipher: 3,
+            hash: 2,
+            folders: vec![WalletFolderIndex {
+                folder_hash: md5(b"Passwords"),
+                entry_hashes: vec![md5(b"my router"), md5(b"too big")],
+            }],
+            ciphertext_offset: 0,
+        };
+        let walked = item(&[], b"s");
+        let refused = Provenance::kwallet("kdewallet", "Passwords", "too big");
+
+        // Without the refused provenance the refused entry is unlisted, and
+        // walked + unlisted overshoots the header: the double count.
+        let double_counted =
+            unlisted_wallet_entries(&inventory, std::slice::from_ref(&walked), &[], &[]);
+        assert_eq!(double_counted.len(), 1);
+
+        let unlisted = unlisted_wallet_entries(
+            &inventory,
+            std::slice::from_ref(&walked),
+            std::slice::from_ref(&refused),
+            &[],
+        );
+        assert!(unlisted.is_empty(), "{unlisted:?}");
+        // One walked plus one refused against a header of two.
+        assert!(CountCheck::new(Some(2), 2, unlisted.len()).passed());
+    }
+
+    /// A non-empty unlisted set is unproved, never passed-away: the count
+    /// reconciles, and completeness still does not.
+    #[test]
+    fn a_nonempty_unlisted_set_is_unproved() {
+        let v = Verification {
+            count: CountCheck::new(Some(2), 1, 1),
+            fingerprint_mismatches: Vec::new(),
+            fingerprints_compared: Some(1),
+            hash_table_misses: Vec::new(),
+            hash_table_checked: None,
+            unlisted: vec![UnlistedEntry {
+                folder_hash: "aa".to_string(),
+                entry_hash: "bb".to_string(),
+                folder: None,
+                entry: None,
+            }],
+            probes: ProbeSummary {
+                passed: 1,
+                failed: 0,
+                not_issued: 0,
+            },
+            failed_probes: Vec::new(),
+            source_lengths: Histogram::of_lengths([1]),
+            destination_lengths: Some(Histogram::of_lengths([1])),
+            length_differences: Vec::new(),
+        };
+        assert!(v.passed());
+        let unproved = v.unproved();
+        assert_eq!(unproved.len(), 1, "{unproved:?}");
+        assert!(
+            unproved[0].contains("never listed by the source"),
+            "{unproved:?}"
+        );
     }
 
     #[test]
@@ -1612,7 +1759,7 @@ mod tests {
     #[test]
     fn a_verification_passes_only_when_every_check_it_made_agreed() {
         let mut v = Verification {
-            count: CountCheck::new(Some(2), 2),
+            count: CountCheck::new(Some(2), 2, 0),
             fingerprint_mismatches: Vec::new(),
             fingerprints_compared: Some(2),
             hash_table_misses: Vec::new(),
@@ -1634,12 +1781,12 @@ mod tests {
         v.probes.failed = 1;
         assert!(!v.passed());
         v.probes.failed = 0;
-        v.count = CountCheck::new(Some(3), 2);
+        v.count = CountCheck::new(Some(3), 2, 0);
         assert!(!v.passed());
 
         // Absent checks are unproved, not failed.
         let dry = Verification {
-            count: CountCheck::new(None, 2),
+            count: CountCheck::new(None, 2, 0),
             fingerprints_compared: None,
             destination_lengths: None,
             probes: ProbeSummary {
@@ -1672,7 +1819,7 @@ mod tests {
         assert!(plan.is_empty(), "an attribute-less item must not be probed");
 
         let v = Verification {
-            count: CountCheck::new(Some(2), 2),
+            count: CountCheck::new(Some(2), 2, 0),
             fingerprint_mismatches: Vec::new(),
             fingerprints_compared: Some(2),
             hash_table_misses: Vec::new(),
@@ -1704,5 +1851,150 @@ mod tests {
             ..v.clone()
         };
         assert!(probed.unproved().is_empty(), "{:?}", probed.unproved());
+    }
+
+    fn wallet_inventory(pairs: &[(&str, &[&str])]) -> crate::import::formats::WalletInventory {
+        use crate::import::formats::{WalletFolderIndex, WalletInventory};
+        WalletInventory {
+            cipher: 3,
+            hash: 2,
+            folders: pairs
+                .iter()
+                .map(|(folder, entries)| WalletFolderIndex {
+                    folder_hash: md5(folder.as_bytes()),
+                    entry_hashes: entries.iter().map(|e| md5(e.as_bytes())).collect(),
+                })
+                .collect(),
+            ciphertext_offset: 0,
+        }
+    }
+
+    fn kwallet_item(folder: &str, entry: &str) -> SourceItem {
+        let mut it = item(&[], b"s");
+        it.provenance = Provenance::kwallet("kdewallet", folder, entry);
+        it
+    }
+
+    /// A walked item outside the index does not shrink the unlisted set: the
+    /// forgery displaces nothing, so the file's real entry stays unlisted and
+    /// the count reads one declared, one walked, one never listed — a failure.
+    #[test]
+    fn a_walked_item_outside_the_index_does_not_shrink_unlisted() {
+        let inventory = wallet_inventory(&[("Passwords", &["my router"])]);
+        let walked = kwallet_item("Passwords", "forged-entry");
+        let unlisted = unlisted_wallet_entries(&inventory, &[walked], &[], &[]);
+        assert_eq!(unlisted.len(), 1);
+        assert_eq!(unlisted[0].entry_hash, hex(&md5(b"my router")));
+        let count = CountCheck {
+            header_item_count: Some(1),
+            walked: 1,
+            unlisted: unlisted.len(),
+        };
+        assert!(
+            !count.passed(),
+            "1 declared against 1 walked plus 1 unlisted is a failure"
+        );
+    }
+
+    /// Items with no KWallet provenance are not in the index and never shrink
+    /// it: a gnome item walked against a wallet leaves the wallet's entry
+    /// unlisted rather than panicking on a missing folder.
+    #[test]
+    fn gnome_provenance_walked_items_are_ignored_not_a_panic() {
+        let inventory = wallet_inventory(&[("Passwords", &["my router"])]);
+        let mut gnome = item(&[], b"s");
+        gnome.provenance = Provenance::gnome("Login", 1);
+        let unlisted = unlisted_wallet_entries(&inventory, &[gnome], &[], &[]);
+        assert_eq!(unlisted.len(), 1);
+    }
+
+    /// A key with no slash is tried as `("", key)`: the empty folder is a
+    /// folder, and its hash is `MD5("")`.
+    #[test]
+    fn a_slashless_sidecar_key_resolves_as_empty_folder() {
+        let inventory = wallet_inventory(&[("", &["lonely"])]);
+        let unlisted = unlisted_wallet_entries(&inventory, &[], &[], &["lonely".to_string()]);
+        assert_eq!(unlisted.len(), 1);
+        assert_eq!(unlisted[0].folder.as_deref(), Some(""));
+        assert_eq!(unlisted[0].entry.as_deref(), Some("lonely"));
+    }
+
+    /// One sidecar key naming two index pairs pins current resolution: each
+    /// unlisted pair resolves through its own split, first matching split per
+    /// pair wins, and neither pair steals the other's name. Intent is
+    /// first-match-wins within a pair, not deduplication across pairs — logic
+    /// unchanged, behaviour pinned.
+    #[test]
+    fn one_sidecar_key_matching_two_pairs_resolves_each_through_its_split() {
+        let inventory = wallet_inventory(&[("a", &["b/c"]), ("a/b", &["c"])]);
+        let unlisted = unlisted_wallet_entries(&inventory, &[], &[], &["a/b/c".to_string()]);
+        assert_eq!(unlisted.len(), 2, "{unlisted:?}");
+        // Each pair finds its own split of the same key.
+        let mut names: Vec<(Option<String>, Option<String>)> = unlisted
+            .iter()
+            .map(|u| (u.folder.clone(), u.entry.clone()))
+            .collect();
+        names.sort();
+        assert!(names.contains(&(Some("a".to_string()), Some("b/c".to_string()))));
+        assert!(names.contains(&(Some("a/b".to_string()), Some("c".to_string()))));
+    }
+
+    /// Zero unlisted adds no suffix: the Display names the split only when
+    /// there is one.
+    #[test]
+    fn count_display_omits_the_never_listed_suffix_when_zero() {
+        let plain = CountCheck::new(Some(3), 3, 0).to_string();
+        assert!(!plain.contains("never listed"), "{plain}");
+        let with = CountCheck {
+            header_item_count: Some(3),
+            walked: 2,
+            unlisted: 1,
+        }
+        .to_string();
+        assert!(with.contains("never listed"), "{with}");
+    }
+
+    /// An old report without the unlisted keys still parses, with the same
+    /// passed() semantics as before the field existed.
+    #[test]
+    fn an_old_report_without_unlisted_keys_deserializes_as_zero() {
+        let old_count: CountCheck =
+            serde_json::from_str(r#"{"header_item_count":2,"walked":2}"#).unwrap();
+        assert_eq!(old_count.unlisted, 0);
+        assert!(old_count.passed());
+
+        let old: Verification = serde_json::from_value(serde_json::json!({
+            "count": {"header_item_count": 1, "walked": 1},
+            "probes": {"passed": 0, "failed": 0, "not_issued": 0},
+            "source_lengths": [0, 0, 0, 0, 0, 0, 0, 0],
+        }))
+        .unwrap();
+        assert!(old.unlisted.is_empty());
+        assert_eq!(old.count.unlisted, 0);
+        assert!(old.passed());
+
+        // And a fresh zero omits the key again, so old and new files agree.
+        let fresh = Verification {
+            count: CountCheck::new(Some(1), 1, 0),
+            fingerprint_mismatches: Vec::new(),
+            fingerprints_compared: Some(1),
+            hash_table_misses: Vec::new(),
+            hash_table_checked: None,
+            unlisted: Vec::new(),
+            probes: ProbeSummary {
+                passed: 0,
+                failed: 0,
+                not_issued: 0,
+            },
+            failed_probes: Vec::new(),
+            source_lengths: Histogram::of_lengths([4]),
+            destination_lengths: Some(Histogram::of_lengths([4])),
+            length_differences: Vec::new(),
+        };
+        let json = serde_json::to_string(&fresh).unwrap();
+        assert!(
+            !json.contains("\"unlisted\""),
+            "a zero unlisted set must be omitted: {json}"
+        );
     }
 }

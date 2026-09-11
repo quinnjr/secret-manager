@@ -496,7 +496,12 @@ reported by attribute *keys* and object path, never values.
 
 **An independent count.** Both sources' cleartext headers give an item count
 with no password. If the file says 28 and the walk produced 27, the import
-failed regardless of what the fingerprints agree on. For KWallet there is a
+failed regardless of what the fingerprints agree on. KWallet entries the
+daemon never lists are accounted separately: the `--report` schema carries
+the additive keys `verification.unlisted[]` (index entries proved in the file
+but never listed; default `[]`, skipped when empty) and `count.unlisted`
+(their tally; default `0`, skipped when zero), so the count check reads
+header == walked + unlisted. For KWallet there is a
 stronger version: recompute `MD5(folder)` and `MD5(key)` for every imported
 item and assert membership in the `.kwl` hash table, proving no name was
 mangled, using only hashes.
