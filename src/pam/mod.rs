@@ -1050,16 +1050,25 @@ fn privileges_to_drop(euid: u32, target: u32) -> bool {
     euid == 0 && target != 0 && euid != target
 }
 
-/// Shed root before the first connect: a daemon behind mount sandboxing
-/// runs inside a single-uid user namespace, where every host uid except
-/// the target maps to the overflow uid — so root would arrive
-/// unrecognisable and be refused, while the target uid maps to itself.
+/// Shed root for the target uid inside a forked child, before it touches
+/// the socket: a daemon behind mount sandboxing runs inside a single-uid
+/// user namespace, where every host uid except the target maps to the
+/// overflow uid — so root would arrive unrecognisable and be refused, while
+/// the target uid maps to itself.
+///
+/// Child-only: `setuid` is irreversible by design, and the calling process
+/// is the PAM session its login path forks the user session from — a
+/// display manager that lost root here could authenticate the user and
+/// then fail to start anything with `EPERM`. The fork that isolates this
+/// is [`fork_report`]; production callers that need target-uid socket
+/// credentials go through [`run_socket_work_as_target`], never here
+/// directly (tests excepted).
 /// Supplementary groups go first (peer checks are uid-only, and nothing
-/// past this point needs root's memberships); setuid is irreversible by
-/// design. Everything root is needed for (fd-pinned directory validation,
-/// header read) already happened above. A failure keeps old behaviour
-/// (proceed as-is) rather than inventing a new one.
-fn drop_privileges_for_socket(target: u32) -> bool {
+/// past this point needs root's memberships). Everything root is needed
+/// for (fd-pinned directory validation, header read) already happened
+/// above. A failure keeps old behaviour (proceed as-is) rather than
+/// inventing a new one.
+fn drop_privileges_in_forked_child(target: u32) -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if !privileges_to_drop(euid, target) {
@@ -1077,6 +1086,194 @@ fn drop_privileges_for_socket(target: u32) -> bool {
     true
 }
 
+/// Reaps a forked child within `timeout`. `true` once it is collected.
+///
+/// `EINTR` restarts the wait; any other wait error means there is nothing
+/// left to reap. Giving up logs and leaves a zombie until this process
+/// exits, which is far cheaper than a hung login.
+fn reap_child(pid: libc::pid_t, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        let mut status = 0;
+        // SAFETY: `pid` is a child of this process; `status` is a live int.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid {
+            return true;
+        }
+        if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            log("socket child did not exit in time; leaving it to init to reap");
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Logs a failed `kill` with its errno: under fd exhaustion or a
+/// fork-bomb-adjacent `EAGAIN` the errno is the entire diagnosis.
+fn kill_child(pid: libc::pid_t) {
+    // SAFETY: `pid` is a child of this process.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        log(&format!(
+            "cannot kill the socket child: {}; vault stays locked",
+            sanitize(&std::io::Error::last_os_error().to_string())
+        ));
+    }
+}
+
+/// Writes the whole buffer, retrying `EINTR`. `false` on any other failure.
+fn write_exact_fd(fd: libc::c_int, buf: &[u8]) -> bool {
+    let mut done = 0;
+    while done < buf.len() {
+        // SAFETY: `buf[done..]` is live for the write; the fd is the pipe's.
+        let rc = unsafe {
+            libc::write(
+                fd,
+                buf.as_ptr().add(done) as *const libc::c_void,
+                buf.len() - done,
+            )
+        };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if rc == 0 {
+            return false;
+        }
+        done += rc as usize;
+    }
+    true
+}
+
+/// Runs `work` in a forked child and returns the two bytes it reported
+/// through a pipe, or `None` when the report never arrived.
+///
+/// The parent keeps its pid, credentials and descriptors: only the child's
+/// two bytes cross back. Fail-open throughout — a pipe/fork/read/timeout
+/// failure logs and returns `None`, and the caller treats that as "vault
+/// stays locked, login proceeds".
+fn fork_report(budget: &Budget, work: impl FnOnce() -> [u8; 2]) -> Option<[u8; 2]> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a live array of two ints, which is what pipe2 writes.
+    // CLOEXEC so the descriptors never leak into a `systemctl` grandchild.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        log(&format!(
+            "cannot create the child report pipe ({}); vault stays locked",
+            sanitize(&std::io::Error::last_os_error().to_string())
+        ));
+        return None;
+    }
+    // SAFETY: the child runs `work` and `_exit`s below; the parent closes
+    // the end it does not need on each side of the fork.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        log(&format!(
+            "cannot fork for the socket work ({}); vault stays locked",
+            sanitize(&std::io::Error::last_os_error().to_string())
+        ));
+        // SAFETY: both descriptors came from pipe2 above and are owned here.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return None;
+    }
+    if pid == 0 {
+        // The child holds the login password: never let it dump core.
+        // SAFETY: prctl takes only constants here; best effort.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        // SAFETY: the read end is not needed here.
+        unsafe { libc::close(fds[0]) };
+        // A panic must not unwind past the fork into a second login flow:
+        // contain it here and exit, so the parent reads EOF and fails open.
+        let bytes = match catch_unwind(AssertUnwindSafe(work)) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // SAFETY: owned here; the parent is already polling on it.
+                unsafe { libc::close(fds[1]) };
+                unsafe { libc::_exit(2) };
+            }
+        };
+        // Child: report and `_exit` without running destructors, so no
+        // stdio buffer flushes twice and no lock is touched. Secrets it
+        // holds are freed by the kernel on exit; the parent's copies are
+        // untouched and still cleared by the hook.
+        let ok = write_exact_fd(fds[1], &bytes);
+        // SAFETY: owned here; the parent is already polling on it.
+        unsafe { libc::close(fds[1]) };
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    // Parent.
+    // SAFETY: the write end belongs to the child now.
+    unsafe { libc::close(fds[1]) };
+    let report = wait_for_report(fds[0], pid, budget);
+    // SAFETY: the read end is owned here and no longer needed.
+    unsafe { libc::close(fds[0]) };
+    report
+}
+
+/// Reads the child's two report bytes, bounded by what is left of the hook
+/// budget: every read is preceded by a [`poll_readable`] against the
+/// remaining budget, so no byte can stall the login. A child that never
+/// reports (or reports short) is killed and reaped; its outcome is `None`.
+fn wait_for_report(fd: libc::c_int, pid: libc::pid_t, budget: &Budget) -> Option<[u8; 2]> {
+    let mut out = [0u8; 2];
+    match read_exact_bounded(fd, &mut out, budget) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            log("socket child did not report in time; vault stays locked");
+            kill_child(pid);
+            reap_child(pid, REAP_TIMEOUT);
+            return None;
+        }
+        Err(e) => {
+            log(&format!(
+                "socket child report unreadable ({}); vault stays locked",
+                sanitize(&e.to_string())
+            ));
+            reap_child(pid, REAP_TIMEOUT);
+            return None;
+        }
+    }
+    // The child is past its last blocking point; collect it within bounds —
+    // never an unbounded wait, even here. A child that reported but will
+    // not exit (stopped, e.g.) is killed rather than waited on forever.
+    if !reap_child(pid, REAP_TIMEOUT) {
+        kill_child(pid);
+        reap_child(pid, REAP_TIMEOUT);
+    }
+    Some(out)
+}
+
+/// Runs socket-touching `work` with the target uid's socket credentials
+/// while this process keeps its own: root facing a foreign target forks a
+/// child that drops first; anything else runs inline. `None` means the
+/// child never reported — fail open.
+///
+/// The `[u8; 2]` are the child's report bytes, opaque here: each caller
+/// encodes its own outcome before the fork and decodes after (see
+/// [`session_outcome_code`] and [`chauthtok_outcome_code`]), so this
+/// function never interprets them.
+fn run_socket_work_as_target(
+    target: u32,
+    budget: &Budget,
+    work: impl FnOnce() -> [u8; 2],
+) -> Option<[u8; 2]> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !privileges_to_drop(euid, target) {
+        return Some(work());
+    }
+    fork_report(budget, || {
+        drop_privileges_in_forked_child(target);
+        work()
+    })
+}
+
 /// Whether a failed connect proves the socket is stale. `None` means it does
 /// not: a permission or timeout failure can happen against a perfectly live
 /// daemon, and unlinking there would take its socket away.
@@ -1085,6 +1282,104 @@ pub(crate) fn stale_socket_action(kind: std::io::ErrorKind) -> Option<StaleSocke
         std::io::ErrorKind::ConnectionRefused => Some(StaleSocket::Unlink),
         std::io::ErrorKind::NotFound => Some(StaleSocket::LeaveAlone),
         _ => None,
+    }
+}
+
+/// Byte codes the forked socket child uses to report its [`SessionOutcome`]
+/// through the pipe, so the parent — which stayed root — can reconstruct
+/// exactly what the child decided.
+///
+/// First byte: the outcome, `0..=8` for the plain variants, [`REPORT_STARTED`]
+/// for a daemon-start outcome whose detail rides the second byte. Second
+/// byte: only significant under [`REPORT_STARTED`] — [`REPORT_NOT_RETRIED_BASE]
+/// `..=15` packs `NotRetried` as bit0 = `waited`, bits1+ = `revalidated`
+/// (`0` = `None`, `1` = `Some(false)`, `2` = `Some(true)`), and
+/// [`REPORT_RETRY_BASE]` `..=22` names the remaining three. Anything else —
+/// any unknown first byte, any second byte outside its outcome's range —
+/// decodes to [`SessionOutcome::Failed`]: a garbled report must fail open
+/// (vault stays locked, login proceeds), never invent a success.
+///
+/// Adding a [`SessionOutcome`] or [`StartOutcome`] variant means extending
+/// this codec *and* [`assert_session_outcome_covered`], which fails to
+/// compile until the new outcome is answered for.
+const REPORT_STARTED: u8 = 9;
+const REPORT_NOT_RETRIED_BASE: u8 = 10;
+const REPORT_RETRY_BASE: u8 = 20;
+fn session_outcome_code(outcome: &SessionOutcome) -> (u8, u8) {
+    match outcome {
+        SessionOutcome::NoPassword => (0, 0),
+        SessionOutcome::NoTarget => (1, 0),
+        SessionOutcome::RefusedSocketDir => (2, 0),
+        SessionOutcome::NoVaultHeader => (3, 0),
+        SessionOutcome::BudgetSpent => (4, 0),
+        SessionOutcome::NoCallBudget => (5, 0),
+        SessionOutcome::Attempted => (6, 0),
+        SessionOutcome::Failed => (7, 0),
+        SessionOutcome::ConnectNotStale => (8, 0),
+        SessionOutcome::Started(inner) => (
+            REPORT_STARTED,
+            match inner {
+                StartOutcome::NoStartBudget => 0,
+                StartOutcome::StaleSocketStuck => 1,
+                StartOutcome::NoUser => 2,
+                StartOutcome::NotRetried {
+                    waited,
+                    revalidated,
+                } => {
+                    REPORT_NOT_RETRIED_BASE
+                        + u8::from(*waited)
+                        + match revalidated {
+                            None => 0,
+                            Some(false) => 2,
+                            Some(true) => 4,
+                        }
+                }
+                StartOutcome::RetryBudgetSpent => REPORT_RETRY_BASE,
+                StartOutcome::NoRetryCallBudget => REPORT_RETRY_BASE + 1,
+                StartOutcome::Retried => REPORT_RETRY_BASE + 2,
+            },
+        ),
+    }
+}
+
+fn session_outcome_from_codes(a: u8, b: u8) -> SessionOutcome {
+    match (a, b) {
+        (0, 0) => SessionOutcome::NoPassword,
+        (1, 0) => SessionOutcome::NoTarget,
+        (2, 0) => SessionOutcome::RefusedSocketDir,
+        (3, 0) => SessionOutcome::NoVaultHeader,
+        (4, 0) => SessionOutcome::BudgetSpent,
+        (5, 0) => SessionOutcome::NoCallBudget,
+        (6, 0) => SessionOutcome::Attempted,
+        (7, 0) => SessionOutcome::Failed,
+        (8, 0) => SessionOutcome::ConnectNotStale,
+        (REPORT_STARTED, 0) => SessionOutcome::Started(StartOutcome::NoStartBudget),
+        (REPORT_STARTED, 1) => SessionOutcome::Started(StartOutcome::StaleSocketStuck),
+        (REPORT_STARTED, 2) => SessionOutcome::Started(StartOutcome::NoUser),
+        (REPORT_STARTED, b)
+            if (REPORT_NOT_RETRIED_BASE..=REPORT_NOT_RETRIED_BASE + 5).contains(&b) =>
+        {
+            let waited = (b - REPORT_NOT_RETRIED_BASE) & 1 == 1;
+            let revalidated = match (b - REPORT_NOT_RETRIED_BASE) >> 1 {
+                0 => None,
+                1 => Some(false),
+                _ => Some(true),
+            };
+            SessionOutcome::Started(StartOutcome::NotRetried {
+                waited,
+                revalidated,
+            })
+        }
+        (REPORT_STARTED, b) if b == REPORT_RETRY_BASE => {
+            SessionOutcome::Started(StartOutcome::RetryBudgetSpent)
+        }
+        (REPORT_STARTED, b) if b == REPORT_RETRY_BASE + 1 => {
+            SessionOutcome::Started(StartOutcome::NoRetryCallBudget)
+        }
+        (REPORT_STARTED, b) if b == REPORT_RETRY_BASE + 2 => {
+            SessionOutcome::Started(StartOutcome::Retried)
+        }
+        _ => SessionOutcome::Failed,
     }
 }
 
@@ -1493,7 +1788,7 @@ pub(crate) fn open_session_decision(
     // The directory is held open from here on: every later unlink, connect and
     // re-check goes through this descriptor rather than through a name the
     // user can swap underneath root.
-    let Some(mut dir) = SocketDir::open(&t.sock, t.uid) else {
+    let Some(dir) = SocketDir::open(&t.sock, t.uid) else {
         return SessionOutcome::RefusedSocketDir;
     };
     // Salt and parameters come from the vault file itself, never from whatever
@@ -1505,10 +1800,56 @@ pub(crate) fn open_session_decision(
         log(SPENT);
         return SessionOutcome::BudgetSpent;
     }
-    // Shed root before touching the socket: root-validated directory and
-    // header are behind us, and every later step (connects, systemctl as
-    // the user, the key send) is better — or only works — as the target.
-    drop_privileges_for_socket(t.uid);
+    // Everything past the root-validated directory and header touches the
+    // socket, so it runs with the target's credentials — in a forked child
+    // when root faces a foreign target, so this process keeps root and the
+    // login path can still fork the user session afterwards. (An in-process
+    // `setuid` here broke display-manager logins: authentication succeeded
+    // and the session spawn then failed with `EPERM`.)
+    let password = Zeroizing::new(password.to_owned());
+    let report = run_socket_work_as_target(t.uid, budget, move || {
+        let (a, b) = session_outcome_code(&session_socket_tail(
+            dir,
+            opts,
+            t,
+            password,
+            salt,
+            kdf,
+            budget,
+            start_daemon,
+        ));
+        [a, b]
+    });
+    match report {
+        Some([a, b]) => session_outcome_from_codes(a, b),
+        None => {
+            log("socket child never reported; vault stays locked");
+            SessionOutcome::Failed
+        }
+    }
+}
+
+/// Everything `open_session` does past the root-validated directory and
+/// vault header: connects, unlocks, and starts-and-retries the daemon.
+///
+/// Runs via [`run_socket_work_as_target`] — in a forked child as the
+/// target uid when root faces a foreign target, inline otherwise — so it
+/// must neither assume nor change its own credentials. Split out so the
+/// ordering stays directly testable without libpam (see
+/// `session_socket_tail_unlocks_through_a_live_daemon`). The password
+/// travels as [`Zeroizing`], so the parent's copy is scrubbed on drop;
+/// the child's copy dies with it (and the child is non-dumpable).
+#[allow(clippy::too_many_arguments)]
+fn session_socket_tail(
+    mut dir: SocketDir,
+    opts: Options,
+    target: Target,
+    password: Zeroizing<String>,
+    salt: [u8; SALT_LEN],
+    kdf: KdfParams,
+    budget: &Budget,
+    start_daemon: &dyn Fn(&Budget) -> bool,
+) -> SessionOutcome {
     // A leftover socket from a crashed daemon looks exactly like a running
     // one, so only a failed connect is a usable test.
     let sock = dir.socket_path();
@@ -1520,14 +1861,14 @@ pub(crate) fn open_session_decision(
     // holding the directory open pins the parent, but `connect(2)` still
     // resolves the final component, so a symlink planted there would redirect
     // root. A refusal is reported as a connect failure, which is what it is.
-    let attempt = unlock_once(&dir, &opts, &t, password, &salt, kdf, call, budget);
+    let attempt = unlock_once(&dir, &opts, &target, &password, &salt, kdf, call, budget);
     match attempt {
         Ok(()) => SessionOutcome::Attempted,
         Err(ProtocolError::Connect(e)) if opts.auto_start => start_and_retry(
             &mut dir,
             &opts,
-            &t,
-            password,
+            &target,
+            &password,
             &salt,
             kdf,
             budget,
@@ -1555,7 +1896,7 @@ pub(crate) fn open_session_decision(
                 log_transport("unlock", &e);
                 return SessionOutcome::Failed;
             }
-            match unlock_once(&dir, &opts, &t, password, &salt, kdf, call, budget) {
+            match unlock_once(&dir, &opts, &target, &password, &salt, kdf, call, budget) {
                 Ok(()) => SessionOutcome::Attempted,
                 Err(second) if retryable_reset(&second) => {
                     log_transport("unlock", &second);
@@ -1564,8 +1905,8 @@ pub(crate) fn open_session_decision(
                 Err(ProtocolError::Connect(e2)) if opts.auto_start => start_and_retry(
                     &mut dir,
                     &opts,
-                    &t,
-                    password,
+                    &target,
+                    &password,
                     &salt,
                     kdf,
                     budget,
@@ -1664,11 +2005,42 @@ pub(crate) fn chauthtok_decision(
         log("no time left in the password-change budget");
         return ChauthtokOutcome::NoCallBudget;
     };
-    // Same blindness as the login path: shed root before touching the
-    // socket so the daemon sees the target uid, not the overflow uid.
-    drop_privileges_for_socket(t.uid);
+    // Same blindness as the login path, same fork: the daemon must see the
+    // target uid, and this process must keep root for whatever the login
+    // path forks afterwards. Runs via [`run_socket_work_as_target`].
+    let report = run_socket_work_as_target(t.uid, budget, move || {
+        [
+            chauthtok_outcome_code(&password_socket_tail(dir, req, t.uid, left)),
+            0,
+        ]
+    });
+    if report.is_none() {
+        log("socket child never reported; password change not forwarded");
+    }
+    chauthtok_outcome_from_report(report)
+}
+
+/// Decodes the child's report: only [`CHAUTHTOK_SENT`] reads as sent — any
+/// other byte, and no report at all, reads as not forwarded.
+fn chauthtok_outcome_from_report(report: Option<[u8; 2]>) -> ChauthtokOutcome {
+    match report {
+        Some([CHAUTHTOK_SENT, _]) => ChauthtokOutcome::Sent,
+        _ => ChauthtokOutcome::SendFailed,
+    }
+}
+
+/// Everything `chauthtok` does past the request build: the connect and the
+/// send. Runs via [`run_socket_work_as_target`] for the same reason as
+/// [`session_socket_tail`]: the daemon must see the target uid, and this
+/// process must keep root.
+fn password_socket_tail(
+    dir: SocketDir,
+    req: Request,
+    uid: u32,
+    call: Duration,
+) -> ChauthtokOutcome {
     match dir.connect_path() {
-        Ok(path) => match try_send(&path, &req, t.uid, "password change", left) {
+        Ok(path) => match try_send(&path, &req, uid, "password change", call) {
             Ok(()) => ChauthtokOutcome::Sent,
             Err(e) => {
                 log_transport("password change", &e);
@@ -1679,6 +2051,29 @@ pub(crate) fn chauthtok_decision(
             log_transport("password change", &ProtocolError::Connect(e));
             ChauthtokOutcome::SendFailed
         }
+    }
+}
+
+/// One-byte report code for [`password_socket_tail`]: only success crosses
+/// the pipe as success — anything else, including a garbled byte, is a
+/// failure, and the password change simply is not forwarded.
+///
+/// Exhaustive with no wildcard, so a new [`ChauthtokOutcome`] variant fails
+/// to compile until it is answered for here.
+const CHAUTHTOK_SENT: u8 = 1;
+const CHAUTHTOK_NOT_SENT: u8 = 0;
+fn chauthtok_outcome_code(outcome: &ChauthtokOutcome) -> u8 {
+    match outcome {
+        ChauthtokOutcome::Sent => CHAUTHTOK_SENT,
+        ChauthtokOutcome::Prelim
+        | ChauthtokOutcome::Missing(_)
+        | ChauthtokOutcome::NoTarget
+        | ChauthtokOutcome::RefusedSocketDir
+        | ChauthtokOutcome::NoVaultHeader
+        | ChauthtokOutcome::NoRequest
+        | ChauthtokOutcome::BudgetSpent
+        | ChauthtokOutcome::NoCallBudget
+        | ChauthtokOutcome::SendFailed => CHAUTHTOK_NOT_SENT,
     }
 }
 
@@ -3220,7 +3615,7 @@ mod tests {
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
-            let ok = drop_privileges_for_socket(target);
+            let ok = drop_privileges_in_forked_child(target);
             let landed = unsafe { libc::geteuid() } == target;
             unsafe { libc::_exit(i32::from(!(ok && landed))) };
         }
@@ -3229,6 +3624,350 @@ mod tests {
         assert!(
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "child did not land on uid {target}"
+        );
+    }
+
+    /// Every session outcome survives the byte codes the forked child uses
+    /// to report it through the pipe: a code the parent cannot decode
+    /// would turn a known outcome into a failure.
+    #[test]
+    fn session_outcomes_survive_the_child_report_codes() {
+        let outcomes = [
+            SessionOutcome::NoPassword,
+            SessionOutcome::NoTarget,
+            SessionOutcome::RefusedSocketDir,
+            SessionOutcome::NoVaultHeader,
+            SessionOutcome::BudgetSpent,
+            SessionOutcome::NoCallBudget,
+            SessionOutcome::Attempted,
+            SessionOutcome::Failed,
+            SessionOutcome::ConnectNotStale,
+            SessionOutcome::Started(StartOutcome::NoStartBudget),
+            SessionOutcome::Started(StartOutcome::StaleSocketStuck),
+            SessionOutcome::Started(StartOutcome::NoUser),
+            SessionOutcome::Started(StartOutcome::RetryBudgetSpent),
+            SessionOutcome::Started(StartOutcome::NoRetryCallBudget),
+            SessionOutcome::Started(StartOutcome::Retried),
+        ];
+        for outcome in outcomes {
+            assert_session_outcome_covered(&outcome);
+            let (a, b) = session_outcome_code(&outcome);
+            assert_eq!(
+                session_outcome_from_codes(a, b),
+                outcome,
+                "outcome did not survive its report codes"
+            );
+        }
+        // All six NotRetried states, not a sample: the packing is arithmetic.
+        for waited in [false, true] {
+            for revalidated in [None, Some(false), Some(true)] {
+                let outcome = SessionOutcome::Started(StartOutcome::NotRetried {
+                    waited,
+                    revalidated,
+                });
+                assert_session_outcome_covered(&outcome);
+                let (a, b) = session_outcome_code(&outcome);
+                assert_eq!(
+                    session_outcome_from_codes(a, b),
+                    outcome,
+                    "NotRetried {waited:?}/{revalidated:?} did not survive"
+                );
+            }
+        }
+        // Garbled bytes fail open: unknown first bytes and unknown Started
+        // sub-codes never invent a success.
+        for codes in [
+            (9u8, 3u8),
+            (9, 16),
+            (9, 17),
+            (9, 23),
+            (10, 0),
+            (255, 255),
+            (0, 5),
+            (6, 1),
+        ] {
+            assert_eq!(
+                session_outcome_from_codes(codes.0, codes.1),
+                SessionOutcome::Failed,
+                "garbled codes {codes:?} must fail open"
+            );
+        }
+    }
+
+    /// Exhaustive over [`SessionOutcome`] with no wildcard: adding a variant
+    /// breaks this match at compile time, forcing the codec and its test to
+    /// answer for the new outcome.
+    fn assert_session_outcome_covered(outcome: &SessionOutcome) {
+        match outcome {
+            SessionOutcome::NoPassword
+            | SessionOutcome::NoTarget
+            | SessionOutcome::RefusedSocketDir
+            | SessionOutcome::NoVaultHeader
+            | SessionOutcome::BudgetSpent
+            | SessionOutcome::NoCallBudget
+            | SessionOutcome::Attempted
+            | SessionOutcome::Failed
+            | SessionOutcome::ConnectNotStale
+            | SessionOutcome::Started(_) => {}
+        }
+    }
+
+    /// The fork transport returns exactly what the child reported, in the
+    /// parent: same pid, same credentials, child's bytes.
+    #[test]
+    fn forked_socket_work_returns_the_child_bytes_in_the_parent() {
+        let pid_before = unsafe { libc::getpid() };
+        let euid_before = unsafe { libc::geteuid() };
+        let egid_before = unsafe { libc::getegid() };
+        let reported = fork_report(&full_budget(), || [7u8, 22u8]);
+        assert_eq!(reported, Some([7u8, 22u8]));
+        assert_eq!(unsafe { libc::getpid() }, pid_before);
+        assert_eq!(unsafe { libc::geteuid() }, euid_before);
+        assert_eq!(unsafe { libc::getegid() }, egid_before);
+    }
+
+    /// Only success crosses the pipe as success: every other password-hook
+    /// outcome — and any garbled byte — must read as "not forwarded".
+    #[test]
+    fn only_a_sent_password_change_reports_success() {
+        assert_eq!(chauthtok_outcome_code(&ChauthtokOutcome::Sent), 1);
+        for outcome in [
+            ChauthtokOutcome::Prelim,
+            ChauthtokOutcome::Missing("old and new passwords"),
+            ChauthtokOutcome::SendFailed,
+            ChauthtokOutcome::NoTarget,
+            ChauthtokOutcome::RefusedSocketDir,
+            ChauthtokOutcome::NoVaultHeader,
+            ChauthtokOutcome::NoRequest,
+            ChauthtokOutcome::BudgetSpent,
+            ChauthtokOutcome::NoCallBudget,
+        ] {
+            assert_eq!(
+                chauthtok_outcome_code(&outcome),
+                0,
+                "{outcome:?} must not report success"
+            );
+        }
+        // Through the parent-side decode, including garbled bytes and the
+        // no-report case: only a 1 first byte is Sent (the second byte is
+        // unused by this codec).
+        assert_eq!(
+            chauthtok_outcome_from_report(Some([1, 0])),
+            ChauthtokOutcome::Sent
+        );
+        assert_eq!(
+            chauthtok_outcome_from_report(Some([1, 7])),
+            ChauthtokOutcome::Sent
+        );
+        for report in [None, Some([0, 0]), Some([2, 5]), Some([255, 255])] {
+            assert_eq!(
+                chauthtok_outcome_from_report(report),
+                ChauthtokOutcome::SendFailed,
+                "report {report:?} must read as not forwarded"
+            );
+        }
+    }
+
+    /// The encoded outcome survives the real pipe, not just the codec: this
+    /// is the composition non-root CI otherwise never exercises (the fork
+    /// in `run_socket_work_as_target` only fires as root).
+    #[test]
+    fn encoded_outcomes_survive_the_real_pipe() {
+        for outcome in [
+            SessionOutcome::Attempted,
+            SessionOutcome::Failed,
+            SessionOutcome::Started(StartOutcome::NotRetried {
+                waited: true,
+                revalidated: Some(true),
+            }),
+            SessionOutcome::Started(StartOutcome::Retried),
+        ] {
+            let reported = fork_report(&full_budget(), || {
+                let (a, b) = session_outcome_code(&outcome);
+                [a, b]
+            });
+            let Some([a, b]) = reported else {
+                panic!("child never reported for {outcome:?}");
+            };
+            assert_eq!(session_outcome_from_codes(a, b), outcome);
+        }
+    }
+
+    /// A child that dies mid-report is a `None`, not a hang: one byte then
+    /// EOF must fail open within budget.
+    #[test]
+    fn a_truncated_child_report_fails_open() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: live array of two ints, as pipe2 requires.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the child writes one byte and exits; the parent only reads.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::close(fds[0]) };
+            let one = [7u8];
+            let mut written = 0;
+            while written < one.len() {
+                // SAFETY: `one` outlives the write.
+                let rc = unsafe {
+                    libc::write(
+                        fds[1],
+                        one.as_ptr().add(written) as *const libc::c_void,
+                        one.len() - written,
+                    )
+                };
+                if rc <= 0 {
+                    break;
+                }
+                written += rc as usize;
+            }
+            unsafe { libc::close(fds[1]) };
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(fds[1]) };
+        let report = wait_for_report(fds[0], pid, &full_budget());
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(report, None, "a 1-byte report must fail open");
+    }
+
+    /// A child that never reports is killed and reaped within budget: the
+    /// hook waits on the pipe, never on the child.
+    #[test]
+    fn an_unreporting_child_is_killed_within_budget() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: live array of two ints, as pipe2 requires.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the child sleeps past every deadline; the parent kills it.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::close(fds[0]) };
+            std::thread::sleep(Duration::from_secs(30));
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(fds[1]) };
+        let start = Instant::now();
+        let report = wait_for_report(fds[0], pid, &Budget::new(Duration::from_millis(200)));
+        let elapsed = start.elapsed();
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(report, None);
+        assert!(
+            elapsed < REAP_TIMEOUT + Duration::from_secs(2),
+            "killing an unreporting child took {elapsed:?}"
+        );
+    }
+
+    /// The tail itself, without the fork: ordering stays directly testable,
+    /// with a stubbed daemon starter that must never run on this path.
+    #[test]
+    fn session_socket_tail_unlocks_through_a_live_daemon() {
+        let (_dir, vault, sock) = session_fixture();
+        let server = fake_daemon(&sock);
+        let outcome = session_socket_tail(
+            SocketDir::open(&sock, me()).expect("fixture dir validates"),
+            Options {
+                collection: "default".into(),
+                auto_start: false,
+                socket: None,
+                vault_dir: None,
+            },
+            target_at(sock.clone(), &vault),
+            Zeroizing::new("hunter2".to_owned()),
+            SALT,
+            LOGIN_KDF,
+            &full_budget(),
+            &no_start,
+        );
+        let req = server.join().expect("fake daemon answered");
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        match req {
+            Request::UnlockWithKey { collection, .. } => assert_eq!(collection, "default"),
+            other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// The supplementary groups of this process, for the credential checks.
+    fn current_groups() -> Vec<libc::gid_t> {
+        // SAFETY: a null buffer with size 0 queries the count without
+        // writing anywhere.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0, "getgroups count failed");
+        let mut buf = vec![0 as libc::gid_t; count as usize];
+        // SAFETY: `buf` has room for exactly `count` entries.
+        let got = unsafe { libc::getgroups(buf.len() as libc::c_int, buf.as_mut_ptr()) };
+        assert_eq!(got, count, "group list changed mid-read");
+        buf
+    }
+
+    /// Re-owns a session fixture's tree to the target uid, the way a real
+    /// `/run/user/<uid>` and vault file are owned by the logging-in user.
+    fn reown_tree(path: &Path, uid: u32) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = CString::new(path.as_os_str().as_bytes()).expect("NUL in path");
+        // SAFETY: `c` is a live NUL-terminated path; chown takes no other
+        // pointer arguments.
+        let rc = unsafe { libc::chown(c.as_ptr(), uid, uid) };
+        assert_eq!(rc, 0, "chown {} failed", path.display());
+    }
+
+    /// The wdm bug, as root: `open_session` against a foreign target must
+    /// leave the caller root, with groups intact, so the login path can
+    /// still fork the user session afterwards. An in-process `setuid`
+    /// authenticates the user and then breaks the spawn with `EPERM`.
+    ///
+    /// Only runs as root — anyone else has no privilege to lose and
+    /// returns early. Isolated in a fork so the test runner itself is
+    /// never mutated; the fixture is re-owned to the target first so the
+    /// fd-pinned validation accepts it like a real login tree.
+    #[test]
+    fn open_session_keeps_root_for_the_login_path() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let target: u32 = 65534;
+        let (_dir, vault, sock) = session_fixture();
+        reown_tree(_dir.path(), target);
+        reown_tree(&vault, target);
+        reown_tree(&vault.join("default.vault"), target);
+        reown_tree(sock.parent().expect("socket has a parent"), target);
+        // SAFETY: the child runs the decision and `_exit`s; the parent
+        // only waits. The TempDir guard stays in the parent, so cleanup
+        // still happens exactly once.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let egid_before = unsafe { libc::getegid() };
+            let groups_before = current_groups();
+            // No daemon behind the socket and no auto-start: the decision
+            // still walks the whole socket path (and would drop privileges
+            // in-process on the buggy code) and lands on Failed.
+            let outcome = open_session_decision(
+                Some("hunter2"),
+                &["auto_start=no".to_string()],
+                &full_budget(),
+                &|_| {
+                    Some(Target {
+                        sock: sock.clone(),
+                        uid: target,
+                        vault_dir: vault.clone(),
+                    })
+                },
+                &no_start,
+            );
+            // SAFETY: synchronous reads of our own credentials.
+            let kept = unsafe { libc::geteuid() } == 0
+                && unsafe { libc::getegid() } == egid_before
+                && current_groups() == groups_before;
+            let ok = kept && outcome == SessionOutcome::Failed;
+            unsafe { libc::_exit(i32::from(!ok)) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is a child of this process; `status` is a live int.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "open_session lost root or took an unexpected path"
         );
     }
 
