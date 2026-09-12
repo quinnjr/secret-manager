@@ -1043,6 +1043,40 @@ fn retryable_reset(e: &ProtocolError) -> bool {
     )
 }
 
+/// Whether this process must shed root before touching the socket: only
+/// root facing a foreign target. Anything else is already where it needs
+/// to be (the target itself, or root's own vault), or cannot get there.
+fn privileges_to_drop(euid: u32, target: u32) -> bool {
+    euid == 0 && target != 0 && euid != target
+}
+
+/// Shed root before the first connect: a daemon behind mount sandboxing
+/// runs inside a single-uid user namespace, where every host uid except
+/// the target maps to the overflow uid — so root would arrive
+/// unrecognisable and be refused, while the target uid maps to itself.
+/// Supplementary groups go first (peer checks are uid-only, and nothing
+/// past this point needs root's memberships); setuid is irreversible by
+/// design. Everything root is needed for (fd-pinned directory validation,
+/// header read) already happened above. A failure keeps old behaviour
+/// (proceed as-is) rather than inventing a new one.
+fn drop_privileges_for_socket(target: u32) -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !privileges_to_drop(euid, target) {
+        return true;
+    }
+    // SAFETY: dropping to an empty group list; root only reaches here.
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        log("cannot drop supplementary groups; continuing with them");
+    }
+    // SAFETY: setuid from euid 0; target is a validated non-zero uid.
+    if unsafe { libc::setuid(target) } != 0 {
+        log(&format!("cannot setuid to {target}; continuing as root"));
+        return false;
+    }
+    true
+}
+
 /// Whether a failed connect proves the socket is stale. `None` means it does
 /// not: a permission or timeout failure can happen against a perfectly live
 /// daemon, and unlinking there would take its socket away.
@@ -1471,6 +1505,10 @@ pub(crate) fn open_session_decision(
         log(SPENT);
         return SessionOutcome::BudgetSpent;
     }
+    // Shed root before touching the socket: root-validated directory and
+    // header are behind us, and every later step (connects, systemctl as
+    // the user, the key send) is better — or only works — as the target.
+    drop_privileges_for_socket(t.uid);
     // A leftover socket from a crashed daemon looks exactly like a running
     // one, so only a failed connect is a usable test.
     let sock = dir.socket_path();
@@ -1626,6 +1664,9 @@ pub(crate) fn chauthtok_decision(
         log("no time left in the password-change budget");
         return ChauthtokOutcome::NoCallBudget;
     };
+    // Same blindness as the login path: shed root before touching the
+    // socket so the daemon sees the target uid, not the overflow uid.
+    drop_privileges_for_socket(t.uid);
     match dir.connect_path() {
         Ok(path) => match try_send(&path, &req, t.uid, "password change", left) {
             Ok(()) => ChauthtokOutcome::Sent,
@@ -3154,6 +3195,41 @@ mod tests {
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
+    }
+
+    /// Dropping root is a decision, and only root facing a foreign target
+    /// takes it: anything else is already where it needs to be, or cannot
+    /// get there.
+    #[test]
+    fn privilege_drop_only_root_facing_a_foreign_target() {
+        assert!(privileges_to_drop(0, 1000));
+        assert!(!privileges_to_drop(0, 0));
+        assert!(!privileges_to_drop(1000, 1000));
+        assert!(!privileges_to_drop(1000, 0));
+    }
+
+    /// The drop itself, isolated from the test runner by a fork: whatever
+    /// uid runs the suite, the child lands on the target and the parent
+    /// keeps its own.
+    #[test]
+    fn dropping_privileges_lands_on_the_target_uid() {
+        let me = unsafe { libc::getuid() };
+        // A target the child can always name: root drops to the overflow
+        // uid, anyone else drops nowhere.
+        let target = if me == 0 { 65534 } else { me };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let ok = drop_privileges_for_socket(target);
+            let landed = unsafe { libc::geteuid() } == target;
+            unsafe { libc::_exit(i32::from(!(ok && landed))) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child did not land on uid {target}"
+        );
     }
 
     /// One retry, not a loop: two resets in a row mean the failure is not a
