@@ -87,16 +87,21 @@ const DEFAULT_VAULT_SUBDIR: &str = ".local/share/secret-manager";
 /// The real bound on a hook is *not* exactly this constant. Argon2 is not
 /// interruptible, so the budget is checked before each derivation but cannot
 /// cut one short once it has begun. `open_session` runs at most two
-/// derivations (the first unlock and the retry after starting the daemon) and
-/// `chauthtok` runs two (old key and new key), each bounded by the login KDF
-/// ceiling of [`MAX_M_COST_KIB_LOGIN`] / [`MAX_T_COST_LOGIN`] /
-/// [`MAX_P_COST_LOGIN`] rather than by the vault's. So the guarantee is:
+/// derivations (the first unlock and the retry after starting the daemon),
+/// three when the reset retry fires (first unlock, reset retry, and the retry
+/// after starting the daemon), and `chauthtok` runs two (old key and new key),
+/// each bounded by the login KDF ceiling of [`MAX_M_COST_KIB_LOGIN`] /
+/// [`MAX_T_COST_LOGIN`] / [`MAX_P_COST_LOGIN`] rather than by the vault's. So
+/// the guarantee is:
 ///
 /// > this budget, plus at most the KDF ceiling cost of the derivations that
-/// > were actually started before it ran out.
+/// > were actually started before it ran out — budget plus at most two KDF
+/// > ceilings when the reset retry fires.
 ///
 /// A derivation is never *started* after the budget is spent, so the excess is
-/// bounded by one ceiling-cost derivation in practice.
+/// bounded by one ceiling-cost derivation in practice, two when the reset
+/// retry fires. The reset retry deliberately re-derives rather than reusing
+/// the first key.
 pub(crate) const HOOK_BUDGET: Duration = Duration::from_secs(8);
 /// Secondary budget for reaping a child that has already been killed.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1022,6 +1027,22 @@ pub(crate) enum StaleSocket {
     LeaveAlone,
 }
 
+/// Transport deaths worth exactly one retry: the peer vanished mid-call —
+/// a daemon restart landing in the window — not a decision. Anything else
+/// (refused, timed out, malformed, a daemon error reply) is deterministic,
+/// and retrying it only spends login budget re-proving the failure.
+fn retryable_reset(e: &ProtocolError) -> bool {
+    let ProtocolError::Io(io) = e else {
+        return false;
+    };
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// Whether a failed connect proves the socket is stale. `None` means it does
 /// not: a permission or timeout failure can happen against a perfectly live
 /// daemon, and unlinking there would take its socket away.
@@ -1067,8 +1088,9 @@ pub(crate) fn try_send(
 ///
 /// The check is *before* the derivation, not during it: `derive_key` is not
 /// interruptible, so a started derivation always runs to completion. The
-/// bound this gives is "budget plus at most one KDF ceiling cost", which is
-/// what [`HOOK_BUDGET`] documents.
+/// bound this gives is "budget plus at most one KDF ceiling cost" — budget
+/// plus at most two KDF ceilings when the reset retry fires — which is what
+/// [`HOOK_BUDGET`] documents.
 fn derive(password: &str, salt: &[u8; SALT_LEN], kdf: KdfParams, budget: &Budget) -> Option<Key> {
     if budget.remaining().is_none() {
         log("no time left in the login budget; skipping the key derivation");
@@ -1108,6 +1130,35 @@ pub(crate) fn unlock_by_key(
         key: Zeroizing::new(*key.as_bytes()),
     };
     try_send(sock, &req, uid, "unlock", call_budget)
+}
+
+/// One unlock attempt: the `fstatat` check on the socket name plus the
+/// derivation and the call. `connect_path` refusals surface as
+/// `ProtocolError::Connect`, so callers map every error the same way.
+#[allow(clippy::too_many_arguments)]
+fn unlock_once(
+    dir: &SocketDir,
+    opts: &Options,
+    target: &Target,
+    password: &str,
+    salt: &[u8; SALT_LEN],
+    kdf: KdfParams,
+    call: Duration,
+    budget: &Budget,
+) -> Result<(), ProtocolError> {
+    match dir.connect_path() {
+        Ok(path) => unlock_by_key(
+            &path,
+            &opts.collection,
+            target.uid,
+            password,
+            salt,
+            kdf,
+            budget,
+            call,
+        ),
+        Err(e) => Err(ProtocolError::Connect(e)),
+    }
 }
 
 /// Builds the `ChangeKey` request: `old_key` under the header's salt, and
@@ -1318,6 +1369,67 @@ pub(crate) enum StartOutcome {
     Retried,
 }
 
+/// The `auto_start` tail shared by the first attempt and the reset retry:
+/// clear a provably stale socket, start the daemon, wait for its socket,
+/// revalidate the directory, and try the unlock once more. Callers route a
+/// `Connect` failure here; everything after the connect error is identical,
+/// so it lives in one place rather than twice.
+#[allow(clippy::too_many_arguments)]
+fn start_and_retry(
+    dir: &mut SocketDir,
+    opts: &Options,
+    target: &Target,
+    password: &str,
+    salt: &[u8; SALT_LEN],
+    kdf: KdfParams,
+    budget: &Budget,
+    sock: &Path,
+    e: std::io::Error,
+    start_daemon: &dyn Fn(&Budget) -> bool,
+) -> SessionOutcome {
+    let Some(action) = stale_socket_action(e.kind()) else {
+        log_transport("unlock", &ProtocolError::Connect(e));
+        return SessionOutcome::ConnectNotStale;
+    };
+    log(&format!("cannot reach the daemon ({e}); starting it"));
+    if budget.capped(START_TIMEOUT).is_none() {
+        log(SPENT);
+        return SessionOutcome::Started(StartOutcome::NoStartBudget);
+    }
+    if !start_after_clearing(dir, action) {
+        return SessionOutcome::Started(StartOutcome::StaleSocketStuck);
+    }
+    if !start_daemon(budget) {
+        return SessionOutcome::Started(StartOutcome::NoUser);
+    }
+    // The runtime directory is re-checked: the wait spans a window in which
+    // the user could have replaced it. `revalidate` is only consulted when the
+    // socket actually turned up, so a timed-out wait leaves it unevaluated.
+    let waited = budget
+        .capped(START_TIMEOUT)
+        .is_some_and(|left| wait_for(sock, left));
+    let revalidated = if waited { Some(dir.revalidate()) } else { None };
+    if revalidated != Some(true) {
+        log("daemon did not start in time; vault stays locked");
+        return SessionOutcome::Started(StartOutcome::NotRetried {
+            waited,
+            revalidated,
+        });
+    }
+    if budget.remaining().is_none() {
+        log(SPENT);
+        return SessionOutcome::Started(StartOutcome::RetryBudgetSpent);
+    }
+    let Some(left) = budget.capped(CALL_BUDGET) else {
+        log("no time left in the login budget");
+        return SessionOutcome::Started(StartOutcome::NoRetryCallBudget);
+    };
+    if let Err(e) = unlock_once(dir, opts, target, password, salt, kdf, left, budget) {
+        log_transport("unlock", &e);
+    }
+    SessionOutcome::Started(StartOutcome::Retried)
+}
+
 /// Everything `open_session` decides, in the order it decides it.
 ///
 /// `resolve_target` and `start_daemon` are closures because the hook resolves
@@ -1370,82 +1482,70 @@ pub(crate) fn open_session_decision(
     // holding the directory open pins the parent, but `connect(2)` still
     // resolves the final component, so a symlink planted there would redirect
     // root. A refusal is reported as a connect failure, which is what it is.
-    let attempt = match dir.connect_path() {
-        Ok(path) => unlock_by_key(
-            &path,
-            &opts.collection,
-            t.uid,
+    let attempt = unlock_once(&dir, &opts, &t, password, &salt, kdf, call, budget);
+    match attempt {
+        Ok(()) => SessionOutcome::Attempted,
+        Err(ProtocolError::Connect(e)) if opts.auto_start => start_and_retry(
+            &mut dir,
+            &opts,
+            &t,
             password,
             &salt,
             kdf,
             budget,
-            call,
+            &sock,
+            e,
+            start_daemon,
         ),
-        Err(e) => Err(ProtocolError::Connect(e)),
-    };
-    let e = match attempt {
-        Ok(()) => return SessionOutcome::Attempted,
-        Err(ProtocolError::Connect(e)) if opts.auto_start => e,
-        Err(e) => {
+        Err(e) if retryable_reset(&e) => {
+            // One retry, not a loop: whatever the second attempt reports is
+            // returned. The re-derivation below is itself budget-gated inside
+            // `unlock_by_key` via `derive`; the reset retry deliberately
+            // re-derives rather than reusing the first key.
             log_transport("unlock", &e);
-            return SessionOutcome::Failed;
-        }
-    };
-    let Some(action) = stale_socket_action(e.kind()) else {
-        log_transport("unlock", &ProtocolError::Connect(e));
-        return SessionOutcome::ConnectNotStale;
-    };
-    log(&format!("cannot reach the daemon ({e}); starting it"));
-    if budget.capped(START_TIMEOUT).is_none() {
-        log(SPENT);
-        return SessionOutcome::Started(StartOutcome::NoStartBudget);
-    }
-    if !start_after_clearing(&dir, action) {
-        return SessionOutcome::Started(StartOutcome::StaleSocketStuck);
-    }
-    if !start_daemon(budget) {
-        return SessionOutcome::Started(StartOutcome::NoUser);
-    }
-    // The runtime directory is re-checked: the wait spans a window in which
-    // the user could have replaced it. `revalidate` is only consulted when the
-    // socket actually turned up, so a timed-out wait leaves it unevaluated.
-    let waited = budget
-        .capped(START_TIMEOUT)
-        .is_some_and(|left| wait_for(&sock, left));
-    let revalidated = if waited { Some(dir.revalidate()) } else { None };
-    if revalidated != Some(true) {
-        log("daemon did not start in time; vault stays locked");
-        return SessionOutcome::Started(StartOutcome::NotRetried {
-            waited,
-            revalidated,
-        });
-    }
-    if budget.remaining().is_none() {
-        log(SPENT);
-        return SessionOutcome::Started(StartOutcome::RetryBudgetSpent);
-    }
-    let Some(left) = budget.capped(CALL_BUDGET) else {
-        log("no time left in the login budget");
-        return SessionOutcome::Started(StartOutcome::NoRetryCallBudget);
-    };
-    match dir.connect_path() {
-        Ok(path) => {
-            if let Err(e) = unlock_by_key(
-                &path,
-                &opts.collection,
-                t.uid,
-                password,
-                &salt,
-                kdf,
-                budget,
-                left,
-            ) {
+            let Some(call) = budget.capped(CALL_BUDGET) else {
+                log("no time left in the login budget; vault stays locked");
+                return SessionOutcome::NoCallBudget;
+            };
+            log("unlock hit a reset transport; retrying once within budget");
+            // The retry is a second connect into a directory the logging-in
+            // user controls. Re-check the held descriptor first; if the
+            // directory changed, abort. Whatever socket the retry does reach
+            // is still contained by the SO_PEERCRED check, which requires the
+            // peer to run as the target uid.
+            if !dir.revalidate() {
                 log_transport("unlock", &e);
+                return SessionOutcome::Failed;
+            }
+            match unlock_once(&dir, &opts, &t, password, &salt, kdf, call, budget) {
+                Ok(()) => SessionOutcome::Attempted,
+                Err(second) if retryable_reset(&second) => {
+                    log_transport("unlock", &second);
+                    SessionOutcome::Failed
+                }
+                Err(ProtocolError::Connect(e2)) if opts.auto_start => start_and_retry(
+                    &mut dir,
+                    &opts,
+                    &t,
+                    password,
+                    &salt,
+                    kdf,
+                    budget,
+                    &sock,
+                    e2,
+                    start_daemon,
+                ),
+                Err(second) => {
+                    log_transport("unlock", &second);
+                    SessionOutcome::Failed
+                }
             }
         }
-        Err(e) => log_transport("unlock", &ProtocolError::Connect(e)),
+        Err(e) => {
+            log_transport("unlock", &e);
+            SessionOutcome::Failed
+        }
     }
-    SessionOutcome::Started(StartOutcome::Retried)
 }
 
 /// What [`chauthtok_decision`] decided.
@@ -1600,6 +1700,67 @@ mod tests {
         let listener = UnixListener::bind(sock).unwrap();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            let body = read_frame_sync(&mut stream).unwrap();
+            let req: Request = decode_frame(&body).unwrap();
+            stream
+                .write_all(&encode_frame(&Response::Ok).unwrap())
+                .unwrap();
+            req
+        })
+    }
+
+    /// How long a fake daemon waits for the next connection, and how often it
+    /// polls. The timeouts are the hang guard: a missing connection fails the
+    /// test instead of blocking `join` forever.
+    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+    const ACCEPT_POLL: Duration = Duration::from_millis(20);
+
+    fn accept_one(
+        listener: &UnixListener,
+        what: &str,
+    ) -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::SocketAddr,
+    ) {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    // The timeouts are the hang guard: a client that connects
+                    // and then never sends must not block the test forever.
+                    stream.set_read_timeout(Some(ACCEPT_TIMEOUT)).unwrap();
+                    return (stream, addr);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let elapsed = start.elapsed();
+                    assert!(
+                        elapsed < ACCEPT_TIMEOUT,
+                        "no {what} arrived after {elapsed:?}"
+                    );
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    panic!("{what} accept failed after {elapsed:?}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Fake daemon that drops `drops` connections unanswered (a restart
+    /// landing mid-call), then serves one `Ok` and hands its request back.
+    fn fake_daemon_flapping(sock: &Path, drops: usize) -> std::thread::JoinHandle<Request> {
+        let listener = UnixListener::bind(sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            for i in 0..drops {
+                let (mut first, _) = accept_one(&listener, &format!("connection {}", i + 1));
+                let _ = read_frame_sync(&mut first);
+                drop(first);
+            }
+            let (mut stream, _) = accept_one(&listener, "retry");
+            // The timeouts are the hang guard: see `accept_one`.
+            stream.set_read_timeout(Some(ACCEPT_TIMEOUT)).unwrap();
             let body = read_frame_sync(&mut stream).unwrap();
             let req: Request = decode_frame(&body).unwrap();
             stream
@@ -2967,6 +3128,236 @@ mod tests {
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
+    }
+
+    /// A transport reset mid-unlock is retried once: the first connection is
+    /// dropped unanswered (a daemon restart landing mid-call), the second is
+    /// served, and the key is still delivered.
+    #[test]
+    fn a_reset_mid_unlock_retries_once() {
+        let (_dir, vault, sock) = session_fixture();
+        let server = fake_daemon_flapping(&sock, 1);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        let req = server.join().unwrap();
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
+        match req {
+            Request::UnlockWithKey { collection, key } => {
+                assert_eq!(collection, "default");
+                assert_eq!(&*key, expected.as_bytes());
+            }
+            ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// One retry, not a loop: two resets in a row mean the failure is not a
+    /// restart landing in the window, so the second one is returned as-is and
+    /// no third connection is ever made.
+    #[test]
+    fn a_second_reset_is_a_failure_not_another_retry() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = std::sync::Arc::clone(&accepts);
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = accept_one(&listener, "unlock attempt");
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = read_frame_sync(&mut stream);
+                drop(stream);
+            }
+        });
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        server.join().unwrap();
+        assert_eq!(outcome, SessionOutcome::Failed);
+        assert!(outcome.clears_stash());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly the first attempt plus one retry"
+        );
+    }
+
+    /// The retry's budget gate comes before its log and its connect: a budget
+    /// that dies during the first derivation still pays for that derivation
+    /// (Argon2 is not interruptible) but never starts a second connection.
+    #[test]
+    fn a_reset_with_no_retry_budget_makes_no_second_connection() {
+        let (_dir, vault, sock) = session_fixture();
+        // Fastest of a few runs, so a cold first allocation does not inflate
+        // the estimate: overestimating `d` is what would leave budget over.
+        let one_derivation = || {
+            (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    crypto::derive_key(b"calibrate", &SALT, LOGIN_KDF).unwrap();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        one_derivation();
+        let d = one_derivation();
+        let budget = Budget::new(d / 2);
+
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = std::sync::Arc::clone(&accepts);
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = accept_one(&listener, "first connection");
+            counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_frame_sync(&mut first);
+            drop(first);
+            // A buggy retry would arrive promptly (one derivation, no sleep);
+            // a short poll catches it without paying the full hang guard.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(800) {
+                match listener.accept() {
+                    Ok((mut second, _)) => {
+                        counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = read_frame_sync(&mut second);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(ACCEPT_POLL);
+                    }
+                    Err(e) => panic!("second accept failed: {e}"),
+                }
+            }
+        });
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &budget,
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        server.join().unwrap();
+        assert_eq!(
+            outcome,
+            SessionOutcome::NoCallBudget,
+            "the spent retry budget must stop before the second connect \
+             (one derivation took {d:?})"
+        );
+        assert!(outcome.clears_stash());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry must not connect a second time"
+        );
+    }
+
+    /// A timeout is deterministic, not a vanished peer: the server took the
+    /// request and never answered, so retrying would only spend login budget
+    /// re-proving the stall.
+    #[test]
+    fn a_timeout_mid_unlock_is_not_retried() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = std::sync::Arc::clone(&accepts);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = accept_one(&listener, "only connection");
+            counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_frame_sync(&mut stream);
+            std::thread::sleep(CALL_BUDGET + Duration::from_secs(1));
+            drop(stream);
+        });
+        let start = Instant::now();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        server.join().unwrap();
+        assert_eq!(outcome, SessionOutcome::Failed);
+        assert!(outcome.clears_stash());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a timeout must not be retried"
+        );
+        assert!(
+            start.elapsed() < CALL_BUDGET + ACCEPT_TIMEOUT + Duration::from_secs(2),
+            "took {elapsed:?}",
+            elapsed = start.elapsed()
+        );
+    }
+
+    /// Only a vanished peer is worth one retry. Refused, timed out, would-block
+    /// and malformed are deterministic; a connect wrapper never is.
+    #[test]
+    fn retryable_reset_only_retries_a_vanished_peer() {
+        use std::io::ErrorKind::*;
+        for kind in [ConnectionReset, BrokenPipe, UnexpectedEof] {
+            assert!(
+                retryable_reset(&ProtocolError::Io(std::io::Error::new(kind, "gone"))),
+                "{kind:?} must retry"
+            );
+        }
+        for kind in [TimedOut, ConnectionRefused, WouldBlock, InvalidData] {
+            assert!(
+                !retryable_reset(&ProtocolError::Io(std::io::Error::new(kind, "no"))),
+                "{kind:?} must not retry"
+            );
+        }
+        assert!(
+            !retryable_reset(&ProtocolError::Connect(std::io::Error::new(
+                ConnectionReset,
+                "connect"
+            ))),
+            "a Connect wrapper is a start decision, never a reset retry"
+        );
+    }
+
+    /// Arm order: a reset first does not swallow a connect decision. Drop the
+    /// first connection (reset, worth one retry), then refuse the retry, and
+    /// the refused retry must route to the daemon-start path — a `Started`
+    /// variant, never `Failed`. This pins the Finding-2 routing.
+    #[test]
+    fn a_connect_after_a_reset_still_starts_the_daemon() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = accept_one(&listener, "first connection");
+            let _ = read_frame_sync(&mut first);
+            drop(first);
+            // The retry must see a refused connect, not another listener:
+            // dropping with the file left behind makes the next connect
+            // refused, which proves nobody is behind the socket. The client's
+            // re-derivation lands after this drop, so the race is not close.
+            drop(listener);
+        });
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &|_| true,
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(outcome, SessionOutcome::Started(_)),
+            "a Connect after a reset must route to start, got {outcome:?}"
+        );
+        assert!(outcome.clears_stash());
     }
 
     /// `auto_start=no` is a switch on unlinking and `systemctl` running as
