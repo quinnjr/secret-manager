@@ -224,9 +224,10 @@ Example addition to `/etc/pam.d/common-password`:
 password  optional  pam_secret_manager.so
 ```
 
-Log out and back in, then `sm status` should show `default` unlocked.
-If your collection's id is not `default`, append
-`collection=<id>` to each `pam_secret_manager.so` line.
+Log out and back in, then `sm status` should show every vault unlocked —
+a login opens all wallets, each pinned so it never auto-locks afterwards.
+(`collection=<id>` is still accepted and always attempted, but it is no
+longer needed for non-default ids.)
 Problems are logged to the journal: `journalctl -p warning -g pam_secret_manager`
 (the messages carry a `pam_secret_manager:` prefix in `authpriv`).
 

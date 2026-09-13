@@ -31,8 +31,16 @@
 //! [`catch_unwind`](std::panic::catch_unwind), so a panic can never unwind
 //! into libpam.
 //!
+//! A correct login opens *every* vault in the vault directory and pins each
+//! one, so no wallet relocks on its own afterwards — the idle-lock timer
+//! skips pinned collections until someone explicitly locks them. An
+//! interactive `sm unlock` never pins, so auto-lock still applies there.
+//!
 //! Options:
-//! * `collection=<id>` (default `default`)
+//! * `collection=<id>` (default `default`) — always attempted, plus every
+//!   other `<id>.vault` found in the vault directory. Kept so a deployment
+//!   that names a non-default vault still unlocks it when the directory
+//!   cannot be listed; it is not a restriction to that one vault.
 //! * `vault_dir=<absolute path>` — where `<collection>.vault` lives. Default
 //!   `<home>/.local/share/secret-manager`, from the target user's `pw_dir`.
 //!   A relative value is logged and ignored.
@@ -846,6 +854,75 @@ pub(crate) fn vault_header(
     Some((header.salt, header.kdf))
 }
 
+/// Every vault id in `vault_dir`: one `<id>.vault` file per collection.
+/// A login unlocks all of them, not just `default`, so every wallet the
+/// user owns is open after a correct login.
+///
+/// Only regular-file names that pass [`collection_is_valid`] are returned —
+/// anything else cannot be a collection the daemon would load under that
+/// name — sorted, so the unlock order is deterministic. A directory that
+/// cannot be listed yields an empty vec; the caller falls back to the single
+/// configured collection so the failure is still logged against a name.
+pub(crate) fn list_vault_collections(vault_dir: &Path) -> Vec<String> {
+    // WHY: a PAM hook runs as root at login and must fail open with a reason.
+    // A vault directory root cannot list is not "no wallets" — the caller
+    // falls back to the configured collection — so the error is logged
+    // against the directory rather than swallowed.
+    let entries = match std::fs::read_dir(vault_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log(&format!(
+                "cannot list vault directory {}: {}",
+                vault_dir.display(),
+                sanitize(&e.to_string())
+            ));
+            return Vec::new();
+        }
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log(&format!(
+                    "cannot read a vault directory entry in {}: {}",
+                    vault_dir.display(),
+                    sanitize(&e.to_string())
+                ));
+                continue;
+            }
+        };
+        // Only regular files are collections: a subdirectory named
+        // `<id>.vault` is not a vault the daemon would load under that id.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name.strip_suffix(".vault") else {
+            continue;
+        };
+        if collection_is_valid(id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids.sort();
+    ids
+}
+
+/// Every vault to attempt: everything listed plus the configured collection,
+/// which is always included so an empty or unreadable vault directory behaves
+/// as one attempt against that name, with its failure logged against it.
+/// Sorted, so the unlock order is deterministic.
+fn all_vault_ids(vault_dir: &Path, configured: &str) -> Vec<String> {
+    let mut ids = list_vault_collections(vault_dir);
+    if !ids.contains(&configured.to_string()) {
+        ids.push(configured.to_string());
+        ids.sort();
+    }
+    ids
+}
+
 /// `socket=` is a test-harness affordance. A real login runs as root, where a
 /// typo in the PAM config could otherwise aim the unlock at any socket on the
 /// system; there the option is ignored.
@@ -856,6 +933,7 @@ fn socket_override_allowed(euid: u32) -> bool {
 /// Everything the session and password hooks need about the target user: the
 /// control socket, the uid the daemon there must run as, and where the vault
 /// files live.
+#[derive(Clone)]
 pub(crate) struct Target {
     pub sock: PathBuf,
     pub uid: u32,
@@ -1440,6 +1518,10 @@ fn derive(password: &str, salt: &[u8; SALT_LEN], kdf: KdfParams, budget: &Budget
 /// Derives the key locally from the header's own salt and parameters and
 /// unlocks with it. Only transport errors are returned; everything else is
 /// logged and treated as done.
+///
+/// The unlock is always pinned: a vault opened by a correct login never
+/// relocks on its own — the idle-lock timer skips it until someone
+/// explicitly locks it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn unlock_by_key(
     sock: &Path,
@@ -1457,8 +1539,17 @@ pub(crate) fn unlock_by_key(
     let req = Request::UnlockWithKey {
         collection: collection.to_string(),
         key: Zeroizing::new(*key.as_bytes()),
+        pin: true,
     };
-    try_send(sock, &req, uid, "unlock", call_budget)
+    // WHY: one login sends N unlocks; the collection id names which one this
+    // line is about. Ids are charset-restricted, so the id is syslog-safe.
+    try_send(
+        sock,
+        &req,
+        uid,
+        &format!("unlock '{collection}'"),
+        call_budget,
+    )
 }
 
 /// One unlock attempt: the `fstatat` check on the socket name plus the
@@ -1791,30 +1882,53 @@ pub(crate) fn open_session_decision(
     let Some(dir) = SocketDir::open(&t.sock, t.uid) else {
         return SessionOutcome::RefusedSocketDir;
     };
-    // Salt and parameters come from the vault file itself, never from whatever
-    // happens to answer the socket.
-    let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, budget) else {
+    // Salts and parameters come from the vault files themselves, never from
+    // whatever happens to answer the socket. A login opens *every* wallet,
+    // not just the configured one: each vault has its own salt and KDF, so
+    // each header is read and each key derived separately under the same
+    // login password. The configured collection is always included, so an
+    // empty or unreadable vault directory behaves exactly as before — one
+    // attempt against that name, with its failure logged against it.
+    let ids = all_vault_ids(&t.vault_dir, &opts.collection);
+    let mut vaults = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        if budget.remaining().is_none() {
+            // WHY: a budget break here would otherwise silently drop wallets —
+            // the caller reports success if any earlier vault unlocked — so
+            // the ids never attempted are logged against their names.
+            log(&format!(
+                "login budget spent; skipping vault headers: {}",
+                ids[i..].join(", ")
+            ));
+            break;
+        }
+        if let Some((salt, kdf)) = vault_header(&t.vault_dir, id, t.uid, budget) {
+            vaults.push((id.clone(), salt, kdf));
+        }
+    }
+    if vaults.is_empty() {
         return SessionOutcome::NoVaultHeader;
-    };
+    }
     if budget.remaining().is_none() {
         log(SPENT);
         return SessionOutcome::BudgetSpent;
     }
-    // Everything past the root-validated directory and header touches the
+    // Everything past the root-validated directory and headers touches the
     // socket, so it runs with the target's credentials — in a forked child
     // when root faces a foreign target, so this process keeps root and the
     // login path can still fork the user session afterwards. (An in-process
     // `setuid` here broke display-manager logins: authentication succeeded
-    // and the session spawn then failed with `EPERM`.)
+    // and the session spawn then failed with `EPERM`.) One fork for all
+    // vaults, not one per vault: the child carries the password and is
+    // non-dumpable, and fewer forks mean less of it in flight.
     let password = Zeroizing::new(password.to_owned());
     let report = run_socket_work_as_target(t.uid, budget, move || {
-        let (a, b) = session_outcome_code(&session_socket_tail(
+        let (a, b) = session_outcome_code(&session_socket_tail_all(
             dir,
-            opts,
+            &opts,
             t,
             password,
-            salt,
-            kdf,
+            &vaults,
             budget,
             start_daemon,
         ));
@@ -1839,9 +1953,80 @@ pub(crate) fn open_session_decision(
 /// `session_socket_tail_unlocks_through_a_live_daemon`). The password
 /// travels as [`Zeroizing`], so the parent's copy is scrubbed on drop;
 /// the child's copy dies with it (and the child is non-dumpable).
+/// One `open_session` fork, every vault: each collection is unlocked with
+/// the key derived under its own header, and each unlock is pinned, so a
+/// correct login leaves all wallets open and none of them relocks on its
+/// own. Every vault is attempted even after one succeeds — returning early
+/// would leave the remaining wallets locked.
+///
+/// The first unlock that reaches the daemon decides the outcome: an
+/// `Attempted` (or a `Retried` start) is returned as-is, so a single-vault
+/// login reports exactly what it always did. When nothing reaches the
+/// daemon, the first outcome is returned, so the logged reason still names
+/// the collection that failed.
+#[allow(clippy::too_many_arguments)]
+fn session_socket_tail_all(
+    mut dir: SocketDir,
+    opts: &Options,
+    target: Target,
+    password: Zeroizing<String>,
+    vaults: &[(String, [u8; SALT_LEN], KdfParams)],
+    budget: &Budget,
+    start_daemon: &dyn Fn(&Budget) -> bool,
+) -> SessionOutcome {
+    let mut first: Option<SessionOutcome> = None;
+    let mut success: Option<SessionOutcome> = None;
+    for (idx, (id, salt, kdf)) in vaults.iter().enumerate() {
+        if budget.remaining().is_none() {
+            log(SPENT);
+            // WHY: the aggregation below keeps the first success, so without
+            // this line a wallet skipped here would vanish from the logs.
+            // Ids are charset-restricted, so the list is syslog-safe.
+            let skipped: Vec<&str> = vaults[idx..].iter().map(|(id, _, _)| id.as_str()).collect();
+            log(&format!(
+                "login budget spent; skipping unlocks: {}",
+                skipped.join(", ")
+            ));
+            return success.or(first).unwrap_or(SessionOutcome::BudgetSpent);
+        }
+        let per_vault = Options {
+            collection: id.clone(),
+            auto_start: opts.auto_start,
+            socket: opts.socket.clone(),
+            vault_dir: opts.vault_dir.clone(),
+        };
+        let outcome = session_socket_tail(
+            &mut dir,
+            per_vault,
+            target.clone(),
+            Zeroizing::new(password.as_str().to_owned()),
+            *salt,
+            *kdf,
+            budget,
+            start_daemon,
+        );
+        match outcome {
+            o @ (SessionOutcome::Attempted | SessionOutcome::Started(StartOutcome::Retried)) => {
+                if success.is_none() {
+                    success = Some(o);
+                }
+            }
+            o => {
+                // WHY: N vaults emit N identical outcomes; the id names the
+                // wallet this one belongs to. Ids are charset-restricted.
+                log(&format!("unlock '{id}' did not succeed: {o:?}"));
+                if first.is_none() {
+                    first = Some(o);
+                }
+            }
+        }
+    }
+    success.or(first).unwrap_or(SessionOutcome::NoVaultHeader)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn session_socket_tail(
-    mut dir: SocketDir,
+    dir: &mut SocketDir,
     opts: Options,
     target: Target,
     password: Zeroizing<String>,
@@ -1861,11 +2046,14 @@ fn session_socket_tail(
     // holding the directory open pins the parent, but `connect(2)` still
     // resolves the final component, so a symlink planted there would redirect
     // root. A refusal is reported as a connect failure, which is what it is.
-    let attempt = unlock_once(&dir, &opts, &target, &password, &salt, kdf, call, budget);
+    // WHY: one login sends N unlocks; the id tells which wallet each line is
+    // about. Ids are charset-restricted, so the id is syslog-safe.
+    let what = format!("unlock '{}'", opts.collection);
+    let attempt = unlock_once(dir, &opts, &target, &password, &salt, kdf, call, budget);
     match attempt {
         Ok(()) => SessionOutcome::Attempted,
         Err(ProtocolError::Connect(e)) if opts.auto_start => start_and_retry(
-            &mut dir,
+            dir,
             &opts,
             &target,
             &password,
@@ -1881,7 +2069,7 @@ fn session_socket_tail(
             // returned. The re-derivation below is itself budget-gated inside
             // `unlock_by_key` via `derive`; the reset retry deliberately
             // re-derives rather than reusing the first key.
-            log_transport("unlock", &e);
+            log_transport(&what, &e);
             let Some(call) = budget.capped(CALL_BUDGET) else {
                 log("no time left in the login budget; vault stays locked");
                 return SessionOutcome::NoCallBudget;
@@ -1893,17 +2081,17 @@ fn session_socket_tail(
             // is still contained by the SO_PEERCRED check, which requires the
             // peer to run as the target uid.
             if !dir.revalidate() {
-                log_transport("unlock", &e);
+                log_transport(&what, &e);
                 return SessionOutcome::Failed;
             }
-            match unlock_once(&dir, &opts, &target, &password, &salt, kdf, call, budget) {
+            match unlock_once(dir, &opts, &target, &password, &salt, kdf, call, budget) {
                 Ok(()) => SessionOutcome::Attempted,
                 Err(second) if retryable_reset(&second) => {
-                    log_transport("unlock", &second);
+                    log_transport(&what, &second);
                     SessionOutcome::Failed
                 }
                 Err(ProtocolError::Connect(e2)) if opts.auto_start => start_and_retry(
-                    &mut dir,
+                    dir,
                     &opts,
                     &target,
                     &password,
@@ -1915,13 +2103,13 @@ fn session_socket_tail(
                     start_daemon,
                 ),
                 Err(second) => {
-                    log_transport("unlock", &second);
+                    log_transport(&what, &second);
                     SessionOutcome::Failed
                 }
             }
         }
         Err(e) => {
-            log_transport("unlock", &e);
+            log_transport(&what, &e);
             SessionOutcome::Failed
         }
     }
@@ -1991,12 +2179,44 @@ pub(crate) fn chauthtok_decision(
     let Some(dir) = SocketDir::open(&t.sock, t.uid) else {
         return ChauthtokOutcome::RefusedSocketDir;
     };
-    let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, budget) else {
-        return ChauthtokOutcome::NoVaultHeader;
-    };
-    let Some(req) = change_key_request(&opts.collection, old, new, &salt, kdf, budget) else {
-        return ChauthtokOutcome::NoRequest;
-    };
+    // Same "every wallet" rule as the session hook: a `passwd` rotation
+    // follows the login password into each vault whose header is readable,
+    // so no wallet is left behind on the old password. The configured
+    // collection is always included, preserving the old single-vault path
+    // when the directory lists nothing.
+    let ids = all_vault_ids(&t.vault_dir, &opts.collection);
+    let mut reqs = Vec::new();
+    let mut any_header = false;
+    // WHY: a request that is never built is never sent, so a budget break or
+    // a failed build must mark the rotation incomplete — otherwise one
+    // delivered vault would report the whole rotation as `Sent`.
+    let mut incomplete = false;
+    for (i, id) in ids.iter().enumerate() {
+        if budget.remaining().is_none() {
+            log(&format!(
+                "password-change budget spent; skipping vaults: {}",
+                ids[i..].join(", ")
+            ));
+            incomplete = true;
+            break;
+        }
+        let Some((salt, kdf)) = vault_header(&t.vault_dir, id, t.uid, budget) else {
+            continue;
+        };
+        any_header = true;
+        if let Some(req) = change_key_request(id, old, new, &salt, kdf, budget) {
+            reqs.push(req);
+        } else {
+            incomplete = true;
+        }
+    }
+    if reqs.is_empty() {
+        return if any_header {
+            ChauthtokOutcome::NoRequest
+        } else {
+            ChauthtokOutcome::NoVaultHeader
+        };
+    }
     if budget.remaining().is_none() {
         log(SPENT);
         return ChauthtokOutcome::BudgetSpent;
@@ -2007,12 +2227,32 @@ pub(crate) fn chauthtok_decision(
     };
     // Same blindness as the login path, same fork: the daemon must see the
     // target uid, and this process must keep root for whatever the login
-    // path forks afterwards. Runs via [`run_socket_work_as_target`].
+    // path forks afterwards. Runs via [`run_socket_work_as_target`]. One
+    // fork for all rotations; `Sent` only if every built rotation was
+    // delivered and none was skipped — a partial rotation is `SendFailed`,
+    // so a wallet is never silently left on the old password. A single
+    // vault is unchanged: its one send decides.
     let report = run_socket_work_as_target(t.uid, budget, move || {
-        [
-            chauthtok_outcome_code(&password_socket_tail(dir, req, t.uid, left)),
-            0,
-        ]
+        let mut all_sent = true;
+        for req in reqs {
+            // WHY: collection ids are charset-restricted, so the id is
+            // syslog-safe and tells which of N identical rotations failed.
+            let id = match &req {
+                Request::ChangeKey { collection, .. } => collection.clone(),
+                _ => "?".to_string(),
+            };
+            if password_socket_tail(&dir, &req, t.uid, left) == ChauthtokOutcome::Sent {
+            } else {
+                log(&format!("password change '{id}' was not forwarded"));
+                all_sent = false;
+            }
+        }
+        let outcome = if all_sent && !incomplete {
+            ChauthtokOutcome::Sent
+        } else {
+            ChauthtokOutcome::SendFailed
+        };
+        [chauthtok_outcome_code(&outcome), 0]
     });
     if report.is_none() {
         log("socket child never reported; password change not forwarded");
@@ -2034,21 +2274,29 @@ fn chauthtok_outcome_from_report(report: Option<[u8; 2]>) -> ChauthtokOutcome {
 /// [`session_socket_tail`]: the daemon must see the target uid, and this
 /// process must keep root.
 fn password_socket_tail(
-    dir: SocketDir,
-    req: Request,
+    dir: &SocketDir,
+    req: &Request,
     uid: u32,
     call: Duration,
 ) -> ChauthtokOutcome {
+    // WHY: one password change sends N rotations; the id tells which wallet
+    // each line is about. Ids are charset-restricted, so the id is
+    // syslog-safe. Derived from the request itself so the log names the
+    // vault actually attempted.
+    let what = match req {
+        Request::ChangeKey { collection, .. } => format!("password change '{collection}'"),
+        _ => "password change".to_string(),
+    };
     match dir.connect_path() {
-        Ok(path) => match try_send(&path, &req, uid, "password change", call) {
+        Ok(path) => match try_send(&path, req, uid, &what, call) {
             Ok(()) => ChauthtokOutcome::Sent,
             Err(e) => {
-                log_transport("password change", &e);
+                log_transport(&what, &e);
                 ChauthtokOutcome::SendFailed
             }
         },
         Err(e) => {
-            log_transport("password change", &ProtocolError::Connect(e));
+            log_transport(&what, &ProtocolError::Connect(e));
             ChauthtokOutcome::SendFailed
         }
     }
@@ -2133,16 +2381,10 @@ mod tests {
     /// Fake daemon: accepts exactly one connection, decodes the request,
     /// answers `Ok`, and hands the request back through the join handle.
     fn fake_daemon(sock: &Path) -> std::thread::JoinHandle<Request> {
-        let listener = UnixListener::bind(sock).unwrap();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let body = read_frame_sync(&mut stream).unwrap();
-            let req: Request = decode_frame(&body).unwrap();
-            stream
-                .write_all(&encode_frame(&Response::Ok).unwrap())
-                .unwrap();
-            req
-        })
+        // WHY: one-connection is the one-vault case of `fake_daemon_n`, so it
+        // is defined in terms of it rather than duplicating the serve loop.
+        let inner = fake_daemon_n(sock, 1);
+        std::thread::spawn(move || inner.join().unwrap().pop().unwrap())
     }
 
     /// How long a fake daemon waits for the next connection, and how often it
@@ -2423,9 +2665,15 @@ mod tests {
         let req = server.join().unwrap();
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match req {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "work");
                 assert_eq!(&*key, expected.as_bytes());
+                // A login unlock pins: it must never relock on its own.
+                assert!(pin, "PAM unlocks pin the vault");
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
@@ -3558,12 +3806,227 @@ mod tests {
         assert!(outcome.clears_stash());
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match server.join().unwrap() {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "default");
                 assert_eq!(&*key, expected.as_bytes());
+                assert!(pin, "PAM unlocks pin the vault");
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
+    }
+
+    /// A fake daemon that serves exactly `n` unlocks, so a login spanning
+    /// several wallets can be asserted on as a whole.
+    fn fake_daemon_n(sock: &Path, n: usize) -> std::thread::JoinHandle<Vec<Request>> {
+        let listener = UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = read_frame_sync(&mut stream).unwrap();
+                let req: Request = decode_frame(&body).unwrap();
+                stream
+                    .write_all(&encode_frame(&Response::Ok).unwrap())
+                    .unwrap();
+                out.push(req);
+            }
+            out
+        })
+    }
+
+    /// A login opens every wallet, not just `default`: one pinned unlock
+    /// per vault file, each derived under its own header.
+    #[test]
+    fn a_login_unlocks_every_wallet_not_just_default() {
+        let (_dir, vault, sock) = session_fixture();
+        const WORK_SALT: [u8; SALT_LEN] = [0x5b; SALT_LEN];
+        write_vault(&vault, "work", header_with(LOGIN_KDF, WORK_SALT));
+        let server = fake_daemon_n(&sock, 2);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        let mut reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 2, "one unlock per wallet: {reqs:?}");
+        reqs.sort_by(|a, b| {
+            let id = |r: &Request| match r {
+                Request::UnlockWithKey { collection, .. } => collection.clone(),
+                other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+            };
+            id(a).cmp(&id(b))
+        });
+        for (req, (id, salt)) in reqs
+            .into_iter()
+            .zip([("default", SALT), ("work", WORK_SALT)])
+        {
+            match req {
+                Request::UnlockWithKey {
+                    collection,
+                    key,
+                    pin,
+                } => {
+                    assert_eq!(collection, id);
+                    let expected = crypto::derive_key(b"hunter2", &salt, LOGIN_KDF).unwrap();
+                    assert_eq!(&*key, expected.as_bytes());
+                    assert!(pin, "{id}: a login unlock pins the vault");
+                }
+                other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+            }
+        }
+    }
+
+    /// One good vault plus one name whose header fails: the good wallet still
+    /// unlocks (`Attempted`) and exactly one unlock reaches the wire. The
+    /// fake daemon serves exactly one connection, so a second unlock attempt
+    /// would refuse (and panic via `no_start`) or hang the join.
+    #[test]
+    fn a_login_with_one_bad_header_still_unlocks_the_good_vault() {
+        let (_dir, vault, sock) = session_fixture();
+        let bad = vault.join("bad.vault");
+        std::fs::write(&bad, b"NOTAVAULT and then some").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = fake_daemon_n(&sock, 1);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        let reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 1, "only the good vault unlocks: {reqs:?}");
+        match &reqs[0] {
+            Request::UnlockWithKey { collection, .. } => assert_eq!(collection, "default"),
+            other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// A vault directory that lists but has no readable header: nothing
+    /// reaches the daemon, so the first failure is returned.
+    #[test]
+    fn a_login_where_all_headers_fail_reports_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = private_dir(dir.path(), "vault");
+        let bad = vault.join("bad.vault");
+        std::fs::write(&bad, b"NOTAVAULT and then some").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        // WHY: no listener on purpose — nothing may connect when no header
+        // is readable, and `no_start` panics if a start is attempted.
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::NoVaultHeader);
+    }
+
+    /// A budget that dies between vaults: the first vault unlocks, the second
+    /// is skipped, and the outcome stays `Attempted` with exactly one wire
+    /// unlock. The budget is half of one measured derivation, so the first
+    /// derivation (already started) runs to completion while the second
+    /// iteration finds the budget spent — the same pattern as
+    /// `a_reset_with_no_retry_budget_makes_no_second_connection`.
+    #[test]
+    fn a_budget_that_dies_between_vaults_skips_only_the_second() {
+        let (_dir, vault, sock) = session_fixture();
+        write_vault(&vault, "work", header_with(LOGIN_KDF, SALT));
+        // Fastest of a few runs, so a cold Argon2 allocation does not inflate
+        // the estimate: overestimating `d` would leave budget for both vaults.
+        let one_derivation = || {
+            (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    crypto::derive_key(b"calibrate", &SALT, LOGIN_KDF).unwrap();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        one_derivation();
+        let d = one_derivation();
+        let budget = Budget::new(d / 2);
+        // WHY: exactly one connection served — a second unlock would refuse
+        // once the listener is gone and panic via `no_start`.
+        let server = fake_daemon_n(&sock, 1);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &budget,
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(
+            outcome,
+            SessionOutcome::Attempted,
+            "the first vault unlocks; the second is skipped (one derivation took {d:?})"
+        );
+        let reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one wire unlock: {reqs:?}");
+        match &reqs[0] {
+            Request::UnlockWithKey { collection, .. } => assert_eq!(collection, "default"),
+            other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// Only `<id>.vault` files with a usable id count: stray files,
+    /// non-UTF-8 names and ids outside the daemon's charset are not
+    /// collections and must never be attempted.
+    #[test]
+    fn list_vault_collections_finds_only_vaults() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        // WHY: creation order is reversed on purpose — the output must still
+        // be sorted, so the unlock order is deterministic.
+        write_vault(dir.path(), "work", header_with(LOGIN_KDF, SALT));
+        write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
+        std::fs::write(dir.path().join("notes.txt"), b"not a vault").unwrap();
+        std::fs::write(dir.path().join("evil.vault.bak"), b"").unwrap();
+        std::fs::write(dir.path().join("with-dash.vault"), b"").unwrap();
+        // A non-UTF-8 `*.vault` name can never be a collection id.
+        std::fs::write(
+            dir.path()
+                .join(std::ffi::OsStr::from_bytes(b"\xff\xfe.vault")),
+            b"",
+        )
+        .unwrap();
+        // A subdirectory is not a vault file, even with the right suffix.
+        std::fs::create_dir(dir.path().join("dir.vault")).unwrap();
+        assert_eq!(
+            list_vault_collections(dir.path()),
+            vec!["default".to_string(), "work".to_string()]
+        );
+        assert!(list_vault_collections(Path::new("/definitely/not/here-9f2c")).is_empty());
+    }
+
+    /// An empty vault directory keeps the old behaviour: one attempt against
+    /// the configured collection, with the failure logged against its name.
+    #[test]
+    fn a_login_with_no_vault_files_reports_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        let vault = private_dir(dir.path(), "vault");
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::NoVaultHeader);
     }
 
     /// A transport reset mid-unlock is retried once: the first connection is
@@ -3584,9 +4047,14 @@ mod tests {
         assert_eq!(outcome, SessionOutcome::Attempted);
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match req {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "default");
                 assert_eq!(&*key, expected.as_bytes());
+                assert!(pin, "PAM unlocks pin the vault");
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
@@ -3864,7 +4332,7 @@ mod tests {
         let (_dir, vault, sock) = session_fixture();
         let server = fake_daemon(&sock);
         let outcome = session_socket_tail(
-            SocketDir::open(&sock, me()).expect("fixture dir validates"),
+            &mut SocketDir::open(&sock, me()).expect("fixture dir validates"),
             Options {
                 collection: "default".into(),
                 auto_start: false,
@@ -4282,9 +4750,14 @@ mod tests {
         let server = started.lock().unwrap().take().expect("the daemon started");
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match server.join().unwrap() {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "default");
                 assert_eq!(&*key, expected.as_bytes());
+                assert!(pin, "PAM unlocks pin the vault");
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
@@ -4567,6 +5040,98 @@ mod tests {
                 assert_eq!(&*new_key, expected_new.as_bytes());
             }
             ref other => panic!("expected ChangeKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// A `passwd` rotation follows the login into every wallet, not just
+    /// `default`: one `ChangeKey` per vault file, each old key derived under
+    /// its own header. Mirrors `a_login_unlocks_every_wallet_not_just_default`.
+    #[test]
+    fn a_password_change_rotates_every_wallet() {
+        let (_dir, vault, sock) = session_fixture();
+        const WORK_SALT: [u8; SALT_LEN] = [0x5b; SALT_LEN];
+        write_vault(&vault, "work", header_with(LOGIN_KDF, WORK_SALT));
+        let server = fake_daemon_n(&sock, 2);
+        // WHY: no auto-start exists on this path — the resolver below would
+        // panic if the decision tried to start a daemon, so returning at all
+        // proves no start was attempted.
+        let outcome = chauthtok_decision(
+            0,
+            Some("old-pw"),
+            Some("new-pw"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+        );
+        assert_eq!(outcome, ChauthtokOutcome::Sent);
+        let mut reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 2, "one rotation per wallet: {reqs:?}");
+        reqs.sort_by(|a, b| {
+            let id = |r: &Request| match r {
+                Request::ChangeKey { collection, .. } => collection.clone(),
+                other => panic!("expected ChangeKey, got {}", other.variant_name()),
+            };
+            id(a).cmp(&id(b))
+        });
+        for (req, (id, salt)) in reqs
+            .into_iter()
+            .zip([("default", SALT), ("work", WORK_SALT)])
+        {
+            match req {
+                Request::ChangeKey {
+                    collection,
+                    old_key,
+                    new_kdf,
+                    new_key,
+                    new_salt,
+                } => {
+                    assert_eq!(collection, id);
+                    let expected_old = crypto::derive_key(b"old-pw", &salt, LOGIN_KDF).unwrap();
+                    assert_eq!(
+                        &*old_key,
+                        expected_old.as_bytes(),
+                        "{id}: old key under its own header"
+                    );
+                    assert_eq!(new_kdf, LOGIN_KDF);
+                    let expected_new = crypto::derive_key(b"new-pw", &new_salt, LOGIN_KDF).unwrap();
+                    assert_eq!(&*new_key, expected_new.as_bytes());
+                }
+                other => panic!("expected ChangeKey, got {}", other.variant_name()),
+            }
+        }
+    }
+
+    /// A corrupt header must not block the healthy wallet: the readable vault
+    /// is still rotated and the outcome is still `Sent`.
+    #[test]
+    fn a_password_change_with_one_corrupt_header_still_rotates_the_healthy_vault() {
+        let (_dir, vault, sock) = session_fixture();
+        let bad = vault.join("bad.vault");
+        std::fs::write(&bad, b"NOTAVAULT and then some").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = fake_daemon_n(&sock, 1);
+        let outcome = chauthtok_decision(
+            0,
+            Some("old-pw"),
+            Some("new-pw"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+        );
+        assert_eq!(outcome, ChauthtokOutcome::Sent);
+        let reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 1, "only the healthy vault rotates: {reqs:?}");
+        match reqs.into_iter().next().unwrap() {
+            Request::ChangeKey {
+                collection,
+                old_key,
+                ..
+            } => {
+                assert_eq!(collection, "default");
+                let expected_old = crypto::derive_key(b"old-pw", &SALT, LOGIN_KDF).unwrap();
+                assert_eq!(&*old_key, expected_old.as_bytes());
+            }
+            other => panic!("expected ChangeKey, got {}", other.variant_name()),
         }
     }
 

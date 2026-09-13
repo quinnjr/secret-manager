@@ -63,8 +63,9 @@ their secrets stay readable through whichever API does serve them.
 1. Migrate first and read the report: tallies as expected, count line
    reconciled, fingerprints matched on the real run.
 2. Disable the old provider per your distro's guide (units, autostart,
-   activation override, PAM lines old out and ours in, with
-   `collection=<id>` if the vault's id is not `default`).
+   activation override, PAM lines old out and ours in — no
+   `collection=<id>` needed for non-default ids; a login opens every
+   vault).
 3. If the running kernel differs from the installed one (`uname -r`
    against the packaged version), reboot rather than logging out: a
    display manager that cannot start its greeter leaves you with no
@@ -188,16 +189,22 @@ that matters to your threat model.
 ## What the PAM module sends
 
 Nothing that answers the control socket can choose the salt or the Argon2
-parameters any more. At login the module reads the collection's vault header
-straight off disk (`<home>/.local/share/secret-manager/<collection>.vault`
-by default, or the directory named by `vault_dir=` below), derives the
-vault key itself in its own (root) process using the salt and parameters
-recorded in that header, wipes the password, and sends only the derived key
-to the daemon — the socket never carries a password or a `KdfParams`-style
-request that could hand an impostor the choice of salt or cost. If the
-header cannot be read (missing file, bad permissions, corrupt header), PAM
-logs the reason and skips the unlock; it never falls back to parameters
-supplied over the socket.
+parameters any more. At login the module reads every vault header straight
+off disk (`<home>/.local/share/secret-manager/*.vault` by default, or the
+directory named by `vault_dir=` below), derives each vault key itself in
+its own (root) process using the salt and parameters recorded in that
+header, wipes the password, and sends only the derived keys to the daemon —
+the socket never carries a password or a `KdfParams`-style request that
+could hand an impostor the choice of salt or cost. Each unlock is pinned,
+so a vault opened by a correct login never relocks on its own: the
+idle-lock timer (`[vault] auto_lock_after`, 15 minutes by default) skips
+pinned collections until someone explicitly locks them with `sm lock`.
+An interactive `sm unlock` never pins, so auto-lock still applies there.
+If a header cannot be read (missing file, bad permissions, corrupt
+header), PAM logs the reason and skips that vault; it never falls back to
+parameters supplied over the socket. `passwd` follows the same rule: the
+rotation is forwarded into every vault whose header is readable, so no
+wallet is left behind on the old password.
 
 The control socket lives in your runtime directory, so any process already
 running as you could still bind it before the daemon; what such an impostor
@@ -228,7 +235,7 @@ Append options to the `pam_secret_manager.so` lines (space separated):
 
 | option              | default                            | meaning                                                                    |
 |---------------------|-------------------------------------|-----------------------------------------------------------------------------|
-| `collection=<id>`   | `default`                           | vault collection to unlock                                                 |
+| `collection=<id>`   | `default`                           | always unlocked, plus every other vault in the directory (a login opens all wallets, each pinned so it never auto-locks) |
 | `auto_start=no`     | (unset)                             | do not `systemctl --user start` the daemon if its control socket is down   |
 | `vault_dir=<path>`  | `<home>/.local/share/secret-manager` | absolute directory to read `<collection>.vault` from; set this when the user's `[vault] dir` is customised, since PAM cannot read their config file |
 | `socket=<path>`     | (unset)                             | test-only override for the control socket path; **ignored** whenever the module is running as root (i.e. every real login) |
@@ -271,6 +278,14 @@ attribute-set collisions. Such items are reported as `epoch_stamped_items`.
 
 ## Troubleshooting
 
+**After upgrading: `UnsupportedVersion` or unlock failures**
+
+The daemon, CLI, and PAM module ship together (`make build`) and must be
+upgraded together: a v4 client talking to a v5 daemon (or vice versa) is
+rejected with `UnsupportedVersion`. After upgrading, restart the user daemon
+(`systemctl --user restart secret-manager.service`) so no stale artifact
+survives; the daemon logs the version mismatch (see `src/control/server.rs`).
+
 **`secret-manager.service` is `failed` or `start-limit-hit`**
 
 Another process already owns `org.freedesktop.secrets` on the session bus
@@ -302,10 +317,11 @@ Check what the module said, from that login attempt:
 journalctl -b -g pam_secret_manager
 ```
 
-`cannot open .../<id>.vault: No such file or directory` means the
-`collection=` on the PAM lines does not name an existing vault id — the
-module opens `<id>.vault` literally and does not resolve the daemon's
-`default` alias. `control socket ... Connection reset by peer` means the
+`cannot open .../<id>.vault: No such file or directory` means there is no
+vault file at all — the module opens every `<id>.vault` in the vault
+directory, and only falls back to the single `collection=` id (which it
+opens literally, without resolving the daemon's `default` alias) when the
+directory lists nothing. `control socket ... Connection reset by peer` means the
 daemon refused the module: it runs as root at login and is allowed only
 when the daemon sees root as root. A user-namespaced sandbox around the
 daemon (mount sandboxing on a user unit implies one) maps every foreign

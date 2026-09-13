@@ -27,12 +27,14 @@ fn same_request(a: &Request, b: &Request) -> bool {
             Request::UnlockWithKey {
                 collection: c1,
                 key: k1,
+                pin: p1,
             },
             Request::UnlockWithKey {
                 collection: c2,
                 key: k2,
+                pin: p2,
             },
-        ) => c1 == c2 && k1[..] == k2[..],
+        ) => c1 == c2 && k1[..] == k2[..] && p1 == p2,
         (
             Request::ChangeKey {
                 collection: c1,
@@ -81,6 +83,7 @@ fn variant_indices_are_pinned_to_declaration_order() {
         index_of(&Request::UnlockWithKey {
             collection: String::new(),
             key: key.clone(),
+            pin: false,
         }),
         3,
         "UnlockWithKey"
@@ -120,6 +123,7 @@ fn variant_indices_are_pinned_to_declaration_order() {
             Request::UnlockWithKey {
                 collection: String::new(),
                 key: key.clone(),
+                pin: false,
             }
             .variant_name(),
             Request::ChangeKey {
@@ -139,10 +143,11 @@ fn any_request() -> impl Strategy<Value = Request> {
         proptest::option::of(".{0,32}").prop_map(|collection| Request::Lock { collection }),
         Just(()).prop_map(|_| Request::Status),
         Just(()).prop_map(|_| Request::Reload),
-        (".{0,32}", any::<[u8; KEY_LEN]>()).prop_map(|(collection, key)| {
+        (".{0,32}", any::<[u8; KEY_LEN]>(), any::<bool>(),).prop_map(|(collection, key, pin)| {
             Request::UnlockWithKey {
                 collection,
                 key: Zeroizing::new(key),
+                pin,
             }
         }),
         (

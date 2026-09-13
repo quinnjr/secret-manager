@@ -264,7 +264,7 @@ own uid or 0 (root), because the PAM module runs as root during
 display-manager and console logins.
 
 Protocol: `u32` big-endian length prefix, then a frame body of
-`[version u8 = 4][postcard encoded message]`. The version byte lets a future
+`[version u8 = 5][postcard encoded message]`. The version byte lets a future
 protocol change be rejected cleanly instead of failing postcard decoding.
 
 ```rust
@@ -272,7 +272,7 @@ enum Request {
     Lock { collection: Option<String> },        // None = all
     Status,
     Reload,          // rescan the vault directory; `sm reload`, and `sm init`
-    UnlockWithKey { collection: String, key: Zeroizing<[u8; 32]> },
+    UnlockWithKey { collection: String, key: Zeroizing<[u8; 32]>, pin: bool },
     ChangeKey { collection: String, old_key: Zeroizing<[u8; 32]>, new_salt: [u8; 16], new_kdf: KdfParams, new_key: Zeroizing<[u8; 32]> },
 }
 enum Response {
@@ -314,7 +314,7 @@ everything they call sits in `mod.rs` and is unit-tested without it.
   during a real login — it exists solely for tests). If the socket is
   absent, run `systemctl --user --machine=<user>@.host start
   secret-manager.service` and poll for the socket up to 5 s. Send
-  `UnlockWithKey { collection: "default", key }`. Any failure is logged to
+  `UnlockWithKey { collection: "default", key, pin: true }`. Any failure is logged to
   syslog at `LOG_WARNING` and the hook still returns `PAM_SUCCESS`. Login is
   never blocked by the vault. The module must be listed after `pam_systemd`
   in the session stack. Every hook is wrapped in `catch_unwind` so a panic
@@ -582,3 +582,23 @@ paths pointing at `/usr/bin`.
   being ignored as root (the suite asserts it is *honoured* below root, and
   refuses to run as root at all), and the error arms of `send_data` /
   `retrieve_data`.
+
+## Amendment 2026-09-13: PAM unlocks every wallet and pins it
+
+* **A login opens all wallets, not just `default`.** `open_session` lists
+  `<vault_dir>/*.vault` and unlocks each collection under its own header
+  (own salt and KDF, same login password), in one forked socket child. The
+  `collection=` option is always attempted as well, so an empty or
+  unlistable vault directory behaves exactly as before. `chauthtok` follows
+  the same rule: a `passwd` rotation is forwarded into every readable vault,
+  so no wallet is left behind on the old password.
+* **`PROTOCOL_VERSION` is 5 for one added field:
+  `Request::UnlockWithKey.pin`.** The PAM module sends `pin = true`;
+  interactive `sm unlock` sends `pin = false`. The pin lives on `Vault`
+  itself (in-memory only): the daemon's idle-lock timer skips pinned vaults
+  under the vault's own guard, so a vault opened by a correct login never
+  relocks on its own, and no unlock can interleave between the pin check and
+  the wipe. Any explicit `Vault::lock` (control `Lock`, D-Bus lock, prompt
+  reclaim) clears the pin, and a `pin = false` unlock clears a stale one —
+  the pin always reflects the *last* successful unlock. The central
+  invariant is unchanged: still no password-carrying request.

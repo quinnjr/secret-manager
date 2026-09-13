@@ -302,6 +302,16 @@ pub struct Vault {
     /// set under the same guard that unlinks, so a save either ran strictly
     /// before the delete or refuses.
     retired: bool,
+    /// Set when a correct PAM login opens the vault. The daemon's idle-lock
+    /// timer never touches a pinned vault, so a login unlock stays open for
+    /// the life of the daemon. Any explicit lock clears it, and an
+    /// interactive (non-PAM) unlock clears it too — the pin always reflects
+    /// the *last* successful unlock.
+    ///
+    /// In-memory only, never serialized: it lives under the vault's own
+    /// lock alongside the plaintext, so the idle check and the wipe are one
+    /// atomic step and no second lock is ever needed to consult it.
+    pinned: bool,
 }
 
 impl std::fmt::Debug for Vault {
@@ -388,6 +398,7 @@ impl Vault {
             #[cfg(test)]
             saves: 0,
             retired: false,
+            pinned: false,
         };
         Ok(vault)
     }
@@ -413,6 +424,7 @@ impl Vault {
             #[cfg(test)]
             saves: 0,
             retired: false,
+            pinned: false,
         })
     }
 
@@ -492,6 +504,20 @@ impl Vault {
     /// been deleted and this handle can no longer be written.
     pub fn is_retired(&self) -> bool {
         self.retired
+    }
+
+    /// Whether the idle-lock timer must leave this vault alone. Set by a
+    /// PAM-login unlock, cleared by any explicit lock and by an interactive
+    /// unlock.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Record (or clear) the idle-lock exemption. Called by the daemon's
+    /// control-socket unlock path under the vault's own lock, so the flag
+    /// and the decryption are one atomic step.
+    pub fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
     }
 
     pub fn item_ids(&self) -> Vec<String> {
@@ -662,6 +688,9 @@ impl Vault {
 
     pub fn lock(&mut self) {
         self.state = State::Locked;
+        // An explicit lock ends the login's exemption with it: what the
+        // operator locked stays locked until someone unlocks it again.
+        self.pinned = false;
     }
 
     pub fn items(&self) -> Result<&[Item], VaultError> {
@@ -1971,6 +2000,23 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, VaultError::Retired), "{err:?}");
+    }
+
+    /// The pin is the idle-lock exemption a PAM login sets: fresh vaults are
+    /// unpinned, and any explicit lock clears it, so only a vault whose
+    /// *last* unlock was a login stays open past the idle deadline.
+    #[test]
+    fn an_explicit_lock_clears_the_login_pin() {
+        let (_d, path) = tmp();
+        let mut v = Vault::create(&path, "Default", b"pw", FAST).unwrap();
+        assert!(!v.is_pinned());
+        v.set_pinned(true);
+        assert!(v.is_pinned());
+        v.lock();
+        assert!(!v.is_pinned(), "locking must end the login exemption");
+        v.set_pinned(true);
+        v.set_pinned(false);
+        assert!(!v.is_pinned(), "an interactive unlock clears a stale pin");
     }
 
     /// `retire` also closes the door the other way: a retired vault must not
