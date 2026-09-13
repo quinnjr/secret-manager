@@ -58,6 +58,7 @@ fn unlock_with(fx: &Fixture, collection: &str, password: &str) -> Request {
     Request::UnlockWithKey {
         collection: collection.to_string(),
         key: key_for(fx, collection, password),
+        pin: false,
     }
 }
 
@@ -83,6 +84,7 @@ async fn control_socket_status_unlock_lock_change_password() {
             Request::UnlockWithKey {
                 collection: "missing".into(),
                 key: key_for(&fx, "default", PASSWORD),
+                pin: false,
             }
         )
         .await,
@@ -225,6 +227,38 @@ async fn idle_lock_locks_after_inactivity() {
     );
 }
 
+/// A PAM-login unlock (`pin = true`) never relocks on its own: the idle
+/// timer skips it past the deadline. An interactive unlock (`pin = false`)
+/// still auto-locks, and a manual `Lock` ends the exemption.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_unlock_survives_idle_lock_until_manually_locked() {
+    let fx = Fixture::start_with_idle(Duration::from_millis(500)).await;
+    let pinned = Request::UnlockWithKey {
+        collection: "default".into(),
+        key: key_for(&fx, "default", PASSWORD),
+        pin: true,
+    };
+    assert_eq!(control(&fx, pinned).await, Response::Ok);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
+        "a login-pinned vault must survive the idle deadline"
+    );
+    assert_eq!(
+        control(&fx, Request::Lock { collection: None }).await,
+        Response::Ok
+    );
+    assert!(secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await);
+    // The manual lock cleared the pin: an interactive unlock auto-locks again.
+    fx.unlock_default().await;
+    assert!(
+        wait_for(Duration::from_secs(5), || async {
+            secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await
+        })
+        .await
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_daemon_exits_with_code_3() {
     let fx = Fixture::start().await;
@@ -280,6 +314,7 @@ async fn corrupt_vault_file_appears_locked_with_format_error() {
         Request::UnlockWithKey {
             collection: "broken".into(),
             key: key_for(&fx, "default", "whatever"),
+            pin: false,
         },
     )
     .await
@@ -380,6 +415,7 @@ async fn control_socket_key_based_unlock_and_rotation() {
             Request::UnlockWithKey {
                 collection: "default".into(),
                 key: as_wire(&wrong),
+                pin: false,
             }
         )
         .await,
@@ -391,6 +427,7 @@ async fn control_socket_key_based_unlock_and_rotation() {
             Request::UnlockWithKey {
                 collection: "default".into(),
                 key: as_wire(&key),
+                pin: false,
             }
         )
         .await,
@@ -430,6 +467,7 @@ async fn control_socket_key_based_unlock_and_rotation() {
             Request::UnlockWithKey {
                 collection: "default".into(),
                 key: as_wire(&key),
+                pin: false,
             }
         )
         .await,
@@ -441,6 +479,7 @@ async fn control_socket_key_based_unlock_and_rotation() {
             Request::UnlockWithKey {
                 collection: "default".into(),
                 key: as_wire(&new_key),
+                pin: false,
             }
         )
         .await,
@@ -673,6 +712,7 @@ async fn change_key_names_a_collection_that_does_not_exist() {
         Request::UnlockWithKey {
             collection: "missing".into(),
             key: key_for(&fx, "default", PASSWORD),
+            pin: false,
         },
     )
     .await
@@ -800,5 +840,102 @@ async fn sigterm_ends_run_until_shutdown_and_frees_the_name() {
         })
         .await,
         "the bus name must be released with the daemon"
+    );
+}
+
+/// The interactive CLI unlock must not pin: `sm unlock` sends `pin = false`,
+/// so the idle timer still applies. Fails if `src/cli/vault_cmds.rs` ever
+/// sends `pin: true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_unlock_does_not_pin_so_idle_lock_still_applies() {
+    let fx = Fixture::start_with_idle(Duration::from_millis(500)).await;
+    fx.sm().arg("unlock").write_stdin("pw\n").assert().success();
+    assert!(
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
+        "sm unlock must leave the collection unlocked"
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || async {
+            secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await
+        })
+        .await,
+        "an interactively unlocked vault must still auto-lock past the idle deadline"
+    );
+}
+
+/// A failed `pin = true` attempt must not pin, and a later `pin = false`
+/// unlock still auto-locks past the idle deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_pinned_unlock_does_not_pin_and_unpinned_still_auto_locks() {
+    let fx = Fixture::start_with_idle(Duration::from_millis(500)).await;
+    assert!(matches!(
+        control(
+            &fx,
+            Request::UnlockWithKey {
+                collection: "default".into(),
+                key: key_for(&fx, "default", "wrong"),
+                pin: true,
+            }
+        )
+        .await,
+        Response::Error(_)
+    ));
+    let pinned = secret_manager::dbus::state::with_vault(&fx.daemon.state, "default", |vault| {
+        vault.is_pinned()
+    })
+    .await;
+    assert!(!pinned, "a failed login attempt cannot pin the vault");
+    assert_eq!(
+        control(&fx, unlock_with(&fx, "default", PASSWORD)).await,
+        Response::Ok
+    );
+    assert!(
+        wait_for(Duration::from_secs(5), || async {
+            secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await
+        })
+        .await,
+        "a pin: false unlock must auto-lock past the idle deadline"
+    );
+}
+
+/// The idle sweep skips only the pinned vault: a pinned `default` stays open
+/// while an unpinned second vault locks. Catches implementations that skip
+/// the whole sweep when any vault is pinned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_lock_skips_only_the_pinned_collection() {
+    let fx = Fixture::start_with_idle(Duration::from_millis(500)).await;
+    let dir = fx.data_dir.path().join("secret-manager");
+    Vault::create(
+        &dir.join("work.vault"),
+        "Work",
+        PASSWORD.as_bytes(),
+        KdfParams::FAST_FOR_TESTS,
+    )
+    .unwrap();
+    assert_eq!(control(&fx, Request::Reload).await, Response::Ok);
+    assert_eq!(
+        control(
+            &fx,
+            Request::UnlockWithKey {
+                collection: "default".into(),
+                key: key_for(&fx, "default", PASSWORD),
+                pin: true,
+            }
+        )
+        .await,
+        Response::Ok
+    );
+    assert_eq!(
+        control(&fx, unlock_with(&fx, "work", PASSWORD)).await,
+        Response::Ok
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "default").await,
+        "the pinned vault must stay open past the idle deadline"
+    );
+    assert!(
+        secret_manager::dbus::state::collection_is_locked(&fx.daemon.state, "work").await,
+        "the unpinned vault must lock past the idle deadline"
     );
 }

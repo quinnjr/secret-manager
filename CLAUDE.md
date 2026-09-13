@@ -59,11 +59,17 @@ over a **private control socket** at
 
 **The central invariant: no password crosses the control socket.** Control
 protocol v3 onward has no password-carrying request (`PROTOCOL_VERSION` is
-now 4). Both the CLI and the PAM module
+now 5). Both the CLI and the PAM module
 read the collection's vault header from disk, derive the key locally with
 Argon2id, and send only the key. Nothing that answers the socket can choose a
 salt or a KDF cost. Preserve this when touching `src/protocol.rs`,
 `src/cli/vault_cmds.rs`, or `src/pam/`.
+
+A PAM login opens *every* vault and pins each one (`UnlockWithKey.pin`),
+so a correctly logged-in session never auto-relocks; an interactive `sm
+unlock` sends `pin = false` and keeps auto-lock. The pin lives on `Vault`
+itself so the idle check and the wipe share the vault's own guard, and any
+explicit `Vault::lock` clears it.
 
 **Trust model.** The uid boundary is the one the code enforces: another user
 or the network must reach nothing. Same-uid processes are semi-trusted, which

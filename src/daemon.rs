@@ -278,9 +278,11 @@ fn control_handler(state: Shared, conn: Connection) -> Handler {
 
 async fn handle_control(state: Shared, conn: Connection, req: Request) -> Response {
     match req {
-        Request::UnlockWithKey { collection, key } => {
-            unlock_with_key(&state, &conn, &collection, &Key::from_zeroizing(key)).await
-        }
+        Request::UnlockWithKey {
+            collection,
+            key,
+            pin,
+        } => unlock_with_key(&state, &conn, &collection, &Key::from_zeroizing(key), pin).await,
         Request::ChangeKey {
             collection,
             old_key,
@@ -324,6 +326,8 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                         Some(vault) => {
                             let mut vault = vault.lock().await;
                             if !vault.is_locked() {
+                                // `Vault::lock` also clears the PAM pin, so
+                                // what the operator locked stays locked.
                                 vault.lock();
                                 changed.push(id);
                             }
@@ -429,6 +433,7 @@ async fn unlock_with_key(
     conn: &Connection,
     collection: &str,
     key: &Key,
+    pin: bool,
 ) -> Response {
     let target = {
         let st = state.lock().await;
@@ -453,8 +458,16 @@ async fn unlock_with_key(
         // collection's own lock and off the async worker.
         Ok(vault) => {
             let mut vault = vault.lock().await;
-            block_in_place(|| vault.unlock_with_key(key))
-                .map_err(|_| "cannot unlock that collection".to_string())
+            // The pin and the decryption share this guard, so the idle
+            // timer can never slip a wipe between the two: `pin = true`
+            // (a PAM login) exempts the collection from auto-lock, while
+            // `pin = false` (an interactive unlock) clears a stale pin.
+            block_in_place(|| {
+                vault.unlock_with_key(key).map(|()| {
+                    vault.set_pinned(pin);
+                })
+            })
+            .map_err(|_| "cannot unlock that collection".to_string())
         }
         Err(e) => Err(e),
     };
@@ -679,7 +692,15 @@ async fn idle_lock(conn: Connection, state: Shared, after: Duration, check_every
         };
         let mut ids = Vec::new();
         for (id, vault) in vaults {
+            // The pin lives on the vault itself, so this check and the wipe
+            // below share the vault's own guard: a PAM-pinned collection is
+            // never auto-locked, and no unlock can interleave between the
+            // two. `Vault::lock` is a no-pin-op here — a pinned vault never
+            // reaches it.
             let mut vault = vault.lock().await;
+            if vault.is_pinned() {
+                continue;
+            }
             if !vault.is_locked() {
                 vault.lock();
                 ids.push(id);

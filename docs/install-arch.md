@@ -208,11 +208,11 @@ session   include   system-login
 session   optional  pam_secret_manager.so
 ```
 
-Log out and back in, then `sm status` should show `default` unlocked.
-If your collection's id is not `default`, append
-`collection=<id>` to each `pam_secret_manager.so` line — the module
-opens `<id>.vault` literally and does not resolve the daemon's `default`
-alias. See "PAM module options" in `docs/install-common.md`.
+Log out and back in, then `sm status` should show every vault unlocked —
+a login opens all wallets, each pinned so it never auto-locks afterwards.
+(`collection=<id>` is still accepted and always attempted, but it is no
+longer needed for non-default ids. See "PAM module options" in
+`docs/install-common.md`.)
 
 Problems are logged to the journal: `journalctl -p warning -g pam_secret_manager`
 (the messages carry a `pam_secret_manager:` prefix in `authpriv`).
