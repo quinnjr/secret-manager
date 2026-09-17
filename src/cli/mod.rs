@@ -1,6 +1,7 @@
 //! Command line interface. Every subcommand except `daemon` is a client.
 
 pub mod client;
+pub mod gpg;
 pub mod import;
 pub mod secrets;
 pub mod ssh;
@@ -100,6 +101,11 @@ pub enum Command {
     Ssh {
         #[command(subcommand)]
         command: ssh::SshCommand,
+    },
+    /// GPG signing-key passphrases and the agent preset helper
+    Gpg {
+        #[command(subcommand)]
+        command: gpg::GpgCommand,
     },
 }
 
@@ -250,6 +256,10 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             ssh::SshCommand::List => ssh::list().await,
             ssh::SshCommand::Remove { path } => ssh::remove(path).await,
             ssh::SshCommand::Askpass { prompt } => ssh::askpass(prompt).await,
+        },
+        Command::Gpg { command } => match command {
+            gpg::GpgCommand::Enroll { keyid } => gpg::enroll(keyid).await,
+            gpg::GpgCommand::Preset => gpg::preset().await,
         },
     }
 }

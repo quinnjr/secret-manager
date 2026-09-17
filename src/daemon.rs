@@ -176,6 +176,7 @@ impl Daemon {
             opts.config.vault.dir.clone(),
             opts.config.kdf.into(),
             pinentry,
+            opts.config.gpg.clone(),
         );
         state.index_attributes = opts.config.vault.locked_search;
         let swept = crate::vault::store::sweep_stale_temp_files(&opts.config.vault.dir);
@@ -473,6 +474,10 @@ async fn unlock_with_key(
     };
     match result {
         Ok(()) => {
+            // No guard is held here — the vault guard from the decrypt
+            // above is dead — so the hook's brief acquisitions nest
+            // nothing. It spawns detached work and returns.
+            crate::dbus::gpg_preset::note_unlocked(state).await;
             state.lock().await.touch();
             registry::notify_collection_changed(conn, collection).await;
             Response::Ok
@@ -730,6 +735,7 @@ mod tests {
             dir.path().to_path_buf(),
             KdfParams::FAST_FOR_TESTS,
             Pinentry::new("pinentry"),
+            crate::config::GpgConfig::default(),
         );
         let p = "/org/freedesktop/secrets/prompt/p1";
         let running = tokio::spawn(std::future::pending::<()>());
@@ -787,6 +793,7 @@ mod tests {
             dir.path().to_path_buf(),
             KdfParams::FAST_FOR_TESTS,
             Pinentry::new("pinentry"),
+            crate::config::GpgConfig::default(),
         );
         st.collections
             .insert("default".into(), crate::dbus::state::vault_ref(vault));

@@ -109,6 +109,54 @@ per-use consent for SSH keys: once logged in, anything that can invoke
 the convenience anyway, also set a real `auto_lock_after` (see
 Configuration below) so an idle session eventually re-locks the vault.
 
+## GPG passphrases
+
+```sh
+sm gpg enroll                       # prompts once (omit --keyid with a single signing key)
+sm gpg enroll --keyid D98C3F305E74B9E3
+```
+
+`enroll` stores the passphrase as an ordinary vault item
+(`xdg:schema=org.secret-manager.gpg`, `keyid=<long id>`), presets the
+agent, and proves the roundtrip with a `--batch` testsign that cannot
+prompt — a success means the next `git commit -S` signs silently.
+
+To have the daemon do it on every unlock (so a login unlocks and
+presets in one step), opt in once in
+`~/.config/secret-manager/config.toml`:
+
+```toml
+[gpg]
+enabled = true
+homedir = "/home/you/.config/gnupg"   # wherever your pubring.kbx lives
+# keys = ["D98C3F305E74B9E3"]          # optional: preset only these
+```
+
+then restart the user daemon (`systemctl --user restart
+secret-manager.service`). From then on every unlock — PAM login,
+`sm unlock`, or a D-Bus unlock prompt — feeds the enrolled
+passphrases to gpg-agent in the background, log-only on failure, and
+never raises a dialog itself. `sm gpg preset` remains for manual runs.
+Unenrolled keys are a quiet skip, and with `enabled` unset nothing
+happens at all.
+
+Two prerequisites, both one-time. The agent refuses presets unless
+`~/.config/gnupg/gpg-agent.conf` holds `allow-preset-passphrase`
+(reload with `gpg-connect-agent reloadagent /bye` afterwards) — if it
+is missing, `enroll` says so instead of succeeding vaguely. And
+`GPG_TTY` must name a real terminal: an unguarded
+`export GPG_TTY=$(tty)` in a tty-less shell exports the literal
+`not a tty` and breaks pinentry's terminal handling, so only export it
+when `tty` succeeds.
+
+A preset lasts until the agent's maximum cache lifetime (two hours by
+default) and is refreshed at every unlock; it does not change the
+passphrase or the key.
+
+A config file that fails to parse stops the daemon at startup (loud),
+while `sm gpg preset` warns and proceeds unfiltered — the login helper
+must not fail the boot on a typo, but it refuses to do so silently.
+
 ## Configuration
 
 `~/.config/secret-manager/config.toml`, all keys optional. The file path

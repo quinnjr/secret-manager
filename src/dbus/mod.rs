@@ -2,6 +2,7 @@
 
 pub mod collection;
 pub mod errors;
+pub mod gpg_preset;
 pub mod item;
 pub mod paths;
 pub mod prompt;

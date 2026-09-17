@@ -47,6 +47,7 @@ for the vault/SSH/configuration steps shared by both.
 | `sm reload` | tell a running daemon to rescan the vault directory |
 | `sm import --from gnome-keyring\|kwallet` | migrate an existing keyring or wallet |
 | `sm ssh add/list/remove/askpass` | SSH passphrases and the askpass helper |
+| `sm gpg enroll / preset` | GPG signing-key passphrases and the agent preset helper |
 | `sm completions <shell>` | shell completions |
 
 Exit codes: 0 ok · 1 not found, prompt dismissed, or any other failure (I/O,

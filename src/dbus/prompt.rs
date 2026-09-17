@@ -659,6 +659,9 @@ async fn unlock_collection_inner(
         };
         match result {
             Ok(()) => {
+                // No guard is held here — the collection guard above is
+                // dead — so the hook's brief acquisitions nest nothing.
+                super::gpg_preset::note_unlocked(state).await;
                 state.lock().await.touch();
                 registry::notify_collection_changed(conn, id).await;
                 return Outcome::Unlocked;

@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 //! Private bus + in-process daemon for integration tests.
 
-use secret_manager::config::{Config, KdfConfig, PromptConfig, VaultConfig};
+use secret_manager::config::{Config, GpgConfig, KdfConfig, PromptConfig, VaultConfig};
 use secret_manager::daemon::{BusAddress, Daemon, DaemonOptions};
 use secret_manager::vault::Vault;
 use secret_manager::vault::crypto::KdfParams;
@@ -58,6 +58,53 @@ pub fn fake_pinentry() -> PathBuf {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/fake-pinentry.sh"
     ))
+}
+
+/// Shared fixtures for the scripted `gpg` stand-ins (`sm gpg` resolves
+/// both helpers by bare name, so these live on PATH in tests). Kept here
+/// so `cli_gpg` and `daemon_gpg_preset` cannot drift apart.
+pub mod gpg {
+    use std::path::PathBuf;
+
+    pub const GRIP: &str = "EFEB25D85B8B0F2835DE2591EA242763FE1FCCF9";
+    pub const KEYID: &str = "D98C3F305E74B9E3";
+    pub const FPR: &str = "214A13BF20AED6B3C7EB6BDCD98C3F305E74B9E3";
+    pub const GRIP_B: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    pub const KEYID_B: &str = "AAAAAAAAAAAAAAAA";
+    pub const FPR_B: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    pub fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
+    }
+
+    /// `PATH` with the fixture shims first, so `gpg`/`gpg-connect-agent`
+    /// resolve to the stand-ins.
+    pub fn fixture_path() -> std::ffi::OsString {
+        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures"));
+        let path = std::env::var("PATH").unwrap_or_default();
+        std::ffi::OsString::from(format!("{}:{}", dir.display(), path))
+    }
+
+    fn sec_line(keyid: &str) -> String {
+        format!("sec:u:255:22:{keyid}:1774453727:1837525727::u:::scESC:::+:::23::0:")
+    }
+
+    /// One sign-capable secret key, in `gpg -K --with-keygrip --with-colons` shape.
+    pub fn colons_single() -> String {
+        format!(
+            "{}\nfpr:::::::::{FPR}:\ngrp:::::::::{GRIP}:\n",
+            sec_line(KEYID)
+        )
+    }
+
+    /// Two sign-capable secret keys, for filter and rotation tests.
+    pub fn colons_two_keys() -> String {
+        format!(
+            "{}\nfpr:::::::::{FPR}:\ngrp:::::::::{GRIP}:\n{}\nfpr:::::::::{FPR_B}:\ngrp:::::::::{GRIP_B}:\n",
+            sec_line(KEYID),
+            sec_line(KEYID_B)
+        )
+    }
 }
 
 pub struct Fixture {
@@ -154,17 +201,17 @@ impl Fixture {
                 t_cost: 1,
                 p_cost: 1,
             },
+            gpg: GpgConfig::default(),
         };
         mutate(&mut config);
         let config_dir = data_dir.path().join("config").join("secret-manager");
         std::fs::create_dir_all(&config_dir).unwrap();
+        // Serialize the struct the daemon actually runs with — including
+        // every `mutate` — rather than a hand-written subset, so CLI
+        // children reading the file see the same configuration.
         std::fs::write(
             config_dir.join("config.toml"),
-            format!(
-                "[vault]\ndir = \"{}\"\n[prompt]\npinentry = \"{}\"\n[kdf]\nm_cost_kib = 8\nt_cost = 1\np_cost = 1\n",
-                vault_dir.display(),
-                fake_pinentry().display()
-            ),
+            toml::to_string_pretty(&config).unwrap(),
         )
         .unwrap();
         let mut pinentry_env = vec![(

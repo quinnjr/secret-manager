@@ -1,0 +1,4 @@
+#!/bin/sh
+# Test shim: shadows the real `gpg` on PATH in integration tests so
+# `sm gpg` talks to the scripted stand-in. See fake-gpg.sh.
+exec "$(dirname "$0")/fake-gpg.sh" "$@"
