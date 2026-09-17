@@ -82,6 +82,9 @@ pub struct ServiceState {
     /// hashes. Applied to every vault as it is loaded or created.
     pub index_attributes: bool,
     pub pinentry: Pinentry,
+    /// `[gpg]`: preset enrolled signing-key passphrases into gpg-agent
+    /// whenever a collection unlocks. Off unless explicitly enabled.
+    pub gpg: crate::config::GpgConfig,
     /// Loaded collections, each behind its own lock. See [`VaultRef`] for the
     /// ordering rule that makes this safe.
     pub collections: BTreeMap<String, VaultRef>,
@@ -728,13 +731,19 @@ pub fn search_collection(vault: &Vault, query: &BTreeMap<String, String>) -> Vec
 }
 
 impl ServiceState {
-    pub fn new(vault_dir: PathBuf, kdf: KdfParams, pinentry: Pinentry) -> Self {
+    pub fn new(
+        vault_dir: PathBuf,
+        kdf: KdfParams,
+        pinentry: Pinentry,
+        gpg: crate::config::GpgConfig,
+    ) -> Self {
         let now = Instant::now();
         Self {
             vault_dir,
             kdf,
             index_attributes: true,
             pinentry,
+            gpg,
             collections: BTreeMap::new(),
             broken: BTreeMap::new(),
             aliases: AliasTable::default(),
@@ -988,6 +997,7 @@ mod tests {
             dir.to_path_buf(),
             KdfParams::FAST_FOR_TESTS,
             Pinentry::new("pinentry"),
+            crate::config::GpgConfig::default(),
         )
     }
 

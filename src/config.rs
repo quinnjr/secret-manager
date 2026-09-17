@@ -11,6 +11,7 @@ pub struct Config {
     pub vault: VaultConfig,
     pub prompt: PromptConfig,
     pub kdf: KdfConfig,
+    pub gpg: GpgConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +103,43 @@ impl Default for KdfConfig {
             m_cost_kib: p.m_cost_kib,
             t_cost: p.t_cost,
             p_cost: p.p_cost,
+        }
+    }
+}
+
+/// GPG agent preset: feed enrolled signing-key passphrases to gpg-agent
+/// whenever a collection unlocks, so `git commit -S` signs without a
+/// pinentry prompt.
+///
+/// Opt-in (`enabled = false` default): a daemon that spawns gpg-agent
+/// helpers unasked would surprise every user without gpg, and the
+/// homedir below is genuinely per-user — the daemon's own environment
+/// cannot be trusted for `GNUPGHOME`, so it is stated here instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GpgConfig {
+    pub enabled: bool,
+    /// gpg home passed as `--homedir` (and `GNUPGHOME` on the agent
+    /// child). Unset: `$GNUPGHOME`, else `~/.gnupg`.
+    pub homedir: Option<PathBuf>,
+    /// Full paths so tests can point at fixtures; bare names resolve on PATH.
+    pub gpg_bin: PathBuf,
+    pub agent_bin: PathBuf,
+    /// Long key ids to preset; empty presets every enrolled signing key.
+    /// Entries accept the same forms as `sm gpg enroll --keyid` (long id
+    /// or fingerprint, either case, optional `0x`); anything else matches
+    /// nothing rather than everything.
+    pub keys: Vec<String>,
+}
+
+impl Default for GpgConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            homedir: None,
+            gpg_bin: PathBuf::from("gpg"),
+            agent_bin: PathBuf::from("gpg-connect-agent"),
+            keys: Vec::new(),
         }
     }
 }
@@ -304,6 +342,28 @@ pinentry = "/usr/bin/pinentry-tty"
     #[test]
     fn rejects_unknown_keys() {
         assert!(Config::from_str("[vault]\nbogus = 1\n").is_err());
+        assert!(Config::from_str("[gpg]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn gpg_section_is_opt_in_with_sane_defaults() {
+        let c = Config::from_str("").unwrap();
+        assert!(!c.gpg.enabled);
+        assert_eq!(c.gpg.homedir, None);
+        assert!(c.gpg.keys.is_empty());
+        // The exact helpers the daemon spawns: a bad default here
+        // breaks every preset while this test stays green otherwise.
+        assert_eq!(c.gpg.gpg_bin, PathBuf::from("gpg"));
+        assert_eq!(c.gpg.agent_bin, PathBuf::from("gpg-connect-agent"));
+        let c = Config::from_str(
+            "[gpg]\nenabled = true\nhomedir = \"/home/u/.config/gnupg\"\nkeys = [\"D98C3F305E74B9E3\"]\ngpg_bin = \"/usr/bin/gpg\"\nagent_bin = \"/usr/bin/gpg-connect-agent\"\n",
+        )
+        .unwrap();
+        assert!(c.gpg.enabled);
+        assert_eq!(c.gpg.homedir, Some(PathBuf::from("/home/u/.config/gnupg")));
+        assert_eq!(c.gpg.keys, vec!["D98C3F305E74B9E3".to_string()]);
+        assert_eq!(c.gpg.gpg_bin, PathBuf::from("/usr/bin/gpg"));
+        assert_eq!(c.gpg.agent_bin, PathBuf::from("/usr/bin/gpg-connect-agent"));
     }
 
     #[test]
