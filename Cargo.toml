@@ -1,5 +1,9 @@
 [package]
-name = "secret-manager"
+# The crate is `freedesktop-secret-manager` because `secret-manager` on
+# crates.io is an unrelated published crate. The binary, the lib and the
+# PAM artifact keep their names, so nothing installed changes; only
+# `cargo install`/`cargo add` address the crate by the new name.
+name = "freedesktop-secret-manager"
 version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -101,8 +105,9 @@ proptest = "1"
 # the standard way to enable a feature for them without enabling it for the
 # shipped build. `fuzzing` comes along for the same reason: `tests/prop_text.rs`
 # drives the same internal sanitisers as the fuzz targets, through the same
-# `fuzz_api` wrappers, so the two cannot drift apart.
-secret-manager = { path = ".", features = ["test-util", "fuzzing"] }
+# `fuzz_api` wrappers, so the two cannot drift apart. The key must be the
+# package name; the extern crate stays `secret_manager`, from `[lib] name`.
+freedesktop-secret-manager = { path = ".", features = ["test-util", "fuzzing"] }
 # `tests/dbus_locking.rs` scans `src/dbus/` and `src/daemon.rs` for the lock
 # rules `CLAUDE.md` states. It parses them with the real Rust grammar rather
 # than matching text: a hand-rolled lexer got the `//` stripper, char

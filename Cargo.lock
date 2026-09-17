@@ -492,6 +492,48 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "freedesktop-secret-manager"
+version = "0.1.1"
+dependencies = [
+ "aes",
+ "argon2",
+ "assert_cmd",
+ "cbc",
+ "chacha20poly1305",
+ "clap",
+ "clap_complete",
+ "crypto-bigint",
+ "freedesktop-secret-manager",
+ "futures-util",
+ "hkdf",
+ "humantime-serde",
+ "libc",
+ "pamsm",
+ "postcard",
+ "predicates",
+ "proc-macro2",
+ "proptest",
+ "quote",
+ "rand_core 0.6.4",
+ "regex",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "syn 2.0.119",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zbus",
+ "zeroize",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1080,48 +1122,6 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
-]
-
-[[package]]
-name = "secret-manager"
-version = "0.1.1"
-dependencies = [
- "aes",
- "argon2",
- "assert_cmd",
- "cbc",
- "chacha20poly1305",
- "clap",
- "clap_complete",
- "crypto-bigint",
- "futures-util",
- "hkdf",
- "humantime-serde",
- "libc",
- "pamsm",
- "postcard",
- "predicates",
- "proc-macro2",
- "proptest",
- "quote",
- "rand_core 0.6.4",
- "regex",
- "rpassword",
- "secret-manager",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "syn 2.0.119",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zbus",
- "zeroize",
 ]
 
 [[package]]
