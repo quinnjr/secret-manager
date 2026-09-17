@@ -168,6 +168,9 @@ pub fn unlock(collection: String) -> Result<(), CliError> {
         // stack first and leave that copy unwiped; `to_zeroizing` clones the
         // already-wrapped buffer.
         key: key.to_zeroizing(),
+        // Interactive unlocks never pin: auto-lock still applies. Only a
+        // PAM login sends `pin = true`.
+        pin: false,
     })?;
     println!("Unlocked '{collection}'.");
     Ok(())

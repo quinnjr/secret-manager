@@ -422,7 +422,8 @@ passphrase, with `SM_ASKPASS_NO_CONFIRM=1` as the documented opt-out.
 Hardening failures are fatal rather than logged, and the CLI makes itself
 non-dumpable too. Per-client caps on sessions and prompts; a `GetSecrets`
 item cap; a pinentry dialog timeout; session and prompt paths carry 64 random
-bits. `Vault::create` reserves its name exclusively before deriving; the
+bits. `Vault::create` reserves its name exclusively before deriving[^create];
+the
 header has a write-side size ceiling; `Vault::open` refuses oversized files;
 `change_key` rejects a reused salt and rotates the index salt; the temp-file
 sweep matches the real name shape and an age; the RNG no longer panics on the
@@ -431,6 +432,19 @@ error; the bus watcher retries instead of abandoning cleanup. `make install`
 refuses a `PAMSO` without PAM symbols, installs it 0644, and only touches
 `sm` symlinks that belong to this package. Syslog input is sanitized inside
 `log` itself, including bidi overrides.
+
+[^create]: **Superseded, not regressed.** The exclusive reservation described
+    here — an empty `O_EXCL` file at `<id>.vault`, held across the Argon2
+    derivation and the save — is no longer in the tree. `Vault::create` now
+    builds the whole vault in a temp file and publishes it with
+    `RENAME_NOREPLACE`, which is strictly stronger: exactly one of two
+    concurrent `sm init` runs can win the rename, as before, *and* `path`
+    never has an observable intermediate state. The reservation's window was
+    not survivable — a SIGINT, OOM kill or power loss inside it ran no
+    cleanup and stranded a zero-length `<id>.vault` that `open` reported as
+    `Truncated` and `create` then refused as `AlreadyExists`, permanently.
+    Nothing reserves anything now, and a zero-length file left by an older
+    build is treated as absent. See `Vault::create`'s docstring.
 
 ## Verified sound, unchanged
 

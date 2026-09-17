@@ -31,8 +31,16 @@
 //! [`catch_unwind`](std::panic::catch_unwind), so a panic can never unwind
 //! into libpam.
 //!
+//! A correct login opens *every* vault in the vault directory and pins each
+//! one, so no wallet relocks on its own afterwards — the idle-lock timer
+//! skips pinned collections until someone explicitly locks them. An
+//! interactive `sm unlock` never pins, so auto-lock still applies there.
+//!
 //! Options:
-//! * `collection=<id>` (default `default`)
+//! * `collection=<id>` (default `default`) — always attempted, plus every
+//!   other `<id>.vault` found in the vault directory. Kept so a deployment
+//!   that names a non-default vault still unlocks it when the directory
+//!   cannot be listed; it is not a restriction to that one vault.
 //! * `vault_dir=<absolute path>` — where `<collection>.vault` lives. Default
 //!   `<home>/.local/share/secret-manager`, from the target user's `pw_dir`.
 //!   A relative value is logged and ignored.
@@ -87,16 +95,21 @@ const DEFAULT_VAULT_SUBDIR: &str = ".local/share/secret-manager";
 /// The real bound on a hook is *not* exactly this constant. Argon2 is not
 /// interruptible, so the budget is checked before each derivation but cannot
 /// cut one short once it has begun. `open_session` runs at most two
-/// derivations (the first unlock and the retry after starting the daemon) and
-/// `chauthtok` runs two (old key and new key), each bounded by the login KDF
-/// ceiling of [`MAX_M_COST_KIB_LOGIN`] / [`MAX_T_COST_LOGIN`] /
-/// [`MAX_P_COST_LOGIN`] rather than by the vault's. So the guarantee is:
+/// derivations (the first unlock and the retry after starting the daemon),
+/// three when the reset retry fires (first unlock, reset retry, and the retry
+/// after starting the daemon), and `chauthtok` runs two (old key and new key),
+/// each bounded by the login KDF ceiling of [`MAX_M_COST_KIB_LOGIN`] /
+/// [`MAX_T_COST_LOGIN`] / [`MAX_P_COST_LOGIN`] rather than by the vault's. So
+/// the guarantee is:
 ///
 /// > this budget, plus at most the KDF ceiling cost of the derivations that
-/// > were actually started before it ran out.
+/// > were actually started before it ran out — budget plus at most two KDF
+/// > ceilings when the reset retry fires.
 ///
 /// A derivation is never *started* after the budget is spent, so the excess is
-/// bounded by one ceiling-cost derivation in practice.
+/// bounded by one ceiling-cost derivation in practice, two when the reset
+/// retry fires. The reset retry deliberately re-derives rather than reusing
+/// the first key.
 pub(crate) const HOOK_BUDGET: Duration = Duration::from_secs(8);
 /// Secondary budget for reaping a child that has already been killed.
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -841,6 +854,75 @@ pub(crate) fn vault_header(
     Some((header.salt, header.kdf))
 }
 
+/// Every vault id in `vault_dir`: one `<id>.vault` file per collection.
+/// A login unlocks all of them, not just `default`, so every wallet the
+/// user owns is open after a correct login.
+///
+/// Only regular-file names that pass [`collection_is_valid`] are returned —
+/// anything else cannot be a collection the daemon would load under that
+/// name — sorted, so the unlock order is deterministic. A directory that
+/// cannot be listed yields an empty vec; the caller falls back to the single
+/// configured collection so the failure is still logged against a name.
+pub(crate) fn list_vault_collections(vault_dir: &Path) -> Vec<String> {
+    // WHY: a PAM hook runs as root at login and must fail open with a reason.
+    // A vault directory root cannot list is not "no wallets" — the caller
+    // falls back to the configured collection — so the error is logged
+    // against the directory rather than swallowed.
+    let entries = match std::fs::read_dir(vault_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log(&format!(
+                "cannot list vault directory {}: {}",
+                vault_dir.display(),
+                sanitize(&e.to_string())
+            ));
+            return Vec::new();
+        }
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log(&format!(
+                    "cannot read a vault directory entry in {}: {}",
+                    vault_dir.display(),
+                    sanitize(&e.to_string())
+                ));
+                continue;
+            }
+        };
+        // Only regular files are collections: a subdirectory named
+        // `<id>.vault` is not a vault the daemon would load under that id.
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(id) = name.strip_suffix(".vault") else {
+            continue;
+        };
+        if collection_is_valid(id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids.sort();
+    ids
+}
+
+/// Every vault to attempt: everything listed plus the configured collection,
+/// which is always included so an empty or unreadable vault directory behaves
+/// as one attempt against that name, with its failure logged against it.
+/// Sorted, so the unlock order is deterministic.
+fn all_vault_ids(vault_dir: &Path, configured: &str) -> Vec<String> {
+    let mut ids = list_vault_collections(vault_dir);
+    if !ids.contains(&configured.to_string()) {
+        ids.push(configured.to_string());
+        ids.sort();
+    }
+    ids
+}
+
 /// `socket=` is a test-harness affordance. A real login runs as root, where a
 /// typo in the PAM config could otherwise aim the unlock at any socket on the
 /// system; there the option is ignored.
@@ -851,6 +933,7 @@ fn socket_override_allowed(euid: u32) -> bool {
 /// Everything the session and password hooks need about the target user: the
 /// control socket, the uid the daemon there must run as, and where the vault
 /// files live.
+#[derive(Clone)]
 pub(crate) struct Target {
     pub sock: PathBuf,
     pub uid: u32,
@@ -1022,6 +1105,253 @@ pub(crate) enum StaleSocket {
     LeaveAlone,
 }
 
+/// Transport deaths worth exactly one retry: the peer vanished mid-call —
+/// a daemon restart landing in the window — not a decision. Anything else
+/// (refused, timed out, malformed, a daemon error reply) is deterministic,
+/// and retrying it only spends login budget re-proving the failure.
+fn retryable_reset(e: &ProtocolError) -> bool {
+    let ProtocolError::Io(io) = e else {
+        return false;
+    };
+    matches!(
+        io.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Whether this process must shed root before touching the socket: only
+/// root facing a foreign target. Anything else is already where it needs
+/// to be (the target itself, or root's own vault), or cannot get there.
+fn privileges_to_drop(euid: u32, target: u32) -> bool {
+    euid == 0 && target != 0 && euid != target
+}
+
+/// Shed root for the target uid inside a forked child, before it touches
+/// the socket: a daemon behind mount sandboxing runs inside a single-uid
+/// user namespace, where every host uid except the target maps to the
+/// overflow uid — so root would arrive unrecognisable and be refused, while
+/// the target uid maps to itself.
+///
+/// Child-only: `setuid` is irreversible by design, and the calling process
+/// is the PAM session its login path forks the user session from — a
+/// display manager that lost root here could authenticate the user and
+/// then fail to start anything with `EPERM`. The fork that isolates this
+/// is [`fork_report`]; production callers that need target-uid socket
+/// credentials go through [`run_socket_work_as_target`], never here
+/// directly (tests excepted).
+/// Supplementary groups go first (peer checks are uid-only, and nothing
+/// past this point needs root's memberships). Everything root is needed
+/// for (fd-pinned directory validation, header read) already happened
+/// above. A failure keeps old behaviour (proceed as-is) rather than
+/// inventing a new one.
+fn drop_privileges_in_forked_child(target: u32) -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !privileges_to_drop(euid, target) {
+        return true;
+    }
+    // SAFETY: dropping to an empty group list; root only reaches here.
+    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+        log("cannot drop supplementary groups; continuing with them");
+    }
+    // SAFETY: setuid from euid 0; target is a validated non-zero uid.
+    if unsafe { libc::setuid(target) } != 0 {
+        log(&format!("cannot setuid to {target}; continuing as root"));
+        return false;
+    }
+    true
+}
+
+/// Reaps a forked child within `timeout`. `true` once it is collected.
+///
+/// `EINTR` restarts the wait; any other wait error means there is nothing
+/// left to reap. Giving up logs and leaves a zombie until this process
+/// exits, which is far cheaper than a hung login.
+fn reap_child(pid: libc::pid_t, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        let mut status = 0;
+        // SAFETY: `pid` is a child of this process; `status` is a live int.
+        let rc = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if rc == pid {
+            return true;
+        }
+        if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            log("socket child did not exit in time; leaving it to init to reap");
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Logs a failed `kill` with its errno: under fd exhaustion or a
+/// fork-bomb-adjacent `EAGAIN` the errno is the entire diagnosis.
+fn kill_child(pid: libc::pid_t) {
+    // SAFETY: `pid` is a child of this process.
+    if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+        log(&format!(
+            "cannot kill the socket child: {}; vault stays locked",
+            sanitize(&std::io::Error::last_os_error().to_string())
+        ));
+    }
+}
+
+/// Writes the whole buffer, retrying `EINTR`. `false` on any other failure.
+fn write_exact_fd(fd: libc::c_int, buf: &[u8]) -> bool {
+    let mut done = 0;
+    while done < buf.len() {
+        // SAFETY: `buf[done..]` is live for the write; the fd is the pipe's.
+        let rc = unsafe {
+            libc::write(
+                fd,
+                buf.as_ptr().add(done) as *const libc::c_void,
+                buf.len() - done,
+            )
+        };
+        if rc < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return false;
+        }
+        if rc == 0 {
+            return false;
+        }
+        done += rc as usize;
+    }
+    true
+}
+
+/// Runs `work` in a forked child and returns the two bytes it reported
+/// through a pipe, or `None` when the report never arrived.
+///
+/// The parent keeps its pid, credentials and descriptors: only the child's
+/// two bytes cross back. Fail-open throughout — a pipe/fork/read/timeout
+/// failure logs and returns `None`, and the caller treats that as "vault
+/// stays locked, login proceeds".
+fn fork_report(budget: &Budget, work: impl FnOnce() -> [u8; 2]) -> Option<[u8; 2]> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a live array of two ints, which is what pipe2 writes.
+    // CLOEXEC so the descriptors never leak into a `systemctl` grandchild.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        log(&format!(
+            "cannot create the child report pipe ({}); vault stays locked",
+            sanitize(&std::io::Error::last_os_error().to_string())
+        ));
+        return None;
+    }
+    // SAFETY: the child runs `work` and `_exit`s below; the parent closes
+    // the end it does not need on each side of the fork.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        log(&format!(
+            "cannot fork for the socket work ({}); vault stays locked",
+            sanitize(&std::io::Error::last_os_error().to_string())
+        ));
+        // SAFETY: both descriptors came from pipe2 above and are owned here.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return None;
+    }
+    if pid == 0 {
+        // The child holds the login password: never let it dump core.
+        // SAFETY: prctl takes only constants here; best effort.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        // SAFETY: the read end is not needed here.
+        unsafe { libc::close(fds[0]) };
+        // A panic must not unwind past the fork into a second login flow:
+        // contain it here and exit, so the parent reads EOF and fails open.
+        let bytes = match catch_unwind(AssertUnwindSafe(work)) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                // SAFETY: owned here; the parent is already polling on it.
+                unsafe { libc::close(fds[1]) };
+                unsafe { libc::_exit(2) };
+            }
+        };
+        // Child: report and `_exit` without running destructors, so no
+        // stdio buffer flushes twice and no lock is touched. Secrets it
+        // holds are freed by the kernel on exit; the parent's copies are
+        // untouched and still cleared by the hook.
+        let ok = write_exact_fd(fds[1], &bytes);
+        // SAFETY: owned here; the parent is already polling on it.
+        unsafe { libc::close(fds[1]) };
+        unsafe { libc::_exit(i32::from(!ok)) };
+    }
+    // Parent.
+    // SAFETY: the write end belongs to the child now.
+    unsafe { libc::close(fds[1]) };
+    let report = wait_for_report(fds[0], pid, budget);
+    // SAFETY: the read end is owned here and no longer needed.
+    unsafe { libc::close(fds[0]) };
+    report
+}
+
+/// Reads the child's two report bytes, bounded by what is left of the hook
+/// budget: every read is preceded by a [`poll_readable`] against the
+/// remaining budget, so no byte can stall the login. A child that never
+/// reports (or reports short) is killed and reaped; its outcome is `None`.
+fn wait_for_report(fd: libc::c_int, pid: libc::pid_t, budget: &Budget) -> Option<[u8; 2]> {
+    let mut out = [0u8; 2];
+    match read_exact_bounded(fd, &mut out, budget) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            log("socket child did not report in time; vault stays locked");
+            kill_child(pid);
+            reap_child(pid, REAP_TIMEOUT);
+            return None;
+        }
+        Err(e) => {
+            log(&format!(
+                "socket child report unreadable ({}); vault stays locked",
+                sanitize(&e.to_string())
+            ));
+            reap_child(pid, REAP_TIMEOUT);
+            return None;
+        }
+    }
+    // The child is past its last blocking point; collect it within bounds —
+    // never an unbounded wait, even here. A child that reported but will
+    // not exit (stopped, e.g.) is killed rather than waited on forever.
+    if !reap_child(pid, REAP_TIMEOUT) {
+        kill_child(pid);
+        reap_child(pid, REAP_TIMEOUT);
+    }
+    Some(out)
+}
+
+/// Runs socket-touching `work` with the target uid's socket credentials
+/// while this process keeps its own: root facing a foreign target forks a
+/// child that drops first; anything else runs inline. `None` means the
+/// child never reported — fail open.
+///
+/// The `[u8; 2]` are the child's report bytes, opaque here: each caller
+/// encodes its own outcome before the fork and decodes after (see
+/// [`session_outcome_code`] and [`chauthtok_outcome_code`]), so this
+/// function never interprets them.
+fn run_socket_work_as_target(
+    target: u32,
+    budget: &Budget,
+    work: impl FnOnce() -> [u8; 2],
+) -> Option<[u8; 2]> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !privileges_to_drop(euid, target) {
+        return Some(work());
+    }
+    fork_report(budget, || {
+        drop_privileges_in_forked_child(target);
+        work()
+    })
+}
+
 /// Whether a failed connect proves the socket is stale. `None` means it does
 /// not: a permission or timeout failure can happen against a perfectly live
 /// daemon, and unlinking there would take its socket away.
@@ -1030,6 +1360,104 @@ pub(crate) fn stale_socket_action(kind: std::io::ErrorKind) -> Option<StaleSocke
         std::io::ErrorKind::ConnectionRefused => Some(StaleSocket::Unlink),
         std::io::ErrorKind::NotFound => Some(StaleSocket::LeaveAlone),
         _ => None,
+    }
+}
+
+/// Byte codes the forked socket child uses to report its [`SessionOutcome`]
+/// through the pipe, so the parent — which stayed root — can reconstruct
+/// exactly what the child decided.
+///
+/// First byte: the outcome, `0..=8` for the plain variants, [`REPORT_STARTED`]
+/// for a daemon-start outcome whose detail rides the second byte. Second
+/// byte: only significant under [`REPORT_STARTED`] — [`REPORT_NOT_RETRIED_BASE]
+/// `..=15` packs `NotRetried` as bit0 = `waited`, bits1+ = `revalidated`
+/// (`0` = `None`, `1` = `Some(false)`, `2` = `Some(true)`), and
+/// [`REPORT_RETRY_BASE]` `..=22` names the remaining three. Anything else —
+/// any unknown first byte, any second byte outside its outcome's range —
+/// decodes to [`SessionOutcome::Failed`]: a garbled report must fail open
+/// (vault stays locked, login proceeds), never invent a success.
+///
+/// Adding a [`SessionOutcome`] or [`StartOutcome`] variant means extending
+/// this codec *and* [`assert_session_outcome_covered`], which fails to
+/// compile until the new outcome is answered for.
+const REPORT_STARTED: u8 = 9;
+const REPORT_NOT_RETRIED_BASE: u8 = 10;
+const REPORT_RETRY_BASE: u8 = 20;
+fn session_outcome_code(outcome: &SessionOutcome) -> (u8, u8) {
+    match outcome {
+        SessionOutcome::NoPassword => (0, 0),
+        SessionOutcome::NoTarget => (1, 0),
+        SessionOutcome::RefusedSocketDir => (2, 0),
+        SessionOutcome::NoVaultHeader => (3, 0),
+        SessionOutcome::BudgetSpent => (4, 0),
+        SessionOutcome::NoCallBudget => (5, 0),
+        SessionOutcome::Attempted => (6, 0),
+        SessionOutcome::Failed => (7, 0),
+        SessionOutcome::ConnectNotStale => (8, 0),
+        SessionOutcome::Started(inner) => (
+            REPORT_STARTED,
+            match inner {
+                StartOutcome::NoStartBudget => 0,
+                StartOutcome::StaleSocketStuck => 1,
+                StartOutcome::NoUser => 2,
+                StartOutcome::NotRetried {
+                    waited,
+                    revalidated,
+                } => {
+                    REPORT_NOT_RETRIED_BASE
+                        + u8::from(*waited)
+                        + match revalidated {
+                            None => 0,
+                            Some(false) => 2,
+                            Some(true) => 4,
+                        }
+                }
+                StartOutcome::RetryBudgetSpent => REPORT_RETRY_BASE,
+                StartOutcome::NoRetryCallBudget => REPORT_RETRY_BASE + 1,
+                StartOutcome::Retried => REPORT_RETRY_BASE + 2,
+            },
+        ),
+    }
+}
+
+fn session_outcome_from_codes(a: u8, b: u8) -> SessionOutcome {
+    match (a, b) {
+        (0, 0) => SessionOutcome::NoPassword,
+        (1, 0) => SessionOutcome::NoTarget,
+        (2, 0) => SessionOutcome::RefusedSocketDir,
+        (3, 0) => SessionOutcome::NoVaultHeader,
+        (4, 0) => SessionOutcome::BudgetSpent,
+        (5, 0) => SessionOutcome::NoCallBudget,
+        (6, 0) => SessionOutcome::Attempted,
+        (7, 0) => SessionOutcome::Failed,
+        (8, 0) => SessionOutcome::ConnectNotStale,
+        (REPORT_STARTED, 0) => SessionOutcome::Started(StartOutcome::NoStartBudget),
+        (REPORT_STARTED, 1) => SessionOutcome::Started(StartOutcome::StaleSocketStuck),
+        (REPORT_STARTED, 2) => SessionOutcome::Started(StartOutcome::NoUser),
+        (REPORT_STARTED, b)
+            if (REPORT_NOT_RETRIED_BASE..=REPORT_NOT_RETRIED_BASE + 5).contains(&b) =>
+        {
+            let waited = (b - REPORT_NOT_RETRIED_BASE) & 1 == 1;
+            let revalidated = match (b - REPORT_NOT_RETRIED_BASE) >> 1 {
+                0 => None,
+                1 => Some(false),
+                _ => Some(true),
+            };
+            SessionOutcome::Started(StartOutcome::NotRetried {
+                waited,
+                revalidated,
+            })
+        }
+        (REPORT_STARTED, b) if b == REPORT_RETRY_BASE => {
+            SessionOutcome::Started(StartOutcome::RetryBudgetSpent)
+        }
+        (REPORT_STARTED, b) if b == REPORT_RETRY_BASE + 1 => {
+            SessionOutcome::Started(StartOutcome::NoRetryCallBudget)
+        }
+        (REPORT_STARTED, b) if b == REPORT_RETRY_BASE + 2 => {
+            SessionOutcome::Started(StartOutcome::Retried)
+        }
+        _ => SessionOutcome::Failed,
     }
 }
 
@@ -1067,8 +1495,9 @@ pub(crate) fn try_send(
 ///
 /// The check is *before* the derivation, not during it: `derive_key` is not
 /// interruptible, so a started derivation always runs to completion. The
-/// bound this gives is "budget plus at most one KDF ceiling cost", which is
-/// what [`HOOK_BUDGET`] documents.
+/// bound this gives is "budget plus at most one KDF ceiling cost" — budget
+/// plus at most two KDF ceilings when the reset retry fires — which is what
+/// [`HOOK_BUDGET`] documents.
 fn derive(password: &str, salt: &[u8; SALT_LEN], kdf: KdfParams, budget: &Budget) -> Option<Key> {
     if budget.remaining().is_none() {
         log("no time left in the login budget; skipping the key derivation");
@@ -1089,6 +1518,10 @@ fn derive(password: &str, salt: &[u8; SALT_LEN], kdf: KdfParams, budget: &Budget
 /// Derives the key locally from the header's own salt and parameters and
 /// unlocks with it. Only transport errors are returned; everything else is
 /// logged and treated as done.
+///
+/// The unlock is always pinned: a vault opened by a correct login never
+/// relocks on its own — the idle-lock timer skips it until someone
+/// explicitly locks it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn unlock_by_key(
     sock: &Path,
@@ -1106,8 +1539,46 @@ pub(crate) fn unlock_by_key(
     let req = Request::UnlockWithKey {
         collection: collection.to_string(),
         key: Zeroizing::new(*key.as_bytes()),
+        pin: true,
     };
-    try_send(sock, &req, uid, "unlock", call_budget)
+    // WHY: one login sends N unlocks; the collection id names which one this
+    // line is about. Ids are charset-restricted, so the id is syslog-safe.
+    try_send(
+        sock,
+        &req,
+        uid,
+        &format!("unlock '{collection}'"),
+        call_budget,
+    )
+}
+
+/// One unlock attempt: the `fstatat` check on the socket name plus the
+/// derivation and the call. `connect_path` refusals surface as
+/// `ProtocolError::Connect`, so callers map every error the same way.
+#[allow(clippy::too_many_arguments)]
+fn unlock_once(
+    dir: &SocketDir,
+    opts: &Options,
+    target: &Target,
+    password: &str,
+    salt: &[u8; SALT_LEN],
+    kdf: KdfParams,
+    call: Duration,
+    budget: &Budget,
+) -> Result<(), ProtocolError> {
+    match dir.connect_path() {
+        Ok(path) => unlock_by_key(
+            &path,
+            &opts.collection,
+            target.uid,
+            password,
+            salt,
+            kdf,
+            budget,
+            call,
+        ),
+        Err(e) => Err(ProtocolError::Connect(e)),
+    }
 }
 
 /// Builds the `ChangeKey` request: `old_key` under the header's salt, and
@@ -1318,6 +1789,67 @@ pub(crate) enum StartOutcome {
     Retried,
 }
 
+/// The `auto_start` tail shared by the first attempt and the reset retry:
+/// clear a provably stale socket, start the daemon, wait for its socket,
+/// revalidate the directory, and try the unlock once more. Callers route a
+/// `Connect` failure here; everything after the connect error is identical,
+/// so it lives in one place rather than twice.
+#[allow(clippy::too_many_arguments)]
+fn start_and_retry(
+    dir: &mut SocketDir,
+    opts: &Options,
+    target: &Target,
+    password: &str,
+    salt: &[u8; SALT_LEN],
+    kdf: KdfParams,
+    budget: &Budget,
+    sock: &Path,
+    e: std::io::Error,
+    start_daemon: &dyn Fn(&Budget) -> bool,
+) -> SessionOutcome {
+    let Some(action) = stale_socket_action(e.kind()) else {
+        log_transport("unlock", &ProtocolError::Connect(e));
+        return SessionOutcome::ConnectNotStale;
+    };
+    log(&format!("cannot reach the daemon ({e}); starting it"));
+    if budget.capped(START_TIMEOUT).is_none() {
+        log(SPENT);
+        return SessionOutcome::Started(StartOutcome::NoStartBudget);
+    }
+    if !start_after_clearing(dir, action) {
+        return SessionOutcome::Started(StartOutcome::StaleSocketStuck);
+    }
+    if !start_daemon(budget) {
+        return SessionOutcome::Started(StartOutcome::NoUser);
+    }
+    // The runtime directory is re-checked: the wait spans a window in which
+    // the user could have replaced it. `revalidate` is only consulted when the
+    // socket actually turned up, so a timed-out wait leaves it unevaluated.
+    let waited = budget
+        .capped(START_TIMEOUT)
+        .is_some_and(|left| wait_for(sock, left));
+    let revalidated = if waited { Some(dir.revalidate()) } else { None };
+    if revalidated != Some(true) {
+        log("daemon did not start in time; vault stays locked");
+        return SessionOutcome::Started(StartOutcome::NotRetried {
+            waited,
+            revalidated,
+        });
+    }
+    if budget.remaining().is_none() {
+        log(SPENT);
+        return SessionOutcome::Started(StartOutcome::RetryBudgetSpent);
+    }
+    let Some(left) = budget.capped(CALL_BUDGET) else {
+        log("no time left in the login budget");
+        return SessionOutcome::Started(StartOutcome::NoRetryCallBudget);
+    };
+    if let Err(e) = unlock_once(dir, opts, target, password, salt, kdf, left, budget) {
+        log_transport("unlock", &e);
+    }
+    SessionOutcome::Started(StartOutcome::Retried)
+}
+
 /// Everything `open_session` decides, in the order it decides it.
 ///
 /// `resolve_target` and `start_daemon` are closures because the hook resolves
@@ -1347,18 +1879,162 @@ pub(crate) fn open_session_decision(
     // The directory is held open from here on: every later unlink, connect and
     // re-check goes through this descriptor rather than through a name the
     // user can swap underneath root.
-    let Some(mut dir) = SocketDir::open(&t.sock, t.uid) else {
+    let Some(dir) = SocketDir::open(&t.sock, t.uid) else {
         return SessionOutcome::RefusedSocketDir;
     };
-    // Salt and parameters come from the vault file itself, never from whatever
-    // happens to answer the socket.
-    let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, budget) else {
+    // Salts and parameters come from the vault files themselves, never from
+    // whatever happens to answer the socket. A login opens *every* wallet,
+    // not just the configured one: each vault has its own salt and KDF, so
+    // each header is read and each key derived separately under the same
+    // login password. The configured collection is always included, so an
+    // empty or unreadable vault directory behaves exactly as before — one
+    // attempt against that name, with its failure logged against it.
+    let ids = all_vault_ids(&t.vault_dir, &opts.collection);
+    let mut vaults = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        if budget.remaining().is_none() {
+            // WHY: a budget break here would otherwise silently drop wallets —
+            // the caller reports success if any earlier vault unlocked — so
+            // the ids never attempted are logged against their names.
+            log(&format!(
+                "login budget spent; skipping vault headers: {}",
+                ids[i..].join(", ")
+            ));
+            break;
+        }
+        if let Some((salt, kdf)) = vault_header(&t.vault_dir, id, t.uid, budget) {
+            vaults.push((id.clone(), salt, kdf));
+        }
+    }
+    if vaults.is_empty() {
         return SessionOutcome::NoVaultHeader;
-    };
+    }
     if budget.remaining().is_none() {
         log(SPENT);
         return SessionOutcome::BudgetSpent;
     }
+    // Everything past the root-validated directory and headers touches the
+    // socket, so it runs with the target's credentials — in a forked child
+    // when root faces a foreign target, so this process keeps root and the
+    // login path can still fork the user session afterwards. (An in-process
+    // `setuid` here broke display-manager logins: authentication succeeded
+    // and the session spawn then failed with `EPERM`.) One fork for all
+    // vaults, not one per vault: the child carries the password and is
+    // non-dumpable, and fewer forks mean less of it in flight.
+    let password = Zeroizing::new(password.to_owned());
+    let report = run_socket_work_as_target(t.uid, budget, move || {
+        let (a, b) = session_outcome_code(&session_socket_tail_all(
+            dir,
+            &opts,
+            t,
+            password,
+            &vaults,
+            budget,
+            start_daemon,
+        ));
+        [a, b]
+    });
+    match report {
+        Some([a, b]) => session_outcome_from_codes(a, b),
+        None => {
+            log("socket child never reported; vault stays locked");
+            SessionOutcome::Failed
+        }
+    }
+}
+
+/// Everything `open_session` does past the root-validated directory and
+/// vault header: connects, unlocks, and starts-and-retries the daemon.
+///
+/// Runs via [`run_socket_work_as_target`] — in a forked child as the
+/// target uid when root faces a foreign target, inline otherwise — so it
+/// must neither assume nor change its own credentials. Split out so the
+/// ordering stays directly testable without libpam (see
+/// `session_socket_tail_unlocks_through_a_live_daemon`). The password
+/// travels as [`Zeroizing`], so the parent's copy is scrubbed on drop;
+/// the child's copy dies with it (and the child is non-dumpable).
+/// One `open_session` fork, every vault: each collection is unlocked with
+/// the key derived under its own header, and each unlock is pinned, so a
+/// correct login leaves all wallets open and none of them relocks on its
+/// own. Every vault is attempted even after one succeeds — returning early
+/// would leave the remaining wallets locked.
+///
+/// The first unlock that reaches the daemon decides the outcome: an
+/// `Attempted` (or a `Retried` start) is returned as-is, so a single-vault
+/// login reports exactly what it always did. When nothing reaches the
+/// daemon, the first outcome is returned, so the logged reason still names
+/// the collection that failed.
+#[allow(clippy::too_many_arguments)]
+fn session_socket_tail_all(
+    mut dir: SocketDir,
+    opts: &Options,
+    target: Target,
+    password: Zeroizing<String>,
+    vaults: &[(String, [u8; SALT_LEN], KdfParams)],
+    budget: &Budget,
+    start_daemon: &dyn Fn(&Budget) -> bool,
+) -> SessionOutcome {
+    let mut first: Option<SessionOutcome> = None;
+    let mut success: Option<SessionOutcome> = None;
+    for (idx, (id, salt, kdf)) in vaults.iter().enumerate() {
+        if budget.remaining().is_none() {
+            log(SPENT);
+            // WHY: the aggregation below keeps the first success, so without
+            // this line a wallet skipped here would vanish from the logs.
+            // Ids are charset-restricted, so the list is syslog-safe.
+            let skipped: Vec<&str> = vaults[idx..].iter().map(|(id, _, _)| id.as_str()).collect();
+            log(&format!(
+                "login budget spent; skipping unlocks: {}",
+                skipped.join(", ")
+            ));
+            return success.or(first).unwrap_or(SessionOutcome::BudgetSpent);
+        }
+        let per_vault = Options {
+            collection: id.clone(),
+            auto_start: opts.auto_start,
+            socket: opts.socket.clone(),
+            vault_dir: opts.vault_dir.clone(),
+        };
+        let outcome = session_socket_tail(
+            &mut dir,
+            per_vault,
+            target.clone(),
+            Zeroizing::new(password.as_str().to_owned()),
+            *salt,
+            *kdf,
+            budget,
+            start_daemon,
+        );
+        match outcome {
+            o @ (SessionOutcome::Attempted | SessionOutcome::Started(StartOutcome::Retried)) => {
+                if success.is_none() {
+                    success = Some(o);
+                }
+            }
+            o => {
+                // WHY: N vaults emit N identical outcomes; the id names the
+                // wallet this one belongs to. Ids are charset-restricted.
+                log(&format!("unlock '{id}' did not succeed: {o:?}"));
+                if first.is_none() {
+                    first = Some(o);
+                }
+            }
+        }
+    }
+    success.or(first).unwrap_or(SessionOutcome::NoVaultHeader)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session_socket_tail(
+    dir: &mut SocketDir,
+    opts: Options,
+    target: Target,
+    password: Zeroizing<String>,
+    salt: [u8; SALT_LEN],
+    kdf: KdfParams,
+    budget: &Budget,
+    start_daemon: &dyn Fn(&Budget) -> bool,
+) -> SessionOutcome {
     // A leftover socket from a crashed daemon looks exactly like a running
     // one, so only a failed connect is a usable test.
     let sock = dir.socket_path();
@@ -1370,82 +2046,73 @@ pub(crate) fn open_session_decision(
     // holding the directory open pins the parent, but `connect(2)` still
     // resolves the final component, so a symlink planted there would redirect
     // root. A refusal is reported as a connect failure, which is what it is.
-    let attempt = match dir.connect_path() {
-        Ok(path) => unlock_by_key(
-            &path,
-            &opts.collection,
-            t.uid,
-            password,
+    // WHY: one login sends N unlocks; the id tells which wallet each line is
+    // about. Ids are charset-restricted, so the id is syslog-safe.
+    let what = format!("unlock '{}'", opts.collection);
+    let attempt = unlock_once(dir, &opts, &target, &password, &salt, kdf, call, budget);
+    match attempt {
+        Ok(()) => SessionOutcome::Attempted,
+        Err(ProtocolError::Connect(e)) if opts.auto_start => start_and_retry(
+            dir,
+            &opts,
+            &target,
+            &password,
             &salt,
             kdf,
             budget,
-            call,
+            &sock,
+            e,
+            start_daemon,
         ),
-        Err(e) => Err(ProtocolError::Connect(e)),
-    };
-    let e = match attempt {
-        Ok(()) => return SessionOutcome::Attempted,
-        Err(ProtocolError::Connect(e)) if opts.auto_start => e,
-        Err(e) => {
-            log_transport("unlock", &e);
-            return SessionOutcome::Failed;
-        }
-    };
-    let Some(action) = stale_socket_action(e.kind()) else {
-        log_transport("unlock", &ProtocolError::Connect(e));
-        return SessionOutcome::ConnectNotStale;
-    };
-    log(&format!("cannot reach the daemon ({e}); starting it"));
-    if budget.capped(START_TIMEOUT).is_none() {
-        log(SPENT);
-        return SessionOutcome::Started(StartOutcome::NoStartBudget);
-    }
-    if !start_after_clearing(&dir, action) {
-        return SessionOutcome::Started(StartOutcome::StaleSocketStuck);
-    }
-    if !start_daemon(budget) {
-        return SessionOutcome::Started(StartOutcome::NoUser);
-    }
-    // The runtime directory is re-checked: the wait spans a window in which
-    // the user could have replaced it. `revalidate` is only consulted when the
-    // socket actually turned up, so a timed-out wait leaves it unevaluated.
-    let waited = budget
-        .capped(START_TIMEOUT)
-        .is_some_and(|left| wait_for(&sock, left));
-    let revalidated = if waited { Some(dir.revalidate()) } else { None };
-    if revalidated != Some(true) {
-        log("daemon did not start in time; vault stays locked");
-        return SessionOutcome::Started(StartOutcome::NotRetried {
-            waited,
-            revalidated,
-        });
-    }
-    if budget.remaining().is_none() {
-        log(SPENT);
-        return SessionOutcome::Started(StartOutcome::RetryBudgetSpent);
-    }
-    let Some(left) = budget.capped(CALL_BUDGET) else {
-        log("no time left in the login budget");
-        return SessionOutcome::Started(StartOutcome::NoRetryCallBudget);
-    };
-    match dir.connect_path() {
-        Ok(path) => {
-            if let Err(e) = unlock_by_key(
-                &path,
-                &opts.collection,
-                t.uid,
-                password,
-                &salt,
-                kdf,
-                budget,
-                left,
-            ) {
-                log_transport("unlock", &e);
+        Err(e) if retryable_reset(&e) => {
+            // One retry, not a loop: whatever the second attempt reports is
+            // returned. The re-derivation below is itself budget-gated inside
+            // `unlock_by_key` via `derive`; the reset retry deliberately
+            // re-derives rather than reusing the first key.
+            log_transport(&what, &e);
+            let Some(call) = budget.capped(CALL_BUDGET) else {
+                log("no time left in the login budget; vault stays locked");
+                return SessionOutcome::NoCallBudget;
+            };
+            log("unlock hit a reset transport; retrying once within budget");
+            // The retry is a second connect into a directory the logging-in
+            // user controls. Re-check the held descriptor first; if the
+            // directory changed, abort. Whatever socket the retry does reach
+            // is still contained by the SO_PEERCRED check, which requires the
+            // peer to run as the target uid.
+            if !dir.revalidate() {
+                log_transport(&what, &e);
+                return SessionOutcome::Failed;
+            }
+            match unlock_once(dir, &opts, &target, &password, &salt, kdf, call, budget) {
+                Ok(()) => SessionOutcome::Attempted,
+                Err(second) if retryable_reset(&second) => {
+                    log_transport(&what, &second);
+                    SessionOutcome::Failed
+                }
+                Err(ProtocolError::Connect(e2)) if opts.auto_start => start_and_retry(
+                    dir,
+                    &opts,
+                    &target,
+                    &password,
+                    &salt,
+                    kdf,
+                    budget,
+                    &sock,
+                    e2,
+                    start_daemon,
+                ),
+                Err(second) => {
+                    log_transport(&what, &second);
+                    SessionOutcome::Failed
+                }
             }
         }
-        Err(e) => log_transport("unlock", &ProtocolError::Connect(e)),
+        Err(e) => {
+            log_transport(&what, &e);
+            SessionOutcome::Failed
+        }
     }
-    SessionOutcome::Started(StartOutcome::Retried)
 }
 
 /// What [`chauthtok_decision`] decided.
@@ -1512,12 +2179,44 @@ pub(crate) fn chauthtok_decision(
     let Some(dir) = SocketDir::open(&t.sock, t.uid) else {
         return ChauthtokOutcome::RefusedSocketDir;
     };
-    let Some((salt, kdf)) = vault_header(&t.vault_dir, &opts.collection, t.uid, budget) else {
-        return ChauthtokOutcome::NoVaultHeader;
-    };
-    let Some(req) = change_key_request(&opts.collection, old, new, &salt, kdf, budget) else {
-        return ChauthtokOutcome::NoRequest;
-    };
+    // Same "every wallet" rule as the session hook: a `passwd` rotation
+    // follows the login password into each vault whose header is readable,
+    // so no wallet is left behind on the old password. The configured
+    // collection is always included, preserving the old single-vault path
+    // when the directory lists nothing.
+    let ids = all_vault_ids(&t.vault_dir, &opts.collection);
+    let mut reqs = Vec::new();
+    let mut any_header = false;
+    // WHY: a request that is never built is never sent, so a budget break or
+    // a failed build must mark the rotation incomplete — otherwise one
+    // delivered vault would report the whole rotation as `Sent`.
+    let mut incomplete = false;
+    for (i, id) in ids.iter().enumerate() {
+        if budget.remaining().is_none() {
+            log(&format!(
+                "password-change budget spent; skipping vaults: {}",
+                ids[i..].join(", ")
+            ));
+            incomplete = true;
+            break;
+        }
+        let Some((salt, kdf)) = vault_header(&t.vault_dir, id, t.uid, budget) else {
+            continue;
+        };
+        any_header = true;
+        if let Some(req) = change_key_request(id, old, new, &salt, kdf, budget) {
+            reqs.push(req);
+        } else {
+            incomplete = true;
+        }
+    }
+    if reqs.is_empty() {
+        return if any_header {
+            ChauthtokOutcome::NoRequest
+        } else {
+            ChauthtokOutcome::NoVaultHeader
+        };
+    }
     if budget.remaining().is_none() {
         log(SPENT);
         return ChauthtokOutcome::BudgetSpent;
@@ -1526,18 +2225,103 @@ pub(crate) fn chauthtok_decision(
         log("no time left in the password-change budget");
         return ChauthtokOutcome::NoCallBudget;
     };
+    // Same blindness as the login path, same fork: the daemon must see the
+    // target uid, and this process must keep root for whatever the login
+    // path forks afterwards. Runs via [`run_socket_work_as_target`]. One
+    // fork for all rotations; `Sent` only if every built rotation was
+    // delivered and none was skipped — a partial rotation is `SendFailed`,
+    // so a wallet is never silently left on the old password. A single
+    // vault is unchanged: its one send decides.
+    let report = run_socket_work_as_target(t.uid, budget, move || {
+        let mut all_sent = true;
+        for req in reqs {
+            // WHY: collection ids are charset-restricted, so the id is
+            // syslog-safe and tells which of N identical rotations failed.
+            let id = match &req {
+                Request::ChangeKey { collection, .. } => collection.clone(),
+                _ => "?".to_string(),
+            };
+            if password_socket_tail(&dir, &req, t.uid, left) == ChauthtokOutcome::Sent {
+            } else {
+                log(&format!("password change '{id}' was not forwarded"));
+                all_sent = false;
+            }
+        }
+        let outcome = if all_sent && !incomplete {
+            ChauthtokOutcome::Sent
+        } else {
+            ChauthtokOutcome::SendFailed
+        };
+        [chauthtok_outcome_code(&outcome), 0]
+    });
+    if report.is_none() {
+        log("socket child never reported; password change not forwarded");
+    }
+    chauthtok_outcome_from_report(report)
+}
+
+/// Decodes the child's report: only [`CHAUTHTOK_SENT`] reads as sent — any
+/// other byte, and no report at all, reads as not forwarded.
+fn chauthtok_outcome_from_report(report: Option<[u8; 2]>) -> ChauthtokOutcome {
+    match report {
+        Some([CHAUTHTOK_SENT, _]) => ChauthtokOutcome::Sent,
+        _ => ChauthtokOutcome::SendFailed,
+    }
+}
+
+/// Everything `chauthtok` does past the request build: the connect and the
+/// send. Runs via [`run_socket_work_as_target`] for the same reason as
+/// [`session_socket_tail`]: the daemon must see the target uid, and this
+/// process must keep root.
+fn password_socket_tail(
+    dir: &SocketDir,
+    req: &Request,
+    uid: u32,
+    call: Duration,
+) -> ChauthtokOutcome {
+    // WHY: one password change sends N rotations; the id tells which wallet
+    // each line is about. Ids are charset-restricted, so the id is
+    // syslog-safe. Derived from the request itself so the log names the
+    // vault actually attempted.
+    let what = match req {
+        Request::ChangeKey { collection, .. } => format!("password change '{collection}'"),
+        _ => "password change".to_string(),
+    };
     match dir.connect_path() {
-        Ok(path) => match try_send(&path, &req, t.uid, "password change", left) {
+        Ok(path) => match try_send(&path, req, uid, &what, call) {
             Ok(()) => ChauthtokOutcome::Sent,
             Err(e) => {
-                log_transport("password change", &e);
+                log_transport(&what, &e);
                 ChauthtokOutcome::SendFailed
             }
         },
         Err(e) => {
-            log_transport("password change", &ProtocolError::Connect(e));
+            log_transport(&what, &ProtocolError::Connect(e));
             ChauthtokOutcome::SendFailed
         }
+    }
+}
+
+/// One-byte report code for [`password_socket_tail`]: only success crosses
+/// the pipe as success — anything else, including a garbled byte, is a
+/// failure, and the password change simply is not forwarded.
+///
+/// Exhaustive with no wildcard, so a new [`ChauthtokOutcome`] variant fails
+/// to compile until it is answered for here.
+const CHAUTHTOK_SENT: u8 = 1;
+const CHAUTHTOK_NOT_SENT: u8 = 0;
+fn chauthtok_outcome_code(outcome: &ChauthtokOutcome) -> u8 {
+    match outcome {
+        ChauthtokOutcome::Sent => CHAUTHTOK_SENT,
+        ChauthtokOutcome::Prelim
+        | ChauthtokOutcome::Missing(_)
+        | ChauthtokOutcome::NoTarget
+        | ChauthtokOutcome::RefusedSocketDir
+        | ChauthtokOutcome::NoVaultHeader
+        | ChauthtokOutcome::NoRequest
+        | ChauthtokOutcome::BudgetSpent
+        | ChauthtokOutcome::NoCallBudget
+        | ChauthtokOutcome::SendFailed => CHAUTHTOK_NOT_SENT,
     }
 }
 
@@ -1597,9 +2381,64 @@ mod tests {
     /// Fake daemon: accepts exactly one connection, decodes the request,
     /// answers `Ok`, and hands the request back through the join handle.
     fn fake_daemon(sock: &Path) -> std::thread::JoinHandle<Request> {
+        // WHY: one-connection is the one-vault case of `fake_daemon_n`, so it
+        // is defined in terms of it rather than duplicating the serve loop.
+        let inner = fake_daemon_n(sock, 1);
+        std::thread::spawn(move || inner.join().unwrap().pop().unwrap())
+    }
+
+    /// How long a fake daemon waits for the next connection, and how often it
+    /// polls. The timeouts are the hang guard: a missing connection fails the
+    /// test instead of blocking `join` forever.
+    const ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+    const ACCEPT_POLL: Duration = Duration::from_millis(20);
+
+    fn accept_one(
+        listener: &UnixListener,
+        what: &str,
+    ) -> (
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::SocketAddr,
+    ) {
+        let start = Instant::now();
+        loop {
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    // The timeouts are the hang guard: a client that connects
+                    // and then never sends must not block the test forever.
+                    stream.set_read_timeout(Some(ACCEPT_TIMEOUT)).unwrap();
+                    return (stream, addr);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let elapsed = start.elapsed();
+                    assert!(
+                        elapsed < ACCEPT_TIMEOUT,
+                        "no {what} arrived after {elapsed:?}"
+                    );
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                Err(e) => {
+                    let elapsed = start.elapsed();
+                    panic!("{what} accept failed after {elapsed:?}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Fake daemon that drops `drops` connections unanswered (a restart
+    /// landing mid-call), then serves one `Ok` and hands its request back.
+    fn fake_daemon_flapping(sock: &Path, drops: usize) -> std::thread::JoinHandle<Request> {
         let listener = UnixListener::bind(sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            for i in 0..drops {
+                let (mut first, _) = accept_one(&listener, &format!("connection {}", i + 1));
+                let _ = read_frame_sync(&mut first);
+                drop(first);
+            }
+            let (mut stream, _) = accept_one(&listener, "retry");
+            // The timeouts are the hang guard: see `accept_one`.
+            stream.set_read_timeout(Some(ACCEPT_TIMEOUT)).unwrap();
             let body = read_frame_sync(&mut stream).unwrap();
             let req: Request = decode_frame(&body).unwrap();
             stream
@@ -1826,9 +2665,15 @@ mod tests {
         let req = server.join().unwrap();
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match req {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "work");
                 assert_eq!(&*key, expected.as_bytes());
+                // A login unlock pins: it must never relock on its own.
+                assert!(pin, "PAM unlocks pin the vault");
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
@@ -2961,12 +3806,841 @@ mod tests {
         assert!(outcome.clears_stash());
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match server.join().unwrap() {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "default");
                 assert_eq!(&*key, expected.as_bytes());
+                assert!(pin, "PAM unlocks pin the vault");
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
+    }
+
+    /// A fake daemon that serves exactly `n` unlocks, so a login spanning
+    /// several wallets can be asserted on as a whole.
+    fn fake_daemon_n(sock: &Path, n: usize) -> std::thread::JoinHandle<Vec<Request>> {
+        let listener = UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            for _ in 0..n {
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = read_frame_sync(&mut stream).unwrap();
+                let req: Request = decode_frame(&body).unwrap();
+                stream
+                    .write_all(&encode_frame(&Response::Ok).unwrap())
+                    .unwrap();
+                out.push(req);
+            }
+            out
+        })
+    }
+
+    /// A login opens every wallet, not just `default`: one pinned unlock
+    /// per vault file, each derived under its own header.
+    #[test]
+    fn a_login_unlocks_every_wallet_not_just_default() {
+        let (_dir, vault, sock) = session_fixture();
+        const WORK_SALT: [u8; SALT_LEN] = [0x5b; SALT_LEN];
+        write_vault(&vault, "work", header_with(LOGIN_KDF, WORK_SALT));
+        let server = fake_daemon_n(&sock, 2);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        let mut reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 2, "one unlock per wallet: {reqs:?}");
+        reqs.sort_by(|a, b| {
+            let id = |r: &Request| match r {
+                Request::UnlockWithKey { collection, .. } => collection.clone(),
+                other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+            };
+            id(a).cmp(&id(b))
+        });
+        for (req, (id, salt)) in reqs
+            .into_iter()
+            .zip([("default", SALT), ("work", WORK_SALT)])
+        {
+            match req {
+                Request::UnlockWithKey {
+                    collection,
+                    key,
+                    pin,
+                } => {
+                    assert_eq!(collection, id);
+                    let expected = crypto::derive_key(b"hunter2", &salt, LOGIN_KDF).unwrap();
+                    assert_eq!(&*key, expected.as_bytes());
+                    assert!(pin, "{id}: a login unlock pins the vault");
+                }
+                other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+            }
+        }
+    }
+
+    /// One good vault plus one name whose header fails: the good wallet still
+    /// unlocks (`Attempted`) and exactly one unlock reaches the wire. The
+    /// fake daemon serves exactly one connection, so a second unlock attempt
+    /// would refuse (and panic via `no_start`) or hang the join.
+    #[test]
+    fn a_login_with_one_bad_header_still_unlocks_the_good_vault() {
+        let (_dir, vault, sock) = session_fixture();
+        let bad = vault.join("bad.vault");
+        std::fs::write(&bad, b"NOTAVAULT and then some").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = fake_daemon_n(&sock, 1);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        let reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 1, "only the good vault unlocks: {reqs:?}");
+        match &reqs[0] {
+            Request::UnlockWithKey { collection, .. } => assert_eq!(collection, "default"),
+            other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// A vault directory that lists but has no readable header: nothing
+    /// reaches the daemon, so the first failure is returned.
+    #[test]
+    fn a_login_where_all_headers_fail_reports_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = private_dir(dir.path(), "vault");
+        let bad = vault.join("bad.vault");
+        std::fs::write(&bad, b"NOTAVAULT and then some").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        // WHY: no listener on purpose — nothing may connect when no header
+        // is readable, and `no_start` panics if a start is attempted.
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::NoVaultHeader);
+    }
+
+    /// A budget that dies between vaults: the first vault unlocks, the second
+    /// is skipped, and the outcome stays `Attempted` with exactly one wire
+    /// unlock. The budget is half of one measured derivation, so the first
+    /// derivation (already started) runs to completion while the second
+    /// iteration finds the budget spent — the same pattern as
+    /// `a_reset_with_no_retry_budget_makes_no_second_connection`.
+    #[test]
+    fn a_budget_that_dies_between_vaults_skips_only_the_second() {
+        let (_dir, vault, sock) = session_fixture();
+        write_vault(&vault, "work", header_with(LOGIN_KDF, SALT));
+        // Fastest of a few runs, so a cold Argon2 allocation does not inflate
+        // the estimate: overestimating `d` would leave budget for both vaults.
+        let one_derivation = || {
+            (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    crypto::derive_key(b"calibrate", &SALT, LOGIN_KDF).unwrap();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        one_derivation();
+        let d = one_derivation();
+        let budget = Budget::new(d / 2);
+        // WHY: exactly one connection served — a second unlock would refuse
+        // once the listener is gone and panic via `no_start`.
+        let server = fake_daemon_n(&sock, 1);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &budget,
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(
+            outcome,
+            SessionOutcome::Attempted,
+            "the first vault unlocks; the second is skipped (one derivation took {d:?})"
+        );
+        let reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one wire unlock: {reqs:?}");
+        match &reqs[0] {
+            Request::UnlockWithKey { collection, .. } => assert_eq!(collection, "default"),
+            other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// Only `<id>.vault` files with a usable id count: stray files,
+    /// non-UTF-8 names and ids outside the daemon's charset are not
+    /// collections and must never be attempted.
+    #[test]
+    fn list_vault_collections_finds_only_vaults() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        // WHY: creation order is reversed on purpose — the output must still
+        // be sorted, so the unlock order is deterministic.
+        write_vault(dir.path(), "work", header_with(LOGIN_KDF, SALT));
+        write_vault(dir.path(), "default", header_with(LOGIN_KDF, SALT));
+        std::fs::write(dir.path().join("notes.txt"), b"not a vault").unwrap();
+        std::fs::write(dir.path().join("evil.vault.bak"), b"").unwrap();
+        std::fs::write(dir.path().join("with-dash.vault"), b"").unwrap();
+        // A non-UTF-8 `*.vault` name can never be a collection id.
+        std::fs::write(
+            dir.path()
+                .join(std::ffi::OsStr::from_bytes(b"\xff\xfe.vault")),
+            b"",
+        )
+        .unwrap();
+        // A subdirectory is not a vault file, even with the right suffix.
+        std::fs::create_dir(dir.path().join("dir.vault")).unwrap();
+        assert_eq!(
+            list_vault_collections(dir.path()),
+            vec!["default".to_string(), "work".to_string()]
+        );
+        assert!(list_vault_collections(Path::new("/definitely/not/here-9f2c")).is_empty());
+    }
+
+    /// An empty vault directory keeps the old behaviour: one attempt against
+    /// the configured collection, with the failure logged against its name.
+    #[test]
+    fn a_login_with_no_vault_files_reports_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = private_dir(dir.path(), "secret-manager");
+        let sock = rt.join("control.sock");
+        let vault = private_dir(dir.path(), "vault");
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        assert_eq!(outcome, SessionOutcome::NoVaultHeader);
+    }
+
+    /// A transport reset mid-unlock is retried once: the first connection is
+    /// dropped unanswered (a daemon restart landing mid-call), the second is
+    /// served, and the key is still delivered.
+    #[test]
+    fn a_reset_mid_unlock_retries_once() {
+        let (_dir, vault, sock) = session_fixture();
+        let server = fake_daemon_flapping(&sock, 1);
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        let req = server.join().unwrap();
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
+        match req {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
+                assert_eq!(collection, "default");
+                assert_eq!(&*key, expected.as_bytes());
+                assert!(pin, "PAM unlocks pin the vault");
+            }
+            ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// Dropping root is a decision, and only root facing a foreign target
+    /// takes it: anything else is already where it needs to be, or cannot
+    /// get there.
+    #[test]
+    fn privilege_drop_only_root_facing_a_foreign_target() {
+        assert!(privileges_to_drop(0, 1000));
+        assert!(!privileges_to_drop(0, 0));
+        assert!(!privileges_to_drop(1000, 1000));
+        assert!(!privileges_to_drop(1000, 0));
+    }
+
+    /// The drop itself, isolated from the test runner by a fork: whatever
+    /// uid runs the suite, the child lands on the target and the parent
+    /// keeps its own.
+    #[test]
+    fn dropping_privileges_lands_on_the_target_uid() {
+        let me = unsafe { libc::getuid() };
+        // A target the child can always name: root drops to the overflow
+        // uid, anyone else drops nowhere.
+        let target = if me == 0 { 65534 } else { me };
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let ok = drop_privileges_in_forked_child(target);
+            let landed = unsafe { libc::geteuid() } == target;
+            unsafe { libc::_exit(i32::from(!(ok && landed))) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child did not land on uid {target}"
+        );
+    }
+
+    /// Every session outcome survives the byte codes the forked child uses
+    /// to report it through the pipe: a code the parent cannot decode
+    /// would turn a known outcome into a failure.
+    #[test]
+    fn session_outcomes_survive_the_child_report_codes() {
+        let outcomes = [
+            SessionOutcome::NoPassword,
+            SessionOutcome::NoTarget,
+            SessionOutcome::RefusedSocketDir,
+            SessionOutcome::NoVaultHeader,
+            SessionOutcome::BudgetSpent,
+            SessionOutcome::NoCallBudget,
+            SessionOutcome::Attempted,
+            SessionOutcome::Failed,
+            SessionOutcome::ConnectNotStale,
+            SessionOutcome::Started(StartOutcome::NoStartBudget),
+            SessionOutcome::Started(StartOutcome::StaleSocketStuck),
+            SessionOutcome::Started(StartOutcome::NoUser),
+            SessionOutcome::Started(StartOutcome::RetryBudgetSpent),
+            SessionOutcome::Started(StartOutcome::NoRetryCallBudget),
+            SessionOutcome::Started(StartOutcome::Retried),
+        ];
+        for outcome in outcomes {
+            assert_session_outcome_covered(&outcome);
+            let (a, b) = session_outcome_code(&outcome);
+            assert_eq!(
+                session_outcome_from_codes(a, b),
+                outcome,
+                "outcome did not survive its report codes"
+            );
+        }
+        // All six NotRetried states, not a sample: the packing is arithmetic.
+        for waited in [false, true] {
+            for revalidated in [None, Some(false), Some(true)] {
+                let outcome = SessionOutcome::Started(StartOutcome::NotRetried {
+                    waited,
+                    revalidated,
+                });
+                assert_session_outcome_covered(&outcome);
+                let (a, b) = session_outcome_code(&outcome);
+                assert_eq!(
+                    session_outcome_from_codes(a, b),
+                    outcome,
+                    "NotRetried {waited:?}/{revalidated:?} did not survive"
+                );
+            }
+        }
+        // Garbled bytes fail open: unknown first bytes and unknown Started
+        // sub-codes never invent a success.
+        for codes in [
+            (9u8, 3u8),
+            (9, 16),
+            (9, 17),
+            (9, 23),
+            (10, 0),
+            (255, 255),
+            (0, 5),
+            (6, 1),
+        ] {
+            assert_eq!(
+                session_outcome_from_codes(codes.0, codes.1),
+                SessionOutcome::Failed,
+                "garbled codes {codes:?} must fail open"
+            );
+        }
+    }
+
+    /// Exhaustive over [`SessionOutcome`] with no wildcard: adding a variant
+    /// breaks this match at compile time, forcing the codec and its test to
+    /// answer for the new outcome.
+    fn assert_session_outcome_covered(outcome: &SessionOutcome) {
+        match outcome {
+            SessionOutcome::NoPassword
+            | SessionOutcome::NoTarget
+            | SessionOutcome::RefusedSocketDir
+            | SessionOutcome::NoVaultHeader
+            | SessionOutcome::BudgetSpent
+            | SessionOutcome::NoCallBudget
+            | SessionOutcome::Attempted
+            | SessionOutcome::Failed
+            | SessionOutcome::ConnectNotStale
+            | SessionOutcome::Started(_) => {}
+        }
+    }
+
+    /// The fork transport returns exactly what the child reported, in the
+    /// parent: same pid, same credentials, child's bytes.
+    #[test]
+    fn forked_socket_work_returns_the_child_bytes_in_the_parent() {
+        let pid_before = unsafe { libc::getpid() };
+        let euid_before = unsafe { libc::geteuid() };
+        let egid_before = unsafe { libc::getegid() };
+        let reported = fork_report(&full_budget(), || [7u8, 22u8]);
+        assert_eq!(reported, Some([7u8, 22u8]));
+        assert_eq!(unsafe { libc::getpid() }, pid_before);
+        assert_eq!(unsafe { libc::geteuid() }, euid_before);
+        assert_eq!(unsafe { libc::getegid() }, egid_before);
+    }
+
+    /// Only success crosses the pipe as success: every other password-hook
+    /// outcome — and any garbled byte — must read as "not forwarded".
+    #[test]
+    fn only_a_sent_password_change_reports_success() {
+        assert_eq!(chauthtok_outcome_code(&ChauthtokOutcome::Sent), 1);
+        for outcome in [
+            ChauthtokOutcome::Prelim,
+            ChauthtokOutcome::Missing("old and new passwords"),
+            ChauthtokOutcome::SendFailed,
+            ChauthtokOutcome::NoTarget,
+            ChauthtokOutcome::RefusedSocketDir,
+            ChauthtokOutcome::NoVaultHeader,
+            ChauthtokOutcome::NoRequest,
+            ChauthtokOutcome::BudgetSpent,
+            ChauthtokOutcome::NoCallBudget,
+        ] {
+            assert_eq!(
+                chauthtok_outcome_code(&outcome),
+                0,
+                "{outcome:?} must not report success"
+            );
+        }
+        // Through the parent-side decode, including garbled bytes and the
+        // no-report case: only a 1 first byte is Sent (the second byte is
+        // unused by this codec).
+        assert_eq!(
+            chauthtok_outcome_from_report(Some([1, 0])),
+            ChauthtokOutcome::Sent
+        );
+        assert_eq!(
+            chauthtok_outcome_from_report(Some([1, 7])),
+            ChauthtokOutcome::Sent
+        );
+        for report in [None, Some([0, 0]), Some([2, 5]), Some([255, 255])] {
+            assert_eq!(
+                chauthtok_outcome_from_report(report),
+                ChauthtokOutcome::SendFailed,
+                "report {report:?} must read as not forwarded"
+            );
+        }
+    }
+
+    /// The encoded outcome survives the real pipe, not just the codec: this
+    /// is the composition non-root CI otherwise never exercises (the fork
+    /// in `run_socket_work_as_target` only fires as root).
+    #[test]
+    fn encoded_outcomes_survive_the_real_pipe() {
+        for outcome in [
+            SessionOutcome::Attempted,
+            SessionOutcome::Failed,
+            SessionOutcome::Started(StartOutcome::NotRetried {
+                waited: true,
+                revalidated: Some(true),
+            }),
+            SessionOutcome::Started(StartOutcome::Retried),
+        ] {
+            let reported = fork_report(&full_budget(), || {
+                let (a, b) = session_outcome_code(&outcome);
+                [a, b]
+            });
+            let Some([a, b]) = reported else {
+                panic!("child never reported for {outcome:?}");
+            };
+            assert_eq!(session_outcome_from_codes(a, b), outcome);
+        }
+    }
+
+    /// A child that dies mid-report is a `None`, not a hang: one byte then
+    /// EOF must fail open within budget.
+    #[test]
+    fn a_truncated_child_report_fails_open() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: live array of two ints, as pipe2 requires.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the child writes one byte and exits; the parent only reads.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::close(fds[0]) };
+            let one = [7u8];
+            let mut written = 0;
+            while written < one.len() {
+                // SAFETY: `one` outlives the write.
+                let rc = unsafe {
+                    libc::write(
+                        fds[1],
+                        one.as_ptr().add(written) as *const libc::c_void,
+                        one.len() - written,
+                    )
+                };
+                if rc <= 0 {
+                    break;
+                }
+                written += rc as usize;
+            }
+            unsafe { libc::close(fds[1]) };
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(fds[1]) };
+        let report = wait_for_report(fds[0], pid, &full_budget());
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(report, None, "a 1-byte report must fail open");
+    }
+
+    /// A child that never reports is killed and reaped within budget: the
+    /// hook waits on the pipe, never on the child.
+    #[test]
+    fn an_unreporting_child_is_killed_within_budget() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: live array of two ints, as pipe2 requires.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: the child sleeps past every deadline; the parent kills it.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::close(fds[0]) };
+            std::thread::sleep(Duration::from_secs(30));
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(fds[1]) };
+        let start = Instant::now();
+        let report = wait_for_report(fds[0], pid, &Budget::new(Duration::from_millis(200)));
+        let elapsed = start.elapsed();
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(report, None);
+        assert!(
+            elapsed < REAP_TIMEOUT + Duration::from_secs(2),
+            "killing an unreporting child took {elapsed:?}"
+        );
+    }
+
+    /// The tail itself, without the fork: ordering stays directly testable,
+    /// with a stubbed daemon starter that must never run on this path.
+    #[test]
+    fn session_socket_tail_unlocks_through_a_live_daemon() {
+        let (_dir, vault, sock) = session_fixture();
+        let server = fake_daemon(&sock);
+        let outcome = session_socket_tail(
+            &mut SocketDir::open(&sock, me()).expect("fixture dir validates"),
+            Options {
+                collection: "default".into(),
+                auto_start: false,
+                socket: None,
+                vault_dir: None,
+            },
+            target_at(sock.clone(), &vault),
+            Zeroizing::new("hunter2".to_owned()),
+            SALT,
+            LOGIN_KDF,
+            &full_budget(),
+            &no_start,
+        );
+        let req = server.join().expect("fake daemon answered");
+        assert_eq!(outcome, SessionOutcome::Attempted);
+        match req {
+            Request::UnlockWithKey { collection, .. } => assert_eq!(collection, "default"),
+            other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// The supplementary groups of this process, for the credential checks.
+    fn current_groups() -> Vec<libc::gid_t> {
+        // SAFETY: a null buffer with size 0 queries the count without
+        // writing anywhere.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        assert!(count >= 0, "getgroups count failed");
+        let mut buf = vec![0 as libc::gid_t; count as usize];
+        // SAFETY: `buf` has room for exactly `count` entries.
+        let got = unsafe { libc::getgroups(buf.len() as libc::c_int, buf.as_mut_ptr()) };
+        assert_eq!(got, count, "group list changed mid-read");
+        buf
+    }
+
+    /// Re-owns a session fixture's tree to the target uid, the way a real
+    /// `/run/user/<uid>` and vault file are owned by the logging-in user.
+    fn reown_tree(path: &Path, uid: u32) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = CString::new(path.as_os_str().as_bytes()).expect("NUL in path");
+        // SAFETY: `c` is a live NUL-terminated path; chown takes no other
+        // pointer arguments.
+        let rc = unsafe { libc::chown(c.as_ptr(), uid, uid) };
+        assert_eq!(rc, 0, "chown {} failed", path.display());
+    }
+
+    /// The wdm bug, as root: `open_session` against a foreign target must
+    /// leave the caller root, with groups intact, so the login path can
+    /// still fork the user session afterwards. An in-process `setuid`
+    /// authenticates the user and then breaks the spawn with `EPERM`.
+    ///
+    /// Only runs as root — anyone else has no privilege to lose and
+    /// returns early. Isolated in a fork so the test runner itself is
+    /// never mutated; the fixture is re-owned to the target first so the
+    /// fd-pinned validation accepts it like a real login tree.
+    #[test]
+    fn open_session_keeps_root_for_the_login_path() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let target: u32 = 65534;
+        let (_dir, vault, sock) = session_fixture();
+        reown_tree(_dir.path(), target);
+        reown_tree(&vault, target);
+        reown_tree(&vault.join("default.vault"), target);
+        reown_tree(sock.parent().expect("socket has a parent"), target);
+        // SAFETY: the child runs the decision and `_exit`s; the parent
+        // only waits. The TempDir guard stays in the parent, so cleanup
+        // still happens exactly once.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            let egid_before = unsafe { libc::getegid() };
+            let groups_before = current_groups();
+            // No daemon behind the socket and no auto-start: the decision
+            // still walks the whole socket path (and would drop privileges
+            // in-process on the buggy code) and lands on Failed.
+            let outcome = open_session_decision(
+                Some("hunter2"),
+                &["auto_start=no".to_string()],
+                &full_budget(),
+                &|_| {
+                    Some(Target {
+                        sock: sock.clone(),
+                        uid: target,
+                        vault_dir: vault.clone(),
+                    })
+                },
+                &no_start,
+            );
+            // SAFETY: synchronous reads of our own credentials.
+            let kept = unsafe { libc::geteuid() } == 0
+                && unsafe { libc::getegid() } == egid_before
+                && current_groups() == groups_before;
+            let ok = kept && outcome == SessionOutcome::Failed;
+            unsafe { libc::_exit(i32::from(!ok)) };
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is a child of this process; `status` is a live int.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "open_session lost root or took an unexpected path"
+        );
+    }
+
+    /// One retry, not a loop: two resets in a row mean the failure is not a
+    /// restart landing in the window, so the second one is returned as-is and
+    /// no third connection is ever made.
+    #[test]
+    fn a_second_reset_is_a_failure_not_another_retry() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = std::sync::Arc::clone(&accepts);
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = accept_one(&listener, "unlock attempt");
+                counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = read_frame_sync(&mut stream);
+                drop(stream);
+            }
+        });
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        server.join().unwrap();
+        assert_eq!(outcome, SessionOutcome::Failed);
+        assert!(outcome.clears_stash());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly the first attempt plus one retry"
+        );
+    }
+
+    /// The retry's budget gate comes before its log and its connect: a budget
+    /// that dies during the first derivation still pays for that derivation
+    /// (Argon2 is not interruptible) but never starts a second connection.
+    #[test]
+    fn a_reset_with_no_retry_budget_makes_no_second_connection() {
+        let (_dir, vault, sock) = session_fixture();
+        // Fastest of a few runs, so a cold first allocation does not inflate
+        // the estimate: overestimating `d` is what would leave budget over.
+        let one_derivation = || {
+            (0..3)
+                .map(|_| {
+                    let start = Instant::now();
+                    crypto::derive_key(b"calibrate", &SALT, LOGIN_KDF).unwrap();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        one_derivation();
+        let d = one_derivation();
+        let budget = Budget::new(d / 2);
+
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = std::sync::Arc::clone(&accepts);
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = accept_one(&listener, "first connection");
+            counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_frame_sync(&mut first);
+            drop(first);
+            // A buggy retry would arrive promptly (one derivation, no sleep);
+            // a short poll catches it without paying the full hang guard.
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(800) {
+                match listener.accept() {
+                    Ok((mut second, _)) => {
+                        counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = read_frame_sync(&mut second);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(ACCEPT_POLL);
+                    }
+                    Err(e) => panic!("second accept failed: {e}"),
+                }
+            }
+        });
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &budget,
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        server.join().unwrap();
+        assert_eq!(
+            outcome,
+            SessionOutcome::NoCallBudget,
+            "the spent retry budget must stop before the second connect \
+             (one derivation took {d:?})"
+        );
+        assert!(outcome.clears_stash());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the retry must not connect a second time"
+        );
+    }
+
+    /// A timeout is deterministic, not a vanished peer: the server took the
+    /// request and never answered, so retrying would only spend login budget
+    /// re-proving the stall.
+    #[test]
+    fn a_timeout_mid_unlock_is_not_retried() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = std::sync::Arc::clone(&accepts);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = accept_one(&listener, "only connection");
+            counting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = read_frame_sync(&mut stream);
+            std::thread::sleep(CALL_BUDGET + Duration::from_secs(1));
+            drop(stream);
+        });
+        let start = Instant::now();
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &no_start,
+        );
+        server.join().unwrap();
+        assert_eq!(outcome, SessionOutcome::Failed);
+        assert!(outcome.clears_stash());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a timeout must not be retried"
+        );
+        assert!(
+            start.elapsed() < CALL_BUDGET + ACCEPT_TIMEOUT + Duration::from_secs(2),
+            "took {elapsed:?}",
+            elapsed = start.elapsed()
+        );
+    }
+
+    /// Only a vanished peer is worth one retry. Refused, timed out, would-block
+    /// and malformed are deterministic; a connect wrapper never is.
+    #[test]
+    fn retryable_reset_only_retries_a_vanished_peer() {
+        use std::io::ErrorKind::*;
+        for kind in [ConnectionReset, BrokenPipe, UnexpectedEof] {
+            assert!(
+                retryable_reset(&ProtocolError::Io(std::io::Error::new(kind, "gone"))),
+                "{kind:?} must retry"
+            );
+        }
+        for kind in [TimedOut, ConnectionRefused, WouldBlock, InvalidData] {
+            assert!(
+                !retryable_reset(&ProtocolError::Io(std::io::Error::new(kind, "no"))),
+                "{kind:?} must not retry"
+            );
+        }
+        assert!(
+            !retryable_reset(&ProtocolError::Connect(std::io::Error::new(
+                ConnectionReset,
+                "connect"
+            ))),
+            "a Connect wrapper is a start decision, never a reset retry"
+        );
+    }
+
+    /// Arm order: a reset first does not swallow a connect decision. Drop the
+    /// first connection (reset, worth one retry), then refuse the retry, and
+    /// the refused retry must route to the daemon-start path — a `Started`
+    /// variant, never `Failed`. This pins the Finding-2 routing.
+    #[test]
+    fn a_connect_after_a_reset_still_starts_the_daemon() {
+        let (_dir, vault, sock) = session_fixture();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = accept_one(&listener, "first connection");
+            let _ = read_frame_sync(&mut first);
+            drop(first);
+            // The retry must see a refused connect, not another listener:
+            // dropping with the file left behind makes the next connect
+            // refused, which proves nobody is behind the socket. The client's
+            // re-derivation lands after this drop, so the race is not close.
+            drop(listener);
+        });
+        let outcome = open_session_decision(
+            Some("hunter2"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+            &|_| true,
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(outcome, SessionOutcome::Started(_)),
+            "a Connect after a reset must route to start, got {outcome:?}"
+        );
+        assert!(outcome.clears_stash());
     }
 
     /// `auto_start=no` is a switch on unlinking and `systemctl` running as
@@ -3076,9 +4750,14 @@ mod tests {
         let server = started.lock().unwrap().take().expect("the daemon started");
         let expected = crypto::derive_key(b"hunter2", &SALT, LOGIN_KDF).unwrap();
         match server.join().unwrap() {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "default");
                 assert_eq!(&*key, expected.as_bytes());
+                assert!(pin, "PAM unlocks pin the vault");
             }
             ref other => panic!("expected UnlockWithKey, got {}", other.variant_name()),
         }
@@ -3361,6 +5040,98 @@ mod tests {
                 assert_eq!(&*new_key, expected_new.as_bytes());
             }
             ref other => panic!("expected ChangeKey, got {}", other.variant_name()),
+        }
+    }
+
+    /// A `passwd` rotation follows the login into every wallet, not just
+    /// `default`: one `ChangeKey` per vault file, each old key derived under
+    /// its own header. Mirrors `a_login_unlocks_every_wallet_not_just_default`.
+    #[test]
+    fn a_password_change_rotates_every_wallet() {
+        let (_dir, vault, sock) = session_fixture();
+        const WORK_SALT: [u8; SALT_LEN] = [0x5b; SALT_LEN];
+        write_vault(&vault, "work", header_with(LOGIN_KDF, WORK_SALT));
+        let server = fake_daemon_n(&sock, 2);
+        // WHY: no auto-start exists on this path — the resolver below would
+        // panic if the decision tried to start a daemon, so returning at all
+        // proves no start was attempted.
+        let outcome = chauthtok_decision(
+            0,
+            Some("old-pw"),
+            Some("new-pw"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+        );
+        assert_eq!(outcome, ChauthtokOutcome::Sent);
+        let mut reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 2, "one rotation per wallet: {reqs:?}");
+        reqs.sort_by(|a, b| {
+            let id = |r: &Request| match r {
+                Request::ChangeKey { collection, .. } => collection.clone(),
+                other => panic!("expected ChangeKey, got {}", other.variant_name()),
+            };
+            id(a).cmp(&id(b))
+        });
+        for (req, (id, salt)) in reqs
+            .into_iter()
+            .zip([("default", SALT), ("work", WORK_SALT)])
+        {
+            match req {
+                Request::ChangeKey {
+                    collection,
+                    old_key,
+                    new_kdf,
+                    new_key,
+                    new_salt,
+                } => {
+                    assert_eq!(collection, id);
+                    let expected_old = crypto::derive_key(b"old-pw", &salt, LOGIN_KDF).unwrap();
+                    assert_eq!(
+                        &*old_key,
+                        expected_old.as_bytes(),
+                        "{id}: old key under its own header"
+                    );
+                    assert_eq!(new_kdf, LOGIN_KDF);
+                    let expected_new = crypto::derive_key(b"new-pw", &new_salt, LOGIN_KDF).unwrap();
+                    assert_eq!(&*new_key, expected_new.as_bytes());
+                }
+                other => panic!("expected ChangeKey, got {}", other.variant_name()),
+            }
+        }
+    }
+
+    /// A corrupt header must not block the healthy wallet: the readable vault
+    /// is still rotated and the outcome is still `Sent`.
+    #[test]
+    fn a_password_change_with_one_corrupt_header_still_rotates_the_healthy_vault() {
+        let (_dir, vault, sock) = session_fixture();
+        let bad = vault.join("bad.vault");
+        std::fs::write(&bad, b"NOTAVAULT and then some").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = fake_daemon_n(&sock, 1);
+        let outcome = chauthtok_decision(
+            0,
+            Some("old-pw"),
+            Some("new-pw"),
+            &[],
+            &full_budget(),
+            &|_| Some(target_at(sock.clone(), &vault)),
+        );
+        assert_eq!(outcome, ChauthtokOutcome::Sent);
+        let reqs = server.join().unwrap();
+        assert_eq!(reqs.len(), 1, "only the healthy vault rotates: {reqs:?}");
+        match reqs.into_iter().next().unwrap() {
+            Request::ChangeKey {
+                collection,
+                old_key,
+                ..
+            } => {
+                assert_eq!(collection, "default");
+                let expected_old = crypto::derive_key(b"old-pw", &SALT, LOGIN_KDF).unwrap();
+                assert_eq!(&*old_key, expected_old.as_bytes());
+            }
+            other => panic!("expected ChangeKey, got {}", other.variant_name()),
         }
     }
 

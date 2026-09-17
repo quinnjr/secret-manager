@@ -243,6 +243,60 @@ proptest! {
             ));
         }
     }
+
+    /// A header whose declared length runs past its encoded body must be
+    /// refused, not accepted with the surplus quietly absorbed into the
+    /// associated data. `postcard` stops at the end of the first complete
+    /// message, so padding is invisible to the decoder unless the remainder
+    /// is checked — the same non-canonical encoding `protocol::decode_frame`
+    /// refuses, and for the same reason.
+    ///
+    /// The round-trip half matters as much: this tightens only what is
+    /// *accepted*, and no file we write can hit it, because `header_bytes`
+    /// declares exactly the length it encoded. So the canonical encoding of
+    /// the very same header must still decode, to the same header and the
+    /// same associated data.
+    #[test]
+    fn a_padded_vault_header_is_refused(
+        label in hostile_string(),
+        pad in vec(any::<u8>(), 1..8),
+        ciphertext in vec(any::<u8>(), 0..16),
+    ) {
+        let mut header = fixed_header();
+        header.label = label;
+        let file = VaultFile::new(header.clone(), ciphertext.clone()).unwrap();
+        let canonical = file.encode();
+
+        let decoded = VaultFile::decode(&canonical).unwrap();
+        prop_assert_eq!(&decoded.header, &header);
+        prop_assert_eq!(&decoded.aad, &file.aad);
+        prop_assert_eq!(&decoded.ciphertext, &ciphertext);
+        prop_assert_eq!(format::decode_header(&canonical).unwrap(), header);
+
+        // The same header body, padded, with the length prefix bumped to
+        // cover the padding.
+        let body_len = file.aad.len() - format::PREFIX_LEN;
+        let mut padded = file.aad.clone();
+        padded.extend_from_slice(&pad);
+        padded.extend_from_slice(&ciphertext);
+        padded[8..format::PREFIX_LEN]
+            .copy_from_slice(&((body_len + pad.len()) as u32).to_le_bytes());
+
+        prop_assert!(
+            matches!(
+                VaultFile::decode(&padded),
+                Err(FormatError::TrailingHeaderBytes(n)) if n == pad.len()
+            ),
+            "a padded header was accepted by VaultFile::decode"
+        );
+        prop_assert!(
+            matches!(
+                format::decode_header(&padded),
+                Err(FormatError::TrailingHeaderBytes(n)) if n == pad.len()
+            ),
+            "a padded header was accepted by decode_header"
+        );
+    }
 }
 
 proptest! {

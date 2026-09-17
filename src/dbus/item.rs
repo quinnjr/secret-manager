@@ -7,6 +7,7 @@ use super::require_sender;
 use super::session::SecretStruct;
 use super::state::{Shared, VaultRef, block_in_place};
 use crate::session::SessionCipher;
+use crate::vault::format::Cap;
 use std::collections::HashMap;
 use zbus::Connection;
 use zbus::interface;
@@ -38,10 +39,28 @@ impl Item {
     }
 
     /// Read one field of the decrypted item; `None` while locked or missing.
+    ///
+    /// Fail-closed: `Locked` and `NoSuchItem` both read as absent, so a
+    /// deleted item in an unlocked collection never reports "unlocked but
+    /// blank". The underlying variant is debug-logged so a swallow is still
+    /// diagnosable; `Retired` cannot arise from `Vault::item` (it is a
+    /// save-path error) and would likewise read as absent here, where the
+    /// property getters have no `UnknownObject` to return.
     async fn with_item<T>(&self, f: impl FnOnce(&crate::vault::format::Item) -> T) -> Option<T> {
         let vault = self.vault().await?;
         let vault = vault.lock().await;
-        vault.item(&self.id).ok().map(f)
+        match vault.item(&self.id) {
+            Ok(item) => Some(f(item)),
+            Err(e) => {
+                tracing::debug!(
+                    collection = %self.collection,
+                    id = %self.id,
+                    error = ?e,
+                    "with_item miss"
+                );
+                None
+            }
+        }
     }
 
     async fn update(
@@ -86,7 +105,7 @@ impl Item {
         &self,
         session: OwnedObjectPath,
         #[zbus(header)] header: Header<'_>,
-    ) -> Result<SecretStruct> {
+    ) -> Result<(SecretStruct,)> {
         let (cipher, vault) = {
             let st = self.state.lock().await;
             let cipher =
@@ -98,7 +117,9 @@ impl Item {
             let vault = vault.lock().await;
             let item = vault.item(&self.id)?;
             let (parameters, value) = cipher.encrypt(&item.secret);
-            (parameters, value, item.content_type.clone())
+            // `Plain` hands back the plaintext itself; taking ownership here
+            // is what wipes it when the reply is done with.
+            (parameters, Zeroizing::new(value), item.content_type.clone())
         };
         // Only an authorised read counts as activity. Touching first meant any
         // bus client could refresh `last_activity` with a bogus or another
@@ -106,12 +127,23 @@ impl Item {
         // real item path needed — so `idle_lock` never fired and the keys
         // stayed in daemon memory indefinitely.
         self.state.lock().await.touch();
-        Ok(SecretStruct {
+        // A one-tuple, not a bare struct: zbus writes message-body signature
+        // headers with top-level struct parentheses stripped
+        // (`SignatureSerializer::to_string_no_parens` on the message header
+        // builder path), so a bare `SecretStruct` return goes out as
+        // `oayays` while introspection —
+        // and the spec, and every strict client — expects one `(oayays)`
+        // struct. The tuple's own signature is `((oayays))`, the strip
+        // leaves exactly one layer, and introspection iterates the single
+        // element, so all three agree. If a future zbus stops stripping,
+        // `get_secret_reply_is_a_single_struct_on_the_wire` fails and this
+        // wrapper goes away with it.
+        Ok((SecretStruct {
             session,
             parameters,
             value,
             content_type,
-        })
+        },))
     }
 
     async fn set_secret(
@@ -153,16 +185,14 @@ impl Item {
             let plaintext = cipher
                 .decrypt(&secret.parameters, &secret.value)
                 .map_err(Error::failed)?;
-            // The same cap `CreateItem` enforces. Without it here the cap is
-            // only a speed bump: create a one-byte item, then replace its
-            // secret with a hundred megabytes and the collection is past the
-            // vault size limit anyway, at which point it stops saving
+            // The same cap `CreateItem` enforces, through the same `Cap`, so
+            // a boundary change here is one edit and not four. Without it the
+            // cap is only a speed bump: create a one-byte item, then replace
+            // its secret with a hundred megabytes and the collection is past
+            // the vault size limit anyway, at which point it stops saving
             // entirely. Found while auditing negative-test coverage.
-            if plaintext.len() > collection::MAX_ITEM_SECRET {
-                return Err(Error::invalid_args(format!(
-                    "secret is too large; at most {} bytes per item",
-                    collection::MAX_ITEM_SECRET
-                )));
+            if let Some(over) = Cap::Secret.check(plaintext.len()) {
+                return Err(Error::invalid_args(collection::cap_message(over)));
             }
             let content_type = secret.content_type.clone();
             block_in_place(|| {
@@ -179,12 +209,20 @@ impl Item {
         Ok(())
     }
 
+    /// Whether this item can be read.
+    ///
+    /// Routed through [`Item::with_item`], not through `Vault::is_locked`
+    /// alone, so an item that no longer exists reads as locked. Between a
+    /// delete and the `object_server` unexport that follows it, the object is
+    /// still on the bus with nothing behind it; answering `is_locked` for its
+    /// *collection* made a deleted item in an unlocked collection report
+    /// `Locked = false` while `Label` and `Attributes` — which both go
+    /// through `with_item` — answered empty. "Unlocked but blank" is not a
+    /// state this interface has; "locked" is what every other property
+    /// already says in that window.
     #[zbus(property)]
     async fn locked(&self) -> bool {
-        match self.vault().await {
-            Some(v) => v.lock().await.is_locked(),
-            None => true,
-        }
+        self.with_item(|_| false).await.unwrap_or(true)
     }
 
     #[zbus(property)]

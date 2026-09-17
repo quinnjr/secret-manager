@@ -31,7 +31,7 @@ enum Msg {
     Lock(Option<String>),
     Status,
     Reload,
-    UnlockWithKey(String, [u8; KEY_LEN]),
+    UnlockWithKey(String, [u8; KEY_LEN], bool),
     ChangeKey(
         String,
         [u8; KEY_LEN],
@@ -61,12 +61,14 @@ fn same_request(a: &Request, b: &Request) -> bool {
             Request::UnlockWithKey {
                 collection: c1,
                 key: k1,
+                pin: p1,
             },
             Request::UnlockWithKey {
                 collection: c2,
                 key: k2,
+                pin: p2,
             },
-        ) => c1 == c2 && k1[..] == k2[..],
+        ) => c1 == c2 && k1[..] == k2[..] && p1 == p2,
         (
             Request::ChangeKey {
                 collection: c1,
@@ -112,6 +114,7 @@ fn assert_wire_order() {
             Request::UnlockWithKey {
                 collection: String::new(),
                 key: key.clone(),
+                pin: false,
             },
             3,
             "UnlockWithKey",
@@ -192,9 +195,10 @@ fn with_benign_collection(req: &Request) -> Request {
         },
         Request::Status => Request::Status,
         Request::Reload => Request::Reload,
-        Request::UnlockWithKey { key, .. } => Request::UnlockWithKey {
+        Request::UnlockWithKey { key, pin, .. } => Request::UnlockWithKey {
             collection: NAME.to_string(),
             key: key.clone(),
+            pin: *pin,
         },
         Request::ChangeKey {
             old_key,
@@ -256,9 +260,10 @@ fuzz_target!(|msg: Msg| {
                 Msg::Lock(collection) => Request::Lock { collection },
                 Msg::Status => Request::Status,
                 Msg::Reload => Request::Reload,
-                Msg::UnlockWithKey(collection, k) => Request::UnlockWithKey {
+                Msg::UnlockWithKey(collection, k, pin) => Request::UnlockWithKey {
                     collection,
                     key: Zeroizing::new(k),
+                    pin,
                 },
                 Msg::ChangeKey(collection, old, salt, m, t, p, new) => Request::ChangeKey {
                     collection,

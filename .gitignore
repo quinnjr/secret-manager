@@ -27,3 +27,6 @@
 # Raw coverage counters. `cargo llvm-cov` writes these into whatever directory
 # a profiled process happens to run in, including the repo root.
 *.profraw
+
+# Vagrant box state, not source.
+.vagrant/

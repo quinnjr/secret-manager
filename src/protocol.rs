@@ -34,7 +34,14 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// from starting. The request set is unchanged from v3 - v4 is a response
 /// shape change only - but a `Response` field is as wire-significant as a
 /// request variant under postcard, so the version moved with it.
-pub const PROTOCOL_VERSION: u8 = 4;
+///
+/// v5 added the `pin` flag to [`Request::UnlockWithKey`]. A PAM login unlocks
+/// every vault with `pin = true`, which exempts those collections from the
+/// idle-lock timer for the life of the daemon: a vault opened by a correct
+/// login never relocks on its own. Interactive `sm unlock` sends
+/// `pin = false` and keeps the existing auto-lock behaviour. A manual `Lock`
+/// clears the pin.
+pub const PROTOCOL_VERSION: u8 = 5;
 
 /// Variant names of [`Request`] in wire order, for tests and diagnostics.
 pub const REQUEST_VARIANTS: [&str; 5] = ["Lock", "Status", "Reload", "UnlockWithKey", "ChangeKey"];
@@ -55,9 +62,14 @@ pub enum Request {
     /// Unlock with a key the caller derived from the collection's own header
     /// (`derive_key(password, salt, kdf)`). Whoever answers this socket
     /// learns the vault key, never the password it came from.
+    ///
+    /// `pin` exempts the collection from the idle-lock timer: the PAM
+    /// module sends `true` so a vault opened by a correct login never
+    /// relocks on its own, while interactive unlocks send `false`.
     UnlockWithKey {
         collection: String,
         key: Zeroizing<[u8; KEY_LEN]>,
+        pin: bool,
     },
     /// Rotate the vault key. `old_key` must open the collection; the items
     /// are re-sealed under `new_key`, and `new_salt`/`new_kdf` are written to
@@ -96,10 +108,13 @@ impl std::fmt::Debug for Request {
                 .finish(),
             Request::Status => f.write_str("Status"),
             Request::Reload => f.write_str("Reload"),
-            Request::UnlockWithKey { collection, .. } => f
+            Request::UnlockWithKey {
+                collection, pin, ..
+            } => f
                 .debug_struct("UnlockWithKey")
                 .field("collection", collection)
                 .field("key", &REDACTED)
+                .field("pin", pin)
                 .finish(),
             Request::ChangeKey {
                 collection,
@@ -290,8 +305,11 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Reads the connected peer's credentials via `SO_PEERCRED`.
-fn peer_uid(stream: &UnixStream) -> Result<u32, ProtocolError> {
+/// Reads the connected peer's credentials via `SO_PEERCRED`. The single
+/// definition: the control server's accept loop and the import probe's
+/// pid-identity check both go through here rather than growing their own
+/// `getsockopt` copies.
+fn peer_cred(stream: &UnixStream) -> Result<libc::ucred, ProtocolError> {
     // SAFETY: ucred is plain data; all-zero is a valid initial value.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -309,7 +327,17 @@ fn peer_uid(stream: &UnixStream) -> Result<u32, ProtocolError> {
     if rc != 0 {
         return Err(ProtocolError::Io(std::io::Error::last_os_error()));
     }
-    Ok(cred.uid)
+    Ok(cred)
+}
+
+pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, ProtocolError> {
+    peer_cred(stream).map(|cred| cred.uid)
+}
+
+/// The peer's pid, for callers comparing processes rather than users: the
+/// import probe checks the bus-name owner against the control socket's peer.
+pub(crate) fn peer_pid(stream: &UnixStream) -> Result<i32, ProtocolError> {
+    peer_cred(stream).map(|cred| cred.pid)
 }
 
 /// A blocking-socket timeout surfaces as `WouldBlock` on Linux; normalise it
@@ -644,6 +672,7 @@ mod tests {
         let req = Request::UnlockWithKey {
             collection: "default".into(),
             key: Zeroizing::new([7u8; KEY_LEN]),
+            pin: true,
         };
         let bytes = encode_frame(&req).unwrap();
         assert_eq!(&bytes[..4], &((bytes.len() - 4) as u32).to_be_bytes());
@@ -652,9 +681,14 @@ mod tests {
         let body = read_frame_sync(&mut cur).unwrap();
         let back: Request = decode_frame(&body).unwrap();
         match back {
-            Request::UnlockWithKey { collection, key } => {
+            Request::UnlockWithKey {
+                collection,
+                key,
+                pin,
+            } => {
                 assert_eq!(collection, "default");
                 assert_eq!(*key, [7u8; KEY_LEN]);
+                assert!(pin);
             }
             _ => panic!("wrong variant"),
         }
@@ -669,9 +703,11 @@ mod tests {
     /// should fail here and make it a decision rather than an accident.
     /// v3 → v4 added `Response::Status::aliases_error`, so that a corrupt
     /// `aliases.toml` can be reported instead of refusing to start the daemon.
+    /// v4 → v5 added `Request::UnlockWithKey::pin`, so a PAM login can exempt
+    /// its collections from the idle-lock timer.
     #[test]
     fn the_protocol_has_no_password_requests() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         let names: Vec<&str> = REQUEST_VARIANTS.to_vec();
         assert_eq!(
             names,
@@ -851,6 +887,7 @@ mod tests {
         let unlock = Request::UnlockWithKey {
             collection: "default".into(),
             key: Zeroizing::new([0xab; KEY_LEN]),
+            pin: false,
         };
         let rendered = format!("{unlock:?}");
         assert!(!rendered.contains("171"), "leaked: {rendered}");

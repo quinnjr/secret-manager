@@ -146,3 +146,17 @@ test = false
 doc = false
 bench = false
 
+
+[[bin]]
+name = "import_keyring_header"
+path = "fuzz_targets/import_keyring_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_wallet_header"
+path = "fuzz_targets/import_wallet_header.rs"
+test = false
+doc = false
+bench = false

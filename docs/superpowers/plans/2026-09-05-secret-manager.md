@@ -3253,6 +3253,7 @@ pub trait Collection {
 pub trait Item {
     fn delete(&self) -> zbus::Result<OwnedObjectPath>;
     fn get_secret(&self, session: &OwnedObjectPath) -> zbus::Result<SecretStruct>;
+    // Note: the server wraps the reply in a 1-tuple for framing while this client type stays `SecretStruct`; see the `busctl` wire test `get_secret_reply_is_a_single_struct_on_the_wire`.
     fn set_secret(&self, secret: &SecretStruct) -> zbus::Result<()>;
     #[zbus(property)]
     fn locked(&self) -> zbus::Result<bool>;
@@ -4197,6 +4198,7 @@ impl Item {
     }
 
     async fn get_secret(&self, session: OwnedObjectPath) -> Result<SecretStruct> {
+        // Note: as implemented the server wraps the reply in a 1-tuple for framing while the client type stays `SecretStruct`; see the `busctl` wire test `get_secret_reply_is_a_single_struct_on_the_wire`.
         let mut st = self.state.lock().await;
         st.touch();
         let cipher = st.cipher(session.as_str())?;

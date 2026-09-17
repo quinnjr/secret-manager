@@ -54,8 +54,19 @@ impl DaemonOptions {
 pub enum DaemonError {
     #[error("another secret service already owns {BUS_NAME}")]
     NameTaken,
+    /// A transport failure: the bus could not be reached, addressed or
+    /// connected to. This is the only zbus-shaped variant the CLI reports as
+    /// exit 3 ("daemon or bus unreachable"), which a supervisor reads as "one
+    /// is already running".
     #[error("bus error: {0}")]
     ZBus(zbus::Error),
+    /// A failure to export our own objects or register our own interfaces —
+    /// `serve_at`, `registry::register_all`. The bus is reachable; *we* are
+    /// broken. Reporting this as "unreachable" would tell a supervisor a
+    /// daemon is already running and stop it restarting the one that just
+    /// failed to serve anything.
+    #[error("cannot export the secret service objects: {0}")]
+    Export(zbus::Error),
     #[error("cannot load vaults: {0}")]
     Io(#[from] std::io::Error),
     #[error("cannot bind control socket: {0}")]
@@ -165,6 +176,7 @@ impl Daemon {
             opts.config.vault.dir.clone(),
             opts.config.kdf.into(),
             pinentry,
+            opts.config.gpg.clone(),
         );
         state.index_attributes = opts.config.vault.locked_search;
         let swept = crate::vault::store::sweep_stale_temp_files(&opts.config.vault.dir);
@@ -197,10 +209,13 @@ impl Daemon {
             // name from the first instead of failing with `NameTaken`.
             .allow_name_replacements(false)
             .replace_existing_names(false)
-            .serve_at(SERVICE_PATH, Service::new(state.clone()))?
+            .serve_at(SERVICE_PATH, Service::new(state.clone()))
+            .map_err(DaemonError::Export)?
             .build()
             .await?;
-        registry::register_all(&connection, &state).await?;
+        registry::register_all(&connection, &state)
+            .await
+            .map_err(DaemonError::Export)?;
 
         let socket = match opts.control_socket.clone() {
             Some(s) => s,
@@ -264,9 +279,11 @@ fn control_handler(state: Shared, conn: Connection) -> Handler {
 
 async fn handle_control(state: Shared, conn: Connection, req: Request) -> Response {
     match req {
-        Request::UnlockWithKey { collection, key } => {
-            unlock_with_key(&state, &conn, &collection, &Key::from_zeroizing(key)).await
-        }
+        Request::UnlockWithKey {
+            collection,
+            key,
+            pin,
+        } => unlock_with_key(&state, &conn, &collection, &Key::from_zeroizing(key), pin).await,
         Request::ChangeKey {
             collection,
             old_key,
@@ -310,6 +327,8 @@ async fn handle_control(state: Shared, conn: Connection, req: Request) -> Respon
                         Some(vault) => {
                             let mut vault = vault.lock().await;
                             if !vault.is_locked() {
+                                // `Vault::lock` also clears the PAM pin, so
+                                // what the operator locked stays locked.
                                 vault.lock();
                                 changed.push(id);
                             }
@@ -415,6 +434,7 @@ async fn unlock_with_key(
     conn: &Connection,
     collection: &str,
     key: &Key,
+    pin: bool,
 ) -> Response {
     let target = {
         let st = state.lock().await;
@@ -439,13 +459,25 @@ async fn unlock_with_key(
         // collection's own lock and off the async worker.
         Ok(vault) => {
             let mut vault = vault.lock().await;
-            block_in_place(|| vault.unlock_with_key(key))
-                .map_err(|_| "cannot unlock that collection".to_string())
+            // The pin and the decryption share this guard, so the idle
+            // timer can never slip a wipe between the two: `pin = true`
+            // (a PAM login) exempts the collection from auto-lock, while
+            // `pin = false` (an interactive unlock) clears a stale pin.
+            block_in_place(|| {
+                vault.unlock_with_key(key).map(|()| {
+                    vault.set_pinned(pin);
+                })
+            })
+            .map_err(|_| "cannot unlock that collection".to_string())
         }
         Err(e) => Err(e),
     };
     match result {
         Ok(()) => {
+            // No guard is held here — the vault guard from the decrypt
+            // above is dead — so the hook's brief acquisitions nest
+            // nothing. It spawns detached work and returns.
+            crate::dbus::gpg_preset::note_unlocked(state).await;
             state.lock().await.touch();
             registry::notify_collection_changed(conn, collection).await;
             Response::Ok
@@ -463,9 +495,21 @@ async fn change_key(
     new_kdf: KdfParams,
     new_key: &Key,
 ) -> Response {
-    let vault = state.lock().await.vault(collection);
-    match vault {
-        Some(vault) => {
+    let target = {
+        let st = state.lock().await;
+        match st.vault(collection) {
+            Some(v) => Ok(v),
+            // A vault that failed to load is a different, non-secret
+            // condition the operator needs to see — and `sm change-password`
+            // must name it the same way `sm unlock` does.
+            None => Err(match st.broken_error(collection) {
+                Some(e) => e.to_string(),
+                None => format!("no collection '{collection}'"),
+            }),
+        }
+    };
+    match target {
+        Ok(vault) => {
             // A rotation re-seals the whole collection and fsyncs it twice.
             // It gets this collection's lock and a blocking-friendly thread;
             // the state lock is already released.
@@ -481,7 +525,7 @@ async fn change_key(
                 Err(e) => Response::Error(e.to_string()),
             }
         }
-        None => Response::Error(format!("no collection '{collection}'")),
+        Err(e) => Response::Error(e),
     }
 }
 
@@ -653,7 +697,15 @@ async fn idle_lock(conn: Connection, state: Shared, after: Duration, check_every
         };
         let mut ids = Vec::new();
         for (id, vault) in vaults {
+            // The pin lives on the vault itself, so this check and the wipe
+            // below share the vault's own guard: a PAM-pinned collection is
+            // never auto-locked, and no unlock can interleave between the
+            // two. `Vault::lock` is a no-pin-op here — a pinned vault never
+            // reaches it.
             let mut vault = vault.lock().await;
+            if vault.is_pinned() {
+                continue;
+            }
             if !vault.is_locked() {
                 vault.lock();
                 ids.push(id);
@@ -683,6 +735,7 @@ mod tests {
             dir.path().to_path_buf(),
             KdfParams::FAST_FOR_TESTS,
             Pinentry::new("pinentry"),
+            crate::config::GpgConfig::default(),
         );
         let p = "/org/freedesktop/secrets/prompt/p1";
         let running = tokio::spawn(std::future::pending::<()>());
@@ -740,6 +793,7 @@ mod tests {
             dir.path().to_path_buf(),
             KdfParams::FAST_FOR_TESTS,
             Pinentry::new("pinentry"),
+            crate::config::GpgConfig::default(),
         );
         st.collections
             .insert("default".into(), crate::dbus::state::vault_ref(vault));

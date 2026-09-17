@@ -65,6 +65,198 @@ pub fn check_vault_size_against(len: u64, limit: u64) -> Result<(), FormatError>
     Ok(())
 }
 
+// Per-item caps.
+//
+// These bound what one *item* may carry: they are enforced by the D-Bus
+// layer on every `CreateItem` and property set, and re-applied by
+// `Vault::import_items` for the offline import path, which never goes
+// through D-Bus at all. `src/dbus/` is behind the `daemon` feature and
+// `src/vault/` is always compiled - into the PAM cdylib as well - so the
+// definitions live here and `dbus::collection` re-exports them, leaving one
+// number per cap rather than two that can drift.
+
+/// Upper bound on one item's decrypted secret, matching the control
+/// protocol's frame cap. Without it a single client could push a collection
+/// past the vault-level size limit — at which point the whole collection
+/// stops saving — with one `CreateItem` call.
+pub const MAX_ITEM_SECRET: usize = 1024 * 1024;
+
+/// Upper bound on one item's label.
+///
+/// The label is serialised into the same encrypted item blob as the secret,
+/// so it counts against the vault-level size limit in exactly the same way —
+/// capping only the secret left the cap reachable in two `CreateItem` calls
+/// through the label instead of 256 through the secret. 4 KiB is far more
+/// than any real client needs (libsecret labels are a line of UI text) while
+/// still leaving room for a long multi-byte one.
+pub const MAX_ITEM_LABEL: usize = 4 * 1024;
+
+/// Upper bound on the number of attribute pairs on one item. Attributes are
+/// stored in the item blob, and are also hashed into the header's search
+/// index, so each pair costs twice. Real schemas use a handful; libsecret's
+/// own built-in schemas top out well under ten.
+pub const MAX_ITEM_ATTRIBUTES: usize = 64;
+
+/// Upper bound on one attribute name. Attribute names are schema field names.
+pub const MAX_ATTRIBUTE_KEY: usize = 256;
+
+/// Upper bound on one attribute value. Values are identifiers, paths and
+/// usernames; this project's own largest is an ssh key path.
+///
+/// Together the three attribute caps bound one item's attribute set at
+/// 64 * (256 + 512) = 48 KiB, generous for a real client and small enough
+/// that reaching [`MAX_VAULT_BYTES`] through attributes takes
+/// as many calls as reaching it through capped secrets.
+pub const MAX_ATTRIBUTE_VALUE: usize = 512;
+
+/// Upper bound on one item's content type.
+///
+/// The last caller-supplied field that lands in the encrypted item blob, so
+/// the same reasoning as the label: uncapped, it is another way to push a
+/// collection past the vault size limit, just wearing a different field name.
+/// A content type is a MIME type — RFC 6838 caps a registered type or subtree
+/// name at 127 bytes each, so 255 covers `type/subtree` at the registry's own
+/// maximum, and 256 leaves room for a parameter such as `; charset=utf-8`.
+/// Real clients send `text/plain` or `application/octet-stream`.
+pub const MAX_ITEM_CONTENT_TYPE: usize = 256;
+
+/// One of the six per-item limits above, as a value.
+///
+/// The *constants* had already been hoisted here so there is one number per
+/// cap; the *predicates* had not, and there were three hand-maintained copies
+/// of "which caps, and measured how" — the D-Bus entry points in
+/// `dbus::collection`, `Vault::import_items`'s re-application of them, and
+/// `import::check_caps`'s pre-flight. Three copies of a limit is the worst
+/// kind to let drift: the symptom of a disagreement is a pre-check that
+/// passes an item `import_items` then refuses halfway through a migration.
+/// So the predicate lives here too, and each layer maps [`CapViolation`] into
+/// its own error type rather than re-deciding what "too large" means.
+///
+/// **The order is not shared, and this refactor did not make it so.** What is
+/// shared — and what has to be — is the set of caps, each predicate and each
+/// limit. [`check_caps`] fixes an order for its own callers; `CreateItem` in
+/// `dbus::collection` checks label, content type, attributes and only then
+/// the secret, deliberately, so an over-large label is refused before the
+/// client's secret session value is decrypted. An item over two caps at once
+/// is therefore named by a different one of the two on that path than on
+/// this one. That is a difference in which message a doomed request gets,
+/// never in which requests are refused.
+///
+/// **These variant names are a wire format.** `Cap` is serialized, kebab-
+/// cased, into `sm import`'s `report.json` through
+/// `import::Refusal::CapViolation`, so a rename here changes a file other
+/// programs read — and each name must say what [`Cap::as_str`] says, since
+/// the two describe the same refusal to the same person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Cap {
+    Secret,
+    Label,
+    AttributeCount,
+    /// Serialized as `attribute-name`, not the kebab-case of the variant:
+    /// the JSON is user-facing and every error message spells this cap
+    /// "attribute name". See the wire-format note above.
+    #[serde(rename = "attribute-name")]
+    AttributeKey,
+    AttributeValue,
+    ContentType,
+}
+
+impl Cap {
+    /// The limit this cap enforces.
+    pub const fn limit(self) -> usize {
+        match self {
+            Cap::Secret => MAX_ITEM_SECRET,
+            Cap::Label => MAX_ITEM_LABEL,
+            Cap::AttributeCount => MAX_ITEM_ATTRIBUTES,
+            Cap::AttributeKey => MAX_ATTRIBUTE_KEY,
+            Cap::AttributeValue => MAX_ATTRIBUTE_VALUE,
+            Cap::ContentType => MAX_ITEM_CONTENT_TYPE,
+        }
+    }
+
+    /// The cap's name as an error message spells it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Cap::Secret => "secret",
+            Cap::Label => "label",
+            Cap::AttributeCount => "attribute count",
+            Cap::AttributeKey => "attribute name",
+            Cap::AttributeValue => "attribute value",
+            Cap::ContentType => "content type",
+        }
+    }
+
+    /// Measure one value against this cap. `actual` is a *count* — a byte
+    /// length for every cap but [`Cap::AttributeCount`], which counts pairs.
+    ///
+    /// The comparison is `>`, so a value of exactly `limit()` is accepted.
+    /// This is the only place that decides that, which is what stops a `>=`
+    /// creeping into one of the three layers and silently stranding data at
+    /// the boundary.
+    pub const fn check(self, actual: usize) -> Option<CapViolation> {
+        if actual > self.limit() {
+            Some(CapViolation {
+                cap: self,
+                actual,
+                limit: self.limit(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for Cap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A cap and the size that broke it. Sizes only ever travel as *numbers*:
+/// this never carries the oversized value itself, so it is safe to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapViolation {
+    pub cap: Cap,
+    pub actual: usize,
+    pub limit: usize,
+}
+
+/// The first of the six per-item caps this item violates, or `None`.
+///
+/// The order is fixed here: secret, label, content type, attribute count,
+/// then the attribute pairs in `BTreeMap` order, name before value. Every
+/// caller *of this function* reports the same cap for the same item.
+///
+/// It is not the only order in the tree. `CreateItem` in `dbus::collection`
+/// does not go through here and checks cheap-before-decrypt instead, so an
+/// item over both the secret and the label cap is reported as `label` there
+/// and as `secret` here — see [`Cap`].
+pub fn check_caps(
+    label: &str,
+    attributes: &BTreeMap<String, String>,
+    secret_len: usize,
+    content_type: &str,
+) -> Option<CapViolation> {
+    Cap::Secret
+        .check(secret_len)
+        .or_else(|| Cap::Label.check(label.len()))
+        .or_else(|| Cap::ContentType.check(content_type.len()))
+        .or_else(|| Cap::AttributeCount.check(attributes.len()))
+        .or_else(|| {
+            attributes.iter().find_map(|(k, v)| {
+                Cap::AttributeKey
+                    .check(k.len())
+                    .or_else(|| Cap::AttributeValue.check(v.len()))
+            })
+        })
+}
+
+/// Display rendering lives in [`crate::sanitize`]; re-exported here so the
+/// `vault::format::` paths existing callers name keep working. This module
+/// owns encoding and caps only.
+pub use crate::sanitize::{escape_control, is_invisible_format};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
     pub id: String,
@@ -217,6 +409,7 @@ pub fn build_index(
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum FormatError {
     #[error("not a secret-manager vault (bad magic)")]
     BadMagic,
@@ -232,6 +425,8 @@ pub enum FormatError {
     HeaderTooLarge(usize),
     #[error("vault file is too large to open ({0} bytes; limit is {MAX_VAULT_BYTES})")]
     VaultTooLarge(u64),
+    #[error("{0} unexpected bytes after the vault header")]
+    TrailingHeaderBytes(usize),
 }
 
 fn describe_version(v: u16) -> String {
@@ -274,15 +469,37 @@ pub fn header_prefix_len(prefix: &[u8]) -> Result<usize, FormatError> {
 }
 
 /// Decodes a header from at least the bytes [`header_prefix_len`] reports,
-/// applying the same version and KDF checks as [`VaultFile::decode`].
-pub fn decode_header(bytes: &[u8]) -> Result<Header, FormatError> {
+/// applying the same version and KDF checks as [`VaultFile::decode`],
+/// returning it with the length of the prefix it occupied.
+///
+/// `postcard::from_bytes` stops at the end of the first complete message and
+/// ignores whatever follows, so a `header_len` larger than the encoded body
+/// would decode successfully with the surplus silently absorbed into the
+/// associated data. Nothing we write can produce that - `header_bytes`
+/// declares exactly the length it encoded - and a file we did not write fails
+/// the tag anyway, because the surplus *is* inside the AAD. But the vault
+/// header is the other length-delimited region of attacker-supplied postcard
+/// in this crate, and `protocol::decode_frame` holds the same line for the
+/// same reason: a region that decodes must have been fully consumed, or "the
+/// header that was read" and "the header that was acted on" are different
+/// objects. So the remainder is required to be empty.
+fn decode_header_prefix(bytes: &[u8]) -> Result<(Header, usize), FormatError> {
     let need = header_prefix_len(bytes)?;
     if bytes.len() < need {
         return Err(FormatError::Truncated);
     }
-    let header: Header = postcard::from_bytes(&bytes[PREFIX_LEN..need])?;
+    let (header, rest): (Header, &[u8]) = postcard::take_from_bytes(&bytes[PREFIX_LEN..need])?;
+    if !rest.is_empty() {
+        return Err(FormatError::TrailingHeaderBytes(rest.len()));
+    }
     check_header(&header)?;
-    Ok(header)
+    Ok((header, need))
+}
+
+/// Decodes a header from at least the bytes [`header_prefix_len`] reports,
+/// applying the same version and KDF checks as [`VaultFile::decode`].
+pub fn decode_header(bytes: &[u8]) -> Result<Header, FormatError> {
+    Ok(decode_header_prefix(bytes)?.0)
 }
 
 fn check_header(header: &Header) -> Result<(), FormatError> {
@@ -342,12 +559,7 @@ impl VaultFile {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<VaultFile, FormatError> {
-        let need = header_prefix_len(bytes)?;
-        if bytes.len() < need {
-            return Err(FormatError::Truncated);
-        }
-        let header: Header = postcard::from_bytes(&bytes[PREFIX_LEN..need])?;
-        check_header(&header)?;
+        let (header, need) = decode_header_prefix(bytes)?;
         Ok(VaultFile {
             header,
             aad: bytes[..need].to_vec(),
@@ -662,5 +874,29 @@ mod tests {
             &salt,
             &[("app".to_string(), "git".to_string())].into()
         )));
+    }
+
+    /// `Cap`'s serde names are a wire format: they are written into
+    /// `sm import`'s `report.json` through `import::Refusal::CapViolation`, so
+    /// a rename here changes a file other programs read. A rename requires a
+    /// report_format_version bump, never a silent rename.
+    #[test]
+    fn cap_serde_names_are_pinned() {
+        for (cap, name, limit) in [
+            (Cap::Secret, "secret", MAX_ITEM_SECRET),
+            (Cap::Label, "label", MAX_ITEM_LABEL),
+            (Cap::AttributeCount, "attribute-count", MAX_ITEM_ATTRIBUTES),
+            (Cap::AttributeKey, "attribute-name", MAX_ATTRIBUTE_KEY),
+            (Cap::AttributeValue, "attribute-value", MAX_ATTRIBUTE_VALUE),
+            (Cap::ContentType, "content-type", MAX_ITEM_CONTENT_TYPE),
+        ] {
+            assert_eq!(serde_json::to_string(&cap).unwrap(), format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<Cap>(&format!("\"{name}\"")).unwrap(),
+                cap
+            );
+            assert_eq!(cap.limit(), limit);
+            assert_eq!(cap.as_str(), name.replace('-', " "));
+        }
     }
 }

@@ -22,6 +22,62 @@ systemctl --user enable --now secret-manager.service
 sm status
 ```
 
+## Moving from gnome-keyring or KWallet
+
+`sm import` writes a new collection and never merges into an existing
+one. Run it while the old provider is still running — disabling it
+first strands whatever it alone can still see. Three passes, in order:
+
+```sh
+sm import --from kwallet --inventory     # headers only; no password, no daemon
+sm import --from kwallet --dry-run       # full extraction, writes nothing
+sm import --from kwallet --set-default --report ~/migration-report.json
+```
+
+(`--from gnome-keyring` for the other source. `--inventory` names every
+container the headers describe; `--collection` overrides the new
+collection's label, which otherwise follows the source's own name.)
+
+The dry run ends with a tally per item — fully portable, attributes
+preserved, preserved only — plus refused; see "Commands" in `README.md`
+for what each promises the application that wrote it. The count line is
+the gate: it reconciles the file header against everything the walk
+produced, and a real (non-dry) run additionally compares every
+fingerprint against the file it just wrote.
+
+### Entries the source daemon never lists
+
+A source daemon can omit entries its own file holds — observed live
+with kwalletd, which dropped whole folders from its listings. The
+import diffs the file's cleartext index against what the walk produced
+and names every missing entry it can (`67 in the header, 32 walked, 35
+never listed by the daemon`), recovering names through the attribute
+sidecar where one names them. Those entries are not migrated — no tool
+speaking that daemon's API could reach them — so the run withholds the
+decommission advice until none remain. Keep the old provider (and, for
+KWallet, its sidecar file) until such entries are re-homed by hand;
+their secrets stay readable through whichever API does serve them.
+
+## Cutover order
+
+1. Migrate first and read the report: tallies as expected, count line
+   reconciled, fingerprints matched on the real run.
+2. Disable the old provider per your distro's guide (units, autostart,
+   activation override, PAM lines old out and ours in — no
+   `collection=<id>` needed for non-default ids; a login opens every
+   vault).
+3. If the running kernel differs from the installed one (`uname -r`
+   against the packaged version), reboot rather than logging out: a
+   display manager that cannot start its greeter leaves you with no
+   graphical way back in.
+4. Log in by typing your password (autologin has none to unlock with),
+   then verify: `sm status` shows the collection unlocked,
+   `busctl --user status org.freedesktop.secrets` names
+   `secret-manager`, and the item count matches the report.
+5. Every PAM file touched has a backup next to it; the D-Bus override
+   and autostart shadows delete cleanly. Roll those back first if the
+   new login misbehaves.
+
 ## SSH passphrases
 
 ```sh
@@ -52,6 +108,54 @@ per-use consent for SSH keys: once logged in, anything that can invoke
 `ssh` on your behalf can use every stored key without a prompt. If you want
 the convenience anyway, also set a real `auto_lock_after` (see
 Configuration below) so an idle session eventually re-locks the vault.
+
+## GPG passphrases
+
+```sh
+sm gpg enroll                       # prompts once (omit --keyid with a single signing key)
+sm gpg enroll --keyid D98C3F305E74B9E3
+```
+
+`enroll` stores the passphrase as an ordinary vault item
+(`xdg:schema=org.secret-manager.gpg`, `keyid=<long id>`), presets the
+agent, and proves the roundtrip with a `--batch` testsign that cannot
+prompt — a success means the next `git commit -S` signs silently.
+
+To have the daemon do it on every unlock (so a login unlocks and
+presets in one step), opt in once in
+`~/.config/secret-manager/config.toml`:
+
+```toml
+[gpg]
+enabled = true
+homedir = "/home/you/.config/gnupg"   # wherever your pubring.kbx lives
+# keys = ["D98C3F305E74B9E3"]          # optional: preset only these
+```
+
+then restart the user daemon (`systemctl --user restart
+secret-manager.service`). From then on every unlock — PAM login,
+`sm unlock`, or a D-Bus unlock prompt — feeds the enrolled
+passphrases to gpg-agent in the background, log-only on failure, and
+never raises a dialog itself. `sm gpg preset` remains for manual runs.
+Unenrolled keys are a quiet skip, and with `enabled` unset nothing
+happens at all.
+
+Two prerequisites, both one-time. The agent refuses presets unless
+`~/.config/gnupg/gpg-agent.conf` holds `allow-preset-passphrase`
+(reload with `gpg-connect-agent reloadagent /bye` afterwards) — if it
+is missing, `enroll` says so instead of succeeding vaguely. And
+`GPG_TTY` must name a real terminal: an unguarded
+`export GPG_TTY=$(tty)` in a tty-less shell exports the literal
+`not a tty` and breaks pinentry's terminal handling, so only export it
+when `tty` succeeds.
+
+A preset lasts until the agent's maximum cache lifetime (two hours by
+default) and is refreshed at every unlock; it does not change the
+passphrase or the key.
+
+A config file that fails to parse stops the daemon at startup (loud),
+while `sm gpg preset` warns and proceeds unfiltered — the login helper
+must not fail the boot on a typo, but it refuses to do so silently.
 
 ## Configuration
 
@@ -133,16 +237,22 @@ that matters to your threat model.
 ## What the PAM module sends
 
 Nothing that answers the control socket can choose the salt or the Argon2
-parameters any more. At login the module reads the collection's vault header
-straight off disk (`<home>/.local/share/secret-manager/<collection>.vault`
-by default, or the directory named by `vault_dir=` below), derives the
-vault key itself in its own (root) process using the salt and parameters
-recorded in that header, wipes the password, and sends only the derived key
-to the daemon — the socket never carries a password or a `KdfParams`-style
-request that could hand an impostor the choice of salt or cost. If the
-header cannot be read (missing file, bad permissions, corrupt header), PAM
-logs the reason and skips the unlock; it never falls back to parameters
-supplied over the socket.
+parameters any more. At login the module reads every vault header straight
+off disk (`<home>/.local/share/secret-manager/*.vault` by default, or the
+directory named by `vault_dir=` below), derives each vault key itself in
+its own (root) process using the salt and parameters recorded in that
+header, wipes the password, and sends only the derived keys to the daemon —
+the socket never carries a password or a `KdfParams`-style request that
+could hand an impostor the choice of salt or cost. Each unlock is pinned,
+so a vault opened by a correct login never relocks on its own: the
+idle-lock timer (`[vault] auto_lock_after`, 15 minutes by default) skips
+pinned collections until someone explicitly locks them with `sm lock`.
+An interactive `sm unlock` never pins, so auto-lock still applies there.
+If a header cannot be read (missing file, bad permissions, corrupt
+header), PAM logs the reason and skips that vault; it never falls back to
+parameters supplied over the socket. `passwd` follows the same rule: the
+rotation is forwarded into every vault whose header is readable, so no
+wallet is left behind on the old password.
 
 The control socket lives in your runtime directory, so any process already
 running as you could still bind it before the daemon; what such an impostor
@@ -173,17 +283,68 @@ Append options to the `pam_secret_manager.so` lines (space separated):
 
 | option              | default                            | meaning                                                                    |
 |---------------------|-------------------------------------|-----------------------------------------------------------------------------|
-| `collection=<id>`   | `default`                           | vault collection to unlock                                                 |
+| `collection=<id>`   | `default`                           | always unlocked, plus every other vault in the directory (a login opens all wallets, each pinned so it never auto-locks) |
 | `auto_start=no`     | (unset)                             | do not `systemctl --user start` the daemon if its control socket is down   |
 | `vault_dir=<path>`  | `<home>/.local/share/secret-manager` | absolute directory to read `<collection>.vault` from; set this when the user's `[vault] dir` is customised, since PAM cannot read their config file |
 | `socket=<path>`     | (unset)                             | test-only override for the control socket path; **ignored** whenever the module is running as root (i.e. every real login) |
 
+## `sm import`: timeouts and timestamps
+
+`sm import` bounds every wait it cannot answer itself, so a dialog nobody
+can see is an error rather than a hang. The bounds are constants
+(`src/import/gnome.rs`, `src/import/kwallet.rs`) — none is currently
+configurable by flag or config key:
+
+| Route | Bound | Value | What it guards |
+|---|---|---|---|
+| gnome-keyring | `COMMAND_TIMEOUT` | 5 s | one `busctl`/`ps` helper |
+| gnome-keyring | `CALL_TIMEOUT` | 20 s | one D-Bus call or property read |
+| gnome-keyring | `STARTUP_TIMEOUT` | 20 s | private bus and `gnome-keyring-daemon` coming up |
+| gnome-keyring | `PROMPT_TIMEOUT` | 10 s | an unlock prompt on the private bus, where no prompter runs |
+| gnome-keyring | `SECRETS_FALLBACK_TIMEOUT` | 120 s | aggregate budget for the per-item `GetSecret` fallback |
+| kwallet | `DEFAULT_OPEN_TIMEOUT` | 120 s | waiting for `walletAsyncOpened` |
+| kwallet | `DEFAULT_CALL_TIMEOUT` | 60 s | every other kwalletd call, including reads that can raise the per-application access prompt |
+| kwallet | `DEFAULT_CLOSE_TIMEOUT` | 10 s | the closing `close` call, whose answer is ignored |
+
+The SSH-with-no-display hang is governed by `DEFAULT_OPEN_TIMEOUT` on the
+KWallet route and `PROMPT_TIMEOUT` on the gnome-keyring route. KWallet's
+unlock dialog is a Qt widget needing a display: over SSH with no display it
+cannot appear, so the import requires the wallet to be already open and says
+so plainly instead of waiting — and when a dialog *can* appear, the wait is
+bounded at two minutes, long enough to find it and type a password.
+
+Walk budgets refuse rather than truncate: at most 512 collections and
+100,000 items per collection on the gnome-keyring route; at most 200,000
+entries, a 16 MiB / 100,000-row sidecar, and 4,096 entries per serialised
+map on the KWallet route.
+
+A KWallet entry with no sidecar row — or a row with no usable
+`$fdo_created`/`$fdo_modified` — lands at `created = modified = 0` (the
+Unix epoch), never `now()`: stamping the import's own clock onto 66 items
+would destroy the newest-wins ordering `sm get` uses to break
+attribute-set collisions. Such items are reported as `epoch_stamped_items`.
+
 ## Troubleshooting
+
+**After upgrading: `UnsupportedVersion` or unlock failures**
+
+The daemon, CLI, and PAM module ship together (`make build`) and must be
+upgraded together: a v4 client talking to a v5 daemon (or vice versa) is
+rejected with `UnsupportedVersion`. After upgrading, restart the user daemon
+(`systemctl --user restart secret-manager.service`) so no stale artifact
+survives; the daemon logs the version mismatch (see `src/control/server.rs`).
 
 **`secret-manager.service` is `failed` or `start-limit-hit`**
 
 Another process already owns `org.freedesktop.secrets` on the session bus
-(KWallet's `ksecretd`, or `gnome-keyring-daemon`).
+(KWallet's `ksecretd`, or `gnome-keyring-daemon`). Find out which, rather
+than guessing — the two need different steps, and `ksecretd` can hold the
+name on a machine where gnome-keyring is the one named in the activation
+file:
+
+```sh
+busctl --user status org.freedesktop.secrets | grep -E 'Pid|Comm'
+```
 
 ```sh
 systemctl --user status secret-manager.service
@@ -192,7 +353,45 @@ systemctl --user reset-failed secret-manager.service
 
 Confirm the competing service is disabled or masked (see "Replace
 gnome-keyring or kwallet" in your distro's install guide) before starting
-secret-manager again.
+secret-manager again. Note that `ksecretd` keeps the name for the life of
+the session, so after disabling KWallet you must log out and back in — no
+amount of restarting `secret-manager.service` will take it.
+
+**Unlock never happens: the vault is still locked after login**
+
+Check what the module said, from that login attempt:
+
+```sh
+journalctl -b -g pam_secret_manager
+```
+
+`cannot open .../<id>.vault: No such file or directory` means there is no
+vault file at all — the module opens every `<id>.vault` in the vault
+directory, and only falls back to the single `collection=` id (which it
+opens literally, without resolving the daemon's `default` alias) when the
+directory lists nothing. `control socket ... Connection reset by peer` means the
+daemon refused the module: it runs as root at login and is allowed only
+when the daemon sees root as root. A user-namespaced sandbox around the
+daemon (mount sandboxing on a user unit implies one) maps every foreign
+uid to the overflow uid, so root arrives unrecognisable — run the daemon
+outside such sandboxing, or the login path can never authenticate to it.
+
+**`secret-manager.service` fails with `218/CAPABILITIES` or sits at
+`start-limit-hit`**
+
+A unit drop-in conflicts with what a user unit may hold — notably any
+`CapabilityBoundingSet` beyond the base unit's empty set. Inspect
+`~/.config/systemd/user/secret-manager.service.d/`, remove or narrow
+the override, then `systemctl --user daemon-reload` and
+`systemctl --user reset-failed secret-manager.service` before starting
+it again.
+
+**Repeated `pinentry failed: Inappropriate ioctl for device` while locked**
+
+Prompts need a session context the daemon does not always have (no TTY,
+no display agent reachable). Unlock with `sm unlock` (terminal
+password) or at login instead of answering per-item dialogs; the
+failures are the locked state announcing itself, not a broken pinentry.
 
 **The D-Bus activation override reverts after an upgrade**
 

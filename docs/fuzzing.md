@@ -57,6 +57,29 @@ Targets that also want the dumb "not a vault at all" case still get it: every
 generator is reachable from raw bytes, and several targets fuzz the raw form
 alongside the structured one.
 
+**A structure-aware generator can still miss.** `tests/prop_import.rs` was
+written this way and reached `parse_keyring_item` in *zero* cases: its version
+tuple was drawn `(0u8..4, 0u8..4)`, so fifteen draws in sixteen died at the
+version gate before any length was read, and its declared item count was a
+bare `any::<u32>()`, which is an impossible length for a file that size in all
+but about one draw in a million. Nothing said so — the test asserted the
+absence of a panic, and no panic is exactly what an input rejected by the
+first check produces.
+
+Two habits follow, and both layers now use them:
+
+- **Weight every gate towards the value that gets past it**, and make every
+  count a mixture of honest, boundary and arbitrary values rather than one of
+  the three. An `any::<u32>()` length is all guard and no loop.
+- **Assert the shape reached, not the absence of a crash.** Give the generator
+  an oracle — an input honest in every respect *must* parse, to exactly the
+  values it was built from — and, in the proptest layer, count the
+  distribution and fail on a floor:
+  `the_generators_reach_every_shape_the_parsers_can_produce` samples the
+  strategy and asserts how many cases reached the item loop, each value
+  encoding and each refusal, so a generator that stops reaching the
+  interesting code fails a test instead of passing quietly.
+
 ## The corpus
 
 `fuzz/corpus/<target>/seed-*` are hand-written seeds and **are committed** —
@@ -88,6 +111,8 @@ built from), which it cannot discover by mutation alone.
 | `dbus_paths` | client-supplied object paths | parse/construct round-trips; no component ever contains `/` |
 | `askpass_prompt` | the prompt OpenSSH hands to `SSH_ASKPASS` | any released path is absolute, non-empty, and newline-free |
 | `config_toml` | the config file | no panic; an accepted config has sane KDF parameters |
+| `import_keyring_header` | a gnome-keyring `.keyring`, read by `sm import --inventory` with no authentication at all | no panic; peak allocation stays inside a bound derived from the input length, so no declared item, attribute or ciphertext count sizes anything; an inventory never claims more than the file holds; and — the assertion that makes the rest mean something — an input honest in every respect *must* parse, to exactly the ids, item types and attribute-name sets it was built from |
+| `import_wallet_header` | a KWallet `.kwl` cleartext index | the same allocation bound, over the nested folder/entry loops where a trusted `folderCount` would be 85 GB; an honest index parses to exactly its folder hashes and entry hashes, `contains_entry` finds every entry the index holds, and the parser stops at `ciphertext_offset` and never reads the encrypted half |
 
 ## Adding a target
 
@@ -95,10 +120,11 @@ built from), which it cannot discover by mutation alone.
 2. Add a `[[bin]]` entry to `fuzz/Cargo.toml`.
 3. Add the name to `FUZZ_TARGETS` in the `Makefile`.
 
-Steps 2 and 3 are checked against each other by
-`tests/packaging.rs::every_fuzz_target_is_declared_and_runnable`, so a target
-that exists but is never run — the worst kind, because it looks like coverage
-— fails the suite.
+All three are checked against each other by
+`tests/packaging.rs::every_fuzz_target_is_declared_and_runnable` — the files
+present in `fuzz_targets/`, the `[[bin]]` entries in `fuzz/Cargo.toml`, and
+the `FUZZ_TARGETS` list — so a target that exists but is never run — the
+worst kind, because it looks like coverage — fails the suite.
 
 [proptest]: https://docs.rs/proptest
 [cargo-fuzz]: https://rust-fuzz.github.io/book/cargo-fuzz.html

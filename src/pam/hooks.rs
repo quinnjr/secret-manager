@@ -111,12 +111,16 @@ impl PamServiceModule for PamSecretManager {
             let budget = Budget::new(HOOK_BUDGET);
             // SAFETY: same type as stored under DATA_KEY in `authenticate`.
             let stashed = unsafe { pamh.retrieve_data::<Password>(DATA_KEY) }.ok();
+            // Resolved here, in the parent: the socket work below may run in
+            // a forked child, and the child must never touch the libpam
+            // handle — only this owned name crosses the fork.
+            let user = user_name(&pamh);
             let outcome = open_session_decision(
                 stashed.as_ref().map(|Password(p)| p.as_str()),
                 &args,
                 &budget,
                 &|opts| target(&pamh, opts),
-                &|budget| match user_name(&pamh) {
+                &|budget| match user.clone() {
                     Some(user) => {
                         start_daemon(&user, budget);
                         true
